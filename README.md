@@ -4,7 +4,7 @@
 
 **상태: 합의된 Sonnet 치환 구성 구현·최종 재검증 완료 — 2026-10-20 12:23 KST.**
 
-- 기록 기준: 2026-10-20 12:23 KST
+- 기록 기준: 2026-10-20 13:04 KST (기준 구성12:23 완료, Fable·크레딧 정책 후속 갱신)
 - 이 저장소에는 현재 문서만 있습니다. 실행 코드·API 키·OAuth·개인 설정은 포함하지 않습니다.
 
 ## 목표와 현재 구성
@@ -15,13 +15,14 @@ Claude Code — 기존 Pro 로그인·설정·권한·MCP·플러그인·HUD
       ├─ Sonnet → OpenRouter / DeepSeek V4.1 Flash 1017
       ├─ Opus   → Anthropic / 기존 Pro OAuth
       ├─ Haiku  → Anthropic / 기존 Pro OAuth
-      └─ Fable·미등록 모델·유료 API 대체 → 차단
+      ├─ Fable  → Anthropic / 기존 Pro OAuth · 이용 가능 여부는 앱·플랜 판단
+      └─ 미등록 모델·유료 API 대체 → 차단
 ```
 
 | 항목 | 현재 동작 |
 | --- | --- |
 | Sonnet 실제 추론 | `deepseek/deepseek-v4.1-flash-1017` · OpenRouter 별도 과금 |
-| Opus·Haiku | 저장된 Claude Pro OAuth 인증으로 Anthropic에 전달 |
+| Opus·Haiku·Fable | 저장된 Claude Pro OAuth 인증으로 Anthropic에 전달; 이용 가능 여부는 앱·계정 플랜이 판단 |
 | API 키 보관 | 기존 로컬 `.env.openrouter`를 라우터만 읽음 |
 | Claude Code 인증 | OpenRouter 키로 대체하지 않음 |
 | 기존 설정 | 원래 사용자·프로젝트 설정을 로드하며 파일을 다시 쓰지 않음 |
@@ -29,7 +30,7 @@ Claude Code — 기존 Pro 로그인·설정·권한·MCP·플러그인·HUD
 | 장애 처리 | 해당 제공자 경로 중단; 다른 제공자·모델로 자동 전환하지 않음 |
 | 네이티브 advisor | 혼합 세션에서만 비활성화; 일반 Pro 세션의 저장된 설정은 유지 |
 
-Pro의 **Usage credits 자체가 OFF**여야 합니다. 자동 충전만 OFF인 상태와 다릅니다. 이는 사용자가 계정에서 확인한 조건이며, 라우터가 계정의 크레딧 설정이나 실제 청구 내역을 조회·보장하는 것은 아닙니다.
+Fable 이용 가능 여부와 Usage credits 사용 여부는 Claude 앱·계정 플랜의 판단에 맡깁니다. 라우터는 Fable을 별도로 차단하거나 크레딧 OFF를 요구하지 않으며 계정의 크레딧 설정을 변경하지 않습니다. Sonnet의 DeepSeek 연결과 제공자 간 인증 분리·자동 API 대체 금지는 유지합니다.
 
 ## 해결한 오류
 
