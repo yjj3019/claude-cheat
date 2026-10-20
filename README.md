@@ -1,12 +1,24 @@
 # Claude Code · Sonnet 대체 모델과 Pro fallback
 
-기존 Claude Code Pro 로그인과 설정을 유지하며, 호환되는 Sonnet 요청을 OpenRouter DeepSeek 또는 Local LLM으로 보내는 로컬 라우터의 작업 기록입니다. 저장소에는 문서만 있으며 실행 코드·키·OAuth·개인 설정은 포함하지 않습니다.
+기존 Claude Code Pro 로그인과 설정을 유지하며, 호환되는 Sonnet 요청을 OpenRouter DeepSeek 또는 Local LLM으로 보내는 로컬 라우터입니다. 실행 코드·합성 회귀 테스트를 포함하며 API 키·OAuth·개인 설정·개인 진단 기록은 포함하지 않습니다.
 
 **최신 상태: 재시도·Pro fallback·복구·Local 선택 구현. 모든 기존 기능과 실제 Sonnet 대체의 동시 보장은 미완료.**
 
 - 기록 기준: 2026-10-20 16:14 KST
 
 ## 현재 동작과 실행
+
+이 checkout에서 직접 실행하려면 Node.js·Python·Claude Code와 기존 Pro 로그인이 필요합니다. OpenRouter 키는 checkout 루트의 `.env.openrouter`에 `ANTHROPIC_AUTH_TOKEN=본인의_OpenRouter_키` 형식으로 설정합니다. 이 키는 라우터만 사용하며 Claude의 구독 로그인을 API 키로 바꾸지 않습니다. `.env*` 파일은 Git에서 제외합니다.
+
+```powershell
+# checkout 루트에서 실행
+.\startClaudeOpenRouter.ps1
+# 외부 API 호출 없는 합성 테스트
+node --test tests/claudeRouteProxy.test.mjs
+python openrouterAdvisor.py --self-test
+```
+
+아래의 경로 없는 실행 명령은 기존 PC에 설치된 전역 shim을 사용합니다. clone만으로 전역 shim을 설치하거나 현재 실행 환경을 전환하지 않습니다.
 
 ```powershell
 # 기본: OpenRouter DeepSeek
@@ -29,5 +41,5 @@ LOCAL_LLM_MODEL=YOUR_INSTALLED_MODEL_ID
 # 인증이 필요한 로컬 서버에만 LOCAL_LLM_API_KEY를 별도로 설정
 ```
 
-Local은 literal loopback HTTP `/v1/messages`만 허용하고 redirect를 거부합니다. Local 선택 시 `.env.openrouter` 키를 읽지 않습니다. 아직 실제 로컬 서비스·설치 모델이 확인되지 않아 Local은 모의 검증만 마쳤습니다. 실제 키는 이 저장소·노션·로그에 기록하지 않습니다.
+Local은 literal loopback HTTP `/v1/messages`만 허용하고 redirect를 거부합니다. Local 선택 시 `.env.openrouter` 키를 읽지 않습니다. 사용자가 현재 시스템에 Local LLM이 없다고 확인했으므로 Local은 모의 검증만 마쳤으며 설치·서비스 기동은 하지 않았습니다. 실제 키는 이 저장소·노션·로그에 기록하지 않습니다.
 
