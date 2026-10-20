@@ -111,7 +111,7 @@ Local mode does not read the OpenRouter key. Real `.env*` settings are ignored b
 
 Run real loopback HTTP integration tests with `node --test tests/*.test.mjs` and configuration/metadata tests with `python -m unittest discover -s tests -p test_local_config.py -v`. Their servers and Pro responses are synthetic; they do not contact real LLM providers or accounts.
 
-Independent validation after these Local additions passed **136/136 Node tests**, **13/13 Python tests**, Python self-tests, Node/Python syntax checks, and PowerShell parsing. Real server/model/authentication/TLS deployment checks remain deferred.
+Independent validation after these Local additions passed **138/138 Node tests**, **13/13 Python tests**, Python self-tests, Node/Python syntax checks, and PowerShell parsing. Real server/model/authentication/TLS deployment checks remain deferred.
 
 ## Understanding connection checks and troubleshooting
 

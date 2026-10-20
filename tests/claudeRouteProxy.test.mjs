@@ -704,3 +704,22 @@ test('local credentials reject CRLF before constructing request headers', () => 
   assert.throws(() => createProxy({ nonce: NONCE, provider: 'local',
     localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'configured-model', localKey: 'synthetic\r\ninjected' }));
 });
+
+// Sonnet 5.5 rejects disabled thinking; never synthesize it during fallback.
+for (const thinking of [undefined, { type: 'adaptive' }]) {
+  test(`Sonnet 5.5 fallback preserves ${thinking ? 'adaptive' : 'omitted'} thinking`, async t => {
+    const body = requestBody('claude-sonnet-5-5', { max_tokens: 256,
+      ...(thinking ? { thinking } : {}) });
+    const raw = JSON.stringify(body, null, 2);
+    const { calls, request } = await fixture(t, (url, options) =>
+      native(url, options) || new Response('{}', { status: 503 }));
+    const response = await request(undefined, { raw, headers: proHeaders });
+    assert.equal(response.status, 200);
+    assert.equal(calls.length, 5);
+    assert.equal(calls.filter(call => call.url === externalURL).length, 4);
+    assert.equal(calls.at(-1).url, proURL);
+    assert.equal(Buffer.from(calls.at(-1).body).toString(), raw);
+    assert.deepEqual(calls.at(-1).parsedBody, body);
+    assert.equal(Object.hasOwn(calls.at(-1).parsedBody, 'thinking'), Boolean(thinking));
+  });
+}
