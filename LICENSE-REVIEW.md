@@ -14,6 +14,7 @@
 | `openrouterAdvisor.py` | Python 표준 라이브러리; 별도 설치된 `node`·`claude` 실행; stdio MCP 구현과 자체 검사 |
 | `startClaudeOpenRouter.ps1` | PowerShell 기본 기능으로 Python 실행 |
 | `tests/claudeRouteProxy.test.mjs` | Node.js 내장 assert·events·test, 프로젝트 프록시; 합성 인증값과 모의 응답 |
+| 후속 Local 연동 파일 | `tests/localLlmIntegration.test.mjs`의 Node 내장 HTTP 서버, `tests/test_local_config.py`의 Python 표준 unittest·HTTP 서버·mock; 실행기의 urllib 메타데이터 조회도 표준 라이브러리 사용 |
 | `README.md`, `.gitignore` | 문서·패턴; 기존 별도 라이선스 고지 없음 |
 
 검토한 추적 파일에서 외부 패키지·vendored 구현·기존 저작권 또는 다른 라이선스 고지를 발견하지 못했습니다. 소스는 이 저장소의 최초 코드 반영 커밋에 함께 추가됐습니다. 후보 저장소의 문서 링크와 비교 기록 자체를 코드 포함의 증거로 보지는 않습니다. 이 검토는 해당 소스·고지·Git 이력의 확인이며, 이력에 남지 않은 외부 출처나 모든 권리 관계를 독립적으로 입증한 것은 아닙니다.
@@ -30,6 +31,8 @@
 **Selected license: MIT (SPDX: `MIT`).** It covers this repository's code and documentation; the authoritative project grant is in [LICENSE](LICENSE).
 
 All checked-in source files were reviewed: the Node proxy, Python launcher and consultation helper, PowerShell launcher, and synthetic Node tests. Imports use Node.js built-ins, Python's standard library, and the local project module. The launcher invokes separately installed runtimes and Claude Code. The existing README and ignore patterns were also checked.
+
+The later Local connector adds standard-library urllib metadata checks, Node built-in HTTP integration tests, and Python standard-library unittest/HTTP-server tests. It introduces no bundled external package.
 
 No bundled third-party package, vendored implementation, or pre-existing copyright/license notice was found in the tracked files. The source files entered this repository together in the baseline commit above. Links to comparison repositories are not treated as evidence of embedded code. This is a source, notice, and available-history review, not independent proof of every right or of provenance absent from that history.
 

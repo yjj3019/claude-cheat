@@ -56,15 +56,38 @@ The CLI or HUD can still display Sonnet/Pro for a replacement response. That lab
 
 Real Local inference requires a separately configured service and remains a separate validation step.
 
-For a future local service, create `.env.local-llm` in the checkout root, or set the corresponding process environment variables:
+Create `.env.local-llm` **next to the launcher**, or set the corresponding process environment variables. The configuration directory is not necessarily the working directory. Fill in the real server URL and model ID later. Only Anthropic-compatible `/v1/messages` is supported; no OpenAI-only `/v1/chat/completions` adapter is implemented.
+
+```powershell
+# Run in the checkout root; preserve an existing configuration.
+if (-not (Test-Path -LiteralPath '.env.local-llm')) {
+    Copy-Item -LiteralPath '.env.local-llm.example' -Destination '.env.local-llm'
+}
+notepad .env.local-llm
+# Model metadata only; no inference or Pro login is used.
+.\startClaudeOpenRouter.ps1 -CheckLocal
+# Normal launch still checks the saved Pro authentication.
+.\startClaudeOpenRouter.ps1 -Provider Local
+```
 
 ```dotenv
 LOCAL_LLM_URL=http://127.0.0.1:11434/v1/messages
 LOCAL_LLM_MODEL=YOUR_INSTALLED_MODEL_ID
+LOCAL_LLM_ALLOW_REMOTE=false
 # Set LOCAL_LLM_API_KEY separately only if the local server requires authentication.
+# Optional same-origin model-list URL; default: /v1/models.
+# LOCAL_LLM_MODELS_URL=http://127.0.0.1:11434/api/tags
 ```
 
-Local mode requires an HTTP `/v1/messages` endpoint on a literal loopback address (`127.0.0.1` or `::1`) and rejects redirects. It does not read the OpenRouter key. The server and installed model must be configured and validated separately.
+By default, only literal loopback (`127.0.0.1` or `::1`) HTTP/HTTPS endpoints are allowed. To use an existing remote server, explicitly set `LOCAL_LLM_ALLOW_REMOTE=true` and an `https://server/v1/messages` URL. Remote HTTP, URL credentials/query/fragment, redirects, and invalid credential headers are rejected. Certificate verification is not disabled. A plain-HTTP LAN server needs HTTPS or a separately prepared loopback tunnel. Opting in trusts the configured DNS name and its resolution.
+
+`-CheckLocal` sends only a GET to the same-origin model-list endpoint. It disables environment proxies and redirects, uses only the Local key in a fresh `Authorization: Bearer` header, and limits responses to 1 MiB with a five-second socket timeout. Output contains only model counts, configured-model presence, and fixed error categories. Model metadata success does not establish Messages inference or tool compatibility. If the server has no model-list API, skip that optional check and validate inference separately. A failed check never invokes Pro fallback.
+
+Local mode does not read the OpenRouter key. Real `.env*` settings are ignored by Git; only the credential-free `.env.local-llm.example` template is distributed. The server and model still need real validation later.
+
+Run real loopback HTTP integration tests with `node --test tests/*.test.mjs` and configuration/metadata tests with `python -m unittest discover -s tests -p test_local_config.py -v`. Their servers and Pro responses are synthetic; they do not contact real LLM providers or accounts.
+
+Independent validation after these Local additions passed **136/136 Node tests**, **13/13 Python tests**, Python self-tests, Node/Python syntax checks, and PowerShell parsing. Real server/model/authentication/TLS deployment checks remain deferred.
 
 ## Validation and limitations
 
@@ -97,6 +120,9 @@ See the [connection and recovery checklist](docs/LIVE-VALIDATION.ko.md) for a ge
 | `openrouterAdvisor.py` | Pro authentication checks, environment isolation, proxy lifecycle, isolated consultation tool, self-tests |
 | `claudeRouteProxy.mjs` | Routing, response validation, retries, fallback, recovery |
 | `tests/claudeRouteProxy.test.mjs` | Synthetic proxy regression tests |
+| `tests/localLlmIntegration.test.mjs` | Real loopback HTTP tests with synthetic Messages servers and Pro responses |
+| `tests/test_local_config.py` | Configuration policy and model-metadata checks using synthetic HTTP servers |
+| `.env.local-llm.example` | Credential-free configuration template for an existing server |
 
 The private `tests/probeClaudeRoute.py` used during development is not distributed here.
 

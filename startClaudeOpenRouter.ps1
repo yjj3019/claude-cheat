@@ -1,4 +1,6 @@
-param([ValidateSet('OpenRouter', 'Local')][string]$Provider = 'OpenRouter')
+param([ValidateSet('OpenRouter', 'Local')][string]$Provider = 'OpenRouter', [switch]$CheckLocal)
 $ErrorActionPreference = 'Stop'
-& python (Join-Path $PSScriptRoot 'openrouterAdvisor.py') --provider $Provider.ToLowerInvariant()
-if ($LASTEXITCODE -ne 0) { throw "OpenRouter session exited with code $LASTEXITCODE." }
+$routeArgs = @('--provider', $Provider.ToLowerInvariant())
+if ($CheckLocal) { $routeArgs += '--check-local' }
+& python (Join-Path $PSScriptRoot 'openrouterAdvisor.py') @routeArgs
+if ($LASTEXITCODE -ne 0) { throw "Claude routing or connection check exited with code $LASTEXITCODE." }

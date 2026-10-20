@@ -3,6 +3,13 @@ import { once } from 'node:events';
 import test from 'node:test';
 import { createProxy, DEEPSEEK } from '../claudeRouteProxy.mjs';
 
+for (const localUrl of ['http://127.0.0.1:0/v1/messages', 'http://127.0.0.1:11434/v1/mes\nsages', 'https://llm.example.invalid:0/v1/messages']) {
+  test('Local URL rejects zero port and embedded control characters: ' + JSON.stringify(localUrl), () => {
+    assert.throws(() => createProxy({ nonce: 'fixture-nonce', provider: 'local', localUrl,
+      localModel: 'fixture-model', localAllowRemote: true }));
+  });
+}
+
 // Deliberately synthetic values: these tests never read credentials or contact an upstream.
 const KEY = 'test-openrouter-key';
 const NONCE = 'test-local-nonce';
@@ -655,4 +662,45 @@ test('native role system and unknown thinking configuration preserve original Pr
     assert.equal(calls.at(-1).url, proURL);
     assert.deepEqual(calls.at(-1).parsedBody, body);
   }
+});
+
+for (const localAllowRemote of [undefined, false]) {
+  test(`remote HTTPS local endpoint requires explicit opt-in (${localAllowRemote})`, () => {
+    assert.throws(() => createProxy({ nonce: NONCE, provider: 'local',
+      localUrl: 'https://llm.example.invalid/v1/messages', localModel: 'configured-model', localAllowRemote }));
+  });
+}
+
+test('explicit remote HTTPS uses exactly the configured endpoint, model and isolated credential', async t => {
+  const localUrl = 'https://llm.example.invalid:8443/v1/messages';
+  const localKey = 'synthetic-remote-local-key';
+  const localModel = 'configured-model';
+  const { calls, request } = await fixture(t, jsonResponse, { provider: 'local', key: undefined,
+    localUrl, localModel, localKey, localAllowRemote: true });
+  const response = await request(requestBody(SONNET), { headers: proHeaders });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).model, SONNET);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, localUrl);
+  assert.deepEqual(calls[0].parsedBody, { ...requestBody(SONNET), model: localModel });
+  assert.equal(calls[0].headers.authorization, `Bearer ${localKey}`);
+  assert.equal(calls[0].headers['anthropic-beta'], undefined);
+  assert.equal(calls[0].headers['x-api-key'], undefined);
+  assert.equal(JSON.stringify(calls[0].headers).includes(OAUTH), false);
+  assert.equal(calls[0].redirect, 'error');
+});
+
+test('remote opt-in never allows plaintext HTTP', () => {
+  assert.throws(() => createProxy({ nonce: NONCE, provider: 'local',
+    localUrl: 'http://llm.example.invalid/v1/messages', localModel: 'configured-model', localAllowRemote: true }));
+});
+
+test('remote opt-in requires a boolean rather than a truthy string', () => {
+  assert.throws(() => createProxy({ nonce: NONCE, provider: 'local',
+    localUrl: 'https://llm.example.invalid/v1/messages', localModel: 'configured-model', localAllowRemote: 'true' }));
+});
+
+test('local credentials reject CRLF before constructing request headers', () => {
+  assert.throws(() => createProxy({ nonce: NONCE, provider: 'local',
+    localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'configured-model', localKey: 'synthetic\r\ninjected' }));
 });

@@ -37,15 +37,38 @@ startClaudeOpenRouter.ps1 -Provider Local
 - Pro 요청·응답과 오류는 원형 전달합니다. 기존 advisor·실험 beta를 강제로 비활성화하지 않습니다. 외부가 처리하지 못하는 advisor·서버 도구·inline 도구·서명된 thinking 등은 원본 Pro 요청으로 우회합니다. 이 우회는 장애 fallback이나 외부 복구 성공으로 세지 않습니다.
 - Opus·Haiku·Fable은 기존 Pro 인증 경로입니다. 모델 접근성과 크레딧은 앱·계정 설정이 결정하며 별도 Fable 차단·OFF 요구는 없습니다. 외부 제공자에는 Pro OAuth를 전달하지 않습니다.
 
-Local 설정은 기존 작업공간의 `.env.local-llm` 또는 해당 프로세스 환경변수에서 읽습니다. 예시의 모델 ID는 실제 설치 모델명으로 바꿔야 합니다.
+Local 설정은 **실행기 파일이 있는 폴더**의 `.env.local-llm` 또는 해당 프로세스 환경변수에서 읽습니다. 작업 디렉터리와 다른 폴더일 수 있습니다. 서버 주소와 모델 ID는 나중에 실제 서버에 맞게 지정합니다. 현재는 Anthropic 호환 `/v1/messages`만 지원하며 OpenAI 전용 `/v1/chat/completions` 변환은 구현하지 않았습니다.
+
+```powershell
+# checkout 루트에서 기존 설정을 덮어쓰지 않고 예제 복사
+if (-not (Test-Path -LiteralPath '.env.local-llm')) {
+    Copy-Item -LiteralPath '.env.local-llm.example' -Destination '.env.local-llm'
+}
+notepad .env.local-llm
+# 추론·Pro 로그인 없이 서버 모델 목록과 선택 모델만 점검
+.\startClaudeOpenRouter.ps1 -CheckLocal
+# 실제 사용 시 기존 Pro 인증 검사 후 시작
+.\startClaudeOpenRouter.ps1 -Provider Local
+```
 
 ```dotenv
 LOCAL_LLM_URL=http://127.0.0.1:11434/v1/messages
 LOCAL_LLM_MODEL=YOUR_INSTALLED_MODEL_ID
+LOCAL_LLM_ALLOW_REMOTE=false
 # 인증이 필요한 로컬 서버에만 LOCAL_LLM_API_KEY를 별도로 설정
+# 선택: 같은 scheme/host/port의 모델 목록 URL (기본 /v1/models)
+# LOCAL_LLM_MODELS_URL=http://127.0.0.1:11434/api/tags
 ```
 
-Local은 literal loopback HTTP `/v1/messages`만 허용하고 redirect를 거부합니다. Local 선택 시 `.env.openrouter` 키를 읽지 않습니다. 사용자가 현재 시스템에 Local LLM이 없다고 확인했으므로 Local은 모의 검증만 마쳤으며 설치·서비스 기동은 하지 않았습니다. 실제 키는 이 저장소·노션·로그에 기록하지 않습니다.
+기본은 literal loopback(`127.0.0.1`, `::1`) HTTP/HTTPS만 허용합니다. 기존 원격 서버를 쓰려면 `LOCAL_LLM_ALLOW_REMOTE=true`와 `https://서버주소/v1/messages`를 명시해야 합니다. 원격 HTTP·URL 내 자격증명·쿼리·fragment·redirect·잘못된 인증 헤더는 거부하며 TLS 인증서 검증을 끄지 않습니다. 평문 LAN 서버는 HTTPS를 제공하거나 사용자가 별도로 준비한 loopback 터널을 사용해야 합니다. 원격 허용은 지정한 DNS 이름과 그 해석 결과를 신뢰한다는 뜻입니다.
+
+`-CheckLocal`은 같은 origin의 모델 목록에 GET만 보냅니다. 환경 프록시·redirect를 사용하지 않고 `Authorization: Bearer` 헤더에 Local 전용 키만 전달하며, 응답은 1MiB·소켓 타임아웃 5초로 제한합니다. 결과에는 모델 수·선택 모델 존재 여부·고정 오류 분류만 출력합니다. 모델 목록 성공은 추론·도구 호출 성공을 뜻하지 않습니다. 목록 API가 없는 서버에서는 해당 점검을 생략하고 별도로 추론을 검증해야 합니다. 점검 실패가 Pro fallback을 실행하지는 않습니다.
+
+실제 Local LLM은 현재 시스템에 없으며, 사용자가 실서버 테스트를 추후 진행하기로 했습니다. 설치·서비스 기동·실서버 접속·실제 추론은 하지 않았습니다. Local 선택 시 `.env.openrouter` 키를 읽지 않습니다. 실설정 `.env*`는 Git에서 제외하고 값이 없는 `.env.local-llm.example`만 배포합니다.
+
+Local HTTP 통합 검사는 `node --test tests/*.test.mjs`, 설정·점검 검사는 `python -m unittest discover -s tests -p test_local_config.py -v`로 실행합니다. 실제 루프백 HTTP 서버와 합성 응답을 사용하며 Pro 응답도 합성입니다. 기존 계정이나 외부 LLM에는 요청하지 않습니다.
+
+이번 Local 보완 후 독립 검사에서 Node **136/136**, Python **13/13**, Python 자체 검사·Node/Python 문법·PowerShell 파싱이 통과했습니다. 실제 서버·모델·인증·TLS 배포에 대한 검증은 추후 진행합니다.
 
 ## 라이선스
 

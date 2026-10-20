@@ -14,7 +14,9 @@ import secrets
 import shlex
 import threading
 import argparse
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
+import urllib.request
+import urllib.error
 
 ROOT = Path(__file__).resolve().parent
 DEEPSEEK = "deepseek/deepseek-v4.1-flash-1017"
@@ -66,7 +68,23 @@ def read_key() -> str:
     return token
 
 
-def provider_config(provider: str) -> dict:
+def local_endpoint(url: str, allow_remote: bool) -> tuple:
+    if not isinstance(url, str) or any(ord(char) < 33 or ord(char) == 127 for char in url):
+        raise ValueError("Invalid Local LLM URL; value hidden")
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("Invalid Local LLM URL; value hidden") from None
+    loopback = parsed.hostname in {"127.0.0.1", "::1"}
+    if (parsed.scheme not in {"http", "https"} or not parsed.hostname or port == 0
+            or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment
+            or parsed.path != "/v1/messages" or (not loopback and (not allow_remote or parsed.scheme != "https"))):
+        raise ValueError("Local LLM requires loopback Messages or explicitly allowed remote HTTPS")
+    return parsed, (parsed.scheme, parsed.hostname, port if port is not None else (443 if parsed.scheme == "https" else 80))
+
+
+def provider_config(provider: str, require_model: bool = True) -> dict:
     if provider == "openrouter":
         return {"SONNET_PROVIDER": provider, "OPENROUTER_API_KEY": read_key()}
     if provider != "local":
@@ -74,18 +92,77 @@ def provider_config(provider: str) -> dict:
     path = ROOT / ".env.local-llm"
     values = read_env(path) if path.is_file() else {}
     values = {**values, **{name: os.environ[name] for name in
-              ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY") if name in os.environ}}
+              ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_MODELS_URL") if name in os.environ}}
     url = values.get("LOCAL_LLM_URL", "http://127.0.0.1:11434/v1/messages")
-    parsed = urlsplit(url)
-    if (parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "::1"}
-            or parsed.username or parsed.password or parsed.query or parsed.fragment
-            or parsed.path != "/v1/messages"):
-        raise ValueError("Local LLM requires a literal loopback HTTP /v1/messages endpoint")
+    remote = values.get("LOCAL_LLM_ALLOW_REMOTE", "false").strip().lower()
+    if remote not in {"true", "false"}:
+        raise ValueError("LOCAL_LLM_ALLOW_REMOTE must be true or false")
+    parsed, origin = local_endpoint(url, remote == "true")
     model = values.get("LOCAL_LLM_MODEL", "").strip()
-    if not model or any(ord(char) < 32 for char in model):
+    if (require_model and not model) or any(ord(char) < 32 for char in model):
         raise ValueError("Set LOCAL_LLM_MODEL in .env.local-llm or the process environment")
+    key = values.get("LOCAL_LLM_API_KEY", "")
+    if any(ord(char) < 32 or ord(char) == 127 for char in key):
+        raise ValueError("Invalid Local LLM key; value hidden")
+    models_url = values.get("LOCAL_LLM_MODELS_URL", "") or urlunsplit((parsed.scheme, parsed.netloc, "/v1/models", "", ""))
+    if any(ord(char) < 33 or ord(char) == 127 for char in models_url):
+        raise ValueError("Invalid Local model-list URL; value hidden")
+    try:
+        models = urlsplit(models_url)
+        models_origin = (models.scheme, models.hostname, models.port if models.port is not None else (443 if models.scheme == "https" else 80))
+    except ValueError:
+        raise ValueError("Invalid Local model-list URL; value hidden") from None
+    if (models_origin != origin or models.port == 0 or models.username is not None or models.password is not None
+            or models.query or models.fragment or not models.path.startswith("/")):
+        raise ValueError("Local model-list URL must have the same origin without credentials or query")
     return {"SONNET_PROVIDER": provider, "LOCAL_LLM_URL": url, "LOCAL_LLM_MODEL": model,
-            "LOCAL_LLM_API_KEY": values.get("LOCAL_LLM_API_KEY", "")}
+            "LOCAL_LLM_API_KEY": key, "LOCAL_LLM_ALLOW_REMOTE": remote, "LOCAL_LLM_MODELS_URL": models_url}
+
+
+class NoLocalRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def check_local() -> dict:
+    """Read model metadata only: no CLI authentication, inference, fallback, or installation."""
+    base = {"local_check": False, "inference_checked": False}
+    try:
+        config = provider_config("local", require_model=False)
+        headers = {"Accept": "application/json"}
+        if config["LOCAL_LLM_API_KEY"]:
+            headers["Authorization"] = "Bearer " + config["LOCAL_LLM_API_KEY"]
+        request = urllib.request.Request(config["LOCAL_LLM_MODELS_URL"], headers=headers)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoLocalRedirect())
+        with opener.open(request, timeout=5) as response:
+            if response.status != 200:
+                return {**base, "reason": "http_error", "status": response.status}
+            payload = response.read(1024 * 1024 + 1)
+        if len(payload) > 1024 * 1024:
+            return {**base, "reason": "response_too_large"}
+        data = json.loads(payload)
+        if not isinstance(data, dict):
+            return {**base, "reason": "invalid_model_list"}
+        entries = data.get("data", data.get("models"))
+        if not isinstance(entries, list) or any(not isinstance(item, dict) for item in entries):
+            return {**base, "reason": "invalid_model_list"}
+        ids = [item.get("id", item.get("name", item.get("model"))) for item in entries]
+        if any(not isinstance(item, str) or not item for item in ids):
+            return {**base, "reason": "invalid_model_list"}
+        model = config["LOCAL_LLM_MODEL"]
+        found = bool(model) and model in ids
+        return {**base, "local_check": found, "model_count": len(ids), "configured_model_found": found,
+                "reason": "ready_metadata_only" if found else "model_not_found" if model else "model_not_configured"}
+    except urllib.error.HTTPError as error:
+        result = {**base, "reason": "redirect_rejected" if 300 <= error.code < 400 else "http_error", "status": error.code}
+        error.close()
+        return result
+    except urllib.error.URLError:
+        return {**base, "reason": "connection_failed"}
+    except (TimeoutError, OSError):
+        return {**base, "reason": "connection_failed"}
+    except (ValueError, UnicodeError):
+        return {**base, "reason": "invalid_configuration_or_response"}
 
 
 def clean_env() -> dict:
@@ -233,7 +310,7 @@ def routed_session(provider: str = "openrouter"):
     if not claude:
         raise FileNotFoundError("Claude Code executable not found")
     env = os.environ.copy()
-    for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "SONNET_PROVIDER"):
+    for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER"):
         env.pop(name, None)
     # Remove only provider credentials/routing left by the former OpenRouter setup.
     for name in ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",
@@ -256,7 +333,7 @@ def routed_session(provider: str = "openrouter"):
         raise FileNotFoundError("Node.js required for local routing")
     nonce = secrets.token_urlsafe(32)
     proxy_env = clean_env()
-    for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "SONNET_PROVIDER"):
+    for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER"):
         proxy_env.pop(name, None)
     proxy_env.update(provider_config(provider), LOCAL_ROUTE_TOKEN=nonce)
     proxy = subprocess.Popen([node, str(ROOT / "claudeRouteProxy.mjs")], env=proxy_env,
@@ -517,7 +594,13 @@ if __name__ == "__main__":
         else:
             parser = argparse.ArgumentParser(description="Sonnet replacement with Pro subscription fallback")
             parser.add_argument("--provider", choices=("openrouter", "local"), default="openrouter")
-            sys.exit(launch(parser.parse_args().provider))
+            parser.add_argument("--check-local", action="store_true", help="Check local model metadata without inference or Pro login")
+            options = parser.parse_args()
+            if options.check_local:
+                result = check_local()
+                print(json.dumps(result))
+                sys.exit(0 if result["local_check"] else 1)
+            sys.exit(launch(options.provider))
     except (OSError, RuntimeError, EOFError, ValueError, subprocess.SubprocessError) as exc:
         print(json.dumps({"event": "openrouter_start_failed", "kind": type(exc).__name__}), file=sys.stderr)
         sys.exit(1)

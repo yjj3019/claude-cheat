@@ -71,12 +71,14 @@ function externalCompatible(body, beta) {
   return true;
 }
 
-function localEndpoint(value) {
+function localEndpoint(value, allowRemote) {
+  if (typeof value !== 'string' || /[\x00-\x20\x7f]/.test(value)) throw new Error('Invalid Local Messages URL');
   let url;
   try { url = new URL(value); } catch { throw new Error('Local Messages URL required'); }
-  if (url.protocol !== 'http:' || !['127.0.0.1', '[::1]'].includes(url.hostname) ||
+  const loopback = ['127.0.0.1', '[::1]'].includes(url.hostname);
+  if (!['http:', 'https:'].includes(url.protocol) || url.port === '0' || (!loopback && (!allowRemote || url.protocol !== 'https:')) ||
       url.username || url.password || url.search || url.hash || url.pathname !== '/v1/messages')
-    throw new Error('Local Messages URL must be a loopback Messages endpoint');
+    throw new Error('Local Messages URL requires loopback or explicitly allowed remote HTTPS');
   return url.href;
 }
 
@@ -195,11 +197,13 @@ function abortable(promise, signal) {
 }
 
 export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrouter', localUrl,
-  localModel, localKey, fallbackModel = 'claude-sonnet-5-5', retryDelayMs = 1000,
+  localModel, localKey, localAllowRemote = false, fallbackModel = 'claude-sonnet-5-5', retryDelayMs = 1000,
   cooldownMs = 30000, attemptTimeoutMs = 30000, now = Date.now }) {
   if (!nonce || (provider === 'openrouter' && !key)) throw new Error('Proxy credentials required');
   if (!['openrouter', 'local'].includes(provider)) throw new Error('Unsupported Sonnet provider');
-  const externalUrl = provider === 'local' ? localEndpoint(localUrl) : 'https://openrouter.ai/api/v1/messages';
+  if (typeof localAllowRemote !== 'boolean') throw new Error('Remote Local setting must be boolean');
+  if (localKey !== undefined && (typeof localKey !== 'string' || /[\x00-\x1f\x7f]/.test(localKey))) throw new Error('Invalid Local credential');
+  const externalUrl = provider === 'local' ? localEndpoint(localUrl, localAllowRemote) : 'https://openrouter.ai/api/v1/messages';
   if (provider === 'local' && (typeof localModel !== 'string' || !localModel.trim())) throw new Error('Local model required');
   if (!isSonnet(fallbackModel)) throw new Error('Fallback must be a native Sonnet model');
   for (const value of [retryDelayMs, cooldownMs, attemptTimeoutMs])
@@ -346,8 +350,9 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const server = createProxy({ key: process.env.OPENROUTER_API_KEY, nonce: process.env.LOCAL_ROUTE_TOKEN,
     provider: process.env.SONNET_PROVIDER || 'openrouter', localUrl: process.env.LOCAL_LLM_URL,
-    localModel: process.env.LOCAL_LLM_MODEL, localKey: process.env.LOCAL_LLM_API_KEY });
+    localModel: process.env.LOCAL_LLM_MODEL, localKey: process.env.LOCAL_LLM_API_KEY,
+    localAllowRemote: process.env.LOCAL_LLM_ALLOW_REMOTE === 'true' });
   for (const name of ['OPENROUTER_API_KEY', 'LOCAL_ROUTE_TOKEN', 'SONNET_PROVIDER', 'LOCAL_LLM_URL',
-    'LOCAL_LLM_MODEL', 'LOCAL_LLM_API_KEY']) delete process.env[name];
+    'LOCAL_LLM_MODEL', 'LOCAL_LLM_API_KEY', 'LOCAL_LLM_ALLOW_REMOTE', 'LOCAL_LLM_MODELS_URL']) delete process.env[name];
   server.listen(0, '127.0.0.1', () => process.stdout.write(JSON.stringify({ port: server.address().port }) + '\n'));
 }
