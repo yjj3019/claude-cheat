@@ -1,0 +1,70 @@
+# Claude Code · Sonnet → OpenRouter DeepSeek
+
+기존 Claude Code Pro 로그인과 설정을 유지하면서 Sonnet 추론만 OpenRouter의 DeepSeek로 대체하는 구성의 작업 기록입니다.
+
+**상태: 핵심 라우팅 실사용 검증 성공, 전체 완료 보류.**
+
+- 기록 기준: 2026-10-20 KST
+- 이 저장소에는 현재 문서만 있습니다. 실행 코드·API 키·OAuth·개인 설정은 포함하지 않습니다.
+
+## 목표와 현재 구성
+
+```text
+Claude Code — 기존 Pro 로그인·설정·권한·MCP·플러그인·HUD
+  └─ 프로세스 전용 로컬 라우터
+      ├─ Sonnet → OpenRouter / DeepSeek V4.1 Flash 1017
+      ├─ Opus   → Anthropic / 기존 Pro OAuth
+      ├─ Haiku  → Anthropic / 기존 Pro OAuth
+      └─ Fable·미등록 모델·유료 API 대체 → 차단
+```
+
+| 항목 | 현재 동작 |
+| --- | --- |
+| Sonnet 실제 추론 | `deepseek/deepseek-v4.1-flash-1017` · OpenRouter 별도 과금 |
+| Opus·Haiku | 저장된 Claude Pro OAuth 인증으로 Anthropic에 전달 |
+| API 키 보관 | 기존 로컬 `.env.openrouter`를 라우터만 읽음 |
+| Claude Code 인증 | OpenRouter 키로 대체하지 않음 |
+| 기존 설정 | 원래 사용자·프로젝트 설정을 로드하며 파일을 다시 쓰지 않음 |
+| 실행 범위 | 실행한 자식 프로세스에만 로컬 주소·호환 옵션 적용 |
+| 장애 처리 | 해당 제공자 경로 중단; 다른 제공자·모델로 자동 전환하지 않음 |
+| 네이티브 advisor | 혼합 세션에서만 비활성화; 일반 Pro 세션의 저장된 설정은 유지 |
+
+Pro의 **Usage credits 자체가 OFF**여야 합니다. 자동 충전만 OFF인 상태와 다릅니다. 이는 사용자가 계정에서 확인한 조건이며, 라우터가 계정의 크레딧 설정이나 실제 청구 내역을 조회·보장하는 것은 아닙니다.
+
+## 해결한 오류
+
+### 1. OpenRouter HTTP 400 이후 반복 503
+
+기존 CLI가 Anthropic의 최신 inline-tools 형식인 중간 system 메시지의 `tool_addition` 등을 생성했습니다. 실제 CLI 요청의 역할·자료형·블록 종류를 모의 upstream으로 확인했고, OpenRouter의 해당 형식 거부를 별도 최소 요청으로 재현했습니다.
+
+혼합 자식 세션에만 공식 호환 옵션을 적용했습니다.
+
+```text
+CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1
+CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1
+```
+
+도구를 표준 root 정의로 제공하고 중간 system text의 순서를 유지합니다. system 메시지를 root로 이동하거나 도구 결과를 일반 텍스트로 바꾸는 변환은 채택하지 않았습니다. 실험 기능 비활성화는 inline-tools만의 변경이 아니므로, 모든 Anthropic 실험 기능이 원래와 동일하게 동작한다고 보증하지 않습니다.
+
+### 2. 응답은 끝났지만 다음 대화가 503으로 차단됨
+
+정상 `message_stop` 뒤의 선택적 `[DONE]` 표식을 JSON으로 파싱하면 오류가 나는 경우를 재현했습니다. 같은 청크와 분할된 종료 표식 사례 2개가 수정 전 실패하고 수정 후 통과했습니다.
+
+- 검증된 시작·delta·stop 뒤의 종료 표식만 소비하며 CLI에 전달하지 않습니다.
+- 종료 전 `[DONE]`, 이미 받은 종료 후 추가 메시지·오류, 잘린 응답은 계속 거부합니다.
+- `message_stop`을 완료 경계로 삼습니다. 이후의 모든 청크를 기다리며 검사하는 구조는 아닙니다.
+- 과거 실제 SyntaxError의 원문을 수집해 원인을 확정한 것은 아닙니다. 동일 증상의 재현과 수정 뒤 실제 후속 대화 성공을 확인했습니다.
+
+## 후보 저장소 검토
+
+기존 구현을 기준으로 소스를 비교했으며 새 라우터로 교체하거나 설치하지 않았습니다.
+
+| 후보 | 검토한 commit | 채택을 보류한 이유 |
+| --- | --- | --- |
+| [musistudio/claude-code-router](https://github.com/musistudio/claude-code-router) | `057abaa1f95519ab8faf999e1ccef2b80ccdeb9e` | 조사한 core에서 이번 inline-tools 문제의 변환 근거를 확인하지 못함. 외부 gateway 의존성 내부까지 검증한 것은 아님 |
+| [1rgs/claude-code-proxy](https://github.com/1rgs/claude-code-proxy) | `5e45ba683ded931c1832cfca6468a791c6855e45` | 중간 system 지원과 도구 결과 보존이 요구와 맞지 않는 변환 경로 |
+| [krzychdre/claude-local-proxy](https://github.com/krzychdre/claude-local-proxy) | `86ead843cf9ac96edca41d890a9f4a36986940d9` | 중간 system·미지원 블록·일부 제어 필드의 의미나 보존 문제 |
+| [bborbe/claude-code-router](https://github.com/bborbe/claude-code-router) | `4cd12422d4113f89c7e3b3fea203c67b731e049d` | 중간 system을 root로 이동하는 처리와 미일치 모델의 default provider 전달을 그대로 채택할 수 없음 |
+
+이는 해당 commit의 조사 범위에 대한 판단이며 저장소 전체나 향후 버전의 지원 여부를 단정하지 않습니다. CCR의 현재 OAuth 가져오기 지원도 확인했으므로, “CCR은 무조건 API 키만 지원한다”는 과거 설명은 정정합니다.
+
