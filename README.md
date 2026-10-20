@@ -1,5 +1,9 @@
 # Claude Code · Sonnet 대체 모델과 Pro fallback
 
+**한국어** | [English](README.en.md)
+
+[MIT License](LICENSE) · [라이선스 선정 근거 / License review](LICENSE-REVIEW.md)
+
 기존 Claude Code Pro 로그인과 설정을 유지하며, 호환되는 Sonnet 요청을 OpenRouter DeepSeek 또는 Local LLM으로 보내는 로컬 라우터입니다. 실행 코드·합성 회귀 테스트를 포함하며 API 키·OAuth·개인 설정·개인 진단 기록은 포함하지 않습니다.
 
 **최신 상태: 재시도·Pro fallback·복구·Local 선택 구현. 모든 기존 기능과 실제 Sonnet 대체의 동시 보장은 미완료.**
@@ -43,3 +47,10 @@ LOCAL_LLM_MODEL=YOUR_INSTALLED_MODEL_ID
 
 Local은 literal loopback HTTP `/v1/messages`만 허용하고 redirect를 거부합니다. Local 선택 시 `.env.openrouter` 키를 읽지 않습니다. 사용자가 현재 시스템에 Local LLM이 없다고 확인했으므로 Local은 모의 검증만 마쳤으며 설치·서비스 기동은 하지 않았습니다. 실제 키는 이 저장소·노션·로그에 기록하지 않습니다.
 
+## 라이선스
+
+이 저장소의 코드와 문서는 [MIT License](LICENSE)를 적용합니다. 재배포 시 저작권·허가 고지를 보존해야 하며, 상업적 사용·수정·배포를 허용합니다. [MIT 공식 원문](https://opensource.org/license/mit).
+
+전체 추적 소스를 검토한 범위에서 Node.js·Python 표준 라이브러리와 별도 설치된 Claude CLI만 사용하며, 배포에 포함된 외부 패키지·별도 라이선스 고지는 발견하지 못했습니다. 작은 독립 라우터의 재사용·수정에 적합한 단순 허용형 라이선스로 MIT를 선정했습니다. 검토 범위와 Apache-2.0 비교는 [선정 근거](LICENSE-REVIEW.md)에 기록했습니다.
+
+Claude Code, Node.js, Python, OpenRouter·Anthropic 서비스와 모델 자체는 이 저장소에 포함되지 않으며 각자의 라이선스·이용 조건이 적용됩니다. 이 저장소의 MIT 라이선스는 서비스 접근 권한이나 사용량·요금 정책을 변경하지 않습니다.
