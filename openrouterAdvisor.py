@@ -26,7 +26,7 @@ TOOL_NAME = "pro_consult"
 TOOL = {
     "name": TOOL_NAME,
     "description": (
-        "Ask Opus, Haiku or Fable using the existing Claude Pro login, with no API fallback. "
+        "Ask Opus, Haiku or Fable using the existing Claude Plan login, with no API fallback. "
         "Model availability and usage credits are managed by Claude and the account plan. "
         "Include relevant evidence and prior advice; this advisor has no file access or memory. "
         "Do not include secrets."
@@ -68,7 +68,7 @@ def read_key() -> str:
     return token
 
 
-def local_endpoint(url: str, allow_remote: bool) -> tuple:
+def local_endpoint(url: str, allow_remote: bool, http_url: str = "") -> tuple:
     if not isinstance(url, str) or any(ord(char) < 33 or ord(char) == 127 for char in url):
         raise ValueError("Invalid Local LLM URL; value hidden")
     try:
@@ -77,10 +77,11 @@ def local_endpoint(url: str, allow_remote: bool) -> tuple:
     except ValueError:
         raise ValueError("Invalid Local LLM URL; value hidden") from None
     loopback = parsed.hostname in {"127.0.0.1", "::1"}
+    internal_http = parsed.scheme == "http" and url == http_url
     if (parsed.scheme not in {"http", "https"} or not parsed.hostname or port == 0
             or parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment
-            or parsed.path != "/v1/messages" or (not loopback and (not allow_remote or parsed.scheme != "https"))):
-        raise ValueError("Local LLM requires loopback Messages or explicitly allowed remote HTTPS")
+            or parsed.path != "/v1/messages" or (not loopback and not internal_http and (not allow_remote or parsed.scheme != "https"))):
+        raise ValueError("Local LLM requires loopback Messages, approved internal HTTP, or explicitly allowed remote HTTPS")
     return parsed, (parsed.scheme, parsed.hostname, port if port is not None else (443 if parsed.scheme == "https" else 80))
 
 
@@ -92,12 +93,13 @@ def provider_config(provider: str, require_model: bool = True) -> dict:
     path = ROOT / ".env.local-llm"
     values = read_env(path) if path.is_file() else {}
     values = {**values, **{name: os.environ[name] for name in
-              ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_MODELS_URL") if name in os.environ}}
+              ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL") if name in os.environ}}
     url = values.get("LOCAL_LLM_URL", "http://127.0.0.1:11434/v1/messages")
     remote = values.get("LOCAL_LLM_ALLOW_REMOTE", "false").strip().lower()
     if remote not in {"true", "false"}:
         raise ValueError("LOCAL_LLM_ALLOW_REMOTE must be true or false")
-    parsed, origin = local_endpoint(url, remote == "true")
+    http_url = values.get("LOCAL_LLM_HTTP_URL", "")
+    parsed, origin = local_endpoint(url, remote == "true", http_url)
     model = values.get("LOCAL_LLM_MODEL", "").strip()
     if (require_model and not model) or any(ord(char) < 32 for char in model):
         raise ValueError("Set LOCAL_LLM_MODEL in .env.local-llm or the process environment")
@@ -116,7 +118,7 @@ def provider_config(provider: str, require_model: bool = True) -> dict:
             or models.query or models.fragment or not models.path.startswith("/")):
         raise ValueError("Local model-list URL must have the same origin without credentials or query")
     return {"SONNET_PROVIDER": provider, "LOCAL_LLM_URL": url, "LOCAL_LLM_MODEL": model,
-            "LOCAL_LLM_API_KEY": key, "LOCAL_LLM_ALLOW_REMOTE": remote, "LOCAL_LLM_MODELS_URL": models_url}
+            "LOCAL_LLM_API_KEY": key, "LOCAL_LLM_ALLOW_REMOTE": remote, "LOCAL_LLM_HTTP_URL": http_url, "LOCAL_LLM_MODELS_URL": models_url}
 
 
 class NoLocalRedirect(urllib.request.HTTPRedirectHandler):
@@ -188,7 +190,7 @@ def run_owned(args: list, env: dict, cwd: str, prompt: str = "", timeout: int = 
             process.communicate(timeout=5)
         raise
     if process.returncode:
-        raise RuntimeError("Claude Pro request failed; no fallback attempted")
+        raise RuntimeError("Claude Plan request failed; no fallback attempted")
     result = json.loads(output)
     if not isinstance(result, dict):
         raise ValueError("Expected Claude JSON response")
@@ -200,7 +202,7 @@ def pro_command() -> tuple[list, dict]:
     if not claude:
         raise FileNotFoundError("Claude Code executable not found")
     env = clean_env()
-    # Verified saved Pro login location; credentials are read only by the official CLI.
+    # Verified saved Plan login location; credentials are read only by the official CLI.
     env["CLAUDE_CONFIG_DIR"] = str(Path.home() / ".claude")
     settings = {"forceLoginMethod": "claudeai", "fastMode": False,
                 "availableModels": list(PRO_MODELS.values()), "enforceAvailableModels": True}
@@ -213,13 +215,13 @@ def consult(model: str, question: str) -> dict:
     if not isinstance(question, str) or not question.strip() or len(question) > 64000:
         raise ValueError("question must contain 1 to 64000 characters")
     if os.environ.get(PRO_SESSION_GATE) != "launcher-enabled":
-        raise RuntimeError("Start through the launcher to enable Pro consultation")
+        raise RuntimeError("Start through the launcher to enable Plan consultation")
     command, env = pro_command()
     with tempfile.TemporaryDirectory(prefix="claude-pro-consult-") as cwd:
         auth = run_owned(command + ["auth", "status", "--json"], env, cwd, timeout=30)
         if not (auth.get("loggedIn") is True and auth.get("authMethod") == "claude.ai"
                 and auth.get("apiProvider") == "firstParty" and auth.get("subscriptionType") == "pro"):
-            raise RuntimeError("Existing first-party Pro login required; no API fallback")
+            raise RuntimeError("Existing first-party Plan login required; no API fallback")
         data = run_owned(command + ["-p", "--model", PRO_MODELS[model], "--tools", "",
                          "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
                          "--disable-slash-commands", "--no-chrome", "--no-session-persistence",
@@ -227,13 +229,13 @@ def consult(model: str, question: str) -> dict:
                          "--system-prompt", "Give concise independent advice using only the supplied evidence. No tools or file access. Distinguish evidence from assumptions."],
                          env, cwd, prompt=question)
     if data.get("is_error") is not False or data.get("subtype") != "success":
-        raise RuntimeError("Pro consultation failed; no fallback attempted")
+        raise RuntimeError("Plan consultation failed; no fallback attempted")
     if set(data.get("modelUsage", {})) != {PRO_MODELS[model]}:
-        raise ValueError("Response did not confirm the exact requested Pro model")
+        raise ValueError("Response did not confirm the exact requested Plan model")
     advice = data.get("result")
     if not isinstance(advice, str) or not advice.strip():
         raise ValueError("Claude returned no textual advice")
-    return {"status": "ok", "model": PRO_MODELS[model], "auth": "Claude Pro",
+    return {"status": "ok", "model": PRO_MODELS[model], "auth": "Claude Plan",
             "credits_state": "managed-by-claude", "advice": advice}
 
 
@@ -263,7 +265,7 @@ def handle(request: dict) -> dict | None:
         except (OSError, RuntimeError, subprocess.SubprocessError, ValueError, KeyError, IndexError, TypeError) as exc:
             detail = type(exc).__name__
             print(json.dumps({"event": "advisor_error", "kind": detail}), file=sys.stderr, flush=True)
-            result = {"isError": True, "content": [{"type": "text", "text": f"Pro consultation stopped ({detail}); no successful advice. Check Claude login and account availability. No API or OpenRouter fallback was attempted."}]}
+            result = {"isError": True, "content": [{"type": "text", "text": f"Plan consultation stopped ({detail}); no successful advice. Check Claude login and account availability. No API or OpenRouter fallback was attempted."}]}
     else:
         return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Method not found"}}
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
@@ -310,7 +312,7 @@ def routed_session(provider: str = "openrouter"):
     if not claude:
         raise FileNotFoundError("Claude Code executable not found")
     env = os.environ.copy()
-    for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER"):
+    for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER"):
         env.pop(name, None)
     # Remove only provider credentials/routing left by the former OpenRouter setup.
     for name in ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",
@@ -327,13 +329,13 @@ def routed_session(provider: str = "openrouter"):
     auth = run_owned(command + ["auth", "status", "--json"], env, str(Path.home()), timeout=60)
     if not (auth.get("loggedIn") is True and auth.get("authMethod") == "claude.ai"
             and auth.get("apiProvider") == "firstParty" and auth.get("subscriptionType") == "pro"):
-        raise RuntimeError("Existing first-party Pro login required; no API fallback")
+        raise RuntimeError("Existing first-party Plan login required; no API fallback")
     node = shutil.which("node")
     if not node:
         raise FileNotFoundError("Node.js required for local routing")
     nonce = secrets.token_urlsafe(32)
     proxy_env = clean_env()
-    for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER"):
+    for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER"):
         proxy_env.pop(name, None)
     proxy_env.update(provider_config(provider), LOCAL_ROUTE_TOKEN=nonce)
     proxy = subprocess.Popen([node, str(ROOT / "claudeRouteProxy.mjs")], env=proxy_env,
@@ -394,9 +396,9 @@ def launch(provider: str = "openrouter") -> int:
     claude = shutil.which("claude")
     if not claude:
         raise FileNotFoundError("Claude Code executable not found")
-    print(f"Sonnet replacement: {provider}. Opus/Haiku/Fable keep Claude Pro OAuth.")
+    print(f"Sonnet replacement: {provider}. Opus/Haiku/Fable keep Claude Plan OAuth.")
     print("Initial request + 3 retries, then Plan fallback (subscription Sonnet); recovery checked on a later request.")
-    print("Native-only features stay on Pro. Replacement replies are buffered until validated.")
+    print("Native-only features stay on Plan. Replacement replies are buffered until validated.")
     with routed_session(provider) as env:
         return subprocess.call([claude, "--model", "sonnet"], env=env)
 
@@ -482,6 +484,7 @@ def self_test() -> None:
             with patch(__name__ + ".run_owned", side_effect=[auth, response]) as run:
                 answer = consult(model, "2 + 2?")
                 assert answer["model"] == actual
+                assert answer["auth"] == "Claude Plan"
                 assert answer["credits_state"] == "managed-by-claude"
                 assert run.call_count == 2
                 args, env, cwd = run.call_args.args
@@ -551,9 +554,9 @@ def self_test() -> None:
     assert dict(os.environ) == original_env
     proxy = Mock()
     proxy.stdout.readline.return_value = '{"port": 12345}\n'
-    with patch.dict(os.environ, {"LOCAL_LLM_URL": "http://127.0.0.1:11434/v1/messages", "LOCAL_LLM_MODEL": "fixture-local", "LOCAL_LLM_API_KEY": "test-local-key"}), patch(__name__ + ".run_owned", return_value=auth), patch("shutil.which", return_value="executable"), patch(__name__ + ".read_key", side_effect=AssertionError("Local must not read OpenRouter key")), patch("subprocess.Popen", return_value=proxy) as start:
+    with patch.dict(os.environ, {"LOCAL_LLM_URL": "http://127.0.0.1:11434/v1/messages", "LOCAL_LLM_MODELS_URL": "http://127.0.0.1:11434/v1/models", "LOCAL_LLM_MODEL": "fixture-local", "LOCAL_LLM_API_KEY": "test-local-key"}), patch(__name__ + ".run_owned", return_value=auth), patch("shutil.which", return_value="executable"), patch(__name__ + ".read_key", side_effect=AssertionError("Local must not read OpenRouter key")), patch("subprocess.Popen", return_value=proxy) as start:
         with routed_session("local") as env:
-            assert "LOCAL_LLM_API_KEY" not in env and "LOCAL_LLM_URL" not in env
+            assert "LOCAL_LLM_API_KEY" not in env and "LOCAL_LLM_URL" not in env and "LOCAL_LLM_HTTP_URL" not in env
             assert start.call_args.kwargs["env"]["SONNET_PROVIDER"] == "local"
             assert start.call_args.kwargs["env"]["LOCAL_LLM_MODEL"] == "fixture-local"
             assert "OPENROUTER_API_KEY" not in start.call_args.kwargs["env"]
@@ -582,7 +585,7 @@ def self_test() -> None:
         except RuntimeError:
             pass
         start.assert_not_called()
-    print("PASS: MCP discovery, key parser, isolated consultation, app-managed credits, Pro auth gate, native feature environment preservation, local/OpenRouter credential separation and launcher lifecycle")
+    print("PASS: MCP discovery, key parser, isolated consultation, app-managed credits, Plan auth gate, native feature environment preservation, local/OpenRouter credential separation and launcher lifecycle")
 
 
 if __name__ == "__main__":
@@ -594,7 +597,7 @@ if __name__ == "__main__":
         else:
             parser = argparse.ArgumentParser(description="Sonnet replacement with Plan fallback")
             parser.add_argument("--provider", choices=("openrouter", "local"), default="openrouter")
-            parser.add_argument("--check-local", action="store_true", help="Check local model metadata without inference or Pro login")
+            parser.add_argument("--check-local", action="store_true", help="Check local model metadata without inference or Plan login")
             options = parser.parse_args()
             if options.check_local:
                 result = check_local()

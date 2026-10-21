@@ -1,19 +1,19 @@
-# Claude Code · Sonnet replacement with Pro fallback
+# Claude Code · Sonnet replacement with Plan fallback
 
 [한국어](README.md) | **English**
 
 [MIT License](LICENSE) · [License selection review](LICENSE-REVIEW.md)
 
-A local router that preserves the existing Claude Code Pro login and settings while sending compatible Sonnet requests to OpenRouter DeepSeek or a local LLM. The repository includes the launcher, proxy, and synthetic regression tests. It does not contain API keys, OAuth credentials, personal settings, or private diagnostic scripts.
+A local router that preserves the existing Claude Code Plan login and settings while sending compatible Sonnet requests to OpenRouter DeepSeek or a local LLM. The repository includes the launcher, proxy, and synthetic regression tests. It does not contain API keys, OAuth credentials, personal settings, or private diagnostic scripts.
 
-**Status: provider selection, retries, Pro fallback, and recovery are implemented. Preserving every native feature while actually replacing the main Sonnet model is not fully achieved.**
+**Status: provider selection, retries, Plan fallback, and recovery are implemented. Preserving every native feature while actually replacing the main Sonnet model is not fully achieved.**
 
 Check the installed Claude Code, Node.js, and Python versions for compatibility. No personal development-machine configuration or minimum-version matrix is published.
 - See the [public history guide](docs/HISTORY.ko.md); private environment records are excluded.
 
 ## Setup and execution
 
-Install Node.js, Python, and Claude Code separately, and sign in to Claude Code with the existing Pro subscription. The current authentication gate specifically checks Pro; Max and other plans are not guaranteed to pass. No npm or pip packages are required by the checked-in source.
+Install Node.js, Python, and Claude Code separately, and sign in to Claude Code with the existing Plan subscription. The current authentication gate specifically checks `subscriptionType="pro"`; Max and other plans are not guaranteed to pass. No npm or pip packages are required by the checked-in source.
 
 For OpenRouter, create `.env.openrouter` in this checkout's root:
 
@@ -39,24 +39,26 @@ If you install a global launcher separately, configuration is read beside its ta
 | Request | Route |
 | --- | --- |
 | Compatible Sonnet request | Selected OpenRouter DeepSeek or local model |
-| Unsupported native Sonnet feature or conversation history | Original Pro Sonnet request, unchanged |
-| Opus, Haiku, Fable | Existing Pro OAuth path |
-| External provider fails all four attempts | One request to the original Pro Sonnet model |
+| Unsupported native Sonnet feature or conversation history | Original Plan Sonnet request, unchanged |
+| Opus, Haiku, Fable | Existing Plan OAuth path |
+| External provider fails all four attempts | One request to the original Plan Sonnet model |
 
 - OpenRouter uses `deepseek/deepseek-v4.1-flash-1017`.
 - OpenRouter and Local are selected at launch; the router does not switch between them automatically. Select Sonnet in `/model` for eligible replacement requests.
 - The external provider receives the initial attempt plus three retries. Each attempt has a 30-second limit, with a one-second delay between attempts.
-- Four full timeouts plus retry delays can take approximately 123 seconds before the Pro request begins. Pro response time and the CLI's own retries may add further time. Cancelling stops router retries and fallback.
-- After all four fail, the router forwards the original request to Pro Sonnet once. A Pro failure does not loop back to another provider or switch to an Anthropic API key.
-- During a 30-second cooldown, requests use Pro. Afterward, one compatible real request checks recovery; concurrent requests use Pro. A validated external response restores the external route. There are no separate paid background probes.
+- Four full timeouts plus retry delays can take approximately 123 seconds before the Plan request begins. Plan response time and the CLI's own retries may add further time. Cancelling stops router retries and fallback.
+- After all four fail, the router forwards the original request to Plan Sonnet once. A Plan failure does not loop back to another provider or switch to an Anthropic API key.
+- During a 30-second cooldown, requests use Plan. Afterward, one compatible real request checks recovery; concurrent requests use Plan. A validated external response restores the external route. There are no separate paid background probes.
 - External responses are buffered, up to 32 MiB, until model identity, message completion, block indices, and tool-input JSON are validated. Failed attempts do not expose partial text or tool calls to the CLI. This delays visible responses, and retries may incur duplicate inference costs.
-- Pro requests, responses, streams, and errors pass through unchanged. Native advisor and experimental beta features are not forcibly disabled. Unsupported advisor, server tools, inline tools, signed thinking, and other native history bypass the external provider instead of being removed. Such a bypass is not counted as an external recovery check.
-- The router does not block account-level usage credits, so Pro routing is not a guarantee of zero additional account charges.
-- Model access and usage credits remain subject to the Claude app and account plan. There is no separate Fable ban or credits-OFF requirement. External providers do not receive the Pro OAuth credential.
+- Plan requests, responses, streams, and errors pass through unchanged. Native advisor and experimental beta features are not forcibly disabled. Unsupported advisor, server tools, inline tools, signed thinking, and other native history bypass the external provider instead of being removed. Such a bypass is not counted as an external recovery check.
+- The router does not block account-level usage credits, so Plan routing is not a guarantee of zero additional account charges.
+- Model access and usage credits remain subject to the Claude app and account plan. There is no separate Fable ban or credits-OFF requirement. External providers do not receive the Plan OAuth credential.
 
-Routing metadata uses `route_selected` with provider `openrouter`, `local` or `pro`. Reason `replacement` identifies a validated external response; `native_feature` identifies a native-feature bypass; `fallback` follows failed external attempts; `circuit_open` uses Pro during cooldown or another recovery probe. `external_attempt_failed` records a failed attempt, and `circuit_open` / `circuit_recovered` report circuit transitions. These logs omit keys and request bodies; requests sent to external services may still contain conversation, code, tool definitions and results.
+Routing metadata uses `route_selected` with provider `openrouter`, `local` or `plan`. Reason `replacement` identifies a validated external response; `native_feature` identifies a native-feature bypass; `fallback` follows failed external attempts; `circuit_open` uses Plan during cooldown or another recovery probe. `external_attempt_failed` records a failed attempt, and `circuit_open` / `circuit_recovered` report circuit transitions. These logs omit keys and request bodies; requests sent to external services may still contain conversation, code, tool definitions and results.
 
-The CLI or HUD can still display Sonnet/Pro for a replacement response. That label and its cost estimate do not prove the inference provider or actual OpenRouter billing. Check the safe `route_selected` metadata: `replacement`, `native_feature`, `fallback`, or `circuit_open`.
+For `native_feature`, `detail` reports the first exclusion: `token_count`, `plan_model`, `unsupported_beta`, `unsupported_request_field`, `unsupported_message_shape`, `unsupported_thinking_config`, `unsupported_output_config`, `unsupported_tool_choice`, `native_thinking_history`, `unsupported_content`, `unsupported_content_block`, `unsupported_content_field`, `unsupported_tool_caller`, or `unsupported_tool_definition`. These are fixed labels; header values, user text, tool names, signatures and credentials are never logged. Restart the launcher to enable new diagnostics; old logs cannot reveal these details.
+
+The CLI or HUD can still display Sonnet/Plan for a replacement response. That label and its cost estimate do not prove the inference provider or actual OpenRouter billing. Check the safe `route_selected` metadata: `replacement`, `native_feature`, `fallback`, or `circuit_open`.
 
 ## Local LLM configuration
 
@@ -70,9 +72,9 @@ if (-not (Test-Path -LiteralPath '.env.local-llm')) {
     Copy-Item -LiteralPath '.env.local-llm.example' -Destination '.env.local-llm'
 }
 notepad .env.local-llm
-# Model metadata only; no inference or Pro login is used.
+# Model metadata only; no inference or Plan login is used.
 .\startClaudeOpenRouter.ps1 -CheckLocal
-# Normal launch still checks the saved Pro authentication.
+# Normal launch still checks the saved Plan authentication.
 .\startClaudeOpenRouter.ps1 -Provider Local
 ```
 
@@ -91,6 +93,7 @@ LOCAL_LLM_ALLOW_REMOTE=false
 | `LOCAL_LLM_MODEL` | Required at normal launch; exact server model ID |
 | `LOCAL_LLM_API_KEY` | Optional server-specific Bearer credential |
 | `LOCAL_LLM_ALLOW_REMOTE` | `false`; remote access needs explicit `true` and HTTPS |
+| `LOCAL_LLM_HTTP_URL` | Optional exact HTTP Messages URL pin; empty by default. Plaintext HTTP is allowed only when it exactly matches `LOCAL_LLM_URL`. Keep real values in ignored `.env.local-llm`; prefer HTTPS. |
 | `LOCAL_LLM_MODELS_URL` | Same-origin `/v1/models`; metadata only |
 
 For an existing remote service, for example:
@@ -104,13 +107,13 @@ LOCAL_LLM_ALLOW_REMOTE=true
 
 Replace the example host and model before use. Use `127.0.0.1` rather than `localhost`; the latter is not a permitted loopback literal.
 
-By default, only literal loopback (`127.0.0.1` or `::1`) HTTP/HTTPS endpoints are allowed. To use an existing remote server, explicitly set `LOCAL_LLM_ALLOW_REMOTE=true` and an `https://server/v1/messages` URL. Remote HTTP, URL credentials/query/fragment, redirects, and invalid credential headers are rejected. Certificate verification is not disabled. A plain-HTTP LAN server needs HTTPS or a separately prepared loopback tunnel. Opting in trusts the configured DNS name and its resolution.
+By default, only literal loopback (`127.0.0.1` or `::1`) HTTP/HTTPS endpoints are allowed. To use an existing remote server, explicitly set `LOCAL_LLM_ALLOW_REMOTE=true` and an `https://server/v1/messages` URL. Remote HTTP without an explicit matching `LOCAL_LLM_HTTP_URL`, URL credentials/query/fragment, redirects, and invalid credential headers are rejected. Certificate verification is not disabled. Prefer HTTPS or a separately prepared loopback tunnel; an exact HTTP pin transmits prompts and server credentials without encryption. Opting in trusts the configured DNS name and its resolution.
 
-`-CheckLocal` sends only a GET to the same-origin model-list endpoint. It disables environment proxies and redirects, uses only the Local key in a fresh `Authorization: Bearer` header, and limits responses to 1 MiB with a five-second socket timeout. Output contains only model counts, configured-model presence, and fixed error categories. Model metadata success does not establish Messages inference or tool compatibility. If the server has no model-list API, skip that optional check and validate inference separately. A failed check never invokes Pro fallback.
+`-CheckLocal` sends only a GET to the same-origin model-list endpoint. It disables environment proxies and redirects, uses only the Local key in a fresh `Authorization: Bearer` header, and limits responses to 1 MiB with a five-second socket timeout. Output contains only model counts, configured-model presence, and fixed error categories. Model metadata success does not establish Messages inference or tool compatibility. If the server has no model-list API, skip that optional check and validate inference separately. A failed check never invokes Plan fallback.
 
 Local mode does not read the OpenRouter key. Real `.env*` settings are ignored by Git; only the credential-free `.env.local-llm.example` template is distributed. The server and model still need real validation later.
 
-Run real loopback HTTP integration tests with `node --test tests/*.test.mjs` and configuration/metadata tests with `python -m unittest discover -s tests -p test_local_config.py -v`. Their servers and Pro responses are synthetic; they do not contact real LLM providers or accounts.
+Run real loopback HTTP integration tests with `node --test tests/*.test.mjs` and configuration/metadata tests with `python -m unittest discover -s tests -p test_local_config.py -v`. Their servers and Plan responses are synthetic; they do not contact real LLM providers or accounts.
 
 Independent validation after these Local additions passed **138/138 Node tests**, **13/13 Python tests**, Python self-tests, Node/Python syntax checks, and PowerShell parsing. Real server/model/authentication/TLS deployment checks remain deferred.
 
@@ -131,18 +134,18 @@ Independent validation after these Local additions passed **138/138 Node tests**
 | `invalid_model_list` / `response_too_large` | Unsupported response shape / size |
 | `invalid_configuration_or_response` | Invalid configuration or parsing failure |
 
-A failed check exits with code 1 and never invokes Pro fallback. A successful model list does not establish Messages support: even an OpenAI-only service may expose `/v1/models`. A service without a model-list endpoint may still support inference; configure an appropriate same-origin list endpoint or defer this optional check and test inference separately.
+A failed check exits with code 1 and never invokes Plan fallback. A successful model list does not establish Messages support: even an OpenAI-only service may expose `/v1/models`. A service without a model-list endpoint may still support inference; configure an appropriate same-origin list endpoint or defer this optional check and test inference separately.
 
 | Symptom | What to check |
 | --- | --- |
 | Missing `.env.openrouter` | Actual launcher directory, not current working directory |
 | OpenRouter 401 / missing authentication header | Router key file and key validity; successful HUD installation does not prove inference auth |
 | Old Local address remains active | Process environment overrides, global shim target, then restart |
-| Sonnet continues using Pro | `native_feature` metadata and unsupported conversation history |
+| Sonnet continues using Plan | `native_feature` metadata and unsupported conversation history |
 | Repeated historical `503 ... restart required` | Stale session/proxy and first upstream error; restart with current launcher |
 | HUD or MCP failure | Compare ordinary Claude; loading settings does not prove server connectivity |
 
-Exit and relaunch to change providers. `/model` selects Claude models, not OpenRouter versus Local. To return to ordinary Pro use `claude` in a clean terminal. This launcher does not modify the parent terminal, but old user/system `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` or `CLAUDE_CONFIG_DIR` variables may still be inherited. Do not delete saved login or MCP settings as a blanket fix.
+Exit and relaunch to change providers. `/model` selects Claude models, not OpenRouter versus Local. To return to ordinary Plan use `claude` in a clean terminal. This launcher does not modify the parent terminal, but old user/system `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` or `CLAUDE_CONFIG_DIR` variables may still be inherited. Do not delete saved login or MCP settings as a blanket fix.
 
 ## Validation and limitations
 
@@ -172,10 +175,10 @@ See the [connection and recovery checklist](docs/LIVE-VALIDATION.ko.md) for a ge
 | File | Purpose |
 | --- | --- |
 | `startClaudeOpenRouter.ps1` | PowerShell provider selector and launcher |
-| `openrouterAdvisor.py` | Pro authentication checks, environment isolation, proxy lifecycle, isolated consultation tool, self-tests |
+| `openrouterAdvisor.py` | Plan authentication checks, environment isolation, proxy lifecycle, isolated consultation tool, self-tests |
 | `claudeRouteProxy.mjs` | Routing, response validation, retries, fallback, recovery |
 | `tests/claudeRouteProxy.test.mjs` | Synthetic proxy regression tests |
-| `tests/localLlmIntegration.test.mjs` | Real loopback HTTP tests with synthetic Messages servers and Pro responses |
+| `tests/localLlmIntegration.test.mjs` | Real loopback HTTP tests with synthetic Messages servers and Plan responses |
 | `tests/test_local_config.py` | Configuration policy and model-metadata checks using synthetic HTTP servers |
 | `.env.local-llm.example` | Credential-free configuration template for an existing server |
 | `docs/HISTORY.ko.md` | Historical investigation notes, separate from current policy |

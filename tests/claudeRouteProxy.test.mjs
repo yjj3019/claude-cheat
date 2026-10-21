@@ -67,6 +67,51 @@ async function consume(request) {
 const proHeaders = { authorization: OAUTH, 'anthropic-beta': BETA };
 const SONNET = 'claude-sonnet-4-6';
 
+test('subscription routing logs use the Plan label', async t => {
+  const log = t.mock.method(console, 'error', () => {});
+  const { request } = await fixture(t);
+  const response = await request(requestBody(OPUS), { headers: proHeaders });
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.ok(log.mock.calls.some(call => {
+    const entry = JSON.parse(call.arguments[0]);
+    return entry.event === 'route_selected' && entry.provider === 'plan' && entry.reason === 'native_feature' && entry.detail === 'plan_model';
+  }));
+});
+
+const exclusionCases = [
+  ['unsupported_beta', {}, { ...proHeaders, 'anthropic-beta': BETA + ',private-beta-marker' }],
+  ['unsupported_request_field', { private_field_marker: 'private-value-marker' }],
+  ['unsupported_message_shape', { messages: [{ role: 'system', content: 'private-value-marker' }] }],
+  ['unsupported_thinking_config', { thinking: { type: 'private-value-marker' } }],
+  ['unsupported_output_config', { output_config: { format: 'private-value-marker' } }],
+  ['unsupported_tool_choice', { tool_choice: { private_field_marker: true } }],
+  ['native_thinking_history', { messages: [{ role: 'assistant', content: [{ type: 'thinking', thinking: 'private-value-marker', signature: 'private-signature-marker' }] }] }],
+  ['unsupported_content_block', { messages: [{ role: 'user', content: [{ type: 'private-block-marker' }] }] }],
+  ['unsupported_content_field', { messages: [{ role: 'user', content: [{ type: 'text', text: 'private-value-marker', private_field_marker: true }] }] }],
+  ['unsupported_tool_caller', { messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: {}, caller: { type: 'private-caller-marker' } }] }] }],
+  ['unsupported_content', { messages: [{ role: 'user', content: null }] }],
+  ['unsupported_tool_definition', { tools: [{ type: 'advisor_20260301', name: 'private-tool-marker' }] }],
+  ['token_count', {}, proHeaders, '/v1/messages/count_tokens'],
+];
+for (const [detail, extra, headers = proHeaders, path = '/v1/messages'] of exclusionCases) {
+  test(`native exclusion reports ${detail} without logging request data`, async t => {
+    const log = t.mock.method(console, 'error', () => {});
+    const { calls, request } = await fixture(t);
+    const body = requestBody(SONNET, extra);
+    const response = await request(body, { headers, path });
+    assert.equal(response.status, 200);
+    await response.text();
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, 'https://api.anthropic.com' + path);
+    assert.deepEqual(calls[0].parsedBody, body);
+    const entries = log.mock.calls.map(call => JSON.parse(call.arguments[0]));
+    assert.deepEqual(entries, [{ event: 'route_selected', provider: 'plan', reason: 'native_feature', detail }]);
+    assert.equal(JSON.stringify(entries).includes('private-'), false);
+    assert.equal(JSON.stringify(entries).includes(OAUTH), false);
+  });
+}
+
 for (const provider of ['openrouter', 'local']) {
   test(`${provider} preserves direct caller through tool execution and the next turn`, async t => {
     const tool = { type: 'tool_use', id: 'history-1', name: 'ReadHistory', input: {}, caller: { type: 'direct' } };
@@ -875,7 +920,43 @@ test('explicit remote HTTPS uses exactly the configured endpoint, model and isol
   assert.equal(calls[0].redirect, 'error');
 });
 
-test('remote opt-in never allows plaintext HTTP', () => {
+test('approved internal HTTP uses only the configured endpoint and isolated credential', async t => {
+  const localUrl = 'http://192.0.2.10:4000/v1/messages';
+  const localKey = 'synthetic-internal-key';
+  const { calls, request } = await fixture(t, jsonResponse, { provider: 'local', key: undefined,
+    localUrl, localModel: 'configured-model', localKey, localHttpUrl: localUrl });
+  const response = await request(requestBody(SONNET), { headers: proHeaders });
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, localUrl);
+  assert.equal(calls[0].headers.authorization, `Bearer ${localKey}`);
+  assert.equal(JSON.stringify(calls[0].headers).includes(OAUTH), false);
+  assert.equal(calls[0].redirect, 'error');
+});
+
+test('explicit HTTP exception rejects other origins and invalid URL components', () => {
+  const url = 'http://192.0.2.10:4000/v1/messages';
+  for (const localUrl of [url.replace('.10', '.11'), url.replace(':4000', ':4001'),
+    url.replace(':4000', ''), url.replace('http://', 'http://user:password@'),
+    url + '?q=1', url + '#fragment', url.replace('/v1/messages', '/other'),
+    url.replace('192.0.2.10', '0xc000020a'), url.replace('/v1/messages', '/other/../v1/messages')]) {
+    for (const localAllowRemote of [false, true]) {
+      assert.throws(() => createProxy({ nonce: NONCE, provider: 'local', localUrl,
+        localModel: 'configured-model', localHttpUrl: url, localAllowRemote }));
+    }
+  }
+});
+
+test('HTTP exceptions require a matching pin and never bypass HTTPS opt-in', () => {
+  const http = 'http://192.0.2.10:4000/v1/messages';
+  const https = 'https://llm.example.invalid/v1/messages';
+  for (const [localUrl, localHttpUrl] of [[http, undefined], [http, http.replace(':4000', ':4001')], [https, https]]) {
+    assert.throws(() => createProxy({ nonce: NONCE, provider: 'local', localUrl, localHttpUrl,
+      localModel: 'configured-model' }));
+  }
+});
+
+test('remote opt-in still rejects other plaintext HTTP servers', () => {
   assert.throws(() => createProxy({ nonce: NONCE, provider: 'local',
     localUrl: 'http://llm.example.invalid/v1/messages', localModel: 'configured-model', localAllowRemote: true }));
 });

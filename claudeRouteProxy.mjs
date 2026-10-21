@@ -52,41 +52,53 @@ const CONTENT_FIELDS = {
   tool_use: new Set(['type', 'id', 'name', 'input', 'cache_control', 'caller']),
   tool_result: new Set(['type', 'tool_use_id', 'content', 'is_error', 'cache_control']),
 };
-function externalCompatible(body, beta) {
+function externalExclusion(body, beta) {
   // Unknown betas/fields and native history belong to the subscription API. Never strip them.
   if ((beta || '').split(',').map(x => x.trim()).filter(Boolean).some(x =>
-    !/^oauth-\d{4}-\d{2}-\d{2}$/.test(x) && !['claude-code-20250219', 'prompt-caching-2024-07-31'].includes(x))) return false;
-  if (Object.keys(body).some(name => !BASIC_FIELDS.has(name))) return false;
+    !/^oauth-\d{4}-\d{2}-\d{2}$/.test(x) && !['claude-code-20250219', 'prompt-caching-2024-07-31'].includes(x))) return 'unsupported_beta';
+  if (Object.keys(body).some(name => !BASIC_FIELDS.has(name))) return 'unsupported_request_field';
   if (!Array.isArray(body.messages) || body.messages.some(message => !message ||
-      !['user', 'assistant'].includes(message.role) || Object.keys(message).some(name => !['role', 'content'].includes(name)))) return false;
-  if (body.thinking && (!['enabled', 'disabled', 'adaptive'].includes(body.thinking.type) || Object.keys(body.thinking).some(name => !['type', 'budget_tokens'].includes(name)))) return false;
-  if (body.output_config && Object.keys(body.output_config).some(name => name !== 'effort')) return false;
-  if (body.tool_choice && Object.keys(body.tool_choice).some(name => !['type', 'name', 'disable_parallel_tool_use'].includes(name))) return false;
+      !['user', 'assistant'].includes(message.role) || Object.keys(message).some(name => !['role', 'content'].includes(name)))) return 'unsupported_message_shape';
+  if (body.thinking && (!['enabled', 'disabled', 'adaptive'].includes(body.thinking.type) || Object.keys(body.thinking).some(name => !['type', 'budget_tokens'].includes(name)))) return 'unsupported_thinking_config';
+  if (body.output_config && Object.keys(body.output_config).some(name => name !== 'effort')) return 'unsupported_output_config';
+  if (body.tool_choice && Object.keys(body.tool_choice).some(name => !['type', 'name', 'disable_parallel_tool_use'].includes(name))) return 'unsupported_tool_choice';
+  let contentDetail = 'unsupported_content';
   const contentOK = content => typeof content === 'string' || (Array.isArray(content) && content.every(block => {
-    if (!block || !CONTENT_FIELDS[block.type] || Object.keys(block).some(key => !CONTENT_FIELDS[block.type].has(key))) return false;
+    if (!block || !CONTENT_FIELDS[block.type]) {
+      contentDetail = block?.type === 'thinking' || block?.type === 'redacted_thinking' ? 'native_thinking_history' : 'unsupported_content_block';
+      return false;
+    }
+    if (Object.keys(block).some(key => !CONTENT_FIELDS[block.type].has(key))) {
+      contentDetail = 'unsupported_content_field';
+      return false;
+    }
     if (block.type === 'tool_use' && Object.hasOwn(block, 'caller') &&
         (!block.caller || typeof block.caller !== 'object' || Array.isArray(block.caller) ||
-          block.caller.type !== 'direct' || Object.keys(block.caller).length !== 1)) return false;
+          block.caller.type !== 'direct' || Object.keys(block.caller).length !== 1)) {
+      contentDetail = 'unsupported_tool_caller';
+      return false;
+    }
     return block.type !== 'tool_result' || contentOK(block.content);
   }));
   if (!body.messages.every(message => contentOK(message.content)) ||
-      (body.system !== undefined && !contentOK(body.system))) return false;
+      (body.system !== undefined && !contentOK(body.system))) return contentDetail;
   if (body.tools !== undefined && (!Array.isArray(body.tools) || body.tools.some(tool =>
     !tool || typeof tool.name !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(tool.name) ||
     !tool.input_schema || typeof tool.input_schema !== 'object' || Array.isArray(tool.input_schema) ||
     Object.keys(tool).some(name => !['name', 'description', 'input_schema', 'cache_control', 'type'].includes(name)) ||
-    (tool.type !== undefined && tool.type !== 'custom')))) return false;
-  return true;
+    (tool.type !== undefined && tool.type !== 'custom')))) return 'unsupported_tool_definition';
+  return null;
 }
 
-function localEndpoint(value, allowRemote) {
+function localEndpoint(value, allowRemote, httpUrl) {
   if (typeof value !== 'string' || /[\x00-\x20\x7f]/.test(value)) throw new Error('Invalid Local Messages URL');
   let url;
   try { url = new URL(value); } catch { throw new Error('Local Messages URL required'); }
   const loopback = ['127.0.0.1', '[::1]'].includes(url.hostname);
-  if (!['http:', 'https:'].includes(url.protocol) || url.port === '0' || (!loopback && (!allowRemote || url.protocol !== 'https:')) ||
+  const internalHttp = url.protocol === 'http:' && value === httpUrl;
+  if (!['http:', 'https:'].includes(url.protocol) || url.port === '0' || (!loopback && !internalHttp && (!allowRemote || url.protocol !== 'https:')) ||
       url.username || url.password || url.search || url.hash || url.pathname !== '/v1/messages')
-    throw new Error('Local Messages URL requires loopback or explicitly allowed remote HTTPS');
+    throw new Error('Local Messages URL requires loopback, approved internal HTTP, or explicitly allowed remote HTTPS');
   return url.href;
 }
 
@@ -211,13 +223,13 @@ function abortable(promise, signal) {
 }
 
 export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrouter', localUrl,
-  localModel, localKey, localAllowRemote = false, fallbackModel = 'claude-sonnet-5-5', retryDelayMs = 1000,
+  localModel, localKey, localAllowRemote = false, localHttpUrl, fallbackModel = 'claude-sonnet-5-5', retryDelayMs = 1000,
   cooldownMs = 30000, attemptTimeoutMs = 30000, now = Date.now }) {
   if (!nonce || (provider === 'openrouter' && !key)) throw new Error('Proxy credentials required');
   if (!['openrouter', 'local'].includes(provider)) throw new Error('Unsupported Sonnet provider');
   if (typeof localAllowRemote !== 'boolean') throw new Error('Remote Local setting must be boolean');
   if (localKey !== undefined && (typeof localKey !== 'string' || /[\x00-\x1f\x7f]/.test(localKey))) throw new Error('Invalid Local credential');
-  const externalUrl = provider === 'local' ? localEndpoint(localUrl, localAllowRemote) : 'https://openrouter.ai/api/v1/messages';
+  const externalUrl = provider === 'local' ? localEndpoint(localUrl, localAllowRemote, localHttpUrl) : 'https://openrouter.ai/api/v1/messages';
   if (provider === 'local' && (typeof localModel !== 'string' || !localModel.trim())) throw new Error('Local model required');
   if (!isSonnet(fallbackModel)) throw new Error('Fallback must be a native Sonnet model');
   for (const value of [retryDelayMs, cooldownMs, attemptTimeoutMs])
@@ -252,10 +264,10 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       if (!isPro(model) && !isSonnet(model) && model !== DEEPSEEK) return reject(403, 'Model blocked');
       const oauthOK = /^Bearer\s+sk-ant-oat/.test(req.headers.authorization || '') && !req.headers['x-api-key'] &&
         (req.headers['anthropic-beta'] || '').includes('oauth-');
-      const sendPro = async (reason = 'native_feature') => {
+      const sendPro = async (reason = 'native_feature', detail) => {
         if (!oauthOK) return reject(403, 'Saved subscription OAuth required');
         client.signal.throwIfAborted();
-        console.error(JSON.stringify({ event: 'route_selected', provider: 'pro', reason }));
+        console.error(JSON.stringify({ event: 'route_selected', provider: 'plan', reason, ...(detail ? { detail } : {}) }));
         const headers = {};
         for (const [name, value] of Object.entries(req.headers))
           if (typeof value === 'string' && !['host', 'content-length', 'accept-encoding', 'connection',
@@ -286,7 +298,9 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         }
         res.end();
       };
-      if (req.url.startsWith('/v1/messages/count_tokens') || isPro(model) || !externalCompatible(body, req.headers['anthropic-beta'])) return await sendPro();
+      const nativeDetail = req.url.startsWith('/v1/messages/count_tokens') ? 'token_count' :
+        isPro(model) ? 'plan_model' : externalExclusion(body, req.headers['anthropic-beta']);
+      if (nativeDetail) return await sendPro('native_feature', nativeDetail);
       if (openUntil && (now() < openUntil || probing)) return await sendPro('circuit_open');
       const probe = Boolean(openUntil);
       if (probe) probing = true;
@@ -365,8 +379,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const server = createProxy({ key: process.env.OPENROUTER_API_KEY, nonce: process.env.LOCAL_ROUTE_TOKEN,
     provider: process.env.SONNET_PROVIDER || 'openrouter', localUrl: process.env.LOCAL_LLM_URL,
     localModel: process.env.LOCAL_LLM_MODEL, localKey: process.env.LOCAL_LLM_API_KEY,
-    localAllowRemote: process.env.LOCAL_LLM_ALLOW_REMOTE === 'true' });
+    localHttpUrl: process.env.LOCAL_LLM_HTTP_URL, localAllowRemote: process.env.LOCAL_LLM_ALLOW_REMOTE === 'true' });
   for (const name of ['OPENROUTER_API_KEY', 'LOCAL_ROUTE_TOKEN', 'SONNET_PROVIDER', 'LOCAL_LLM_URL',
-    'LOCAL_LLM_MODEL', 'LOCAL_LLM_API_KEY', 'LOCAL_LLM_ALLOW_REMOTE', 'LOCAL_LLM_MODELS_URL']) delete process.env[name];
+    'LOCAL_LLM_MODEL', 'LOCAL_LLM_API_KEY', 'LOCAL_LLM_ALLOW_REMOTE', 'LOCAL_LLM_HTTP_URL', 'LOCAL_LLM_MODELS_URL']) delete process.env[name];
   server.listen(0, '127.0.0.1', () => process.stdout.write(JSON.stringify({ port: server.address().port }) + '\n'));
 }

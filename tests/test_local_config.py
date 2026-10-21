@@ -62,6 +62,41 @@ class LocalConfigTests(LocalTestCase):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 route.local_endpoint(url, False)
 
+    def test_internal_http_exception_is_limited_to_approved_origin(self):
+        url = "http://192.0.2.10:4000/v1/messages"
+        self.configure(LOCAL_LLM_URL=url)
+        with self.assertRaises(ValueError):
+            route.provider_config("local")
+        self.configure(LOCAL_LLM_HTTP_URL=url)
+        config = route.provider_config("local")
+        self.assertEqual(config["LOCAL_LLM_URL"], url)
+        self.assertEqual(config["LOCAL_LLM_MODELS_URL"], "http://192.0.2.10:4000/v1/models")
+        self.assertEqual(config["LOCAL_LLM_ALLOW_REMOTE"], "false")
+        for invalid in (url.replace(".10", ".11"), url.replace(":4000", ":4001"),
+                        url.replace(":4000", ""), url.replace("http://", "http://user:password@"),
+                        url + "?q=1", url + "#fragment", url.replace("/v1/messages", "/other"),
+                        url.replace("192.0.2.10", "0xc000020a"),
+                        url.replace("/v1/messages", "/other/../v1/messages")):
+            for allow_remote in (False, True):
+                with self.subTest(url=invalid, allow_remote=allow_remote), self.assertRaises(ValueError):
+                    route.local_endpoint(invalid, allow_remote, url)
+        self.configure(LOCAL_LLM_MODELS_URL="http://192.0.2.11:4000/v1/models")
+        with self.assertRaises(ValueError):
+            route.provider_config("local")
+
+    def test_http_pin_cannot_bypass_other_origins_or_https_opt_in(self):
+        url = "http://192.0.2.10:4000/v1/messages"
+        (self.root / ".env.local-llm").write_text(
+            "LOCAL_LLM_MODEL=synthetic-model\nLOCAL_LLM_URL=" + url + "\nLOCAL_LLM_HTTP_URL=" + url + "\n")
+        self.assertEqual(route.provider_config("local")["LOCAL_LLM_HTTP_URL"], url)
+        self.configure(LOCAL_LLM_URL=url.replace(":4000", ":4001"))
+        with self.assertRaises(ValueError):
+            route.provider_config("local")
+        https = "https://llm.invalid/v1/messages"
+        self.configure(LOCAL_LLM_URL=https, LOCAL_LLM_HTTP_URL=https)
+        with self.assertRaises(ValueError):
+            route.provider_config("local")
+
     def test_key_control_characters_rejected(self):
         for key in ("synthetic\rheader", "synthetic\nheader", "synthetic\x7f"):
             self.configure(LOCAL_LLM_API_KEY=key)
