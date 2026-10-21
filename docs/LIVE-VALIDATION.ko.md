@@ -2,7 +2,7 @@
 
 [한국어 안내](../README.md) · [English guide](../README.en.md)
 
-개인 테스트 환경, 계정 사용량·청구 내역, 세션 식별자, 실제 대화·설정 파일·진단 로그는 공개하지 않습니다. 이 문서는 특정 실환경의 통과 보고서가 아니라 재현 가능한 점검 절차입니다.
+개인 테스트 환경, 계정 사용량·청구 내역, 세션 식별자, 실제 대화·설정 파일·진단 로그는 공개하지 않습니다. 이 문서는 재현 가능한 점검 절차와 합성 입력을 사용한 제한된 검증 결과를 담습니다.
 
 ## 외부 호출 없는 점검
 
@@ -37,6 +37,31 @@ Local 모델 목록 조회 성공은 추론·스트리밍·도구 지원의 증�
 
 Local 모드는 요청당 120초를 허용합니다. 시간 초과 시 한 번 실패하고 Plan으로 전환하지 않습니다. CLI 자체의 재시도는 추가될 수 있습니다. 수동·100k 자동 압축 통과가 전체 컨텍스트 한도, 반복 압축, 장시간 도구 작업을 보장하지는 않습니다.
 
+## 한 시간 연속 실행 결과
+
+코드 `5401a96`, Claude Code 2.1.304에서 같은 CLI 프로세스와 Local 전용 프록시를 3,621.83초 유지했습니다. `stream-json` 입력을 열린 상태로 두고 순서대로 요청했습니다. 자동 압축 창은 `100k`, 출력 예산은 8,192였으며, 시각적 대화형 터미널은 점검 범위에 포함하지 않았습니다.
+
+처음에만 제시한 합성 정보를 반복 압축 뒤 회상하도록 했습니다. 도구 작업은 임시 파일에서 매번 새 값을 Read로 읽고, Edit로 다른 파일을 수정하고, Bash로 정해진 합성 문자열을 출력하도록 구성했습니다. 원래 정보는 후속 입력이나 파일로 다시 제공하지 않았습니다.
+
+| 항목 | 관찰 결과 |
+|---|---|
+| Local 서버 요청 | 157회 |
+| 자동 압축 경계 | 22회, 이 중 토큰 수가 50,000보다 많이 줄어든 압축 11회 |
+| Read·Edit·Bash 작업 묶음 | 40회 성공 |
+| 정보·파일 유지 확인 | 52회 일치 |
+| 120초 시간 초과 | 0회 |
+| 서버 응답 본문 수신 완료까지 걸린 최장 시간 | 114.416초 |
+| 100초 이상 걸린 요청 | 4회 |
+| Plan 라우팅 | 0회 |
+
+실패 없이 끝난 실행은 아닙니다. 약 807초에 서버가 HTTP 200과 빈 내용을 반환해 요청 1회가 실패했습니다. 35초 대기 후 같은 CLI·프록시에서 짧은 요청으로 복구했고, 이후 압축·도구 작업을 계속했습니다. 이는 120초 시간 초과와 다른 실패입니다. 실제 시간 초과가 없었으므로 시간 초과 이후의 복구는 미검증입니다.
+
+한 시간 측정에 앞선 별도 준비 실행에서 회상 판정 실패가 1회 있었으며, 정확한 원인은 확인하지 못했습니다. 이 준비 실행은 위 집계에서 제외했습니다. 한 시간 결과는 합성 입력과 해당 버전·설정에 한정되며, 더 긴 실행이나 모든 서버 응답의 안정성을 보장하지 않습니다. 원문 로그와 개인 설정은 공개하지 않습니다.
+
+같은 검증을 반복할 때는 프로세스를 재시작하거나 세션을 재개한 시간을 합산하지 않습니다. 매 요청의 성공 여부, 압축 경계, 실제 도구 결과, 120초 실패 사유를 각각 기록하고, 오류가 나더라도 회상 정보를 다시 주입하지 않은 상태에서 복구를 판정합니다.
+
 ## English
 
-This is a reusable validation procedure, not a live-environment pass report. Keep machine details, credentials, account usage, billing records, session identifiers, and raw diagnostics private. Separate synthetic regression checks from explicitly authorized live validation; metadata checks do not prove inference or full native-feature compatibility.
+This document contains reusable validation procedures and a limited synthetic-input run summary. Keep machine details, credentials, account usage, billing records, session identifiers, and raw diagnostics private. Separate synthetic regression checks from explicitly authorized live validation; metadata checks do not prove inference or full native-feature compatibility.
+
+At commit `5401a96`, Claude Code 2.1.304 kept one CLI process and one Local-only proxy running for 3,621.83 seconds using stream-json input, a 100k auto-compaction window, and an 8,192 output budget. The run completed 11 large automatic compactions (out of 22 automatic boundaries), 40 Read/Edit/Bash rounds, and 52 retention checks. Of 157 upstream requests, none timed out at 120 seconds; the slowest completed in 114.416 seconds. There were no Plan routes. One HTTP 200 response had empty content; a short request after a 35-second cooldown recovered in the same process, and subsequent work continued. This was a run with a recovered failure, not an error-free pass. Actual timeout recovery, visual interactive-terminal behavior, and longer runs remain unverified. A separate setup run had an unresolved recall-check failure and is excluded from these counts.
