@@ -22,7 +22,7 @@ const requestBody = (model = DEEPSEEK, extra = {}) => ({
   model, max_tokens: 64, messages: [{ role: 'user', content: 'fixture' }], ...extra,
 });
 const jsonResponse = (_url, options) => new Response(JSON.stringify({ type: 'message',
-  model: options ? JSON.parse(options.body).model : DEEPSEEK, content: [], stop_reason: 'end_turn' }), {
+  model: options ? JSON.parse(options.body).model : DEEPSEEK, content: [{ type: 'text', text: 'fixture answer' }], stop_reason: 'end_turn' }), {
   headers: { 'content-type': 'application/json' },
 });
 const sseResponse = (parts) => new Response(new ReadableStream({
@@ -66,6 +66,86 @@ async function consume(request) {
 
 const proHeaders = { authorization: OAUTH, 'anthropic-beta': BETA };
 const SONNET = 'claude-sonnet-4-6';
+
+for (const provider of ['openrouter', 'local']) {
+  test(`${provider} preserves direct caller through tool execution and the next turn`, async t => {
+    const tool = { type: 'tool_use', id: 'history-1', name: 'ReadHistory', input: {}, caller: { type: 'direct' } };
+    const config = provider === 'local' ? { provider, localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-model' } : {};
+    const { calls, request } = await fixture(t, (_url, options) => {
+      const body = JSON.parse(options.body);
+      return Response.json({ type: 'message', model: body.model,
+        content: body.messages.length === 1 ? [tool] : [{ type: 'text', text: 'history preserved' }],
+        stop_reason: body.messages.length === 1 ? 'tool_use' : 'end_turn' });
+    }, config);
+    const body = requestBody(SONNET);
+    const first = await (await request(body, { headers: proHeaders })).json();
+    assert.deepEqual(first.content, [tool]);
+    const followup = { ...body, messages: [...body.messages, { role: 'assistant', content: first.content },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: tool.id, content: 'synthetic commit 1234567' }] }] };
+    const snapshot = structuredClone(followup);
+    const second = await (await request(followup, { headers: proHeaders })).json();
+    assert.equal(second.content[0].text, 'history preserved');
+    assert.equal(calls.length, 2);
+    assert.ok(calls.every(call => call.url === (provider === 'local' ? config.localUrl : 'https://openrouter.ai/api/v1/messages')));
+    assert.deepEqual(calls[1].parsedBody.messages, snapshot.messages);
+    assert.deepEqual(followup, snapshot);
+  });
+}
+
+for (const caller of [null, {}, [], 1, 'direct', { type: 'future' }, { type: 'code_execution_20250825', tool_id: 'x' }, { type: 'direct', extra: true }]) {
+  test(`unsupported caller ${JSON.stringify(caller)} preserves native request`, async t => {
+    const body = requestBody(SONNET, { messages: [{ role: 'assistant', content: [
+      { type: 'tool_use', id: 'history-1', name: 'ReadHistory', input: {}, caller },
+    ] }] });
+    const { calls, request } = await fixture(t);
+    assert.equal((await request(body, { headers: proHeaders })).status, 200);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, 'https://api.anthropic.com/v1/messages');
+    assert.deepEqual(calls[0].parsedBody, body);
+  });
+}
+
+for (const nativeFeature of ['beta', 'system role', 'nested caller']) {
+  test(`direct caller does not bypass ${nativeFeature} preservation`, async t => {
+    const tool = { type: 'tool_use', id: 't1', name: 'ReadHistory', input: {}, caller: { type: 'direct' } };
+    const body = requestBody(SONNET, { messages: [{ role: 'assistant', content: [tool] }] });
+    const headers = { ...proHeaders };
+    if (nativeFeature === 'beta') headers['anthropic-beta'] += ',future-native-2026-10-20';
+    if (nativeFeature === 'system role') body.messages.unshift({ role: 'system', content: 'synthetic instruction' });
+    if (nativeFeature === 'nested caller') body.messages.push({ role: 'user', content: [
+      { type: 'tool_result', tool_use_id: 't1', content: [{ ...tool, caller: { type: 'future' } }] },
+    ] });
+    const { calls, request } = await fixture(t);
+    assert.equal((await request(body, { headers })).status, 200);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, 'https://api.anthropic.com/v1/messages');
+    assert.deepEqual(calls[0].parsedBody, body);
+    assert.equal(calls[0].headers['anthropic-beta'], headers['anthropic-beta']);
+  });
+}
+
+test('native 429 does not stop external routing or subsequent native recovery', async t => {
+  let limited = true;
+  const { calls, request } = await fixture(t, (url, options) => {
+    if (url.startsWith('https://api.anthropic.com') && limited) {
+      limited = false;
+      return Response.json({ type: 'error', error: { type: 'rate_limit_error', message: 'synthetic limit' } },
+        { status: 429, headers: { 'retry-after': '7', 'anthropic-ratelimit-unified-5h-status': 'allowed' } });
+    }
+    return jsonResponse(url, options);
+  });
+  const original = requestBody(OPUS);
+  const limitedResponse = await request(original, { headers: proHeaders });
+  assert.equal(limitedResponse.status, 429);
+  assert.equal(limitedResponse.headers.get('retry-after'), '7');
+  assert.equal(limitedResponse.headers.get('anthropic-ratelimit-unified-5h-status'), 'allowed');
+  assert.equal((await limitedResponse.json()).error.type, 'rate_limit_error');
+  assert.deepEqual(calls[0].parsedBody, original);
+  assert.equal((await request(requestBody(SONNET), { headers: proHeaders })).status, 200);
+  assert.equal(calls[1].url, 'https://openrouter.ai/api/v1/messages');
+  assert.equal((await request(original, { headers: proHeaders })).status, 200);
+  assert.equal(calls.length, 3);
+});
 const ARTIFACT_ID_PATTERN = String.raw`^(?!\.\.?(?:\/|$))[A-Za-z0-9_\-.~:@+]{1,200}$`;
 const ARTIFACT_COLLECTION_PATTERN = String.raw`^(?!\.\.?(?:\/|$))[A-Za-z0-9_\-.~:@+]{1,200}(?:\/(?!\.\.?(?:\/|$))[A-Za-z0-9_\-.~:@+]{1,200}){0,14}$`;
 
@@ -179,8 +259,113 @@ test('Pro forwards ArtifactData patterns and propertyNames without compatibility
 
 const proURL = 'https://api.anthropic.com/v1/messages';
 const externalURL = 'https://openrouter.ai/api/v1/messages';
-const complete = model => frame('message_start', { message: { model } }) + frame('message_delta') + frame('message_stop');
+const contentStream = (content, stopReason = 'end_turn') => frame('message_start') +
+  content.map((block, index) => frame('content_block_start', { index, content_block: block }) +
+    frame('content_block_stop', { index })).join('') +
+  frame('message_delta', { delta: { stop_reason: stopReason } }) + frame('message_stop');
+const complete = model => frame('message_start', { message: { model } }) +
+  frame('content_block_start', { index: 0, content_block: { type: 'text', text: '' } }) +
+  frame('content_block_delta', { index: 0, delta: { type: 'text_delta', text: 'fixture answer' } }) +
+  frame('content_block_stop', { index: 0 }) + frame('message_delta') + frame('message_stop');
 const native = (url, options) => url.startsWith('https://api.anthropic.com') ? jsonResponse(url, options) : null;
+
+for (const [label, content] of [
+  ['no blocks', []],
+  ['empty text', [{ type: 'text', text: '' }]],
+  ['whitespace text', [{ type: 'text', text: ' \t\n' }]],
+  ['thinking only', [{ type: 'thinking', thinking: 'synthetic reasoning' }]],
+  ['redacted thinking only', [{ type: 'redacted_thinking', data: 'synthetic' }]],
+  ['whitespace tool ID', [{ type: 'tool_use', id: ' ', name: 'Read', input: {} }]],
+  ['whitespace tool name', [{ type: 'tool_use', id: 'fixture-tool', name: ' ', input: {} }]],
+]) {
+  for (const format of ['json', 'sse']) {
+    test(`external ${format} ${label} retries three times then forwards Pro unchanged`, async t => {
+      const { calls, request } = await fixture(t, url => url === proURL
+        ? new Response('native result', { status: 429, headers: { 'retry-after': '60' } })
+        : format === 'json'
+          ? new Response(JSON.stringify({ type: 'message', model: DEEPSEEK, content, stop_reason: 'end_turn' }), { headers: { 'content-type': 'application/json' } })
+          : sseResponse([contentStream(content)]));
+      const original = requestBody(SONNET, { stream: format === 'sse' });
+      const response = await request(original, { headers: proHeaders });
+      assert.equal(response.status, 429);
+      assert.equal(response.headers.get('retry-after'), '60');
+      assert.equal(await response.text(), 'native result');
+      assert.equal(calls.length, 5);
+      assert.ok(calls.slice(0, 4).every(call => call.url === externalURL));
+      assert.equal(calls.at(-1).url, proURL);
+      assert.deepEqual(calls.at(-1).parsedBody, original);
+      assert.equal(calls.at(-1).headers.authorization, OAUTH);
+    });
+  }
+}
+
+for (const text of ['', ' \t\n']) {
+  test(`external SSE empty text delta ${JSON.stringify(text)} triggers fallback`, async t => {
+    const events = frame('message_start') +
+      frame('content_block_start', { index: 0, content_block: { type: 'text', text: '' } }) +
+      frame('content_block_delta', { index: 0, delta: { type: 'text_delta', text } }) +
+      frame('content_block_stop', { index: 0 }) + frame('message_delta') + frame('message_stop');
+    const { calls, request } = await fixture(t, url => url === proURL
+      ? new Response('native delta fallback') : sseResponse([events]));
+    const response = await request(requestBody(SONNET, { stream: true }), { headers: proHeaders });
+    assert.equal(await response.text(), 'native delta fallback');
+    assert.equal(calls.length, 5);
+    assert.equal(calls.at(-1).url, proURL);
+  });
+}
+
+for (const stopReason of ['refusal', 'model_context_window_exceeded']) {
+  for (const format of ['json', 'sse']) {
+    test(`external ${format} explicit ${stopReason} is preserved without retry or fallback`, async t => {
+      const { calls, request } = await fixture(t, () => format === 'json'
+        ? new Response(JSON.stringify({ type: 'message', model: DEEPSEEK, content: [], stop_reason: stopReason }), { headers: { 'content-type': 'application/json' } })
+        : sseResponse([contentStream([], stopReason)]));
+      const response = await request(requestBody(SONNET, { stream: format === 'sse' }), { headers: proHeaders });
+      assert.equal(response.status, 200);
+      assert.match(await response.text(), new RegExp(stopReason));
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].url, externalURL);
+    });
+  }
+}
+
+for (const format of ['json', 'sse']) {
+  test(`empty OpenRouter ${format} opens cooldown and a real output probe restores replacement`, async t => {
+    let time = 1000, healthy = false;
+    const { calls, request } = await fixture(t, (url, options) => {
+      if (url === proURL) return jsonResponse(url, options);
+      if (healthy) return format === 'sse' ? sseResponse([complete(DEEPSEEK)]) : jsonResponse(url, options);
+      return format === 'json'
+        ? new Response(JSON.stringify({ type: 'message', model: DEEPSEEK, content: [], stop_reason: 'end_turn' }), { headers: { 'content-type': 'application/json' } })
+        : sseResponse([contentStream([])]);
+    }, { now: () => time, cooldownMs: 30 });
+    const original = requestBody(SONNET, { stream: format === 'sse' });
+    await (await request(original, { headers: proHeaders })).text();
+    assert.equal(calls.length, 5);
+    healthy = true;
+    await (await request(original, { headers: proHeaders })).text();
+    assert.equal(calls.length, 6);
+    assert.equal(calls.at(-1).url, proURL);
+    time += 31;
+    for (let i = 0; i < 2; i++) {
+      const response = await request(original, { headers: proHeaders });
+      assert.match(await response.text(), /fixture answer/);
+      assert.equal(calls.at(-1).url, externalURL);
+    }
+    assert.equal(calls.length, 8);
+  });
+}
+
+for (const model of [OPUS, HAIKU, FABLE]) {
+  test(`native ${model} empty completion remains untouched`, async t => {
+    const raw = JSON.stringify({ type: 'message', model, content: [], stop_reason: 'end_turn' });
+    const { calls, request } = await fixture(t, () => new Response(raw, { headers: { 'content-type': 'application/json' } }));
+    const response = await request(requestBody(model), { headers: proHeaders });
+    assert.equal(await response.text(), raw);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, proURL);
+  });
+}
 
 for (const model of [DEEPSEEK, SONNET]) {
   test(`${model} external JSON keeps metadata and isolates OAuth`, async t => {

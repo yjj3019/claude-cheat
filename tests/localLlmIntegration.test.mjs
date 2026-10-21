@@ -10,7 +10,7 @@ const MODEL = 'loopback-fixture';
 const OAUTH = 'Bearer sk-ant-oat-loopback-fixture';
 const body = extra => ({ model: SONNET, max_tokens: 64,
   messages: [{ role: 'user', content: '한글 fixture' }], ...extra });
-const message = (model = MODEL, content = []) => ({ type: 'message', model, content, stop_reason: 'end_turn' });
+const message = (model = MODEL, content = [{ type: 'text', text: 'local fixture answer' }]) => ({ type: 'message', model, content, stop_reason: 'end_turn' });
 const frame = (type, extra = {}) => `event: ${type}\ndata: ${JSON.stringify({ type, ...extra })}\n\n`;
 const json = (res, value) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(value)); };
 
@@ -77,6 +77,48 @@ for (const localKey of [undefined, 'synthetic-local-key']) {
     for (const name of ['anthropic-beta', 'x-api-key', 'x-local-route-token']) assert.equal(received.headers[name], undefined);
     assert.equal(JSON.stringify(received).includes(OAUTH), false);
     assert.equal(f.proCalls.length, 0);
+  });
+}
+
+for (const format of ['json', 'sse']) {
+  test(`empty local HTTP ${format} retries, falls back, and recovers after cooldown`, { timeout: 5000 }, async t => {
+    let time = 1000, healthy = false;
+    const f = await fixture(t, (_req, res) => {
+      if (healthy) {
+        if (format === 'json') { json(res, message()); return; }
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end(frame('message_start', { message: { model: MODEL } }) +
+          frame('content_block_start', { index: 0, content_block: { type: 'text', text: 'local fixture answer' } }) +
+          frame('content_block_stop', { index: 0 }) +
+          frame('message_delta', { delta: { stop_reason: 'end_turn' } }) + frame('message_stop'));
+        return;
+      }
+      if (format === 'json') { json(res, message(MODEL, [])); return; }
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(frame('message_start', { message: { model: MODEL } }) +
+        frame('message_delta', { delta: { stop_reason: 'end_turn' } }) + frame('message_stop'));
+    }, { now: () => time, cooldownMs: 30 });
+    const extra = { stream: format === 'sse' };
+    await (await f.request(extra)).text();
+    assert.equal(f.localCalls.length, 4);
+    assert.equal(f.proCalls.length, 1);
+    assert.deepEqual(f.proCalls[0].body, body(extra));
+    healthy = true;
+    await (await f.request(extra)).text();
+    assert.equal(f.localCalls.length, 4);
+    assert.equal(f.proCalls.length, 2);
+    time += 31;
+    for (let i = 0; i < 2; i++) {
+      const response = await f.request(extra);
+      if (format === 'json') assert.deepEqual(await response.json(), message(SONNET));
+      else {
+        const output = await response.text();
+        assert.match(output, /local fixture answer/);
+        assert.match(output, new RegExp(SONNET));
+      }
+    }
+    assert.equal(f.localCalls.length, 6);
+    assert.equal(f.proCalls.length, 2);
   });
 }
 

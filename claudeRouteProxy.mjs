@@ -28,6 +28,11 @@ function compatibleSchema(schema) {
 }
 
 const STOP_REASONS = new Set(['end_turn', 'max_tokens', 'stop_sequence', 'tool_use', 'refusal', 'model_context_window_exceeded']);
+const CONTROL_STOPS = new Set(['refusal', 'model_context_window_exceeded']);
+function usableContent(block) {
+  return block.type === 'text' ? block.text.trim().length > 0 :
+    block.type === 'tool_use' && block.id.trim().length > 0 && block.name.trim().length > 0;
+}
 function validContentBlock(block) {
   if (!block || typeof block !== 'object') return false;
   if (block.type === 'text') return typeof block.text === 'string';
@@ -44,7 +49,7 @@ const BASIC_FIELDS = new Set(['model', 'messages', 'max_tokens', 'system', 'stre
 const CONTENT_FIELDS = {
   text: new Set(['type', 'text', 'cache_control']),
   image: new Set(['type', 'source', 'cache_control']),
-  tool_use: new Set(['type', 'id', 'name', 'input', 'cache_control']),
+  tool_use: new Set(['type', 'id', 'name', 'input', 'cache_control', 'caller']),
   tool_result: new Set(['type', 'tool_use_id', 'content', 'is_error', 'cache_control']),
 };
 function externalCompatible(body, beta) {
@@ -59,6 +64,9 @@ function externalCompatible(body, beta) {
   if (body.tool_choice && Object.keys(body.tool_choice).some(name => !['type', 'name', 'disable_parallel_tool_use'].includes(name))) return false;
   const contentOK = content => typeof content === 'string' || (Array.isArray(content) && content.every(block => {
     if (!block || !CONTENT_FIELDS[block.type] || Object.keys(block).some(key => !CONTENT_FIELDS[block.type].has(key))) return false;
+    if (block.type === 'tool_use' && Object.hasOwn(block, 'caller') &&
+        (!block.caller || typeof block.caller !== 'object' || Array.isArray(block.caller) ||
+          block.caller.type !== 'direct' || Object.keys(block.caller).length !== 1)) return false;
     return block.type !== 'tool_result' || contentOK(block.content);
   }));
   if (!body.messages.every(message => contentOK(message.content)) ||
@@ -125,10 +133,12 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal) {
     const response = JSON.parse(text);
     if (response.type !== 'message' || response.model !== model || !Array.isArray(response.content) ||
         !response.content.every(validContentBlock) || !STOP_REASONS.has(response.stop_reason)) throw new Error('Invalid message response');
+    if (!response.content.some(usableContent) && !CONTROL_STOPS.has(response.stop_reason)) throw new Error('Empty message response');
     response.model = clientModel;
     return { contentType: 'application/json', text: JSON.stringify(response) };
   }
   let started = false, delta = false, stopped = false;
+  let usable = false, stopReason;
   const blocks = new Map();
   const indices = new Set();
   const frames = text.split(/\r?\n\r?\n/);
@@ -152,6 +162,7 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal) {
       if (!Number.isInteger(event.index) || event.index < 0 || indices.has(event.index) || delta ||
           !validContentBlock(event.content_block)) throw new Error('Invalid content block');
       indices.add(event.index);
+      usable ||= usableContent(event.content_block);
       blocks.set(event.index, { type: event.content_block.type, json: '', hasJson: false });
     }
     if (event.type === 'content_block_delta') {
@@ -164,6 +175,7 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal) {
           (event.delta.type === 'thinking_delta' && block.type === 'thinking' && typeof event.delta.thinking === 'string') ||
           (event.delta.type === 'signature_delta' && block.type === 'thinking' && typeof event.delta.signature === 'string')))
         throw new Error('Invalid content delta');
+      if (event.delta.type === 'text_delta') usable ||= event.delta.text.trim().length > 0;
     }
     if (event.type === 'content_block_stop') {
       const block = blocks.get(event.index);
@@ -177,6 +189,7 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal) {
     if (event.type === 'message_delta') {
       if (blocks.size || !STOP_REASONS.has(event.delta?.stop_reason)) throw new Error('Incomplete message');
       delta = true;
+      stopReason = event.delta.stop_reason;
     }
     if (event.type === 'message_stop') { if (!started || !delta || blocks.size) throw new Error('Missing start or delta'); stopped = true; }
 
@@ -184,6 +197,7 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal) {
       frame.split(/\r?\n/).filter(line => !line.startsWith('data:')).concat(`data: ${JSON.stringify(event)}`).join('\n') + '\n\n');
   }
   if (!started || !stopped) throw new Error('Truncated stream');
+  if (!usable && !CONTROL_STOPS.has(stopReason)) throw new Error('Empty message response');
   return { contentType: 'text/event-stream', text: output.join('') };
 }
 

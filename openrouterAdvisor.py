@@ -395,7 +395,7 @@ def launch(provider: str = "openrouter") -> int:
     if not claude:
         raise FileNotFoundError("Claude Code executable not found")
     print(f"Sonnet replacement: {provider}. Opus/Haiku/Fable keep Claude Pro OAuth.")
-    print("Initial request + 3 retries, then Pro Sonnet fallback; recovery checked on a later request.")
+    print("Initial request + 3 retries, then Plan fallback (subscription Sonnet); recovery checked on a later request.")
     print("Native-only features stay on Pro. Replacement replies are buffered until validated.")
     with routed_session(provider) as env:
         return subprocess.call([claude, "--model", "sonnet"], env=env)
@@ -592,7 +592,7 @@ if __name__ == "__main__":
         elif sys.argv[1:] == ["--self-test"]:
             self_test()
         else:
-            parser = argparse.ArgumentParser(description="Sonnet replacement with Pro subscription fallback")
+            parser = argparse.ArgumentParser(description="Sonnet replacement with Plan fallback")
             parser.add_argument("--provider", choices=("openrouter", "local"), default="openrouter")
             parser.add_argument("--check-local", action="store_true", help="Check local model metadata without inference or Pro login")
             options = parser.parse_args()
