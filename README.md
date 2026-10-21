@@ -46,6 +46,7 @@ Claude Code — 기존 Pro 로그인·사용자 설정
 
 별도로 설치한 **Claude Code, Node.js, Python**과 기존 **Claude Pro 로그인**이 필요합니다. 현재 인증 검사는 Pro 계정을 대상으로 하며 Max 등 다른 플랜의 지원을 보장하지 않습니다. 이 소스에 필요한 추가 npm·pip 패키지는 없습니다.
 
+Claude Code·Node.js·Python을 설치하고 각 버전과 호환성을 직접 확인하세요. 특정 개인 PC 구성이나 최소 지원 버전을 보장하지 않습니다.
 
 ```powershell
 # 처음 내려받는 경우에만 실행

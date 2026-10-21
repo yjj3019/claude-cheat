@@ -8,6 +8,7 @@ A local router that preserves the existing Claude Code Pro login and settings wh
 
 **Status: provider selection, retries, Pro fallback, and recovery are implemented. Preserving every native feature while actually replacing the main Sonnet model is not fully achieved.**
 
+Check the installed Claude Code, Node.js, and Python versions for compatibility. No personal development-machine configuration or minimum-version matrix is published.
 - See the [public history guide](docs/HISTORY.ko.md); private environment records are excluded.
 
 ## Setup and execution
