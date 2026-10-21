@@ -181,6 +181,32 @@ class LocalCliModeTests(LocalTestCase):
         session.assert_not_called()
         child.assert_not_called()
 
+    def test_local_output_budget_is_applied_before_cli_context_calculation(self):
+        for requested, expected in ((None, "8192"), ("", "8192"), ("2048", "8192"),
+                                    ("8192", "8192"), ("16384", "16384"), ("32_768", "32768"), ("3.2e4", "32000")):
+            with self.subTest(requested=requested), mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.304 (Claude Code)")):
+                if requested is not None:
+                    os.environ["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = requested
+                command = route.local_cli_command("synthetic-cli")
+                settings = json.loads(command[command.index("--settings") + 1])
+                self.assertEqual(settings["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"], expected)
+                self.assertFalse(settings["alwaysThinkingEnabled"])
+                self.assertEqual(os.environ.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS"), requested)
+
+    def test_local_output_budget_rejects_invalid_values(self):
+        for value in ("invalid", "0", "-1", "1.5", "nan", "inf", "1e999"):
+            with self.subTest(value=value), mock.patch.dict(os.environ, {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": value}), mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.304 (Claude Code)")):
+                with self.assertRaisesRegex(ValueError, "Local output budget must be a positive integer"):
+                    route.local_cli_command("synthetic-cli")
+
+    def test_ordinary_launch_preserves_existing_output_budget(self):
+        env = {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "2048"}
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(route.shutil, "which", return_value="synthetic-cli"), mock.patch.object(route, "routed_session", return_value=contextlib.nullcontext(env)) as session, mock.patch.object(route.subprocess, "call", return_value=0) as child:
+            self.assertEqual(route.launch("local"), 0)
+        session.assert_called_once_with("local")
+        self.assertEqual(child.call_args.args[0], ["synthetic-cli", "--model", "sonnet"])
+        self.assertEqual(child.call_args.kwargs["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"], "2048")
+
     def test_local_mode_cli_rejects_other_modes_before_network(self):
         for args in (["--local-mode"], ["--provider", "local", "--local-mode", "--check-local"],
                      ["--provider", "local", "--local-mode", "--diagnose-local"]):

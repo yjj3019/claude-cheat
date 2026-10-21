@@ -414,8 +414,17 @@ def local_cli_command(claude: str) -> list:
     match = re.match(r"(\d+)\.(\d+)\.(\d+)", version.stdout.strip())
     if not match or tuple(map(int, match.groups())) < (2, 1, 304):
         raise RuntimeError("Local CLI mode requires Claude Code 2.1.304 or later")
+    try:
+        output_tokens = float(os.environ.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS") or "8192")
+    except ValueError:
+        raise ValueError("Local output budget must be a positive integer") from None
+    if not output_tokens.is_integer() or output_tokens <= 0:
+        raise ValueError("Local output budget must be a positive integer")
+    # Set the budget before the CLI computes compaction and remaining context space.
+    settings = {"alwaysThinkingEnabled": False, "env": {
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(max(8192, int(output_tokens)))}}
     return [claude, "--bare", "--model", "sonnet", "--permission-mode", "default",
-            "--tools", "Bash,Read,Edit,Write,Glob,Grep", "--settings", json.dumps({"alwaysThinkingEnabled": False})]
+            "--tools", "Bash,Read,Edit,Write,Glob,Grep", "--settings", json.dumps(settings)]
 
 
 def launch(provider: str = "openrouter", local_only: bool = False) -> int:
