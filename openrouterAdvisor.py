@@ -306,12 +306,14 @@ def file_mcp_sources() -> list[str]:
 
 
 @contextlib.contextmanager
-def routed_session(provider: str = "openrouter"):
-    """Own one loopback proxy; the CLI alone reads the saved subscription login."""
+def routed_session(provider: str = "openrouter", local_only: bool = False):
+    """Own one loopback proxy; ordinary sessions alone use the subscription login."""
+    if local_only and provider != "local":
+        raise ValueError("Local CLI mode requires the local provider")
     claude = shutil.which("claude")
     if not claude:
         raise FileNotFoundError("Claude Code executable not found")
-    env = os.environ.copy()
+    env = clean_env() if local_only else os.environ.copy()
     for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER"):
         env.pop(name, None)
     # Remove only provider credentials/routing left by the former OpenRouter setup.
@@ -326,10 +328,11 @@ def routed_session(provider: str = "openrouter"):
     if not config_dir or Path(config_dir).resolve() == (Path.home() / ".claude-openrouter").resolve():
         env["CLAUDE_CONFIG_DIR"] = str(Path.home() / ".claude")
     command = [claude]
-    auth = run_owned(command + ["auth", "status", "--json"], env, str(Path.home()), timeout=60)
-    if not (auth.get("loggedIn") is True and auth.get("authMethod") == "claude.ai"
-            and auth.get("apiProvider") == "firstParty" and auth.get("subscriptionType") == "pro"):
-        raise RuntimeError("Existing first-party Plan login required; no API fallback")
+    if not local_only:
+        auth = run_owned(command + ["auth", "status", "--json"], env, str(Path.home()), timeout=60)
+        if not (auth.get("loggedIn") is True and auth.get("authMethod") == "claude.ai"
+                and auth.get("apiProvider") == "firstParty" and auth.get("subscriptionType") == "pro"):
+            raise RuntimeError("Existing first-party Plan login required; no API fallback")
     node = shutil.which("node")
     if not node:
         raise FileNotFoundError("Node.js required for local routing")
@@ -337,7 +340,7 @@ def routed_session(provider: str = "openrouter"):
     proxy_env = clean_env()
     for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER"):
         proxy_env.pop(name, None)
-    proxy_env.update(provider_config(provider), LOCAL_ROUTE_TOKEN=nonce)
+    proxy_env.update(provider_config(provider), LOCAL_ROUTE_TOKEN=nonce, LOCAL_ROUTE_ONLY="1" if local_only else "0")
     proxy = subprocess.Popen([node, str(ROOT / "claudeRouteProxy.mjs")], env=proxy_env,
                              stdout=subprocess.PIPE, text=True, encoding="utf-8")
     ready = queue.Queue()
@@ -352,6 +355,9 @@ def routed_session(provider: str = "openrouter"):
         headers = env.get("ANTHROPIC_CUSTOM_HEADERS", "").strip()
         env.update({"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
                     "ANTHROPIC_CUSTOM_HEADERS": (headers + "\n" if headers else "") + f"X-Local-Route-Token: {nonce}"})
+        if local_only:
+            env.update(ANTHROPIC_API_KEY=nonce, CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="1",
+                       CLAUDE_CODE_DISABLE_ADVISOR_TOOL="1", MAX_THINKING_TOKENS="0")
         yield env
     finally:
         proxy.terminate()
@@ -392,10 +398,35 @@ def hud_configuration() -> tuple[dict, list[str]]:
     return {"statusLine": {"type": "command", "command": command}}, ["--plugin-dir", str(plugin)]
 
 
-def launch(provider: str = "openrouter") -> int:
+def diagnose_local() -> int:
+    """One synthetic Local inference; no CLI, native features, retries or Plan fallback."""
+    config = provider_config("local")
+    node = shutil.which("node")
+    if not node:
+        raise FileNotFoundError("Node.js required for Local diagnostics")
+    env = clean_env()
+    env.update(config)
+    return subprocess.call([node, str(ROOT / "claudeRouteProxy.mjs"), "--diagnose-local"], env=env)
+
+
+def local_cli_command(claude: str) -> list:
+    version = subprocess.run([claude, "--version"], capture_output=True, text=True, timeout=10, check=True)
+    match = re.match(r"(\d+)\.(\d+)\.(\d+)", version.stdout.strip())
+    if not match or tuple(map(int, match.groups())) < (2, 1, 286):
+        raise RuntimeError("Local CLI mode requires Claude Code 2.1.286 or later")
+    return [claude, "--bare", "--model", "sonnet", "--permission-mode", "default",
+            "--tools", "Bash,Read,Edit,Write,Glob,Grep", "--settings", json.dumps({"alwaysThinkingEnabled": False})]
+
+
+def launch(provider: str = "openrouter", local_only: bool = False) -> int:
     claude = shutil.which("claude")
     if not claude:
         raise FileNotFoundError("Claude Code executable not found")
+    if local_only:
+        print("Local CLI mode: built-in file/shell tools; native integrations disabled. No Plan fallback.")
+        command = local_cli_command(claude)
+        with routed_session(provider, local_only=True) as env:
+            return subprocess.call(command, env=env)
     print(f"Sonnet replacement: {provider}. Opus/Haiku/Fable keep Claude Plan OAuth.")
     print("Initial request + 3 retries, then Plan fallback (subscription Sonnet); recovery checked on a later request.")
     print("Native-only features stay on Plan. Replacement replies are buffered until validated.")
@@ -598,12 +629,20 @@ if __name__ == "__main__":
             parser = argparse.ArgumentParser(description="Sonnet replacement with Plan fallback")
             parser.add_argument("--provider", choices=("openrouter", "local"), default="openrouter")
             parser.add_argument("--check-local", action="store_true", help="Check local model metadata without inference or Plan login")
+            parser.add_argument("--diagnose-local", action="store_true", help="One synthetic Local inference without CLI, native features or Plan fallback")
+            parser.add_argument("--local-mode", action="store_true", help="Interactive Local-only CLI with native integrations disabled and no Plan fallback")
             options = parser.parse_args()
+            if options.local_mode and (options.provider != "local" or options.check_local or options.diagnose_local):
+                parser.error("--local-mode requires --provider local and cannot be combined with diagnostic checks")
+            if options.diagnose_local and (options.provider != "local" or options.check_local):
+                parser.error("--diagnose-local requires --provider local and cannot be combined with --check-local")
+            if options.diagnose_local:
+                sys.exit(diagnose_local())
             if options.check_local:
                 result = check_local()
                 print(json.dumps(result))
                 sys.exit(0 if result["local_check"] else 1)
-            sys.exit(launch(options.provider))
+            sys.exit(launch(options.provider, local_only=options.local_mode))
     except (OSError, RuntimeError, EOFError, ValueError, subprocess.SubprocessError) as exc:
         print(json.dumps({"event": "openrouter_start_failed", "kind": type(exc).__name__}), file=sys.stderr)
         sys.exit(1)

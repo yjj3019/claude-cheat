@@ -1,7 +1,76 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import test from 'node:test';
-import { createProxy, DEEPSEEK } from '../claudeRouteProxy.mjs';
+import { createProxy, diagnoseLocal, DEEPSEEK } from '../claudeRouteProxy.mjs';
+
+const diagnosticConfig = { localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'diagnostic-fixture', localKey: 'synthetic-local-key' };
+const diagnosticMessage = extra => ({ type: 'message', model: diagnosticConfig.localModel,
+  content: [{ type: 'text', text: 'LOCAL_DIAGNOSTIC_OK' }], stop_reason: 'end_turn', ...extra });
+
+test('Local diagnostic sends one minimal request with isolated authentication and confirms inference', async () => {
+  const calls = [];
+  const result = await diagnoseLocal({ ...diagnosticConfig, fetchImpl: async (url, options) => {
+    calls.push({ url, ...options });
+    return Response.json(diagnosticMessage());
+  } });
+  assert.deepEqual(result, { local_diagnostic: true, inference_checked: true, model_confirmed: true,
+    reply_confirmed: true, reason: 'ready_inference_only' });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, diagnosticConfig.localUrl);
+  assert.equal(calls[0].redirect, 'error');
+  assert.deepEqual(Object.keys(calls[0].headers).sort(), ['anthropic-version', 'authorization', 'content-type']);
+  assert.equal(calls[0].headers.authorization, 'Bearer synthetic-local-key');
+  const body = JSON.parse(calls[0].body);
+  assert.deepEqual(Object.keys(body).sort(), ['max_tokens', 'messages', 'model', 'stream']);
+  assert.equal(body.stream, false);
+  assert.equal(body.messages.length, 1);
+  assert.equal(body.model, diagnosticConfig.localModel);
+});
+
+for (const [label, reply, reason] of [
+  ['wrong model', diagnosticMessage({ model: 'other-model' }), 'invalid_response'],
+  ['wrong reply', diagnosticMessage({ content: [{ type: 'text', text: 'private-answer-marker' }] }), 'reply_mismatch'],
+  ['truncated reply', diagnosticMessage({ stop_reason: 'max_tokens' }), 'incomplete_response'],
+  ['empty reply', diagnosticMessage({ content: [] }), 'invalid_response'],
+]) {
+  test(`Local diagnostic rejects ${label} without Plan fallback or leaking response content`, async () => {
+    let calls = 0;
+    const result = await diagnoseLocal({ ...diagnosticConfig, fetchImpl: async url => {
+      assert.equal(url, diagnosticConfig.localUrl);
+      calls++;
+      return Response.json(reply);
+    } });
+    assert.equal(calls, 1);
+    assert.equal(result.local_diagnostic, false);
+    assert.equal(result.reason, reason);
+    assert.equal(JSON.stringify(result).includes('private-answer-marker'), false);
+  });
+}
+
+for (const status of [302, 401, 500]) {
+  test(`Local diagnostic HTTP ${status} is reported once without retry or Plan fallback`, async () => {
+    let calls = 0;
+    const result = await diagnoseLocal({ ...diagnosticConfig, fetchImpl: async () => {
+      calls++;
+      return new Response('private-error-marker', { status });
+    } });
+    assert.equal(calls, 1);
+    assert.deepEqual(result, { local_diagnostic: false, inference_checked: true, reason: 'http_error', status });
+  });
+}
+
+test('Local diagnostic deadline covers a stalled response body', async () => {
+  const result = await diagnoseLocal({ ...diagnosticConfig, timeoutMs: 20,
+    fetchImpl: async () => new Response(new ReadableStream({ start() {} })) });
+  assert.deepEqual(result, { local_diagnostic: false, inference_checked: true, reason: 'timeout' });
+});
+
+test('Local diagnostic connection errors are fixed categories without retry', async () => {
+  let calls = 0;
+  const result = await diagnoseLocal({ ...diagnosticConfig, fetchImpl: async () => { calls++; throw new Error('private-error-marker'); } });
+  assert.equal(calls, 1);
+  assert.deepEqual(result, { local_diagnostic: false, inference_checked: true, reason: 'connection_failed' });
+});
 
 for (const localUrl of ['http://127.0.0.1:0/v1/messages', 'http://127.0.0.1:11434/v1/mes\nsages', 'https://llm.example.invalid:0/v1/messages']) {
   test('Local URL rejects zero port and embedded control characters: ' + JSON.stringify(localUrl), () => {
@@ -106,11 +175,32 @@ for (const [detail, extra, headers = proHeaders, path = '/v1/messages'] of exclu
     assert.equal(calls[0].url, 'https://api.anthropic.com' + path);
     assert.deepEqual(calls[0].parsedBody, body);
     const entries = log.mock.calls.map(call => JSON.parse(call.arguments[0]));
-    assert.deepEqual(entries, [{ event: 'route_selected', provider: 'plan', reason: 'native_feature', detail }]);
+    assert.deepEqual(entries, [{ event: 'route_selected', provider: 'plan', reason: 'native_feature', detail,
+      ...(detail === 'unsupported_beta' ? { beta_features: ['[redacted]'], unsupported_beta_count: 1 } : {}) }]);
     assert.equal(JSON.stringify(entries).includes('private-'), false);
     assert.equal(JSON.stringify(entries).includes(OAUTH), false);
   });
 }
+
+test('beta diagnostics show bounded feature identifiers and redact nonstandard or credential-like values', async t => {
+  const log = t.mock.method(console, 'error', () => {});
+  const features = ['test-feature-2026-10-21', 'private-value-marker', 'sk-secret-2026-10-21',
+    ...Array.from({ length: 20 }, (_, i) => `test-feature-${i}-2026-10-21`)];
+  const beta = [BETA, 'claude-code-20250219', ...features].join(',');
+  const { calls, request } = await fixture(t);
+  const response = await request(requestBody(SONNET), { headers: { ...proHeaders, 'anthropic-beta': beta } });
+  assert.equal(response.status, 200);
+  await response.text();
+  const entry = JSON.parse(log.mock.calls[0].arguments[0]);
+  assert.equal(entry.detail, 'unsupported_beta');
+  assert.equal(entry.beta_features.length, 16);
+  assert.equal(entry.unsupported_beta_count, 23);
+  assert.deepEqual(entry.beta_features.slice(0, 3), ['test-feature-2026-10-21', '[redacted]', '[redacted]']);
+  assert.equal(JSON.stringify(entry).includes('private-value-marker'), false);
+  assert.equal(JSON.stringify(entry).includes('sk-secret'), false);
+  assert.equal(JSON.stringify(entry).includes(OAUTH), false);
+  assert.equal(calls[0].headers['anthropic-beta'], beta);
+});
 
 for (const provider of ['openrouter', 'local']) {
   test(`${provider} preserves direct caller through tool execution and the next turn`, async t => {
@@ -487,6 +577,168 @@ for (const [label, extra] of nativeFeatures) {
     assert.deepEqual(calls[0].parsedBody, body);
   });
 }
+
+for (const [label, body, path = '/v1/messages', headers = proHeaders] of [
+  ['Plan model', requestBody(OPUS)],
+  ['token count', requestBody(SONNET), '/v1/messages/count_tokens'],
+  ['native beta', requestBody(SONNET), '/v1/messages', { ...proHeaders, 'anthropic-beta': BETA + ',future-native-2026-10-20' }],
+  ['native tool', requestBody(SONNET, { tools: [{ type: 'advisor_20260301', name: 'advisor' }] })],
+  ['native history', requestBody(SONNET, { messages: [{ role: 'assistant', content: [{ type: 'thinking', thinking: 'fixture' }] }] })],
+]) {
+  test(`Local-only mode rejects ${label} even with valid OAuth and never calls Plan`, async t => {
+    const { calls, request } = await fixture(t, jsonResponse, { provider: 'local', localOnly: true,
+      localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-local' });
+    const response = await request(body, { path, headers });
+    assert.equal(response.status, 400);
+    assert.equal(calls.length, 0);
+  });
+}
+
+test('Local-only mode keeps standard file tool calls and direct caller history on Local', async t => {
+  const { calls, request } = await fixture(t, jsonResponse, { provider: 'local', localOnly: true,
+    localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-local' });
+  const response = await request(requestBody(SONNET, { tools: [{ name: 'Read', input_schema: { type: 'object' } }] }), { headers: proHeaders });
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, 'http://127.0.0.1:11434/v1/messages');
+  assert.equal(calls[0].headers.authorization, undefined);
+});
+
+for (const [localOnly, override, expected] of [[false, undefined, 30000], [true, undefined, 120000], [true, 500, 500]]) {
+  test(`Local compaction timeout preserves ordinary defaults and overrides (${localOnly}, ${override})`, async t => {
+    const timer = t.mock.method(globalThis, 'setTimeout');
+    const { request } = await fixture(t, jsonResponse, { provider: 'local', localOnly, attemptTimeoutMs: override,
+      localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-local' });
+    const response = await request(requestBody(SONNET), { headers: proHeaders });
+    assert.equal(response.status, 200);
+    await response.text();
+    assert.ok(timer.mock.calls.some(call => call.arguments[1] === expected));
+  });
+}
+
+for (const failure of ['HTTP error', 'timeout']) {
+  test(`Local-only ${failure} fails once and circuit-open never invokes Plan`, async t => {
+    const upstream = failure === 'timeout' ? () => new Promise(() => {}) : () => new Response('failure', { status: 500 });
+    const { calls, request } = await fixture(t, upstream, { provider: 'local', localOnly: true, attemptTimeoutMs: 10,
+      localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-local' });
+    assert.equal((await request(requestBody(SONNET), { headers: proHeaders })).status, 400);
+    assert.equal((await request(requestBody(SONNET), { headers: proHeaders })).status, 400);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, 'http://127.0.0.1:11434/v1/messages');
+  });
+}
+
+for (const localOnly of [false, true]) {
+  test(`thinking/effort beta compatibility is limited to Local-only mode (${localOnly})`, async t => {
+    const { calls, request } = await fixture(t, jsonResponse, { provider: 'local', localOnly,
+      localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-local' });
+    const body = requestBody(SONNET, { thinking: { type: 'adaptive' }, output_config: { effort: 'medium' } });
+    const beta = BETA + ',interleaved-thinking-2025-05-14,effort-2025-11-24';
+    assert.equal((await request(body, { headers: { ...proHeaders, 'anthropic-beta': beta } })).status, 200);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, localOnly ? 'http://127.0.0.1:11434/v1/messages' : proURL);
+    assert.deepEqual(calls[0].parsedBody.thinking, localOnly ? { type: 'disabled' } : body.thinking);
+    assert.deepEqual(calls[0].parsedBody.output_config, body.output_config);
+    if (localOnly) assert.equal(calls[0].headers['anthropic-beta'], undefined);
+  });
+}
+
+test('Local-only mode still rejects unknown beta mixed with compatible thinking/effort', async t => {
+  const { calls, request } = await fixture(t, jsonResponse, { provider: 'local', localOnly: true,
+    localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-local' });
+  const beta = BETA + ',interleaved-thinking-2025-05-14,effort-2025-11-24,future-feature-2026-10-21';
+  assert.equal((await request(requestBody(SONNET), { headers: { ...proHeaders, 'anthropic-beta': beta } })).status, 400);
+  assert.equal(calls.length, 0);
+});
+
+test('Local-only mode validates JSON and converts ordered text/tool blocks to CLI SSE without changing usage', async t => {
+  const message = { type: 'message', id: 'msg-local', role: 'assistant', model: 'fixture-local',
+    content: [{ type: 'text', text: 'fixture text' }, { type: 'tool_use', id: 'tool-1', name: 'Read',
+      input: { file_path: 'fixture.txt' }, caller: { type: 'direct' }, provider_specific_fields: { state: 'opaque-fixture' } }], stop_reason: 'tool_use', stop_sequence: null,
+    usage: { input_tokens: 12, output_tokens: 8 } };
+  const { calls, request } = await fixture(t, () => Response.json(message), { provider: 'local', localOnly: true,
+    localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-local' });
+  const response = await request(requestBody(SONNET, { stream: true }), { headers: proHeaders });
+  assert.equal(response.status, 200);
+  assert.equal(calls[0].parsedBody.stream, false);
+  const events = (await response.text()).split('\n\n').filter(Boolean).map(frame => JSON.parse(frame.split('\n').find(line => line.startsWith('data: ')).slice(6)));
+  assert.equal(events[0].message.model, SONNET);
+  assert.equal(events[0].message.id, message.id);
+  const starts = events.filter(event => event.type === 'content_block_start');
+  assert.deepEqual(starts.map(event => event.index), [0, 1]);
+  assert.deepEqual(starts[1].content_block.caller, { type: 'direct' });
+  assert.deepEqual(starts[1].content_block.provider_specific_fields, message.content[1].provider_specific_fields);
+  const deltas = events.filter(event => event.type === 'content_block_delta');
+  assert.equal(deltas[0].delta.text, message.content[0].text);
+  assert.deepEqual(JSON.parse(deltas[1].delta.partial_json), message.content[1].input);
+  const end = events.find(event => event.type === 'message_delta');
+  assert.equal(end.delta.stop_reason, message.stop_reason);
+  assert.deepEqual(end.usage, message.usage);
+  assert.equal(events.at(-1).type, 'message_stop');
+});
+
+for (const [label, extra] of [
+  ['wrong model', { model: 'wrong-model' }],
+  ['missing id', { id: undefined }],
+  ['missing usage', { usage: undefined }],
+  ['negative usage', { usage: { input_tokens: -1, output_tokens: 2 } }],
+  ['thinking history', { content: [{ type: 'thinking', thinking: 'native' }] }],
+  ['unrecognized content fields', { content: [{ type: 'text', text: 'x', citations: [] }] }],
+  ['invalid provider metadata', { content: [{ type: 'tool_use', id: 't1', name: 'Read', input: {}, provider_specific_fields: [] }] }],
+]) {
+  test(`Local-only CLI rejects ${label} without silently changing content or routing to Plan`, async t => {
+    const message = { type: 'message', id: 'msg-local', role: 'assistant', model: 'fixture-local',
+      content: [{ type: 'text', text: 'fixture' }], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 }, ...extra };
+    const { calls, request } = await fixture(t, () => Response.json(message), { provider: 'local', localOnly: true,
+      localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-local' });
+    assert.equal((await request(requestBody(SONNET, { stream: true }), { headers: proHeaders })).status, 400);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, 'http://127.0.0.1:11434/v1/messages');
+  });
+}
+
+test('Local-only non-streaming requests retain validated JSON', async t => {
+  const { calls, request } = await fixture(t, jsonResponse, { provider: 'local', localOnly: true,
+    localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-local' });
+  const response = await request(requestBody(SONNET, { stream: false }), { headers: proHeaders });
+  assert.equal(response.headers.get('content-type'), 'application/json');
+  assert.equal((await response.json()).model, SONNET);
+  assert.equal(calls[0].parsedBody.stream, false);
+});
+
+for (const localOnly of [false, true]) {
+  for (const metadata of [null, { state: { signature: 'opaque-fixture', counter: 1 } }]) {
+    test(`provider tool metadata is preserved only in Local mode (${localOnly}, ${metadata === null ? 'null' : 'object'})`, async t => {
+      const { calls, request } = await fixture(t, jsonResponse, { provider: 'local', localOnly,
+        localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-local' });
+      const tool = { type: 'tool_use', id: 't1', name: 'Read', input: {}, provider_specific_fields: metadata };
+      const body = requestBody(SONNET, { messages: [{ role: 'user', content: 'fixture' }, { role: 'assistant', content: [tool] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'fixture result' }] }] });
+      assert.equal((await request(body, { headers: proHeaders })).status, 200);
+      assert.equal(calls.length, 1);
+      assert.equal(calls[0].url, localOnly ? 'http://127.0.0.1:11434/v1/messages' : proURL);
+      assert.deepEqual(calls[0].parsedBody.messages[1].content[0].provider_specific_fields, metadata);
+    });
+  }
+}
+
+for (const block of [
+  ...[[], 'invalid', 42, true].map(provider_specific_fields => ({ type: 'tool_use', id: 't1', name: 'Read', input: {}, provider_specific_fields })),
+  { type: 'text', text: 'fixture', provider_specific_fields: null },
+  { type: 'tool_result', tool_use_id: 't1', content: 'fixture', provider_specific_fields: {} },
+]) {
+  test(`Local metadata is limited to object/null on tool_use (${block.type}, ${typeof block.provider_specific_fields})`, async t => {
+    const { calls, request } = await fixture(t, jsonResponse, { provider: 'local', localOnly: true,
+      localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-local' });
+    assert.equal((await request(requestBody(SONNET, { messages: [{ role: 'assistant', content: [block] }] }), { headers: proHeaders })).status, 400);
+    assert.equal(calls.length, 0);
+  });
+}
+
+test('Local-only mode requires a boolean and Local provider', () => {
+  assert.throws(() => createProxy({ key: KEY, nonce: NONCE, localOnly: true }));
+  assert.throws(() => createProxy({ key: KEY, nonce: NONCE, localOnly: 'true' }));
+});
 
 test('unknown native beta remains intact on original Sonnet Pro', async t => {
   const { calls, request } = await fixture(t);

@@ -10,3 +10,5 @@ node_modules/
 *.bundle
 PROGRESS.md
 SESSION_LOG.md
+*.un~
+.claude/.verification/

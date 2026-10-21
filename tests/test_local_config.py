@@ -118,6 +118,73 @@ class LocalConfigTests(LocalTestCase):
         route.provider_config("local")
 
 
+class LocalDiagnosticTests(LocalTestCase):
+    def test_diagnostic_launches_only_node_with_isolated_provider_environment(self):
+        self.configure(LOCAL_LLM_API_KEY="synthetic-local-key")
+        os.environ.update({"ANTHROPIC_AUTH_TOKEN": "private-marker", "CLAUDE_CODE_OAUTH_TOKEN": "private-marker", "OPENROUTER_API_KEY": "private-marker"})
+        with mock.patch.object(route.shutil, "which", return_value="synthetic-node") as which, mock.patch.object(route.subprocess, "call", return_value=0) as child:
+            self.assertEqual(route.diagnose_local(), 0)
+        which.assert_called_once_with("node")
+        self.assertEqual(child.call_args.args[0], ["synthetic-node", str(self.root / "claudeRouteProxy.mjs"), "--diagnose-local"])
+        env = child.call_args.kwargs["env"]
+        self.assertEqual(env["SONNET_PROVIDER"], "local")
+        self.assertEqual(env["LOCAL_LLM_API_KEY"], "synthetic-local-key")
+        for name in ("ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "OPENROUTER_API_KEY"):
+            self.assertNotIn(name, env)
+
+    def test_diagnostic_cli_rejects_conflicting_modes_before_network(self):
+        for args in (["--diagnose-local"], ["--provider", "local", "--check-local", "--diagnose-local"]):
+            result = route.subprocess.run([route.sys.executable, SPEC.origin, *args], capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("--diagnose-local requires --provider local", result.stderr)
+
+
+class LocalCliModeTests(LocalTestCase):
+    def test_local_mode_preserves_only_proxy_credentials_and_never_queries_plan_auth(self):
+        self.configure(LOCAL_LLM_API_KEY="private-local-key")
+        os.environ.update({"ANTHROPIC_AUTH_TOKEN": "private-plan-key", "ANTHROPIC_API_KEY": "private-api-key",
+                           "CLAUDE_CODE_OAUTH_TOKEN": "private-oauth", "OPENROUTER_API_KEY": "private-openrouter"})
+        proxy = mock.Mock()
+        proxy.stdout.readline.return_value = '{"port":12345}\n'
+        with mock.patch.object(route.Path, "home", return_value=self.root), mock.patch.object(route.shutil, "which", return_value="synthetic-cli"), mock.patch.object(route.subprocess, "Popen", return_value=proxy) as start:
+            with route.routed_session("local", local_only=True) as env:
+                self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:12345")
+                self.assertNotEqual(env["ANTHROPIC_API_KEY"], "private-api-key")
+                self.assertEqual(env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "1")
+                self.assertEqual(env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"], "1")
+                for name in ("LOCAL_LLM_API_KEY", "LOCAL_LLM_URL", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODEL",
+                             "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "OPENROUTER_API_KEY"):
+                    self.assertNotIn(name, env)
+                proxy_env = start.call_args.kwargs["env"]
+                self.assertEqual(proxy_env["LOCAL_ROUTE_ONLY"], "1")
+                self.assertEqual(proxy_env["LOCAL_LLM_API_KEY"], "private-local-key")
+                self.assertNotIn("ANTHROPIC_API_KEY", proxy_env)
+        proxy.terminate.assert_called_once()
+
+    def test_local_cli_command_requires_supported_bare_version_and_retains_permission_checks(self):
+        with mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.304 (Claude Code)")):
+            command = route.local_cli_command("synthetic-cli")
+        self.assertIn("--bare", command)
+        self.assertIn("default", command)
+        self.assertNotIn("--dangerously-skip-permissions", command)
+        self.assertIn("Read", command[command.index("--tools") + 1])
+        with mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.183 (Claude Code)")):
+            with self.assertRaises(RuntimeError):
+                route.local_cli_command("synthetic-cli")
+
+    def test_local_mode_cli_rejects_other_modes_before_network(self):
+        for args in (["--local-mode"], ["--provider", "local", "--local-mode", "--check-local"],
+                     ["--provider", "local", "--local-mode", "--diagnose-local"]):
+            result = route.subprocess.run([route.sys.executable, SPEC.origin, *args], capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("--local-mode requires --provider local", result.stderr)
+
+    def test_local_mode_is_rejected_for_other_providers(self):
+        with self.assertRaises(ValueError):
+            with route.routed_session("openrouter", local_only=True):
+                self.fail("Invalid Local mode entered")
+
+
 class LocalMetadataTests(LocalTestCase):
     def setUp(self):
         super().setUp()

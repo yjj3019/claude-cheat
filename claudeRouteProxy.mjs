@@ -52,10 +52,14 @@ const CONTENT_FIELDS = {
   tool_use: new Set(['type', 'id', 'name', 'input', 'cache_control', 'caller']),
   tool_result: new Set(['type', 'tool_use_id', 'content', 'is_error', 'cache_control']),
 };
-function externalExclusion(body, beta) {
+function unsupportedBetas(beta, localOnly = false) {
+  return (beta || '').split(',').map(x => x.trim()).filter(x => x &&
+    !/^oauth-\d{4}-\d{2}-\d{2}$/.test(x) && !['claude-code-20250219', 'prompt-caching-2024-07-31'].includes(x) &&
+    !(localOnly && ['interleaved-thinking-2025-05-14', 'effort-2025-11-24'].includes(x)));
+}
+function externalExclusion(body, beta, localOnly = false) {
   // Unknown betas/fields and native history belong to the subscription API. Never strip them.
-  if ((beta || '').split(',').map(x => x.trim()).filter(Boolean).some(x =>
-    !/^oauth-\d{4}-\d{2}-\d{2}$/.test(x) && !['claude-code-20250219', 'prompt-caching-2024-07-31'].includes(x))) return 'unsupported_beta';
+  if (unsupportedBetas(beta, localOnly).length) return 'unsupported_beta';
   if (Object.keys(body).some(name => !BASIC_FIELDS.has(name))) return 'unsupported_request_field';
   if (!Array.isArray(body.messages) || body.messages.some(message => !message ||
       !['user', 'assistant'].includes(message.role) || Object.keys(message).some(name => !['role', 'content'].includes(name)))) return 'unsupported_message_shape';
@@ -68,7 +72,10 @@ function externalExclusion(body, beta) {
       contentDetail = block?.type === 'thinking' || block?.type === 'redacted_thinking' ? 'native_thinking_history' : 'unsupported_content_block';
       return false;
     }
-    if (Object.keys(block).some(key => !CONTENT_FIELDS[block.type].has(key))) {
+    if (Object.keys(block).some(key => !CONTENT_FIELDS[block.type].has(key) &&
+        !(localOnly && block.type === 'tool_use' && key === 'provider_specific_fields')) ||
+        (localOnly && Object.hasOwn(block, 'provider_specific_fields') && block.provider_specific_fields !== null &&
+          (typeof block.provider_specific_fields !== 'object' || Array.isArray(block.provider_specific_fields)))) {
       contentDetail = 'unsupported_content_field';
       return false;
     }
@@ -213,6 +220,27 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal) {
   return { contentType: 'text/event-stream', text: output.join('') };
 }
 
+function jsonMessageStream(text) {
+  const message = JSON.parse(text);
+  if (typeof message.id !== 'string' || !message.id || message.role !== 'assistant' ||
+      !Number.isFinite(message.usage?.input_tokens) || message.usage.input_tokens < 0 ||
+      !Number.isFinite(message.usage?.output_tokens) || message.usage.output_tokens < 0)
+    throw new Error('Invalid stream metadata');
+  const frame = (type, fields = {}) => `event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`;
+  let output = frame('message_start', { message: { ...message, content: [], stop_reason: null, stop_sequence: null,
+    usage: { ...message.usage, output_tokens: 0 } } });
+  message.content.forEach((block, index) => {
+    const initial = block.type === 'text' ? { ...block, text: '' } : { ...block, input: {} };
+    output += frame('content_block_start', { index, content_block: initial });
+    if (block.type === 'text') output += frame('content_block_delta', { index, delta: { type: 'text_delta', text: block.text } });
+    if (block.type === 'tool_use') output += frame('content_block_delta', { index, delta: { type: 'input_json_delta', partial_json: JSON.stringify(block.input) } });
+    output += frame('content_block_stop', { index });
+  });
+  output += frame('message_delta', { delta: { stop_reason: message.stop_reason, stop_sequence: message.stop_sequence ?? null }, usage: message.usage });
+  output += frame('message_stop');
+  return { contentType: 'text/event-stream', text: output };
+}
+
 function abortable(promise, signal) {
   return new Promise((resolve, reject) => {
     const abort = () => reject(new Error('Request aborted'));
@@ -222,9 +250,48 @@ function abortable(promise, signal) {
   });
 }
 
+export async function diagnoseLocal({ localUrl, localModel, localKey, localHttpUrl,
+  localAllowRemote = false, fetchImpl = fetch, timeoutMs = 60000 }) {
+  const url = localEndpoint(localUrl, localAllowRemote, localHttpUrl);
+  if (typeof localAllowRemote !== 'boolean' || typeof localModel !== 'string' || !localModel.trim() ||
+      !Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 60000)
+    throw new Error('Invalid Local diagnostic configuration');
+  if (localKey !== undefined && (typeof localKey !== 'string' || /[\x00-\x1f\x7f]/.test(localKey)))
+    throw new Error('Invalid Local credential');
+  const headers = { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' };
+  if (localKey) headers.authorization = `Bearer ${localKey}`;
+  const controller = new AbortController();
+  const { signal } = controller;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let received = false;
+  try {
+    const response = await abortable(fetchImpl(url, { method: 'POST', headers, redirect: 'error', signal,
+      body: JSON.stringify({ model: localModel, max_tokens: 512, stream: false,
+        messages: [{ role: 'user', content: 'Reply with exactly LOCAL_DIAGNOSTIC_OK. Do not use tools.' }] }) }), signal);
+    received = true;
+    if (!response.ok) {
+      await response.body?.cancel();
+      return { local_diagnostic: false, inference_checked: true, reason: 'http_error', status: response.status };
+    }
+    const validated = await abortable(bufferedResponse(response, localModel, localModel, false, signal), signal);
+    if (validated.contentType !== 'application/json') throw new Error('Expected JSON diagnostic response');
+    const message = JSON.parse(validated.text);
+    const reply = message.content.filter(block => block.type === 'text').map(block => block.text).join('').trim();
+    const passed = reply === 'LOCAL_DIAGNOSTIC_OK' && message.stop_reason === 'end_turn';
+    return { local_diagnostic: passed, inference_checked: true, model_confirmed: true, reply_confirmed: passed,
+      reason: message.stop_reason !== 'end_turn' ? 'incomplete_response' : passed ? 'ready_inference_only' : 'reply_mismatch' };
+  } catch {
+    return { local_diagnostic: false, inference_checked: true,
+      reason: signal.aborted ? 'timeout' : received ? 'invalid_response' : 'connection_failed' };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrouter', localUrl,
-  localModel, localKey, localAllowRemote = false, localHttpUrl, fallbackModel = 'claude-sonnet-5-5', retryDelayMs = 1000,
-  cooldownMs = 30000, attemptTimeoutMs = 30000, now = Date.now }) {
+  localModel, localKey, localAllowRemote = false, localHttpUrl, localOnly = false, fallbackModel = 'claude-sonnet-5-5', retryDelayMs = 1000,
+  cooldownMs = 30000, attemptTimeoutMs = localOnly ? 120000 : 30000, now = Date.now }) {
+  if (typeof localOnly !== 'boolean' || (localOnly && provider !== 'local')) throw new Error('Local-only mode requires local provider');
   if (!nonce || (provider === 'openrouter' && !key)) throw new Error('Proxy credentials required');
   if (!['openrouter', 'local'].includes(provider)) throw new Error('Unsupported Sonnet provider');
   if (typeof localAllowRemote !== 'boolean') throw new Error('Remote Local setting must be boolean');
@@ -265,9 +332,19 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       const oauthOK = /^Bearer\s+sk-ant-oat/.test(req.headers.authorization || '') && !req.headers['x-api-key'] &&
         (req.headers['anthropic-beta'] || '').includes('oauth-');
       const sendPro = async (reason = 'native_feature', detail) => {
+        const betas = detail === 'unsupported_beta' ? unsupportedBetas(req.headers['anthropic-beta'], localOnly) : [];
+        const betaFeatures = betas.slice(0, 16).map(value =>
+          /^[a-z][a-z0-9-]{0,63}-20\d{2}-[01]\d-[0-3]\d$/.test(value) &&
+          !/(?:^|-)(?:sk|key|token|secret|password|bearer)(?:-|$)/.test(value) ? value : '[redacted]');
+        if (localOnly) {
+          console.error(JSON.stringify({ event: 'local_mode_rejected', provider: 'local', reason, ...(detail ? { detail } : {}),
+            ...(betas.length ? { beta_features: betaFeatures, unsupported_beta_count: betas.length } : {}) }));
+          return reject(400, 'Local-only mode cannot route this request; Plan fallback disabled');
+        }
         if (!oauthOK) return reject(403, 'Saved subscription OAuth required');
         client.signal.throwIfAborted();
-        console.error(JSON.stringify({ event: 'route_selected', provider: 'plan', reason, ...(detail ? { detail } : {}) }));
+        console.error(JSON.stringify({ event: 'route_selected', provider: 'plan', reason, ...(detail ? { detail } : {}),
+          ...(betas.length ? { beta_features: betaFeatures, unsupported_beta_count: betas.length } : {}) }));
         const headers = {};
         for (const [name, value] of Object.entries(req.headers))
           if (typeof value === 'string' && !['host', 'content-length', 'accept-encoding', 'connection',
@@ -299,7 +376,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         res.end();
       };
       const nativeDetail = req.url.startsWith('/v1/messages/count_tokens') ? 'token_count' :
-        isPro(model) ? 'plan_model' : externalExclusion(body, req.headers['anthropic-beta']);
+        isPro(model) ? 'plan_model' : externalExclusion(body, req.headers['anthropic-beta'], localOnly);
       if (nativeDetail) return await sendPro('native_feature', nativeDetail);
       if (openUntil && (now() < openUntil || probing)) return await sendPro('circuit_open');
       const probe = Boolean(openUntil);
@@ -309,12 +386,17 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       try {
         const externalModel = provider === 'local' ? localModel : DEEPSEEK;
         const externalBody = { ...body, model: externalModel };
+        if (localOnly) {
+          externalBody.stream = false;
+          externalBody.thinking = { type: 'disabled' };
+        }
         if (body.tools) externalBody.tools = body.tools.map(tool => ({ ...tool, input_schema: compatibleSchema(tool.input_schema) }));
         if (provider === 'openrouter') externalBody.provider = { allow_fallbacks: false };
         const headers = { 'content-type': 'application/json', 'anthropic-version': req.headers['anthropic-version'] || '2023-06-01' };
         const credential = provider === 'local' ? localKey : key;
         if (credential) headers.authorization = `Bearer ${credential}`;
-        for (let attempt = 0; attempt < 4; attempt++) {
+        const attempts = localOnly ? 1 : 4;
+        for (let attempt = 0; attempt < attempts; attempt++) {
           client.signal.throwIfAborted();
           const controller = new AbortController();
           const cancel = () => controller.abort('client_close');
@@ -330,7 +412,26 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
                 await response.body?.cancel();
                 throw new Error('External request failed');
               }
-              return bufferedResponse(response, externalModel, model, body.stream, controller.signal);
+              const validated = await bufferedResponse(response, externalModel, model, localOnly ? false : body.stream, controller.signal);
+              if (localOnly) {
+                if (validated.contentType !== 'application/json') throw new Error('Expected JSON Local response');
+                const content = JSON.parse(validated.text).content;
+                if (content.some(block => ['thinking', 'redacted_thinking'].includes(block.type)))
+                  throw new Error('Local thinking response disabled');
+                if (content.some(block => !['text', 'tool_use'].includes(block.type)))
+                  throw new Error('Unsupported Local response content');
+                const extraFields = content.flatMap(block => Object.keys(block).filter(name => !CONTENT_FIELDS[block.type].has(name) &&
+                  !(block.type === 'tool_use' && name === 'provider_specific_fields')));
+                if (content.some(block => Object.hasOwn(block, 'provider_specific_fields') && block.provider_specific_fields !== null &&
+                    (typeof block.provider_specific_fields !== 'object' || Array.isArray(block.provider_specific_fields))))
+                  throw new Error('Unsupported Local response fields');
+                if (extraFields.length) {
+                  console.error(JSON.stringify({ event: 'local_response_unsupported_fields', fields: extraFields.slice(0, 8).map(name =>
+                    ['signature', 'thought_signature', 'extra_content', 'provider_specific_fields', 'index'].includes(name) ? name : '[redacted]') }));
+                  throw new Error('Unsupported Local response fields');
+                }
+              }
+              return localOnly && body.stream === true ? jsonMessageStream(validated.text) : validated;
             })();
             const response = await abortable(operation, controller.signal);
             client.signal.throwIfAborted();
@@ -343,17 +444,23 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             res.writeHead(200, { 'content-type': response.contentType, 'cache-control': 'no-store' });
             res.end(response.text);
             return;
-          } catch {
+          } catch (error) {
             client.signal.throwIfAborted();
+            const validation = { 'Wrong response model': 'wrong_model', 'Invalid content block': 'invalid_content_block',
+              'Incomplete message': 'incomplete_message', 'Invalid response': 'expected_sse',
+              'Invalid content delta': 'invalid_delta', 'Truncated stream': 'truncated_stream',
+              'Empty message response': 'empty_response', 'Invalid message response': 'invalid_message',
+              'Invalid stream metadata': 'invalid_stream_metadata', 'Expected JSON Local response': 'expected_json', 'Unsupported Local response content': 'unsupported_local_content',
+              'Local thinking response disabled': 'thinking_response', 'Unsupported Local response fields': 'unsupported_content_fields' }[error?.message];
             console.error(JSON.stringify({ event: 'external_attempt_failed', provider, attempt: attempt + 1,
-              ...(Number.isInteger(status) ? { status } : {}),
+              ...(Number.isInteger(status) ? { status } : {}), ...(validation ? { validation } : {}),
               category: controller.signal.reason === 'attempt_timeout' ? 'timeout' : 'upstream' }));
             controller.abort('attempt_failed');
           } finally {
             clearTimeout(timer);
             client.signal.removeEventListener('abort', cancel);
           }
-          if (attempt < 3 && retryDelayMs) await abortable(new Promise(resolve => {
+          if (attempt + 1 < attempts && retryDelayMs) await abortable(new Promise(resolve => {
             const timeout = setTimeout(resolve, retryDelayMs);
             client.signal.addEventListener('abort', () => { clearTimeout(timeout); resolve(); }, { once: true });
           }), client.signal);
@@ -376,11 +483,23 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const server = createProxy({ key: process.env.OPENROUTER_API_KEY, nonce: process.env.LOCAL_ROUTE_TOKEN,
+  const config = { key: process.env.OPENROUTER_API_KEY, nonce: process.env.LOCAL_ROUTE_TOKEN,
     provider: process.env.SONNET_PROVIDER || 'openrouter', localUrl: process.env.LOCAL_LLM_URL,
     localModel: process.env.LOCAL_LLM_MODEL, localKey: process.env.LOCAL_LLM_API_KEY,
-    localHttpUrl: process.env.LOCAL_LLM_HTTP_URL, localAllowRemote: process.env.LOCAL_LLM_ALLOW_REMOTE === 'true' });
-  for (const name of ['OPENROUTER_API_KEY', 'LOCAL_ROUTE_TOKEN', 'SONNET_PROVIDER', 'LOCAL_LLM_URL',
+    localOnly: process.env.LOCAL_ROUTE_ONLY === '1', localHttpUrl: process.env.LOCAL_LLM_HTTP_URL, localAllowRemote: process.env.LOCAL_LLM_ALLOW_REMOTE === 'true' };
+  for (const name of ['OPENROUTER_API_KEY', 'LOCAL_ROUTE_TOKEN', 'LOCAL_ROUTE_ONLY', 'SONNET_PROVIDER', 'LOCAL_LLM_URL',
     'LOCAL_LLM_MODEL', 'LOCAL_LLM_API_KEY', 'LOCAL_LLM_ALLOW_REMOTE', 'LOCAL_LLM_HTTP_URL', 'LOCAL_LLM_MODELS_URL']) delete process.env[name];
-  server.listen(0, '127.0.0.1', () => process.stdout.write(JSON.stringify({ port: server.address().port }) + '\n'));
+  if (process.argv.slice(2).includes('--diagnose-local')) {
+    try {
+      const result = await diagnoseLocal(config);
+      process.stdout.write(JSON.stringify(result) + '\n');
+      process.exitCode = result.local_diagnostic ? 0 : 1;
+    } catch {
+      process.stdout.write(JSON.stringify({ local_diagnostic: false, inference_checked: false, reason: 'invalid_configuration' }) + '\n');
+      process.exitCode = 1;
+    }
+  } else {
+    const server = createProxy(config);
+    server.listen(0, '127.0.0.1', () => process.stdout.write(JSON.stringify({ port: server.address().port }) + '\n'));
+  }
 }

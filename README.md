@@ -191,6 +191,32 @@ URL 내 사용자명·비밀번호·쿼리·fragment, redirect, 잘못된 인증
 
 다시 OpenRouter를 쓰려면 세션을 종료하고 기본 명령으로 재실행합니다. 실행 중인 세션에서 `/model`은 Claude 모델을 선택하며 OpenRouter/Local 제공자를 바꾸는 메뉴가 아닙니다.
 
+### Claude CLI Local 전용 모드
+
+```powershell
+.\startClaudeOpenRouter.ps1 -Provider Local -LocalMode
+```
+
+일반 Claude CLI를 Local 서버로 실행하는 별도 모드입니다. Claude Code **2.1.286 이상**이 필요하며, 2.1.304로 검증합니다. `--bare`와 Bash/Read/Edit/Write/Glob/Grep 도구를 사용하고, 기본 권한 확인(`default`)을 유지합니다. 권한 우회나 Auto 모드를 켜지 않습니다. 기존 실행 명령은 그대로 유지합니다.
+
+이 세션에서는 네이티브 beta·advisor·thinking을 제한합니다. Bare 모드는 hooks·플러그인·MCP·skills·subagents·자동 메모리·CLAUDE.md의 자동 로딩을 생략하므로, 필요한 프로젝트 지침은 명시적으로 제공하세요. [공식 bare 모드 문서](https://code.claude.com/docs/en/headless#start-faster-with-bare-mode)를 참고하세요.
+
+Plan 로그인을 조회하지 않으며 CLI에는 로컬 프록시용 임시 키만 전달합니다. Local 서버 키는 프록시만 보유합니다. 미지원 기능이나 Local 실패를 Plan으로 전환하지 않고 명시적으로 거절합니다. 프록시의 외부 시도는 한 번이며 CLI 자체 재시도는 별도입니다.
+
+Local 응답은 JSON으로 받아 설정한 모델을 검증한 뒤 CLI용 SSE로 변환합니다. 도구 인자·순서·종료 사유·사용량을 보존하고, 서버 전용 `tool_use.provider_specific_fields`는 object/null일 때만 보존합니다. CLI가 후속 이력에서 이 필드를 생략할 수 있으며, 해당 상태가 필수인 서버는 별도 검증이 필요합니다. 모르는 응답 필드나 thinking 블록은 삭제하지 않고 거절합니다. `interleaved-thinking-2025-05-14`·`effort-2025-11-24` 호환 헤더 2개만 이 모드에서 추가 허용합니다.
+
+새 Local 세션으로 시작하세요. 기존 Plan 대화의 네이티브 이력은 재개하지 마세요. Local 모드의 요청 제한 시간은 긴 대화 압축을 위해 120초이며, 일반 모드는 기존 30초를 유지합니다. 토큰 수 계산 API는 지원하지 않습니다. 긴 대화의 압축은 서버와 CLI 버전에 따라 별도 검증해야 합니다. [압축 검증 절차](docs/LIVE-VALIDATION.ko.md#local-모드의-긴-대화압축-점검)를 참고하세요. `-CheckLocal`·`-DiagnoseLocal`과 함께 사용할 수 없습니다. 원래 환경은 종료 후 `-LocalMode` 없이 다시 실행하면 됩니다.
+
+### Local 실제 추론 진단
+
+```powershell
+.\startClaudeOpenRouter.ps1 -Provider Local -DiagnoseLocal
+```
+
+기존 실행과 분리된 진단 모드입니다. Claude CLI를 실행하지 않고 beta·도구·대화 이력 없이 고정 합성 질문을 Local Messages API에 한 번 보냅니다. 출력은 최대 512토큰, 전체 요청은 60초로 제한하며 재시도·Plan fallback·리다이렉트를 하지 않습니다. 기존 주소 검증과 HTTP 허용 설정을 그대로 적용합니다. 실제 추론이므로 서버 자원을 사용합니다.
+
+응답 모델이 설정과 일치하고, `LOCAL_DIAGNOSTIC_OK`라는 정확한 문구로 답하며 `end_turn`으로 종료해야 성공입니다. 성공 시 `local_diagnostic`, `inference_checked`, `model_confirmed`, `reply_confirmed`가 모두 `true`입니다. 실패하면 고정 오류 분류만 출력하고 종료 코드 1을 반환합니다. 이 결과는 최소 Messages 추론 검증이며 일반 CLI의 전체 기능 호환성을 보증하지 않습니다. 모델 목록만 조회하는 `-CheckLocal`과는 함께 사용할 수 없습니다.
+
 ## 5. 재시도·fallback·복구 원리
 
 ```text
@@ -232,7 +258,7 @@ Sonnet 선택과 HUD의 모델·비용 표시는 실제 외부 라우팅이나 �
 
 라우터 자체 진단 로그는 키·요청 본문을 남기지 않는 고정 메타데이터를 사용합니다. 외부 제공자로 보내는 요청에는 실제 대화·코드·도구 정의와 결과가 포함될 수 있습니다. 이 로깅 정책이 외부 서비스의 보관 정책까지 바꾸는 것은 아닙니다.
 
-`native_feature`의 `detail`은 처음 확인된 제외 사유입니다. `token_count`는 토큰 수 계산, `plan_model`은 Plan 전용 모델, `unsupported_beta`는 미지원 beta 헤더, `native_thinking_history`는 네이티브 thinking 이력입니다. 나머지 `unsupported_*`는 요청 필드·메시지 형식·thinking/output/tool_choice 설정·콘텐츠·도구 정의 검사의 실패를 구분합니다. 로그는 고정 분류명만 기록하며 실제 헤더 값·질문·키를 기록하지 않습니다.
+`native_feature`의 `detail`은 처음 확인된 제외 사유입니다. `token_count`는 토큰 수 계산, `plan_model`은 Plan 전용 모델, `unsupported_beta`는 미지원 beta 헤더, `native_thinking_history`는 네이티브 thinking 이력입니다. 나머지 `unsupported_*`는 요청 필드·메시지 형식·thinking/output/tool_choice 설정·콘텐츠·도구 정의 검사의 실패를 구분합니다. 로그는 고정 분류명만 기록하며 헤더 원문·질문·키를 기록하지 않습니다. `unsupported_beta`의 `beta_features`는 날짜 접미사가 있는 기능 식별자를 최대 16개 표시하고, `unsupported_beta_count`는 전체 개수를 표시합니다. 비표준 값과 인증정보 형태의 값은 마스킹합니다.
 
 ## 7. 문제 해결과 일반 Claude로 돌아가기
 
