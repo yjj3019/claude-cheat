@@ -197,7 +197,7 @@ URL 내 사용자명·비밀번호·쿼리·fragment, redirect, 잘못된 인증
 .\startClaudeOpenRouter.ps1 -Provider Local -LocalMode
 ```
 
-일반 Claude CLI를 Local 서버로 실행하는 별도 모드입니다. Claude Code **2.1.286 이상**이 필요하며, 2.1.304로 검증합니다. `--bare`와 Bash/Read/Edit/Write/Glob/Grep 도구를 사용하고, 기본 권한 확인(`default`)을 유지합니다. 권한 우회나 Auto 모드를 켜지 않습니다. 기존 실행 명령은 그대로 유지합니다.
+일반 Claude CLI를 Local 서버로 실행하는 별도 모드입니다. Claude Code **2.1.304 이상**이 필요하며, 2.1.304로 검증했습니다. 이전 버전은 프록시와 세션을 시작하기 전에 차단합니다. `--bare`와 Bash/Read/Edit/Write/Glob/Grep 도구를 사용하고, 기본 권한 확인(`default`)을 유지합니다. 권한 우회나 Auto 모드를 켜지 않습니다. 기존 실행 명령은 그대로 유지합니다.
 
 이 세션에서는 네이티브 beta·advisor·thinking을 제한합니다. Bare 모드는 hooks·플러그인·MCP·skills·subagents·자동 메모리·CLAUDE.md의 자동 로딩을 생략하므로, 필요한 프로젝트 지침은 명시적으로 제공하세요. [공식 bare 모드 문서](https://code.claude.com/docs/en/headless#start-faster-with-bare-mode)를 참고하세요.
 

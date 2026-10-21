@@ -412,8 +412,8 @@ def diagnose_local() -> int:
 def local_cli_command(claude: str) -> list:
     version = subprocess.run([claude, "--version"], capture_output=True, text=True, timeout=10, check=True)
     match = re.match(r"(\d+)\.(\d+)\.(\d+)", version.stdout.strip())
-    if not match or tuple(map(int, match.groups())) < (2, 1, 286):
-        raise RuntimeError("Local CLI mode requires Claude Code 2.1.286 or later")
+    if not match or tuple(map(int, match.groups())) < (2, 1, 304):
+        raise RuntimeError("Local CLI mode requires Claude Code 2.1.304 or later")
     return [claude, "--bare", "--model", "sonnet", "--permission-mode", "default",
             "--tools", "Bash,Read,Edit,Write,Glob,Grep", "--settings", json.dumps({"alwaysThinkingEnabled": False})]
 

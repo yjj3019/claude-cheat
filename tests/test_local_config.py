@@ -162,15 +162,24 @@ class LocalCliModeTests(LocalTestCase):
         proxy.terminate.assert_called_once()
 
     def test_local_cli_command_requires_supported_bare_version_and_retains_permission_checks(self):
-        with mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.304 (Claude Code)")):
-            command = route.local_cli_command("synthetic-cli")
-        self.assertIn("--bare", command)
-        self.assertIn("default", command)
-        self.assertNotIn("--dangerously-skip-permissions", command)
-        self.assertIn("Read", command[command.index("--tools") + 1])
-        with mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.183 (Claude Code)")):
-            with self.assertRaises(RuntimeError):
-                route.local_cli_command("synthetic-cli")
+        for version in ("2.1.304", "2.1.305"):
+            with self.subTest(version=version), mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout=version + " (Claude Code)")):
+                command = route.local_cli_command("synthetic-cli")
+                self.assertIn("--bare", command)
+                self.assertIn("default", command)
+                self.assertNotIn("--dangerously-skip-permissions", command)
+                self.assertIn("Read", command[command.index("--tools") + 1])
+        for version in ("2.1.183", "2.1.286", "2.1.303", "invalid-version"):
+            with self.subTest(version=version), mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout=version)):
+                with self.assertRaisesRegex(RuntimeError, "requires Claude Code 2.1.304 or later"):
+                    route.local_cli_command("synthetic-cli")
+
+    def test_unsupported_local_cli_is_rejected_before_starting_proxy_or_session(self):
+        with mock.patch.object(route.shutil, "which", return_value="synthetic-cli"), mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.303 (Claude Code)")), mock.patch.object(route, "routed_session") as session, mock.patch.object(route.subprocess, "call") as child:
+            with self.assertRaisesRegex(RuntimeError, "requires Claude Code 2.1.304 or later"):
+                route.launch("local", local_only=True)
+        session.assert_not_called()
+        child.assert_not_called()
 
     def test_local_mode_cli_rejects_other_modes_before_network(self):
         for args in (["--local-mode"], ["--provider", "local", "--local-mode", "--check-local"],

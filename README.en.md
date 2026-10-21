@@ -66,7 +66,7 @@ The CLI or HUD can still display Sonnet/Plan for a replacement response. That la
 .\startClaudeOpenRouter.ps1 -Provider Local -LocalMode
 ```
 
-This opt-in mode launches the real Claude CLI with `--bare`, Sonnet as the routing alias, and the standard Bash/Read/Edit/Write/Glob/Grep tools. Claude Code **2.1.286 or later** is required; verification uses 2.1.304. Standard permission prompts stay enabled (`default`); this mode does not enable bypassPermissions or auto mode. Existing launch commands without `-LocalMode` are unchanged.
+This opt-in mode launches the real Claude CLI with `--bare`, Sonnet as the routing alias, and the standard Bash/Read/Edit/Write/Glob/Grep tools. Claude Code **2.1.304 or later** is required; verification uses 2.1.304. Older versions are rejected before the proxy or session starts. Standard permission prompts stay enabled (`default`); this mode does not enable bypassPermissions or auto mode. Existing launch commands without `-LocalMode` are unchanged.
 
 The session disables native beta integrations, advisor, and thinking. Bare mode skips automatic hooks, plugins, MCP, skills, subagents, auto memory, and CLAUDE.md discovery; include necessary project instructions explicitly. Two CLI compatibility headers (`interleaved-thinking-2025-05-14` and `effort-2025-11-24`) are accepted only here. Unknown native features remain blocked. See the official [bare-mode reference](https://code.claude.com/docs/en/headless#start-faster-with-bare-mode).
 
