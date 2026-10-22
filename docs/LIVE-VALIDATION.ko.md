@@ -54,14 +54,35 @@ Local 모드는 요청당 120초를 허용합니다. 시간 초과 시 한 번 �
 | 100초 이상 걸린 요청 | 4회 |
 | Plan 라우팅 | 0회 |
 
-실패 없이 끝난 실행은 아닙니다. 약 807초에 서버가 HTTP 200과 빈 내용을 반환해 요청 1회가 실패했습니다. 35초 대기 후 같은 CLI·프록시에서 짧은 요청으로 복구했고, 이후 압축·도구 작업을 계속했습니다. 이는 120초 시간 초과와 다른 실패입니다. 실제 시간 초과가 없었으므로 시간 초과 이후의 복구는 미검증입니다.
+실패 없이 끝난 실행은 아닙니다. 약 807초에 서버가 HTTP 200과 빈 내용을 반환해 요청 1회가 실패했습니다. 35초 대기 후 같은 CLI·프록시에서 짧은 요청으로 복구했고, 이후 압축·도구 작업을 계속했습니다. 이는 120초 시간 초과와 다른 실패입니다. 한 시간 실행에서는 시간 초과 이후의 복구를 시험하지 않았으며, 아래 별도 시험에서 지연 주입으로 확인했습니다.
 
 한 시간 측정에 앞선 별도 준비 실행에서 회상 판정 실패가 1회 있었으며, 정확한 원인은 확인하지 못했습니다. 이 준비 실행은 위 집계에서 제외했습니다. 한 시간 결과는 합성 입력과 해당 버전·설정에 한정되며, 더 긴 실행이나 모든 서버 응답의 안정성을 보장하지 않습니다. 원문 로그와 개인 설정은 공개하지 않습니다.
 
 같은 검증을 반복할 때는 프로세스를 재시작하거나 세션을 재개한 시간을 합산하지 않습니다. 매 요청의 성공 여부, 압축 경계, 실제 도구 결과, 120초 실패 사유를 각각 기록하고, 오류가 나더라도 회상 정보를 다시 주입하지 않은 상태에서 복구를 판정합니다.
 
+## 120초 시간 초과 이후 같은 Local 세션의 복구
+
+코드 `2ee1cfd`, Claude Code 2.1.304에서 한 시간 실행과 별도로 445.65초 동안 점검했습니다. 같은 `stream-json` CLI·Local 전용 프록시를 유지하고, 자동 압축 창 `100k`와 출력 예산 8,192를 사용했습니다. 기존 실행 코드와 개인 설정은 변경하지 않았습니다.
+
+테스트용 연결 함수에서 요청 하나의 응답을 멈추고 운영 코드의 기본 120초 타이머가 만료되기를 기다렸습니다. 제한값을 줄이거나 시간을 가속하지 않았습니다. 이 요청은 실제 서버로 보내지 않았으며, 서버에서 자연 발생한 지연을 관찰한 시험과는 구분해야 합니다. 이후 요청은 정상 Local 서버로 보냈습니다.
+
+| 항목 | 관찰 결과 |
+|---|---|
+| 의도한 시간 초과 | 1회, 120.006초에 `attempt_timeout` 발생 |
+| 같은 세션 복구 | 35초 대기 후 새 요청 성공, CLI·프록시 재시작 없음 |
+| 복구 후 대용량 자동 압축 | 2회, 각 압축에서 토큰 수가 50,000보다 많이 감소 |
+| 복구 후 Read·Edit·Bash 작업 묶음 | 3회 성공, 시간 초과 전 1회 포함 총 4회 |
+| 전체 정보·파일 유지 확인 | 7회 일치 |
+| 추가 서버 실패 / Plan 라우팅 | 각각 0회 |
+
+시간 초과 시 해당 요청은 실패했고, 기본 30초 회로 차단 시간이 지난 뒤 보낸 새 요청에서 복구했습니다. 실패한 요청을 자동으로 완료한 것으로 해석해서는 안 됩니다. 처음 제시한 합성 정보는 후속 입력이나 파일로 다시 제공하지 않았습니다. 압축 경계, 실제 파일 수정, 새 Read 값과 Bash 출력으로 작업 재개를 확인했습니다. 관련 시간 초과·회로 차단 회귀 테스트 7개와 결과 로그의 수치 정합성 검사도 통과했습니다.
+
+자연 발생 서버 지연, 서버 측 진행 작업의 취소 처리, 응답 본문 수신 도중의 시간 초과는 이 시험에서 검증하지 않았습니다. 원문 로그·테스트용 실행 파일·개인 설정은 공개하지 않습니다.
+
 ## English
 
 This document contains reusable validation procedures and a limited synthetic-input run summary. Keep machine details, credentials, account usage, billing records, session identifiers, and raw diagnostics private. Separate synthetic regression checks from explicitly authorized live validation; metadata checks do not prove inference or full native-feature compatibility.
 
-At commit `5401a96`, Claude Code 2.1.304 kept one CLI process and one Local-only proxy running for 3,621.83 seconds using stream-json input, a 100k auto-compaction window, and an 8,192 output budget. The run completed 11 large automatic compactions (out of 22 automatic boundaries), 40 Read/Edit/Bash rounds, and 52 retention checks. Of 157 upstream requests, none timed out at 120 seconds; the slowest completed in 114.416 seconds. There were no Plan routes. One HTTP 200 response had empty content; a short request after a 35-second cooldown recovered in the same process, and subsequent work continued. This was a run with a recovered failure, not an error-free pass. Actual timeout recovery, visual interactive-terminal behavior, and longer runs remain unverified. A separate setup run had an unresolved recall-check failure and is excluded from these counts.
+At commit `5401a96`, Claude Code 2.1.304 kept one CLI process and one Local-only proxy running for 3,621.83 seconds using stream-json input, a 100k auto-compaction window, and an 8,192 output budget. The run completed 11 large automatic compactions (out of 22 automatic boundaries), 40 Read/Edit/Bash rounds, and 52 retention checks. Of 157 upstream requests, none timed out at 120 seconds; the slowest completed in 114.416 seconds. There were no Plan routes. One HTTP 200 response had empty content; a short request after a 35-second cooldown recovered in the same process, and subsequent work continued. This was a run with a recovered failure, not an error-free pass. Timeout recovery was not exercised during that run; a separate injected-stall test is described below. Visual interactive-terminal behavior and longer runs remain unverified. A separate setup run had an unresolved recall-check failure and is excluded from these counts.
+
+At commit `2ee1cfd`, a separate 445.65-second run used Claude Code 2.1.304 with the same stream-json, 100k compaction window, and 8,192 output budget. A test-only connection function stalled one request until the unchanged production deadline aborted it at 120.006 seconds; that request was not sent to the actual server. After a 35-second cooldown, a new request recovered against the real Local server in the same CLI and proxy processes. Two large automatic compactions and three Read/Edit/Bash rounds then succeeded. Across the run, all seven retention checks passed; there were no additional upstream failures or Plan routes. Seven related timeout/circuit regression tests and evidence consistency checks also passed. The failed request itself was not automatically completed. Production launch code and personal settings were unchanged. Naturally occurring server delays, server-side cancellation, and timeouts while receiving response bodies were not exercised by this test. Raw logs and private settings remain unpublished.
