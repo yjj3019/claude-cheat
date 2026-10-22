@@ -228,29 +228,87 @@ test('real HTTP stalled response times out four times and falls back', { timeout
   await Promise.all(closed);
 });
 
-test('client cancellation closes the local HTTP request without retry or fallback', { timeout: 5000 }, async t => {
-  let entered, closed;
-  const started = new Promise(resolve => { entered = resolve; });
+test('Local-only body timeout closes HTTP, blocks cooldown and concurrent probes, then preserves tool round trips without Plan', { timeout: 5000 }, async t => {
+  let time = 1000, closed, entered, release, active = false, ticks = 0, work;
   const disconnected = new Promise(resolve => { closed = resolve; });
-  const f = await fixture(t, (_req, res) => {
-    if (f.localCalls.length > 1) { json(res, message()); return; }
-    res.once('close', closed);
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.write('{');
-    entered();
-  }, { attemptTimeoutMs: 2000 });
-  const controller = new AbortController();
-  const pending = f.request(undefined, controller.signal);
-  const rejected = assert.rejects(pending, { name: 'AbortError' });
-  await started;
-  controller.abort();
-  await rejected;
+  const probeEntered = new Promise(resolve => { entered = resolve; });
+  const probeReleased = new Promise(resolve => { release = resolve; });
+  t.after(() => { clearInterval(work); release(); });
+  const tool = { type: 'tool_use', id: 'local-recovery-read', name: 'Read', input: { path: 'fixture.txt' } };
+  const f = await fixture(t, async (_req, res) => {
+    if (f.localCalls.length === 1) {
+      active = true;
+      work = setInterval(() => { ticks++; }, 5);
+      res.once('close', () => { clearInterval(work); active = false; closed(); });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.write('{"content":[{"type":"text","text":"PARTIAL_MUST_NOT_ESCAPE');
+      return;
+    }
+    if (f.localCalls.length === 2) {
+      entered();
+      await probeReleased;
+      json(res, { ...message(MODEL, [tool]), stop_reason: 'tool_use' });
+      return;
+    }
+    json(res, { ...message(), id: 'fixture-recovery', role: 'assistant', usage: { input_tokens: 4, output_tokens: 3 } });
+  }, { localOnly: true, now: () => time, cooldownMs: 30, attemptTimeoutMs: 500 });
+  const failed = await f.request({ stream: true });
+  assert.equal(failed.status, 400);
+  assert.doesNotMatch(await failed.text(), /PARTIAL_MUST_NOT_ESCAPE/);
   await disconnected;
-  assert.equal(f.attempts.length, 1);
-  assert.equal(f.proCalls.length, 0);
-  const next = await f.request();
+  assert.equal(active, false);
+  const stoppedTicks = ticks;
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(ticks, stoppedTicks, 'fixture work stops when the response connection closes');
+  assert.equal(f.localCalls.length, 1, 'Local-only performs no upstream retry');
+  assert.equal(f.localCalls[0].body.stream, false);
+  assert.equal((await f.request()).status, 400);
+  assert.equal(f.localCalls.length, 1, 'cooldown must not reach the upstream');
+  time += 31;
+  const recovery = f.request({ tools: [{ name: 'Read', input_schema: { type: 'object', properties: { path: { type: 'string' } } } }] });
+  await probeEntered;
+  assert.equal((await f.request()).status, 400);
+  assert.equal(f.localCalls.length, 2, 'only one recovery probe may reach Local');
+  release();
+  const recovered = await recovery;
+  assert.equal(recovered.status, 200);
+  assert.deepEqual(await recovered.json(), { ...message(SONNET, [tool]), stop_reason: 'tool_use' });
+  const messages = [...body().messages, { role: 'assistant', content: [tool] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: tool.id, content: 'SYNTHETIC_FILE_CONTENT' }] }];
+  const next = await f.request({ stream: true, messages });
   assert.equal(next.status, 200);
-  await next.text();
-  assert.equal(f.localCalls.length, 2);
-  assert.equal(f.proCalls.length, 0);
+  assert.match(next.headers.get('content-type'), /text\/event-stream/);
+  assert.match(await next.text(), /local fixture answer/);
+  assert.deepEqual(f.localCalls[2].body.messages, messages);
+  assert.equal(f.localCalls.length, 3);
+  assert.equal(f.proCalls.length, 0, 'no failure, cooldown, probe or tool turn may invoke Plan');
 });
+
+for (const localOnly of [false, true]) {
+  test(`client cancellation closes the local HTTP request without retry or fallback (Local-only ${localOnly})`, { timeout: 5000 }, async t => {
+    let entered, closed;
+    const started = new Promise(resolve => { entered = resolve; });
+    const disconnected = new Promise(resolve => { closed = resolve; });
+    const f = await fixture(t, (_req, res) => {
+      if (f.localCalls.length > 1) { json(res, message()); return; }
+      res.once('close', closed);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.write('{');
+      entered();
+    }, { localOnly, attemptTimeoutMs: 2000 });
+    const controller = new AbortController();
+    const pending = f.request(undefined, controller.signal);
+    const rejected = assert.rejects(pending, { name: 'AbortError' });
+    await started;
+    controller.abort();
+    await rejected;
+    await disconnected;
+    assert.equal(f.attempts.length, 1);
+    assert.equal(f.proCalls.length, 0);
+    const next = await f.request();
+    assert.equal(next.status, 200);
+    await next.text();
+    assert.equal(f.localCalls.length, 2);
+    assert.equal(f.proCalls.length, 0);
+  });
+}

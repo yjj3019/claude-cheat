@@ -103,6 +103,29 @@ Local 모드는 요청당 120초를 허용합니다. 시간 초과 시 한 번 �
 
 **실제 LLM 서버 내부 연산 취소는 미검증입니다.** 시험 서버의 연결 종료 감지·합성 작업 중단과 실제 API의 클라이언트 취소를 구분해야 합니다. 제공받은 API 문서·엔드포인트·키만으로는 내부 작업 상태를 확인할 수 없었으며, 서버 로그나 작업 지표 없이 추론 연산 중단을 확정하지 않습니다. 원문 로그·테스트 도구·내부 주소·키·개인 설정은 공개하지 않습니다.
 
+## 공개 회귀 테스트와 실제 대화형 TTY 점검
+
+`tests/localLlmIntegration.test.mjs`에 Local 전용 모드의 실제 HTTP 본문 시간 초과부터 복구까지를 공개 회귀 테스트로 추가했습니다. 부분 응답 차단, 연결 종료 후 시험 작업 중단, 회로 차단 중 요청 거절, 만료 후 단일 복구 요청과 동시 요청 차단, 복구 뒤 도구 호출·결과 이력과 CLI용 SSE 응답, Plan 호출 0회를 한 프록시에서 확인합니다. 클라이언트 취소 후 새 요청 성공도 일반 모드와 Local 전용 모드 모두 검사합니다.
+
+```powershell
+node --test --test-name-pattern="Local-only body timeout|client cancellation closes the local HTTP" tests/localLlmIntegration.test.mjs
+```
+
+이 명령의 3개 테스트가 통과했습니다. 본문 시간 초과 테스트의 요청 제한은 500ms이고 회로 복구 시점에는 테스트 시계를 사용하므로 실제 120초를 기다리지 않습니다. 운영 기본 제한 120초는 변경하지 않았으며, 기존 기본값 검사와 앞선 실제 120초 시험으로 구분해 확인합니다. 전체 Node 테스트 243개, Python 설정 테스트 25개, Python 자체 검사와 Node 구문 검사도 통과했습니다. 공개 테스트는 합성 인증값과 임시 루프백 서버만 사용합니다.
+
+실제 CLI 점검은 Claude Code 2.1.304와 Windows ConPTY에서 수행했습니다. stdin·stdout·stderr가 모두 TTY인지 확인하고, 격리한 임시 설정과 합성 작업 폴더에서 기존 Python Local 실행 경로를 사용했습니다. `-p`, `dontAsk`, 권한 우회 또는 자동 승인 모드는 사용하지 않았습니다.
+
+| 항목 | 관찰 결과 |
+|---|---|
+| 기본 Edit 권한 확인 | 승인 전 파일 내용 유지, 한 번만 승인한 뒤 수정 성공 |
+| 다음 Edit 거부 | 다시 권한 확인 표시, 거부 후 기존 파일 내용 유지 |
+| 추론 중 Ctrl+C | 요청 취소 관측, CLI·프록시 유지, 같은 대화에서 새 요청 응답 일치 |
+| 정상 `/exit` | 종료 코드 0, CLI·프록시 종료와 리스너 포트 닫힘 확인 |
+| 별도 세션의 대기 중 Ctrl+C 두 번 | 종료 코드 0, CLI·프록시 종료와 리스너 포트 닫힘 확인 |
+| Plan 라우팅 | 두 세션 모두 0회 |
+
+TTY의 초기 키 확인은 프록시용 임시 키에만 적용했고, 사용자 설정이나 실제 서버 키를 변경하지 않았습니다. 입력 전달에는 붙여넣기 구분과 Enter 키의 CSI-u 표현을 사용했습니다. 실제 Windows Terminal 창의 시각적 배치, 창 강제 닫기와 OS 종료는 이 시험에 포함하지 않았습니다. 임시 CLI 이력·설정·작업 폴더는 정리했으며, 개인 환경 정보는 공개하지 않습니다. 실제 LLM 서버 내부 연산 취소는 계속 미검증입니다.
+
 ## English
 
 This document contains reusable validation procedures and a limited synthetic-input run summary. Keep machine details, credentials, account usage, billing records, session identifiers, and raw diagnostics private. Separate synthetic regression checks from explicitly authorized live validation; metadata checks do not prove inference or full native-feature compatibility.
@@ -114,3 +137,7 @@ At commit `2ee1cfd`, a separate 445.65-second run used Claude Code 2.1.304 with 
 At commit `a23cc65`, a separate 422.57-second run used Claude Code 2.1.304 with the same stream-json, 100k compaction window, 8,192 output budget, and unchanged 120-second deadline. One request used a real HTTP connection to a temporary loopback fixture that sent headers and 73 bytes of partial JSON, then stalled. No configured credentials or conversation body were sent to the fixture. The production body reader consumed those bytes before the deadline fired at 120.000 seconds. Reader cancellation was called twice for that one request. The fixture observed the unfinished response connection closing at 120.004 seconds and stopped its synthetic work, with no subsequent counter growth. No partial content reached the CLI, and there were no Plan routes. After a 35-second cooldown, the same CLI and proxy processes recovered against the real Local server; two large automatic compactions and three Read/Edit/Bash rounds succeeded. All seven retention checks passed, with no additional upstream failure. Five related HTTP timeout/cancellation regression tests and evidence consistency checks passed; temporary workspaces were cleaned up. Production code and personal settings were unchanged.
 
 A separate real-API probe cancelled on `message_start`, before `message_stop` or EOF, and confirmed a subsequent inference's model and reply. It did not establish text-token arrival or computation cancellation. An earlier probe reached stream completion before cancellation and was excluded as proof of cancellation during reception. **Actual LLM server computation cancellation remains unverified.** Fixture socket closure and synthetic job cleanup do not establish backend inference termination. The provided API documentation, endpoint, and key do not expose the server-side job evidence needed to confirm it. Raw logs, test tools, internal addresses, keys, and private settings remain unpublished.
+
+Public regression coverage in `tests/localLlmIntegration.test.mjs` now checks the Local-only HTTP body timeout, partial-response suppression, fixture disconnect cleanup, cooldown rejection, one recovery probe with concurrent rejection, and subsequent tool-history/SSE round trips with zero Plan calls. Client cancellation and immediate recovery are tested in both ordinary and Local-only modes. The three targeted tests and all 243 Node tests, 25 Python configuration tests, Python self-tests, and Node syntax checks passed. The body-timeout case uses a 500ms deadline and an injected clock; production's 120-second default is unchanged and covered separately. Only synthetic credentials and owned loopback servers are used by these public tests.
+
+Interactive verification used Claude Code 2.1.304 in Windows ConPTY with real TTY stdin/stdout/stderr, isolated temporary settings, synthetic files, and the existing Python Local launch path with default permissions. No print mode, `dontAsk`, permission bypass, or automatic approval was enabled. A single approved Edit ran only after approval; a subsequent denied Edit left the file unchanged. Ctrl+C during inference cancelled the request while preserving the CLI and proxy, and a new request in the same conversation succeeded. Normal `/exit` and a separate session's double Ctrl+C at idle both returned zero, terminated the CLI and proxy, and closed the proxy listener. Both sessions had zero Plan routes. Only the temporary proxy key was accepted during onboarding. Bracketed paste and a CSI-u Enter event were used for terminal input. Raw temporary history, settings, and workspaces were removed. Visual rendering in Windows Terminal, force-closing the terminal window, and OS shutdown were not tested; actual LLM computation cancellation remains unverified.
