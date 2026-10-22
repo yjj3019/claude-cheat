@@ -148,6 +148,8 @@ CLI가 추가 요청을 보내면서 최초 오류 대신 대기 안내를 마�
 
 ## 실행 전 오류와 비정상 종료 점검
 
+이 절은 코드 `93b7028`의 과거 검증 결과입니다. 당시 CLI·Bash 잔존 한계는 다음 절의 Windows Job 보호로 보완했습니다.
+
 Local 전용 모드의 실행 전 오류에 고정 `code`와 조치 안내를 추가했습니다. CLI·Node 누락, CLI 버전 미달·버전 확인 실패, 잘못된 설정·출력 예산, 프록시·CLI 시작 실패를 구분합니다. 기존 `openrouter_start_failed` 이벤트와 종료 코드 1을 유지하고, 이 경우 `kind`는 `LocalStartupError`입니다. 원문 예외·명령 출력·설정값을 안내에 포함하지 않습니다. 일반 실행과 진단 모드의 오류 형식은 유지합니다.
 
 기존 코드에서 합성 설정으로 실행기만 강제 종료했을 때 프록시 리스너가 남는 현상을 재현했습니다. Local 실행기가 프록시에만 부모 파이프를 전달하고, 프록시 실행부가 그 파이프의 EOF·오류·닫힘을 감지하면 즉시 종료하도록 보완했습니다. 일반 실행, 진단 실행과 import한 `createProxy`에는 감시를 추가하지 않습니다. 기존 정상 종료의 `finally` 정리와 프록시 준비 제한 15초도 유지합니다.
@@ -168,15 +170,45 @@ Node 회귀 테스트 257개, Python 설정·시작 오류 테스트 30개, Wind
 
 이 변경은 Local 프록시·리스너·연결의 소유권 정리입니다. 실행기만 강제 종료할 때 CLI 또는 Bash 작업 트리 전체를 종료시키는 기능은 포함하지 않습니다. Windows Terminal 창 자체의 닫기, OS 종료·전원 장애는 직접 시험하지 않았습니다. 임시 CLI 설정·작업 폴더는 정리하고 원시 이력과 개인 환경 정보는 공개하지 않습니다.
 
+## Windows Local 프로세스 트리 정리
+
+기존 `startClaudeOpenRouter.ps1 -Provider Local -LocalMode`의 Windows 단발 CLI 진입점에서, 프록시·CLI·버전 확인 프로세스를 만들기 전에 실행기를 Windows Job에 등록합니다. 별도 감시 프로세스가 실제 실행기 핸들의 종료를 기다리며 Job을 소유합니다. 실행기가 정상 또는 강제로 종료되면 Job을 닫아 남은 CLI·프록시·Bash·손자를 정리합니다. [Microsoft Job Object 문서](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)의 자식 상속과 `KILL_ON_JOB_CLOSE`를 사용하며 breakaway를 허용하지 않습니다.
+
+부모의 실제 프로세스 핸들 하나를 명시적으로 상속하므로 PID 재검색으로 다른 프로세스를 종료하지 않습니다. 감시 프로세스에는 OS 환경만 전달하고 제공자 주소·키·모델은 전달하지 않습니다. 감시 준비 실패 시 `local_process_cleanup_failed`로 종료하며 관리되지 않는 CLI를 시작하지 않습니다. 감시 프로세스가 먼저 죽는 경우에도 Job이 닫혀 해당 Local 세션 전체가 종료됩니다. 정상 경로는 감시 프로세스를 기다리지 않고 실행기 종료 후 정리되게 합니다.
+
+보호를 단발 CLI 진입점에 한정해, 모듈을 import한 테스트 러너·라이브러리 프로세스가 Job에 편입되지 않게 했습니다. 일반 실행·진단·비 Windows 동작, 기존 프록시 부모 파이프, CLI 권한 확인, Local 단일 시도·Plan 전환 차단과 120초 제한을 유지합니다.
+
+공개 Windows 종료 테스트는 실제 Git Bash와 그 자식 Python 프로세스를 합성 CLI 아래에 생성하고, 프로세스 핸들을 보유한 채 다음을 검사합니다.
+
+| 조건 | 확인 결과 |
+|---|---|
+| 실행기만 강제 종료, 대기·HTTP 본문 수신 중 | CLI·Bash·손자·프록시·감시 종료, 포트·HTTP 연결 닫힘 |
+| CLI만 강제 종료 | 실행기 반환 후 잔존 Bash·손자까지 정리 |
+| 정상·오류 반환 | 종료 코드 0·7 보존, 남은 Bash·손자 정리 |
+| 감시 프로세스 강제 종료 | 해당 Local 트리 종료, 별도로 만든 시험 프로세스는 생존 |
+| 정리 준비 실패 | CLI 시작 차단, 고정 오류 안내와 비밀값 비노출 |
+
+실제 Claude Code 2.1.304와 Windows ConPTY에서도 격리한 설정·작업 폴더와 합성 루프백 Messages 서버로 검증했습니다. CLI의 Bash 도구로 대기 중인 자식 스크립트를 실행한 뒤 실행기만 종료했습니다. 보유한 핸들로 CLI·실제 Bash·손자·프록시·감시 종료와 포트 닫힘을 확인했고, 별도 시험 프로세스는 살아 있었습니다. Plan 호출은 0회였습니다. 준비 실행의 인라인 경로 인용 오류는 시험 스크립트 파일로 교정했으며, 교정 후 실행만 이 통과 결과에 포함했습니다.
+
+별도 TTY 세션에서 Ctrl+C 취소 후에도 같은 CLI·프록시·감시 프로세스가 유지되고, 새 요청이 정확히 `LOCAL_TREE_OK`로 응답했습니다. 이 실행에서는 HTTP 취소 1회 외에 다른 합성 연결 1개가 시험 서버의 30초 수신 제한으로 끝나 upstream 실패·회로 열림도 각각 1회 관측했습니다. 대기 이후 같은 세션에서 복구했으며 Plan 전환은 없었습니다. 운영 120초 제한에 의한 실패나 오류 없는 취소 시험으로 해석하지 않습니다. `/exit`는 0을 반환했고 실행기·CLI·프록시·감시 종료와 포트 닫힘을 별도 핸들 관측기로 확인했습니다. 이 실행의 감시 준비는 0.867초였으며, Local 세션당 감시 프로세스 하나가 추가됩니다.
+
+Node 257개와 Python 41개(설정·시작 오류·감시 36개, Windows 종료 5개), 자체 검사와 구문 검사가 통과했습니다. 실제 LLM 서버나 개인 주소·키는 사용하지 않았습니다. 임시 CLI 설정·작업 폴더는 정리하고 원시 이력·프로세스 식별자는 공개하지 않습니다. 기존 실행 중인 세션에는 소급 적용되지 않으며 새 Local 세션부터 보호합니다. Windows Terminal 창 닫기·OS 종료·전원 장애 자체는 직접 시험하지 않았고, 서비스나 작업 스케줄러에 위임한 외부 작업은 이 자식 트리의 범위가 아닙니다.
+
 ## English
 
 This document contains reusable validation procedures and a limited synthetic-input run summary. Keep machine details, credentials, account usage, billing records, session identifiers, and raw diagnostics private. Separate synthetic regression checks from explicitly authorized live validation; metadata checks do not prove inference or full native-feature compatibility.
 
+The Windows standalone Local CLI entry point now enrolls its launcher in a kill-on-close Job before spawning the proxy or CLI. A hidden guardian outside that Job owns its non-inheritable handle and waits on an explicitly inherited real launcher handle. Closing the Job removes remaining CLI, proxy, Git Bash, and descendants without PID searches or global kills. The guardian receives only OS environment values. Startup preparation failure blocks unmanaged execution with `local_process_cleanup_failed`; guardian failure ends that Local tree. Imported library calls, ordinary launches, diagnostics, and non-Windows behavior remain unchanged.
+
+All 257 Node and 41 Python tests passed, including five Windows lifecycle tests with actual Git Bash descendants, idle/active HTTP termination, exit codes 0/7, guardian failure, and an unrelated process surviving. A real Claude Code 2.1.304 TTY Bash task also lost its entire owned tree after killing only the launcher; all retained process handles signaled exit, the listener closed, and an unrelated process survived. The corrected file-based script run is counted; an earlier inline-quoting setup failure is excluded.
+
+A separate TTY session retained the same CLI/proxy/guardian after Ctrl+C and returned the exact synthetic recovery marker. One HTTP cancellation and one separate fixture's 30-second receive failure were observed, with one upstream failure/circuit opening and subsequent same-session recovery; this was not an error-free cancellation run or a production 120-second timeout. Plan calls remained zero. `/exit` returned 0, and external retained handles confirmed launcher, CLI, proxy, and guardian exit plus listener closure. Guardian startup took 0.867 seconds in that run and adds one process per Local session. Only synthetic loopback APIs and isolated settings were used; temporary settings/workspaces were cleaned. Actual terminal-window closure, OS/power failure, and external service/scheduler jobs were not verified. Existing sessions require a fresh Local launch to acquire protection.
+
 Local-only startup failures now add a fixed code and action message to the existing `openrouter_start_failed` event, with `kind: LocalStartupError` and exit code 1. Missing CLI/Node, unsupported or unreadable CLI version, invalid configuration/output budget, proxy startup, and CLI spawn failures are distinguished without echoing exception text or configuration values. Ordinary launches and diagnostics retain their error format.
 
-A synthetic baseline reproduced an orphaned proxy listener after killing only the Python launcher. The Local-only launcher now owns a stdin pipe to its proxy; EOF/error/closure ends the proxy immediately. Ordinary launches, diagnostics, and imported `createProxy` instances do not acquire this behavior. Three public Windows lifecycle tests use actual Python/Node processes, synthetic CLI/upstream fixtures, and retained process handles. Killing either CLI or launcher while idle or receiving an incomplete HTTP body closed the proxy listener and active connection, with one Local call and no Plan fallback. Ordinary mode ignored the pipe option, as intended.
+At commit `93b7028`, a synthetic baseline reproduced an orphaned proxy listener after killing only the Python launcher. The Local-only launcher gained a stdin pipe to its proxy; EOF/error/closure ends the proxy immediately. Ordinary launches, diagnostics, and imported `createProxy` instances do not acquire this behavior. Three public Windows lifecycle tests used actual Python/Node processes, synthetic CLI/upstream fixtures, and retained process handles. Killing either CLI or launcher while idle or receiving an incomplete HTTP body closed the proxy listener and active connection, with one Local call and no Plan fallback. Ordinary mode ignored the pipe option, as intended.
 
-Separate interactive Windows ConPTY checks used real Claude Code 2.1.304 and isolated synthetic settings without inference requests or Plan login. Killing the CLI ended the launcher and proxy and closed the port. Killing only the launcher ended the proxy and closed the port, but left the CLI alive; the test then cleaned it explicitly. All 257 Node tests, 30 Python configuration/startup tests, three Windows lifecycle tests, Python self-tests, and syntax checks passed. Whole CLI/Bash process-tree termination is outside this pipe guard. Actual terminal-window closure, OS shutdown, and power loss were not tested. Temporary CLI settings and workspaces were removed; private environment information remains unpublished.
+Those earlier interactive Windows ConPTY checks used real Claude Code 2.1.304 and isolated synthetic settings without inference requests or Plan login. Killing the CLI ended the launcher and proxy and closed the port. Killing only the launcher ended the proxy and closed the port, but left the CLI alive; the test then cleaned it explicitly. All 257 Node tests, 30 Python configuration/startup tests, three Windows lifecycle tests, Python self-tests, and syntax checks passed. Whole CLI/Bash termination was outside that pipe guard and is covered by the newer Job verification above. Actual terminal-window closure, OS shutdown, and power loss were not tested. Temporary CLI settings and workspaces were removed; private environment information remains unpublished.
 
 Local-only error guidance distinguishes timeouts, HTTP 401/403 authentication/access failures, empty responses, other upstream failures, cooldowns with the previous cause and rounded remaining seconds, and an active recovery probe. HTTP 400, the `api_error` envelope, one upstream attempt, the 30-second cooldown, the 120-second production deadline, existing launch commands, and zero Plan fallback remain unchanged. All 257 Node tests, 25 Python configuration tests, Python self-tests, and Node syntax checks passed. Regression cases include empty/blank HTTP bodies, HTTP 204, empty content, blank text, invalid JSON, connection/body timeouts, wait rounding, zero cooldown, concurrent probes, cause updates, and redaction.
 

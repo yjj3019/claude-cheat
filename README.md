@@ -226,8 +226,11 @@ CLI의 후속 요청 때문에 최초 오류 대신 대기 안내가 마지막�
 | `local_output_budget_invalid` | `CLAUDE_CODE_MAX_OUTPUT_TOKENS`가 양의 정수인지 확인 |
 | `local_proxy_start_failed` | Node.js·프록시 파일·루프백 접근 권한. 준비 제한 시간은 기존 15초 유지 |
 | `local_cli_start_failed` | Claude Code 실행 권한과 설치 상태 |
+| `local_process_cleanup_failed` | Python·Windows Job 권한과 감시 파일 확인. 정리 준비 실패 시 CLI를 시작하지 않음 |
 
-Local 전용 프록시는 실행기와의 부모 파이프가 닫히면 즉시 종료합니다. 실행기가 강제 종료되어 `finally` 정리가 실행되지 않아도 프록시·포트·진행 중 연결을 정리합니다. `local_parent_disconnected` 이벤트로 구분합니다. 이 감시는 프록시만 소유하며, 실행기만 강제 종료할 때 남을 수 있는 CLI·Bash 자식까지 종료하지는 않습니다. 일반 종료와 Ctrl+C를 우선 사용하세요. [비정상 종료 검증 범위](docs/LIVE-VALIDATION.ko.md#실행-전-오류와-비정상-종료-점검)를 참고하세요.
+Windows에서 기존 명령의 `-LocalMode` 진입점은 CLI·프록시 생성 전에 실행기를 [Windows Job Object](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)에 넣습니다. 창을 띄우지 않는 감시 프로세스 하나가 실행기 종료를 확인하면 Job을 닫아 CLI·프록시·Bash와 그 자식도 정리합니다. PID 이름 검색이나 전역 프로세스 종료를 사용하지 않습니다. Job 준비에 실패하면 관리되지 않는 CLI를 시작하지 않습니다.
+
+기존 부모 파이프 감시도 유지합니다. 일반 실행·진단 모드와 모듈을 import해 호출하는 경로에는 새 Job을 설치하지 않으며, 비 Windows 환경의 종료 동작은 기존대로입니다. 새 보호는 실행 중인 세션에 소급 적용되지 않으므로 Local 세션을 새로 시작하세요. 일반 종료와 Ctrl+C를 우선 사용하고, [프로세스 트리 검증 범위](docs/LIVE-VALIDATION.ko.md#windows-local-프로세스-트리-정리)를 참고하세요.
 
 출력 예산 부족으로 압축이 중단되지 않도록 이 모드의 실행 시 설정에 `CLAUDE_CODE_MAX_OUTPUT_TOKENS`를 기본 8,192로 지정합니다. 부모 프로세스에서 지정한 양의 정수 예산이 더 크면 유지하고, 더 작으면 8,192로 올립니다. 이 실행 시 설정은 사용자·프로젝트 파일의 예산보다 우선하므로, 더 큰 예산은 부모 환경변수로 지정하세요. 파일이나 부모 환경은 수정하지 않습니다. 압축뿐 아니라 이 Local 세션의 일반 출력에도 적용됩니다. CLI의 모델별 상한과 컨텍스트 여유에 따른 조정은 그대로 적용하며, 프록시에서 `max_tokens`를 강제로 올리지 않습니다. 서버도 해당 출력 예산을 지원해야 합니다. `-LocalMode`가 없는 기존 실행과 진단 모드는 바뀌지 않습니다.
 
@@ -338,6 +341,7 @@ node --check claudeRouteProxy.mjs
 | --- | --- |
 | [startClaudeOpenRouter.ps1](startClaudeOpenRouter.ps1) | 제공자 선택과 Python 실행기 호출 |
 | [openrouterAdvisor.py](openrouterAdvisor.py) | Plan 인증 검사·환경 격리·프록시 수명 관리·Local 목록 점검·별도 격리 상담 도구 |
+| [localProcessTree.py](localProcessTree.py) | Windows Local 전용 진입점의 Job 소유권·프로세스 트리 종료 감시 |
 | [claudeRouteProxy.mjs](claudeRouteProxy.mjs) | 모델별 라우팅·응답 검증·재시도·fallback·복구 |
 | [.env.local-llm.example](.env.local-llm.example) | 키가 없는 Local 설정 예제 |
 | [tests/claudeRouteProxy.test.mjs](tests/claudeRouteProxy.test.mjs) | 프록시 합성 회귀 검사 |

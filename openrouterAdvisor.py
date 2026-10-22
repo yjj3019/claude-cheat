@@ -14,6 +14,7 @@ import secrets
 import shlex
 import threading
 import argparse
+import localProcessTree
 from urllib.parse import urlsplit, urlunsplit
 import urllib.request
 import urllib.error
@@ -32,6 +33,7 @@ LOCAL_STARTUP_MESSAGES = {
     "local_output_budget_invalid": "Local output budget must be a positive integer. Check CLAUDE_CODE_MAX_OUTPUT_TOKENS.",
     "local_proxy_start_failed": "Local routing proxy did not start. Check Node.js, proxy files, and loopback permissions, then restart Local mode.",
     "local_cli_start_failed": "Could not start Claude Code. Check executable permissions and restart Local mode.",
+    "local_process_cleanup_failed": "Windows Local process cleanup could not be prepared. Check Python and Windows job permissions, then restart Local mode. No unmanaged Local session was started.",
 }
 
 
@@ -707,6 +709,11 @@ if __name__ == "__main__":
                 result = check_local()
                 print(json.dumps(result))
                 sys.exit(0 if result["local_check"] else 1)
+            if options.local_mode:
+                try:
+                    localProcessTree.ensure_windows_local_tree()
+                except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+                    raise LocalStartupError("local_process_cleanup_failed") from None
             sys.exit(launch(options.provider, local_only=options.local_mode))
     except LocalStartupError as exc:
         print(json.dumps({"event": "openrouter_start_failed", "kind": type(exc).__name__,

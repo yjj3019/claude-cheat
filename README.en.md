@@ -95,8 +95,11 @@ Before inference starts, Local-only failures add a fixed `code` and action messa
 | `local_output_budget_invalid` | Positive integer `CLAUDE_CODE_MAX_OUTPUT_TOKENS` |
 | `local_proxy_start_failed` | Node.js, proxy files, and loopback permissions; the existing 15-second readiness deadline remains |
 | `local_cli_start_failed` | Claude Code installation and executable permissions |
+| `local_process_cleanup_failed` | Python, Windows Job permissions, and guardian file; no CLI starts if cleanup preparation fails |
 
-The Local-only proxy exits immediately when its parent pipe closes, cleaning its listener and active connections even if the launcher is killed before `finally` runs. It logs `local_parent_disconnected`. This owns only the proxy: killing the launcher alone may leave the CLI or Bash descendants alive. Prefer normal exit or Ctrl+C. See the [shutdown verification scope](docs/LIVE-VALIDATION.ko.md#실행-전-오류와-비정상-종료-점검).
+On Windows, the existing `-LocalMode` CLI entry point puts its launcher in a [Windows Job Object](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects) before creating the CLI or proxy. One hidden guardian waits for the launcher to exit, then closes the Job to clean the CLI, proxy, Bash, and descendants. It does not search process names or kill global processes. Failure to prepare ownership blocks CLI startup.
+
+The existing proxy parent-pipe guard remains. Ordinary launches, diagnostics, imported library calls, and non-Windows shutdown behavior are unchanged. Start a new Local session to acquire this protection; existing sessions are not retroactively enrolled. Prefer normal exit or Ctrl+C. See the [process-tree verification scope](docs/LIVE-VALIDATION.ko.md#windows-local-프로세스-트리-정리).
 
 To prevent low output budgets from truncating compaction, this mode supplies `CLAUDE_CODE_MAX_OUTPUT_TOKENS` through its per-launch settings, defaulting to 8192. A larger positive whole-number value from the parent environment is preserved; a smaller value is raised to 8192. These per-launch settings take precedence over budget values in user/project files; use the parent environment for a larger budget. Neither the files nor the parent environment is changed. The budget applies to ordinary replies in this Local session as well as compaction. The CLI still applies model caps and remaining-context adjustments; the proxy does not raise request `max_tokens`. Your server must support the output budget. Launches without `-LocalMode` and diagnostic modes are unchanged.
 
@@ -230,6 +233,7 @@ See the [connection and recovery checklist](docs/LIVE-VALIDATION.ko.md) for a ge
 | --- | --- |
 | `startClaudeOpenRouter.ps1` | PowerShell provider selector and launcher |
 | `openrouterAdvisor.py` | Plan authentication checks, environment isolation, proxy lifecycle, isolated consultation tool, self-tests |
+| `localProcessTree.py` | Windows Local CLI Job ownership and process-tree guardian |
 | `claudeRouteProxy.mjs` | Routing, response validation, retries, fallback, recovery |
 | `tests/claudeRouteProxy.test.mjs` | Synthetic proxy regression tests |
 | `tests/localLlmIntegration.test.mjs` | Real loopback HTTP tests with synthetic Messages servers and Plan responses |

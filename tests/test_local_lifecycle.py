@@ -17,8 +17,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = Path(__file__).resolve().parents[1]
 NODE = shutil.which("node")
+BASH = shutil.which("bash") or (str(Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/bin/bash.exe"))
 CLI = r"""
-import http.client,json,sys,time,urllib.request
+import http.client,json,subprocess,sys,time,urllib.request
+from pathlib import Path
+bash=subprocess.Popen([sys.argv[4],'--noprofile','--norc','-c',
+    '''"$1" -u -c 'import json,os,time;print(json.dumps({"grandchild_pid":os.getpid()}),flush=True);time.sleep(60)' & wait''',
+    'synthetic-shell',Path(sys.executable).as_posix()],stdin=subprocess.DEVNULL,stdout=sys.stdout,stderr=sys.stderr)
+print(json.dumps({'bash_pid':bash.pid}),flush=True)
+if sys.argv[1] in ('normal','error'):
+    sys.stdin.readline()
+    sys.exit(0 if sys.argv[1]=='normal' else 7)
 if sys.argv[1] == 'active':
     body=json.dumps({'model':'claude-sonnet-5-5','max_tokens':64,'messages':[{'role':'user','content':'synthetic'}]}).encode()
     request=urllib.request.Request(sys.argv[2]+'/v1/messages',data=body,headers={'Content-Type':'application/json','X-Local-Route-Token':sys.argv[3]})
@@ -33,25 +42,26 @@ import json,subprocess,sys
 from unittest.mock import patch,Mock
 from urllib.parse import urlsplit
 import openrouterAdvisor as a
-node,url,mode,cli_code=sys.argv[1:]
+node,url,mode,cli_code,bash=sys.argv[1:]
 original=subprocess.Popen
 proxy=None
 def spawn(args,**kwargs):
     global proxy
     if args[0] == 'synthetic-cli':
         env=kwargs['env']
-        child=original([sys.executable,'-u','-c',cli_code,mode,env['ANTHROPIC_BASE_URL'],env['ANTHROPIC_API_KEY']],**kwargs)
-        print(json.dumps({'proxy_pid':proxy.pid,'cli_pid':child.pid,'port':urlsplit(env['ANTHROPIC_BASE_URL']).port}),flush=True)
+        child=original([sys.executable,'-u','-c',cli_code,mode,env['ANTHROPIC_BASE_URL'],env['ANTHROPIC_API_KEY'],bash],stdin=sys.stdin,stdout=sys.stdout,stderr=sys.stderr,**kwargs)
+        print(json.dumps({'proxy_pid':proxy.pid,'cli_pid':child.pid,'guardian_pid':a.localProcessTree._guardian.pid,'port':urlsplit(env['ANTHROPIC_BASE_URL']).port}),flush=True)
         return child
     proxy=original(args,**kwargs)
     return proxy
 config={'SONNET_PROVIDER':'local','LOCAL_LLM_URL':url,'LOCAL_LLM_MODEL':'synthetic-model','LOCAL_LLM_API_KEY':'synthetic-local-key'}
 with patch.object(a,'provider_config',return_value=config),patch.object(a.shutil,'which',side_effect=lambda n:'synthetic-cli' if n=='claude' else node),patch.object(a.subprocess,'run',return_value=Mock(stdout='2.1.304')),patch.object(a.subprocess,'Popen',side_effect=spawn),patch.object(a,'run_owned',side_effect=AssertionError('Plan auth forbidden')):
+    a.localProcessTree.ensure_windows_local_tree()
     sys.exit(a.launch('local',local_only=True))
 """
 
 
-@unittest.skipUnless(os.name == "nt" and NODE, "Windows and Node.js required")
+@unittest.skipUnless(os.name == "nt" and NODE and Path(BASH).is_file(), "Windows, Node.js and Git Bash required")
 class LocalLifecycleTests(unittest.TestCase):
     def setUp(self):
         self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -79,9 +89,9 @@ class LocalLifecycleTests(unittest.TestCase):
 
     def start_launcher(self, url, mode):
         # -c retains normal Ctrl+C/stdio behavior; only CLI inference is synthetic.
-        parent = subprocess.Popen([sys.executable, "-u", "-c", LAUNCHER, NODE, url, mode, CLI],
+        parent = subprocess.Popen([sys.executable, "-u", "-c", LAUNCHER, NODE, url, mode, CLI, BASH],
                                   cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, text=True, encoding="utf-8")
+                                  stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="backslashreplace")
         def cleanup():
             if parent.poll() is None:
                 parent.kill()
@@ -90,13 +100,24 @@ class LocalLifecycleTests(unittest.TestCase):
                 stream.close()
         self.addCleanup(cleanup)
         ready = queue.Queue()
+        diagnostics = []
         def read_ready():
+            info = {}
             for line in parent.stdout:
-                if line.startswith('{"proxy_pid"'):
-                    ready.put(json.loads(line))
-                    return
+                if line.startswith('{'):
+                    info.update(json.loads(line))
+                    if {"proxy_pid", "cli_pid", "guardian_pid", "bash_pid", "grandchild_pid"} <= info.keys():
+                        ready.put(info)
+                        return
+                else:
+                    diagnostics.append(line.strip())
         threading.Thread(target=read_ready, daemon=True).start()
-        info = ready.get(timeout=10)
+        try:
+            info = ready.get(timeout=10)
+        except queue.Empty:
+            self.fail("Synthetic process tree did not become ready: " + repr(diagnostics[-3:]))
+        for name in ("guardian", "bash", "grandchild"):
+            info[name + "_handle"] = self.owned_handle(info[name + "_pid"])
         return parent, info, self.owned_handle(info["proxy_pid"]), self.owned_handle(info["cli_pid"])
 
     def stalled_upstream(self):
@@ -112,6 +133,7 @@ class LocalLifecycleTests(unittest.TestCase):
                 self.end_headers()
                 self.wfile.write(b'{"type":')
                 self.wfile.flush()
+                self.close_connection = True
                 entered.set()
                 self.connection.settimeout(10)
                 try:
@@ -141,13 +163,15 @@ class LocalLifecycleTests(unittest.TestCase):
                 self.assertTrue(self.kernel.TerminateProcess(cli, 1))
                 self.assertNotEqual(parent.wait(timeout=10), 0)
                 self.assertEqual(self.kernel.WaitForSingleObject(proxy, 5000), 0)
+                for name in ("guardian", "bash", "grandchild"):
+                    self.assertEqual(self.kernel.WaitForSingleObject(info[name + "_handle"], 5000), 0)
                 self.assertFalse(self.listener_open(info["port"]))
                 if mode == "active":
                     self.assertTrue(closed.wait(5))
                     self.assertEqual(requests, ["/v1/messages"])
                 self.assertNotIn('"provider":"plan"', parent.stderr.read())
 
-    def test_killed_launcher_closes_proxy_and_active_connection_but_not_cli_tree(self):
+    def test_killed_launcher_closes_entire_tree_and_active_connection(self):
         for mode in ("idle", "active"):
             with self.subTest(mode=mode):
                 url, entered, closed, requests = self.stalled_upstream()
@@ -162,13 +186,38 @@ class LocalLifecycleTests(unittest.TestCase):
                 if mode == "active":
                     self.assertTrue(closed.wait(5))
                     self.assertEqual(requests, ["/v1/messages"])
-                # The pipe owns only the proxy. Keep this limitation explicit and clean our test CLI.
-                self.assertEqual(self.kernel.WaitForSingleObject(cli, 0), 258)
-                self.assertTrue(self.kernel.TerminateProcess(cli, 1))
                 self.assertEqual(self.kernel.WaitForSingleObject(cli, 5000), 0)
+                for name in ("guardian", "bash", "grandchild"):
+                    self.assertEqual(self.kernel.WaitForSingleObject(info[name + "_handle"], 5000), 0)
                 output = parent.stderr.read()
-                self.assertIn('"event":"local_parent_disconnected"', output)
                 self.assertNotIn('"provider":"plan"', output)
+
+    def test_normal_and_error_exit_preserve_codes_and_clean_remaining_children(self):
+        for mode, code in (("normal", 0), ("error", 7)):
+            with self.subTest(mode=mode):
+                parent, info, proxy, cli = self.start_launcher("http://127.0.0.1:9/v1/messages", mode)
+                parent.stdin.write("finish\n")
+                parent.stdin.flush()
+                self.assertEqual(parent.wait(timeout=10), code)
+                for handle in (proxy, cli, *(info[n + "_handle"] for n in ("guardian", "bash", "grandchild"))):
+                    self.assertEqual(self.kernel.WaitForSingleObject(handle, 5000), 0)
+                self.assertFalse(self.listener_open(info["port"]))
+
+    def test_guardian_failure_closes_tree_without_touching_unrelated_process(self):
+        unrelated = subprocess.Popen([sys.executable, "-c", "import time;time.sleep(60)"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        def cleanup():
+            if unrelated.poll() is None:
+                unrelated.kill()
+            unrelated.wait(timeout=5)
+        self.addCleanup(cleanup)
+        parent, info, proxy, cli = self.start_launcher("http://127.0.0.1:9/v1/messages", "idle")
+        self.assertTrue(self.kernel.TerminateProcess(info["guardian_handle"], 1))
+        parent.wait(timeout=10)
+        for handle in (proxy, cli, info["bash_handle"], info["grandchild_handle"]):
+            self.assertEqual(self.kernel.WaitForSingleObject(handle, 5000), 0)
+        self.assertFalse(self.listener_open(info["port"]))
+        self.assertIsNone(unrelated.poll())
 
     def test_parent_pipe_option_does_not_change_ordinary_mode(self):
         env = {**os.environ, "SONNET_PROVIDER": "local", "LOCAL_ROUTE_TOKEN": "synthetic-lifecycle-nonce",

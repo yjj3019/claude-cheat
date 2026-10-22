@@ -29,6 +29,7 @@ class LocalTestCase(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ, {}, clear=True))
         self.enterContext(mock.patch.object(route, "read_key", side_effect=AssertionError("OpenRouter key access")))
         self.enterContext(mock.patch.object(route, "run_owned", side_effect=AssertionError("Claude invocation")))
+        self.guard = self.enterContext(mock.patch.object(route.localProcessTree, "ensure_windows_local_tree"))
 
     def configure(self, **values):
         os.environ.update({"LOCAL_LLM_MODEL": "synthetic-model", **values})
@@ -142,6 +143,19 @@ class LocalDiagnosticTests(LocalTestCase):
 
 
 class LocalCliModeTests(LocalTestCase):
+    def test_cleanup_preparation_failure_stops_before_cli_and_hides_exception(self):
+        self.guard.side_effect = RuntimeError("private-exception-marker")
+        err = io.StringIO()
+        with mock.patch.object(sys, "argv", [str(SPEC.origin), "--provider", "local", "--local-mode"]), \
+             mock.patch("shutil.which", side_effect=AssertionError("No CLI before cleanup readiness")), \
+             contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as result:
+                runpy.run_path(str(SPEC.origin), run_name="__main__")
+        self.assertEqual(result.exception.code, 1)
+        diagnostic = json.loads(err.getvalue())
+        self.assertEqual(diagnostic["code"], "local_process_cleanup_failed")
+        self.assertNotIn("private-exception-marker", err.getvalue())
+
     def test_missing_cli_keeps_ordinary_errors_and_classifies_only_local_mode(self):
         with mock.patch.object(route.shutil, "which", return_value=None):
             with self.assertRaises(FileNotFoundError):
@@ -320,6 +334,79 @@ class LocalCliModeTests(LocalTestCase):
         with self.assertRaises(ValueError):
             with route.routed_session("openrouter", local_only=True):
                 self.fail("Invalid Local mode entered")
+
+
+@unittest.skipUnless(os.name == "nt", "Windows guardian startup contract")
+class LocalProcessGuardTests(unittest.TestCase):
+    def test_guardian_gets_only_parent_handle_and_os_environment_once(self):
+        guard = route.localProcessTree
+        kernel, process = mock.Mock(), mock.Mock()
+        kernel.OpenProcess.return_value = 123
+        process.stdout.readline.return_value = '{"ready":true}'
+        process.poll.return_value = None
+        env = {"SYSTEMROOT": "synthetic-system", "LOCAL_LLM_API_KEY": "private-key-marker", "LOCAL_LLM_URL": "private-url-marker", "ANTHROPIC_AUTH_TOKEN": "private-plan-marker"}
+        with mock.patch.object(guard, "_guardian", None), mock.patch.object(guard, "_kernel", return_value=kernel), mock.patch.dict(os.environ, env, clear=True), mock.patch.object(guard.subprocess, "Popen", return_value=process) as spawn:
+            guard.ensure_windows_local_tree()
+            guard.ensure_windows_local_tree()
+        spawn.assert_called_once()
+        args, kwargs = spawn.call_args.args[0], spawn.call_args.kwargs
+        self.assertEqual(kwargs["env"], {"SYSTEMROOT": "synthetic-system"})
+        self.assertEqual(kwargs["startupinfo"].lpAttributeList, {"handle_list": [123]})
+        self.assertTrue(kwargs["close_fds"])
+        self.assertEqual(kwargs["creationflags"], route.subprocess.CREATE_NO_WINDOW)
+        self.assertEqual(args[-1], "123")
+        for hidden in ("private-key-marker", "private-url-marker", "private-plan-marker"):
+            self.assertNotIn(hidden, repr(args) + repr(kwargs))
+        kernel.CloseHandle.assert_called_once_with(123)
+        process.wait.assert_not_called()
+        process.terminate.assert_not_called()
+
+    def test_bad_guardian_readiness_fails_without_terminating_guardian(self):
+        guard = route.localProcessTree
+        for message in ('', 'invalid', '{"ready":false}', '{"ready":1}', '{"ready":true,"extra":true}'):
+            with self.subTest(message=message):
+                kernel, process = mock.Mock(), mock.Mock()
+                kernel.OpenProcess.return_value = 123
+                process.stdout.readline.return_value = message
+                with mock.patch.object(guard, "_guardian", None), mock.patch.object(guard, "_kernel", return_value=kernel), mock.patch.object(guard.subprocess, "Popen", return_value=process):
+                    with self.assertRaisesRegex(RuntimeError, "Local process cleanup unavailable"):
+                        guard.ensure_windows_local_tree()
+                kernel.CloseHandle.assert_called_once_with(123)
+                process.kill.assert_not_called()
+                process.terminate.assert_not_called()
+
+    def test_guardian_spawn_failure_closes_parent_handle(self):
+        guard = route.localProcessTree
+        kernel = mock.Mock()
+        kernel.OpenProcess.return_value = 123
+        with mock.patch.object(guard, "_guardian", None), mock.patch.object(guard, "_kernel", return_value=kernel), mock.patch.object(guard.subprocess, "Popen", side_effect=OSError("synthetic spawn failure")):
+            with self.assertRaises(OSError):
+                guard.ensure_windows_local_tree()
+        kernel.CloseHandle.assert_called_once_with(123)
+
+    def test_job_assignment_failure_reports_not_ready_and_closes_only_owned_handles(self):
+        guard = route.localProcessTree
+        kernel = mock.Mock()
+        kernel.CreateJobObjectW.return_value = 456
+        kernel.SetInformationJobObject.return_value = True
+        kernel.AssignProcessToJobObject.return_value = False
+        out = io.StringIO()
+        with mock.patch.object(guard, "_kernel", return_value=kernel), contextlib.redirect_stdout(out):
+            self.assertEqual(guard._watch(123), 1)
+        self.assertEqual(json.loads(out.getvalue()), {"ready": False})
+        kernel.AssignProcessToJobObject.assert_called_once_with(456, 123)
+        self.assertEqual(kernel.SetInformationJobObject.call_args.args[2]._obj.basic.flags, 0x2000)
+        kernel.WaitForSingleObject.assert_not_called()
+        self.assertEqual(kernel.CloseHandle.call_args_list, [mock.call(456), mock.call(123)])
+
+    def test_missing_parent_handle_does_not_start_guardian(self):
+        guard = route.localProcessTree
+        kernel = mock.Mock()
+        kernel.OpenProcess.return_value = 0
+        with mock.patch.object(guard, "_guardian", None), mock.patch.object(guard, "_kernel", return_value=kernel), mock.patch.object(guard.subprocess, "Popen") as spawn:
+            with self.assertRaises(OSError):
+                guard.ensure_windows_local_tree()
+        spawn.assert_not_called()
 
 
 class LocalMetadataTests(LocalTestCase):
