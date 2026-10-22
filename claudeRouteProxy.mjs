@@ -529,6 +529,16 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     }
   } else {
     const server = createProxy(config);
+    if (config.localOnly && process.argv.slice(2).includes('--parent-pipe')) {
+      const parentClosed = () => {
+        console.error(JSON.stringify({ event: 'local_parent_disconnected', provider: 'local' }));
+        process.exit(0);
+      };
+      process.stdin.once('end', parentClosed);
+      process.stdin.once('error', parentClosed);
+      process.stdin.once('close', parentClosed);
+      process.stdin.resume();
+    }
     server.listen(0, '127.0.0.1', () => process.stdout.write(JSON.stringify({ port: server.address().port }) + '\n'));
   }
 }

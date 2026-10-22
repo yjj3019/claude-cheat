@@ -85,6 +85,19 @@ Local-only error messages distinguish these cases. Failures retain the default 3
 
 CLI follow-up requests may make the cooldown message the final visible error, so it preserves the previous failure cause. The `local_mode_rejected` log also includes `code`, applicable `retry_after_seconds`, and `previous_error_code`. An active recovery check has no invented countdown. HTTP 400, the `api_error` envelope, and existing CLI retry behavior remain unchanged. Messages never include raw server responses, addresses, or keys.
 
+Before inference starts, Local-only failures add a fixed `code` and action message to `openrouter_start_failed`, with exit code 1 and no raw exception, address, or key. Ordinary launches and diagnostics retain their behavior.
+
+| Startup code | Check |
+|---|---|
+| `local_cli_not_found` / `local_node_not_found` | Claude Code/Node.js installation and PATH |
+| `local_cli_unsupported` / `local_cli_version_check_failed` | `claude --version`, minimum 2.1.304, executable permissions |
+| `local_configuration_invalid` | Local file/environment URL, HTTP approval, model, key format, and model-list origin |
+| `local_output_budget_invalid` | Positive integer `CLAUDE_CODE_MAX_OUTPUT_TOKENS` |
+| `local_proxy_start_failed` | Node.js, proxy files, and loopback permissions; the existing 15-second readiness deadline remains |
+| `local_cli_start_failed` | Claude Code installation and executable permissions |
+
+The Local-only proxy exits immediately when its parent pipe closes, cleaning its listener and active connections even if the launcher is killed before `finally` runs. It logs `local_parent_disconnected`. This owns only the proxy: killing the launcher alone may leave the CLI or Bash descendants alive. Prefer normal exit or Ctrl+C. See the [shutdown verification scope](docs/LIVE-VALIDATION.ko.md#실행-전-오류와-비정상-종료-점검).
+
 To prevent low output budgets from truncating compaction, this mode supplies `CLAUDE_CODE_MAX_OUTPUT_TOKENS` through its per-launch settings, defaulting to 8192. A larger positive whole-number value from the parent environment is preserved; a smaller value is raised to 8192. These per-launch settings take precedence over budget values in user/project files; use the parent environment for a larger budget. Neither the files nor the parent environment is changed. The budget applies to ordinary replies in this Local session as well as compaction. The CLI still applies model caps and remaining-context adjustments; the proxy does not raise request `max_tokens`. Your server must support the output budget. Launches without `-LocalMode` and diagnostic modes are unchanged.
 
 For this mode only, the upstream request uses non-streaming JSON with thinking disabled. The proxy strictly validates the configured response model and converts validated text/tool responses to CLI SSE when needed; IDs, ordered tool inputs, stop reasons, and token usage are preserved. `tool_use.provider_specific_fields` objects/null are preserved as opaque data when present. The CLI may omit them from later history; compatibility with servers that require this state is not established. Unknown response fields and thinking blocks are rejected rather than dropped. The default routing path is unchanged. CLI model/cost displays remain aliases and estimates; verify `route_selected` with `provider: local`. A blocked feature logs `local_mode_rejected`, never a Plan success.
@@ -194,7 +207,7 @@ Personal machine configurations, account usage, billing records, and live sessio
 
 ```powershell
 node --test tests/*.test.mjs
-python -m unittest discover -s tests -p test_local_config.py -v
+python -m unittest discover -s tests -p 'test_local_*.py' -v
 python openrouterAdvisor.py --self-test
 node --check claudeRouteProxy.mjs
 ```
@@ -221,6 +234,7 @@ See the [connection and recovery checklist](docs/LIVE-VALIDATION.ko.md) for a ge
 | `tests/claudeRouteProxy.test.mjs` | Synthetic proxy regression tests |
 | `tests/localLlmIntegration.test.mjs` | Real loopback HTTP tests with synthetic Messages servers and Plan responses |
 | `tests/test_local_config.py` | Configuration policy and model-metadata checks using synthetic HTTP servers |
+| `tests/test_local_lifecycle.py` | Windows synthetic CLI/launcher termination, proxy and connection cleanup |
 | `.env.local-llm.example` | Credential-free configuration template for an existing server |
 | `docs/HISTORY.ko.md` | Historical investigation notes, separate from current policy |
 

@@ -23,6 +23,24 @@ DEEPSEEK = "deepseek/deepseek-v4.1-flash-1017"
 PRO_MODELS = {"opus": "claude-opus-5-5", "haiku": "claude-haiku-5-5", "fable": "claude-fable-5-1"}
 PRO_SESSION_GATE = "CLAUDE_PRO_CONSULT_ENABLED"
 TOOL_NAME = "pro_consult"
+LOCAL_STARTUP_MESSAGES = {
+    "local_cli_not_found": "Claude Code executable not found. Install it or check PATH, then restart Local mode.",
+    "local_node_not_found": "Node.js executable not found. Install it or check PATH, then restart Local mode.",
+    "local_cli_unsupported": "Local CLI mode requires Claude Code 2.1.304 or later. Check claude --version.",
+    "local_cli_version_check_failed": "Could not check Claude Code version. Run claude --version and check executable permissions.",
+    "local_configuration_invalid": "Invalid Local configuration. Check .env.local-llm and process environment: Messages URL, HTTP approval, model, key format, and same-origin model-list URL. Values hidden.",
+    "local_output_budget_invalid": "Local output budget must be a positive integer. Check CLAUDE_CODE_MAX_OUTPUT_TOKENS.",
+    "local_proxy_start_failed": "Local routing proxy did not start. Check Node.js, proxy files, and loopback permissions, then restart Local mode.",
+    "local_cli_start_failed": "Could not start Claude Code. Check executable permissions and restart Local mode.",
+}
+
+
+class LocalStartupError(RuntimeError):
+    def __init__(self, code):
+        self.code = code
+        super().__init__(LOCAL_STARTUP_MESSAGES[code])
+
+
 TOOL = {
     "name": TOOL_NAME,
     "description": (
@@ -312,6 +330,8 @@ def routed_session(provider: str = "openrouter", local_only: bool = False):
         raise ValueError("Local CLI mode requires the local provider")
     claude = shutil.which("claude")
     if not claude:
+        if local_only:
+            raise LocalStartupError("local_cli_not_found")
         raise FileNotFoundError("Claude Code executable not found")
     env = clean_env() if local_only else os.environ.copy()
     for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER"):
@@ -335,22 +355,48 @@ def routed_session(provider: str = "openrouter", local_only: bool = False):
             raise RuntimeError("Existing first-party Plan login required; no API fallback")
     node = shutil.which("node")
     if not node:
+        if local_only:
+            raise LocalStartupError("local_node_not_found")
         raise FileNotFoundError("Node.js required for local routing")
     nonce = secrets.token_urlsafe(32)
     proxy_env = clean_env()
     for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER"):
         proxy_env.pop(name, None)
-    proxy_env.update(provider_config(provider), LOCAL_ROUTE_TOKEN=nonce, LOCAL_ROUTE_ONLY="1" if local_only else "0")
-    proxy = subprocess.Popen([node, str(ROOT / "claudeRouteProxy.mjs")], env=proxy_env,
-                             stdout=subprocess.PIPE, text=True, encoding="utf-8")
+    try:
+        config = provider_config(provider)
+    except (OSError, ValueError):
+        if local_only:
+            raise LocalStartupError("local_configuration_invalid") from None
+        raise
+    proxy_env.update(config, LOCAL_ROUTE_TOKEN=nonce, LOCAL_ROUTE_ONLY="1" if local_only else "0")
+    proxy_command = [node, str(ROOT / "claudeRouteProxy.mjs")]
+    if local_only:
+        proxy_command.append("--parent-pipe")
+    try:
+        proxy = subprocess.Popen(proxy_command, env=proxy_env,
+                                 **({"stdin": subprocess.PIPE} if local_only else {}),
+                                 stdout=subprocess.PIPE, text=True, encoding="utf-8")
+    except OSError:
+        if local_only:
+            raise LocalStartupError("local_proxy_start_failed") from None
+        raise
     ready = queue.Queue()
-    threading.Thread(target=lambda: ready.put(proxy.stdout.readline()), daemon=True).start()
+    def read_ready():
+        try:
+            ready.put(proxy.stdout.readline())
+        except (OSError, UnicodeError):
+            ready.put("")
+    threading.Thread(target=read_ready, daemon=True).start()
     try:
         try:
             port = json.loads(ready.get(timeout=15))["port"]
         except (queue.Empty, ValueError, KeyError, TypeError):
+            if local_only:
+                raise LocalStartupError("local_proxy_start_failed") from None
             raise RuntimeError("Local routing proxy did not start") from None
         if not isinstance(port, int) or not 1 <= port <= 65535:
+            if local_only:
+                raise LocalStartupError("local_proxy_start_failed")
             raise RuntimeError("Invalid local routing port")
         headers = env.get("ANTHROPIC_CUSTOM_HEADERS", "").strip()
         env.update({"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
@@ -367,6 +413,8 @@ def routed_session(provider: str = "openrouter", local_only: bool = False):
             proxy.kill()
             proxy.wait(timeout=5)
         proxy.stdout.close()
+        if local_only:
+            proxy.stdin.close()
 
 
 def hud_configuration() -> tuple[dict, list[str]]:
@@ -410,16 +458,19 @@ def diagnose_local() -> int:
 
 
 def local_cli_command(claude: str) -> list:
-    version = subprocess.run([claude, "--version"], capture_output=True, text=True, timeout=10, check=True)
+    try:
+        version = subprocess.run([claude, "--version"], capture_output=True, text=True, timeout=10, check=True)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        raise LocalStartupError("local_cli_version_check_failed") from None
     match = re.match(r"(\d+)\.(\d+)\.(\d+)", version.stdout.strip())
     if not match or tuple(map(int, match.groups())) < (2, 1, 304):
-        raise RuntimeError("Local CLI mode requires Claude Code 2.1.304 or later")
+        raise LocalStartupError("local_cli_unsupported")
     try:
         output_tokens = float(os.environ.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS") or "8192")
     except ValueError:
-        raise ValueError("Local output budget must be a positive integer") from None
+        raise LocalStartupError("local_output_budget_invalid") from None
     if not output_tokens.is_integer() or output_tokens <= 0:
-        raise ValueError("Local output budget must be a positive integer")
+        raise LocalStartupError("local_output_budget_invalid")
     # Set the budget before the CLI computes compaction and remaining context space.
     settings = {"alwaysThinkingEnabled": False, "env": {
         "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(max(8192, int(output_tokens)))}}
@@ -430,12 +481,17 @@ def local_cli_command(claude: str) -> list:
 def launch(provider: str = "openrouter", local_only: bool = False) -> int:
     claude = shutil.which("claude")
     if not claude:
+        if local_only:
+            raise LocalStartupError("local_cli_not_found")
         raise FileNotFoundError("Claude Code executable not found")
     if local_only:
         print("Local CLI mode: built-in file/shell tools; native integrations disabled. No Plan fallback.")
         command = local_cli_command(claude)
         with routed_session(provider, local_only=True) as env:
-            return subprocess.call(command, env=env)
+            try:
+                return subprocess.call(command, env=env)
+            except OSError:
+                raise LocalStartupError("local_cli_start_failed") from None
     print(f"Sonnet replacement: {provider}. Opus/Haiku/Fable keep Claude Plan OAuth.")
     print("Initial request + 3 retries, then Plan fallback (subscription Sonnet); recovery checked on a later request.")
     print("Native-only features stay on Plan. Replacement replies are buffered until validated.")
@@ -652,6 +708,10 @@ if __name__ == "__main__":
                 print(json.dumps(result))
                 sys.exit(0 if result["local_check"] else 1)
             sys.exit(launch(options.provider, local_only=options.local_mode))
+    except LocalStartupError as exc:
+        print(json.dumps({"event": "openrouter_start_failed", "kind": type(exc).__name__,
+                          "code": exc.code, "message": str(exc)}), file=sys.stderr)
+        sys.exit(1)
     except (OSError, RuntimeError, EOFError, ValueError, subprocess.SubprocessError) as exc:
         print(json.dumps({"event": "openrouter_start_failed", "kind": type(exc).__name__}), file=sys.stderr)
         sys.exit(1)

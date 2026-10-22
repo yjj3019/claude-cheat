@@ -5,9 +5,11 @@ import importlib.util
 import io
 import json
 import os
+import runpy
 from pathlib import Path
 import tempfile
 import threading
+import sys
 import unittest
 from unittest import mock
 import urllib.error
@@ -140,6 +142,18 @@ class LocalDiagnosticTests(LocalTestCase):
 
 
 class LocalCliModeTests(LocalTestCase):
+    def test_missing_cli_keeps_ordinary_errors_and_classifies_only_local_mode(self):
+        with mock.patch.object(route.shutil, "which", return_value=None):
+            with self.assertRaises(FileNotFoundError):
+                route.pro_command()
+            with self.assertRaises(FileNotFoundError):
+                with route.routed_session("local"):
+                    self.fail("Missing CLI must fail before session")
+            with self.assertRaises(route.LocalStartupError) as result:
+                with route.routed_session("local", local_only=True):
+                    self.fail("Missing CLI must fail before Local session")
+            self.assertEqual(result.exception.code, "local_cli_not_found")
+
     def test_local_mode_preserves_only_proxy_credentials_and_never_queries_plan_auth(self):
         self.configure(LOCAL_LLM_API_KEY="private-local-key")
         os.environ.update({"ANTHROPIC_AUTH_TOKEN": "private-plan-key", "ANTHROPIC_API_KEY": "private-api-key",
@@ -196,8 +210,96 @@ class LocalCliModeTests(LocalTestCase):
     def test_local_output_budget_rejects_invalid_values(self):
         for value in ("invalid", "0", "-1", "1.5", "nan", "inf", "1e999"):
             with self.subTest(value=value), mock.patch.dict(os.environ, {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": value}), mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.304 (Claude Code)")):
-                with self.assertRaisesRegex(ValueError, "Local output budget must be a positive integer"):
+                with self.assertRaisesRegex(route.LocalStartupError, "Local output budget must be a positive integer"):
                     route.local_cli_command("synthetic-cli")
+
+    def test_local_startup_failures_report_fixed_codes_without_environment_or_exception_values(self):
+        for label, version, which, config_error, spawn_error, ready, expected in [
+            ("missing CLI", "2.1.304", lambda _: None, None, None, "", "local_cli_not_found"),
+            ("missing Node", "2.1.304", lambda n: "synthetic-cli" if n == "claude" else None, None, None, "", "local_node_not_found"),
+            ("old CLI", "2.1.303", lambda _: "synthetic-cli", None, None, "", "local_cli_unsupported"),
+            ("bad version", "private-exception-marker", lambda _: "synthetic-cli", None, None, "", "local_cli_unsupported"),
+            ("bad config", "2.1.304", lambda _: "synthetic-cli", ValueError("private-exception-marker"), None, "", "local_configuration_invalid"),
+            ("proxy spawn", "2.1.304", lambda _: "synthetic-cli", None, OSError("private-exception-marker"), "", "local_proxy_start_failed"),
+            ("proxy EOF", "2.1.304", lambda _: "synthetic-cli", None, None, "", "local_proxy_start_failed"),
+            ("proxy unreadable output", "2.1.304", lambda _: "synthetic-cli", None, None, UnicodeError("private-exception-marker"), "local_proxy_start_failed"),
+            ("proxy invalid JSON", "2.1.304", lambda _: "synthetic-cli", None, None, "private-exception-marker", "local_proxy_start_failed"),
+            ("proxy invalid port", "2.1.304", lambda _: "synthetic-cli", None, None, '{"port":0}', "local_proxy_start_failed"),
+            ("CLI spawn", "2.1.304", lambda _: "synthetic-cli", None, None, '{"port":12345}', "local_cli_start_failed"),
+        ]:
+            with self.subTest(label=label):
+                proxy = mock.Mock()
+                if isinstance(ready, Exception):
+                    proxy.stdout.readline.side_effect = ready
+                else:
+                    proxy.stdout.readline.return_value = ready
+                out, err = io.StringIO(), io.StringIO()
+                config = {"SONNET_PROVIDER": "local", "LOCAL_LLM_URL": "http://127.0.0.1:9/v1/messages",
+                          "LOCAL_LLM_MODEL": "private-model-marker", "LOCAL_LLM_API_KEY": "private-key-marker"}
+                is_file = Path.is_file
+                # run_path exercises the actual CLI error handler, with every external action replaced.
+                with mock.patch.object(sys, "argv", [str(SPEC.origin), "--provider", "local", "--local-mode"]), \
+                     mock.patch("shutil.which", side_effect=which), \
+                     mock.patch("subprocess.run", return_value=mock.Mock(stdout=version)), \
+                     mock.patch("subprocess.Popen", side_effect=spawn_error, return_value=proxy), \
+                     mock.patch("subprocess.call", side_effect=OSError("private-exception-marker")), \
+                     mock.patch.object(Path, "home", return_value=self.root), \
+                     mock.patch.object(Path, "is_file", lambda p: False if p.name == ".env.local-llm" else is_file(p)), \
+                     mock.patch.dict(os.environ, config), \
+                     contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    # Invalid configuration is supplied by the existing boundary validator.
+                    if config_error:
+                        os.environ["LOCAL_LLM_URL"] = "private-exception-marker"
+                    with self.assertRaises(SystemExit) as exit_result:
+                        runpy.run_path(str(SPEC.origin), run_name="__main__")
+                self.assertEqual(exit_result.exception.code, 1)
+                diagnostic = json.loads(err.getvalue())
+                self.assertEqual(diagnostic["event"], "openrouter_start_failed")
+                self.assertEqual(diagnostic["kind"], "LocalStartupError")
+                self.assertEqual(diagnostic["code"], expected)
+                self.assertEqual(diagnostic["message"], route.LOCAL_STARTUP_MESSAGES[expected])
+                for hidden in ("private-exception-marker", "private-key-marker", "private-model-marker", config["LOCAL_LLM_URL"]):
+                    self.assertNotIn(hidden, out.getvalue() + err.getvalue())
+
+    def test_local_version_check_errors_and_budget_have_safe_startup_codes(self):
+        for failure in (OSError("private-marker"), route.subprocess.TimeoutExpired("private-marker", 10),
+                        route.subprocess.CalledProcessError(1, "private-marker")):
+            with self.subTest(failure=type(failure).__name__), mock.patch.object(route.subprocess, "run", side_effect=failure):
+                with self.assertRaises(route.LocalStartupError) as result:
+                    route.local_cli_command("synthetic-cli")
+                self.assertEqual(result.exception.code, "local_cli_version_check_failed")
+                self.assertNotIn("private-marker", str(result.exception))
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "private-marker"}), mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.304")):
+            with self.assertRaises(route.LocalStartupError) as result:
+                route.local_cli_command("synthetic-cli")
+            self.assertEqual(result.exception.code, "local_output_budget_invalid")
+
+    def test_local_parent_pipe_is_opt_in_and_closed_during_cleanup(self):
+        self.configure()
+        proxy = mock.Mock()
+        proxy.stdout.readline.return_value = '{"port":12345}'
+        with mock.patch.object(route.Path, "home", return_value=self.root), mock.patch.object(route.shutil, "which", return_value="synthetic-cli"), mock.patch.object(route.subprocess, "Popen", return_value=proxy) as spawn:
+            with route.routed_session("local", local_only=True):
+                self.assertEqual(spawn.call_args.args[0][-1], "--parent-pipe")
+                self.assertEqual(spawn.call_args.kwargs["stdin"], route.subprocess.PIPE)
+        proxy.stdin.close.assert_called_once()
+        proxy.terminate.assert_called_once()
+
+    def test_local_proxy_startup_deadline_cleans_up_without_exposing_output(self):
+        self.configure()
+        proxy = mock.Mock()
+        proxy.stdout.readline.return_value = "private-output-marker"
+        ready = mock.Mock()
+        ready.get.side_effect = route.queue.Empty
+        with mock.patch.object(route.Path, "home", return_value=self.root), mock.patch.object(route.shutil, "which", return_value="synthetic-cli"), mock.patch.object(route.subprocess, "Popen", return_value=proxy), mock.patch.object(route.queue, "Queue", return_value=ready):
+            with self.assertRaises(route.LocalStartupError) as result:
+                with route.routed_session("local", local_only=True):
+                    self.fail("Unready proxy must not start CLI")
+        self.assertEqual(result.exception.code, "local_proxy_start_failed")
+        self.assertNotIn("private-output-marker", str(result.exception))
+        ready.get.assert_called_once_with(timeout=15)
+        proxy.terminate.assert_called_once()
+        proxy.stdin.close.assert_called_once()
 
     def test_ordinary_launch_preserves_existing_output_budget(self):
         env = {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "2048"}

@@ -216,6 +216,19 @@ Local 실패 안내는 아래 코드로 구분합니다. 실패 뒤 기본 대�
 
 CLI의 후속 요청 때문에 최초 오류 대신 대기 안내가 마지막에 표시될 수 있어, 대기 안내에도 직전 원인을 남깁니다. `local_mode_rejected` 로그의 `code`, `retry_after_seconds`, `previous_error_code`로도 확인할 수 있습니다. 복구 확인 중에는 남은 시간을 임의로 표시하지 않습니다. 오류 응답의 HTTP 400·`api_error` 형식과 기존 CLI 재시도 정책은 유지하며, 안내에 서버 응답 원문·주소·키를 포함하지 않습니다.
 
+추론을 시작하기 전의 실패는 `openrouter_start_failed` 이벤트에 고정 `code`와 조치 안내를 추가합니다. 종료 코드는 1이며, 원문 예외·주소·키는 출력하지 않습니다. 이 안내는 `-LocalMode`에 적용하고 일반 실행·진단 모드는 유지합니다.
+
+| 시작 오류 코드 | 확인할 내용 |
+|---|---|
+| `local_cli_not_found` / `local_node_not_found` | Claude Code·Node.js 설치와 PATH |
+| `local_cli_unsupported` / `local_cli_version_check_failed` | `claude --version`, 최소 2.1.304, 실행 권한 |
+| `local_configuration_invalid` | `.env.local-llm`과 환경변수의 URL·HTTP 허용·모델·키 형식·모델 목록 origin |
+| `local_output_budget_invalid` | `CLAUDE_CODE_MAX_OUTPUT_TOKENS`가 양의 정수인지 확인 |
+| `local_proxy_start_failed` | Node.js·프록시 파일·루프백 접근 권한. 준비 제한 시간은 기존 15초 유지 |
+| `local_cli_start_failed` | Claude Code 실행 권한과 설치 상태 |
+
+Local 전용 프록시는 실행기와의 부모 파이프가 닫히면 즉시 종료합니다. 실행기가 강제 종료되어 `finally` 정리가 실행되지 않아도 프록시·포트·진행 중 연결을 정리합니다. `local_parent_disconnected` 이벤트로 구분합니다. 이 감시는 프록시만 소유하며, 실행기만 강제 종료할 때 남을 수 있는 CLI·Bash 자식까지 종료하지는 않습니다. 일반 종료와 Ctrl+C를 우선 사용하세요. [비정상 종료 검증 범위](docs/LIVE-VALIDATION.ko.md#실행-전-오류와-비정상-종료-점검)를 참고하세요.
+
 출력 예산 부족으로 압축이 중단되지 않도록 이 모드의 실행 시 설정에 `CLAUDE_CODE_MAX_OUTPUT_TOKENS`를 기본 8,192로 지정합니다. 부모 프로세스에서 지정한 양의 정수 예산이 더 크면 유지하고, 더 작으면 8,192로 올립니다. 이 실행 시 설정은 사용자·프로젝트 파일의 예산보다 우선하므로, 더 큰 예산은 부모 환경변수로 지정하세요. 파일이나 부모 환경은 수정하지 않습니다. 압축뿐 아니라 이 Local 세션의 일반 출력에도 적용됩니다. CLI의 모델별 상한과 컨텍스트 여유에 따른 조정은 그대로 적용하며, 프록시에서 `max_tokens`를 강제로 올리지 않습니다. 서버도 해당 출력 예산을 지원해야 합니다. `-LocalMode`가 없는 기존 실행과 진단 모드는 바뀌지 않습니다.
 
 Local 응답은 JSON으로 받아 설정한 모델을 검증한 뒤 CLI용 SSE로 변환합니다. 도구 인자·순서·종료 사유·사용량을 보존하고, 서버 전용 `tool_use.provider_specific_fields`는 object/null일 때만 보존합니다. CLI가 후속 이력에서 이 필드를 생략할 수 있으며, 해당 상태가 필수인 서버는 별도 검증이 필요합니다. 모르는 응답 필드나 thinking 블록은 삭제하지 않고 거절합니다. `interleaved-thinking-2025-05-14`·`effort-2025-11-24` 호환 헤더 2개만 이 모드에서 추가 허용합니다.
@@ -302,7 +315,7 @@ claude
 
 ```powershell
 node --test tests/*.test.mjs
-python -m unittest discover -s tests -p test_local_config.py -v
+python -m unittest discover -s tests -p 'test_local_*.py' -v
 python openrouterAdvisor.py --self-test
 node --check claudeRouteProxy.mjs
 ```
@@ -330,6 +343,7 @@ node --check claudeRouteProxy.mjs
 | [tests/claudeRouteProxy.test.mjs](tests/claudeRouteProxy.test.mjs) | 프록시 합성 회귀 검사 |
 | [tests/localLlmIntegration.test.mjs](tests/localLlmIntegration.test.mjs) | loopback HTTP 서버를 사용하는 합성 통합 검사 |
 | [tests/test_local_config.py](tests/test_local_config.py) | Local 설정과 메타데이터 점검 검사 |
+| [tests/test_local_lifecycle.py](tests/test_local_lifecycle.py) | Windows 합성 CLI·실행기 강제 종료 후 프록시·연결 정리 검사 |
 | [docs/HISTORY.ko.md](docs/HISTORY.ko.md) | 이전 구현·진단 기록; 현재 정책과 구분 |
 
 `openrouterAdvisor.py`라는 이름은 이전 구현에서 유지한 이름입니다. 별도 상담 도구와 Claude Code의 네이티브 advisor는 같은 기능이 아닙니다. 개인 진단 스크립트·로그인 파일·실제 API 키·개인 설정은 배포하지 않습니다.

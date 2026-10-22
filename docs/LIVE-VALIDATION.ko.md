@@ -8,7 +8,7 @@
 
 ```powershell
 node --test tests/*.test.mjs
-python -m unittest discover -s tests -p test_local_config.py -v
+python -m unittest discover -s tests -p 'test_local_*.py' -v
 python openrouterAdvisor.py --self-test
 ```
 
@@ -146,9 +146,37 @@ Local 전용 모드의 오류 안내를 타임아웃, 인증·접근 실패(401/
 
 CLI가 추가 요청을 보내면서 최초 오류 대신 대기 안내를 마지막에 표시하는 동작을 관찰했습니다. 따라서 대기 안내에도 직전 원인을 유지합니다. 복구 확인 중 동시 요청은 확인 중 안내가 마지막에 표시될 수 있으며, 최종 원인은 후속 요청이나 `local_mode_rejected` 로그에서 확인합니다. 개인 환경 정보와 원시 대화 이력은 공개하지 않습니다. 실제 LLM 서버 내부 연산 취소는 계속 미검증입니다.
 
+## 실행 전 오류와 비정상 종료 점검
+
+Local 전용 모드의 실행 전 오류에 고정 `code`와 조치 안내를 추가했습니다. CLI·Node 누락, CLI 버전 미달·버전 확인 실패, 잘못된 설정·출력 예산, 프록시·CLI 시작 실패를 구분합니다. 기존 `openrouter_start_failed` 이벤트와 종료 코드 1을 유지하고, 이 경우 `kind`는 `LocalStartupError`입니다. 원문 예외·명령 출력·설정값을 안내에 포함하지 않습니다. 일반 실행과 진단 모드의 오류 형식은 유지합니다.
+
+기존 코드에서 합성 설정으로 실행기만 강제 종료했을 때 프록시 리스너가 남는 현상을 재현했습니다. Local 실행기가 프록시에만 부모 파이프를 전달하고, 프록시 실행부가 그 파이프의 EOF·오류·닫힘을 감지하면 즉시 종료하도록 보완했습니다. 일반 실행, 진단 실행과 import한 `createProxy`에는 감시를 추가하지 않습니다. 기존 정상 종료의 `finally` 정리와 프록시 준비 제한 15초도 유지합니다.
+
+공개 `tests/test_local_lifecycle.py`는 Windows에서 실제 Python 실행기·Node 프록시와 합성 CLI·루프백 HTTP 서버를 사용합니다. 대기 상태와 불완전한 HTTP 본문 수신 상태에서 CLI 또는 실행기를 각각 종료합니다. Windows 프로세스 핸들로 생성한 시험 프로세스만 종료·관측하며, 실제 LLM 서버나 개인 설정을 사용하지 않습니다.
+
+| 종료 조건 | 관찰 결과 |
+|---|---|
+| 합성 CLI 강제 종료 | 실행기 반환, 프록시 종료, 리스너 닫힘 |
+| 실행기 강제 종료 | 부모 파이프 닫힘으로 프록시 종료, 리스너 닫힘 |
+| 위 두 조건의 HTTP 본문 수신 중 종료 | 루프백 서버의 연결 종료 감지, Local 요청 1회, Plan 전환 없음 |
+| 실행기만 종료한 뒤 합성 CLI | 잔존 관측. 시험에서 보유한 핸들로 별도 정리 |
+| 일반 모드에 파이프 옵션을 전달한 대조 시험 | stdin EOF 후에도 리스너 유지. Local 전용 조건 확인 |
+
+실제 Claude Code 2.1.304도 격리한 설정·작업 폴더와 Windows ConPTY의 대화형 TTY에서 확인했습니다. 실제 CLI만 강제 종료하자 실행기·프록시가 종료되고 포트가 닫혔습니다. 실행기만 강제 종료하자 프록시·포트는 정리됐고 실제 CLI는 남았습니다. 이 CLI는 시험 종료 시 별도로 정리했습니다. 추론 요청은 보내지 않았으며, 실제 서버 설정·키를 사용하거나 Plan 로그인을 조회하지 않았습니다.
+
+Node 회귀 테스트 257개, Python 설정·시작 오류 테스트 30개, Windows 프로세스 종료 테스트 3개, Python 자체 검사와 Node/Python 구문 검사가 통과했습니다. 시작 오류 테스트는 실제 CLI 오류 처리 경로의 종료 코드·고정 문구·비밀값 비노출을 검사하며, 기존 Plan·일반 경로의 CLI 미설치 오류도 유지하는지 확인합니다. 정상 종료와 Ctrl+C의 실제 TTY 결과는 앞선 기록에 있으며, 이번 TTY는 강제 프로세스 종료에 한정했습니다.
+
+이 변경은 Local 프록시·리스너·연결의 소유권 정리입니다. 실행기만 강제 종료할 때 CLI 또는 Bash 작업 트리 전체를 종료시키는 기능은 포함하지 않습니다. Windows Terminal 창 자체의 닫기, OS 종료·전원 장애는 직접 시험하지 않았습니다. 임시 CLI 설정·작업 폴더는 정리하고 원시 이력과 개인 환경 정보는 공개하지 않습니다.
+
 ## English
 
 This document contains reusable validation procedures and a limited synthetic-input run summary. Keep machine details, credentials, account usage, billing records, session identifiers, and raw diagnostics private. Separate synthetic regression checks from explicitly authorized live validation; metadata checks do not prove inference or full native-feature compatibility.
+
+Local-only startup failures now add a fixed code and action message to the existing `openrouter_start_failed` event, with `kind: LocalStartupError` and exit code 1. Missing CLI/Node, unsupported or unreadable CLI version, invalid configuration/output budget, proxy startup, and CLI spawn failures are distinguished without echoing exception text or configuration values. Ordinary launches and diagnostics retain their error format.
+
+A synthetic baseline reproduced an orphaned proxy listener after killing only the Python launcher. The Local-only launcher now owns a stdin pipe to its proxy; EOF/error/closure ends the proxy immediately. Ordinary launches, diagnostics, and imported `createProxy` instances do not acquire this behavior. Three public Windows lifecycle tests use actual Python/Node processes, synthetic CLI/upstream fixtures, and retained process handles. Killing either CLI or launcher while idle or receiving an incomplete HTTP body closed the proxy listener and active connection, with one Local call and no Plan fallback. Ordinary mode ignored the pipe option, as intended.
+
+Separate interactive Windows ConPTY checks used real Claude Code 2.1.304 and isolated synthetic settings without inference requests or Plan login. Killing the CLI ended the launcher and proxy and closed the port. Killing only the launcher ended the proxy and closed the port, but left the CLI alive; the test then cleaned it explicitly. All 257 Node tests, 30 Python configuration/startup tests, three Windows lifecycle tests, Python self-tests, and syntax checks passed. Whole CLI/Bash process-tree termination is outside this pipe guard. Actual terminal-window closure, OS shutdown, and power loss were not tested. Temporary CLI settings and workspaces were removed; private environment information remains unpublished.
 
 Local-only error guidance distinguishes timeouts, HTTP 401/403 authentication/access failures, empty responses, other upstream failures, cooldowns with the previous cause and rounded remaining seconds, and an active recovery probe. HTTP 400, the `api_error` envelope, one upstream attempt, the 30-second cooldown, the 120-second production deadline, existing launch commands, and zero Plan fallback remain unchanged. All 257 Node tests, 25 Python configuration tests, Python self-tests, and Node syntax checks passed. Regression cases include empty/blank HTTP bodies, HTTP 204, empty content, blank text, invalid JSON, connection/body timeouts, wait rounding, zero cooldown, concurrent probes, cause updates, and redaction.
 
