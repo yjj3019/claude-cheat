@@ -77,7 +77,31 @@ Local 모드는 요청당 120초를 허용합니다. 시간 초과 시 한 번 �
 
 시간 초과 시 해당 요청은 실패했고, 기본 30초 회로 차단 시간이 지난 뒤 보낸 새 요청에서 복구했습니다. 실패한 요청을 자동으로 완료한 것으로 해석해서는 안 됩니다. 처음 제시한 합성 정보는 후속 입력이나 파일로 다시 제공하지 않았습니다. 압축 경계, 실제 파일 수정, 새 Read 값과 Bash 출력으로 작업 재개를 확인했습니다. 관련 시간 초과·회로 차단 회귀 테스트 7개와 결과 로그의 수치 정합성 검사도 통과했습니다.
 
-자연 발생 서버 지연, 서버 측 진행 작업의 취소 처리, 응답 본문 수신 도중의 시간 초과는 이 시험에서 검증하지 않았습니다. 원문 로그·테스트용 실행 파일·개인 설정은 공개하지 않습니다.
+이 시험은 응답 헤더 수신 전 지연을 사용했습니다. 본문 수신 도중의 시간 초과는 다음 별도 시험에서 점검했으며, 자연 발생 서버 지연과 실제 LLM 내부 연산 취소는 미검증입니다. 원문 로그·테스트용 실행 파일·개인 설정은 공개하지 않습니다.
+
+## 응답 본문 수신 중 시간 초과와 복구
+
+코드 `a23cc65`, Claude Code 2.1.304에서 422.57초 동안 별도로 점검했습니다. 같은 `stream-json` CLI·Local 전용 프록시, 자동 압축 창 `100k`, 출력 예산 8,192와 기본 120초 제한을 유지했습니다. 기존 실행 코드와 개인 설정은 변경하지 않았습니다.
+
+요청 하나만 실제 HTTP 연결을 사용하는 임시 루프백 시험 서버로 보냈습니다. 이 서버는 HTTP 200 헤더와 불완전한 JSON 본문 일부를 보낸 뒤 나머지 본문을 멈췄습니다. 프록시가 실제 본문 reader로 해당 바이트를 읽은 것을 확인했으며, 본문 전체를 먼저 읽는 관측기는 이 요청에 사용하지 않았습니다. 시험 서버에는 인증 정보나 대화 본문을 전달하지 않았고, 복구 이후에는 정상 Local LLM 서버로 요청했습니다.
+
+| 항목 | 관찰 결과 |
+|---|---|
+| 시간 초과 전 본문 수신 | 73바이트 |
+| 본문 수신 중 시간 초과 | 1회, 120.000초에 `attempt_timeout` 발생 |
+| 본문 reader 취소 | 2회 호출, 시간 초과 요청은 1개 |
+| 시험 서버의 연결 종료 감지 | 요청 시작 후 120.004초, 응답 미완료 상태 |
+| 시험 서버의 합성 작업 | 연결 종료 시 중단, 이후 작업 카운터 증가 없음 |
+| 합성 부분 응답 노출 / Plan 라우팅 | 각각 0회 |
+| 같은 Local 세션 복구 | 35초 대기 후 새 요청 성공, CLI·프록시 재시작 없음 |
+| 복구 후 대용량 자동 압축 / Read·Edit·Bash 작업 묶음 | 2회 / 3회 성공 |
+| 전체 정보·파일 유지 확인 | 7회 일치 |
+
+시간 초과 전 도구 작업 1회를 포함하면 도구 작업 묶음은 총 4회 성공했습니다. 의도한 시간 초과 외에 추가 서버 실패는 없었습니다. 처음 제시한 합성 정보를 다시 주입하지 않고 회상을 확인했으며, HTTP 본문 시간 초과·연결 취소 관련 회귀 테스트 5개와 결과 수치 정합성 검사도 통과했습니다. 임시 작업 디렉터리는 정리했습니다.
+
+실제 LLM API도 별도로 점검했습니다. 스트림의 `message_start` 본문을 받은 뒤 `message_stop`이나 EOF를 받기 전에 클라이언트가 취소했고, 후속 요청의 모델·응답 일치를 확인했습니다. 텍스트 토큰 도착이나 내부 연산 중단을 확인한 시험은 아닙니다. 앞선 별도 탐색 요청은 취소 전에 스트림이 끝나, 수신 중 취소의 통과 근거에서 제외했습니다.
+
+**실제 LLM 서버 내부 연산 취소는 미검증입니다.** 시험 서버의 연결 종료 감지·합성 작업 중단과 실제 API의 클라이언트 취소를 구분해야 합니다. 제공받은 API 문서·엔드포인트·키만으로는 내부 작업 상태를 확인할 수 없었으며, 서버 로그나 작업 지표 없이 추론 연산 중단을 확정하지 않습니다. 원문 로그·테스트 도구·내부 주소·키·개인 설정은 공개하지 않습니다.
 
 ## English
 
@@ -85,4 +109,8 @@ This document contains reusable validation procedures and a limited synthetic-in
 
 At commit `5401a96`, Claude Code 2.1.304 kept one CLI process and one Local-only proxy running for 3,621.83 seconds using stream-json input, a 100k auto-compaction window, and an 8,192 output budget. The run completed 11 large automatic compactions (out of 22 automatic boundaries), 40 Read/Edit/Bash rounds, and 52 retention checks. Of 157 upstream requests, none timed out at 120 seconds; the slowest completed in 114.416 seconds. There were no Plan routes. One HTTP 200 response had empty content; a short request after a 35-second cooldown recovered in the same process, and subsequent work continued. This was a run with a recovered failure, not an error-free pass. Timeout recovery was not exercised during that run; a separate injected-stall test is described below. Visual interactive-terminal behavior and longer runs remain unverified. A separate setup run had an unresolved recall-check failure and is excluded from these counts.
 
-At commit `2ee1cfd`, a separate 445.65-second run used Claude Code 2.1.304 with the same stream-json, 100k compaction window, and 8,192 output budget. A test-only connection function stalled one request until the unchanged production deadline aborted it at 120.006 seconds; that request was not sent to the actual server. After a 35-second cooldown, a new request recovered against the real Local server in the same CLI and proxy processes. Two large automatic compactions and three Read/Edit/Bash rounds then succeeded. Across the run, all seven retention checks passed; there were no additional upstream failures or Plan routes. Seven related timeout/circuit regression tests and evidence consistency checks also passed. The failed request itself was not automatically completed. Production launch code and personal settings were unchanged. Naturally occurring server delays, server-side cancellation, and timeouts while receiving response bodies were not exercised by this test. Raw logs and private settings remain unpublished.
+At commit `2ee1cfd`, a separate 445.65-second run used Claude Code 2.1.304 with the same stream-json, 100k compaction window, and 8,192 output budget. A test-only connection function stalled one request until the unchanged production deadline aborted it at 120.006 seconds; that request was not sent to the actual server. After a 35-second cooldown, a new request recovered against the real Local server in the same CLI and proxy processes. Two large automatic compactions and three Read/Edit/Bash rounds then succeeded. Across the run, all seven retention checks passed; there were no additional upstream failures or Plan routes. Seven related timeout/circuit regression tests and evidence consistency checks also passed. The failed request itself was not automatically completed. Production launch code and personal settings were unchanged. This test stalled before response headers; body-receive timeouts were checked separately below. Naturally occurring server delays and actual LLM computation cancellation remain unverified. Raw logs and private settings remain unpublished.
+
+At commit `a23cc65`, a separate 422.57-second run used Claude Code 2.1.304 with the same stream-json, 100k compaction window, 8,192 output budget, and unchanged 120-second deadline. One request used a real HTTP connection to a temporary loopback fixture that sent headers and 73 bytes of partial JSON, then stalled. No configured credentials or conversation body were sent to the fixture. The production body reader consumed those bytes before the deadline fired at 120.000 seconds. Reader cancellation was called twice for that one request. The fixture observed the unfinished response connection closing at 120.004 seconds and stopped its synthetic work, with no subsequent counter growth. No partial content reached the CLI, and there were no Plan routes. After a 35-second cooldown, the same CLI and proxy processes recovered against the real Local server; two large automatic compactions and three Read/Edit/Bash rounds succeeded. All seven retention checks passed, with no additional upstream failure. Five related HTTP timeout/cancellation regression tests and evidence consistency checks passed; temporary workspaces were cleaned up. Production code and personal settings were unchanged.
+
+A separate real-API probe cancelled on `message_start`, before `message_stop` or EOF, and confirmed a subsequent inference's model and reply. It did not establish text-token arrival or computation cancellation. An earlier probe reached stream completion before cancellation and was excluded as proof of cancellation during reception. **Actual LLM server computation cancellation remains unverified.** Fixture socket closure and synthetic job cleanup do not establish backend inference termination. The provided API documentation, endpoint, and key do not expose the server-side job evidence needed to confirm it. Raw logs, test tools, internal addresses, keys, and private settings remain unpublished.
