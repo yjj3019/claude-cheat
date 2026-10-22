@@ -590,6 +590,8 @@ for (const [label, body, path = '/v1/messages', headers = proHeaders] of [
       localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-local' });
     const response = await request(body, { path, headers });
     assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { type: 'error', error: { type: 'api_error',
+      message: 'Local-only mode cannot route this request; Plan fallback disabled' } });
     assert.equal(calls.length, 0);
   });
 }
@@ -627,6 +629,91 @@ for (const failure of ['HTTP error', 'timeout']) {
     assert.equal(calls[0].url, 'http://127.0.0.1:11434/v1/messages');
   });
 }
+
+for (const [label, upstream, code, description] of [
+  ['HTTP 401', () => new Response('private-response-marker', { status: 401 }), 'local_authentication_failed', /API key and access permissions/],
+  ['HTTP 403', () => new Response('private-response-marker', { status: 403 }), 'local_authentication_failed', /API key and access permissions/],
+  ['empty HTTP body', () => new Response(''), 'local_empty_response', /empty response/],
+  ['blank HTTP body', () => new Response(' \r\n '), 'local_empty_response', /empty response/],
+  ['HTTP 204', () => new Response(null, { status: 204 }), 'local_empty_response', /empty response/],
+  ['empty content', () => Response.json({ type: 'message', model: 'private-model-fixture', content: [], stop_reason: 'end_turn' }), 'local_empty_response', /empty response/],
+  ['blank text', () => Response.json({ type: 'message', model: 'private-model-fixture', content: [{ type: 'text', text: '  ' }], stop_reason: 'end_turn' }), 'local_empty_response', /empty response/],
+  ['HTTP 500', () => new Response('private-response-marker', { status: 500 }), 'local_upstream_error', /request failed/],
+  ['connection failure', () => { throw new Error('private-response-marker'); }, 'local_upstream_error', /request failed/],
+  ['invalid JSON', () => new Response('private-response-marker'), 'local_upstream_error', /request failed/],
+  ['fetch timeout', () => new Promise(() => {}), 'local_timeout', /timed out/],
+  ['body timeout', () => new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('{')); } })), 'local_timeout', /timed out/],
+]) {
+  test(`Local-only ${label} reports a safe cause and rounded cooldown without changing retry policy`, async t => {
+    const log = t.mock.method(console, 'error', () => {});
+    let time = 1000;
+    const { calls, request } = await fixture(t, upstream, { provider: 'local', localOnly: true,
+      localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'private-model-fixture', localKey: KEY,
+      now: () => time, cooldownMs: 30000, attemptTimeoutMs: 10 });
+    const failed = await request(requestBody(SONNET), { headers: proHeaders });
+    assert.equal(failed.status, 400);
+    const error = await failed.json();
+    assert.deepEqual(Object.keys(error).sort(), ['error', 'type']);
+    assert.deepEqual(Object.keys(error.error).sort(), ['message', 'type']);
+    assert.equal(error.type, 'error');
+    assert.equal(error.error.type, 'api_error');
+    assert.match(error.error.message, new RegExp(`^\\[${code}\\]`));
+    assert.match(error.error.message, description);
+    assert.match(error.error.message, /Wait 30 seconds before a new request/);
+    assert.match(error.error.message, /Plan fallback disabled/);
+    assert.equal(failed.headers.get('retry-after'), null, 'SDK retry headers are unchanged');
+    time += 12345;
+    const waiting = await request(requestBody(SONNET), { headers: proHeaders });
+    assert.equal(waiting.status, 400);
+    const waitingMessage = (await waiting.json()).error.message;
+    assert.match(waitingMessage, /^\[local_cooldown\].*Wait 18 seconds/);
+    assert.match(waitingMessage, description, 'CLI follow-up requests must not hide the original failure cause');
+    time += 17654;
+    const almostReady = await request(requestBody(SONNET), { headers: proHeaders });
+    assert.equal(almostReady.status, 400);
+    assert.match((await almostReady.json()).error.message, /Wait 1 second before a new request/);
+    assert.equal(calls.length, 1, 'failure and cooldown must never retry upstream or call Plan');
+    const entries = log.mock.calls.map(call => JSON.parse(call.arguments[0]));
+    assert.ok(entries.some(e => e.event === 'local_mode_rejected' && e.code === code && e.retry_after_seconds === 30));
+    assert.ok(entries.some(e => e.event === 'local_mode_rejected' && e.code === 'local_cooldown' && e.retry_after_seconds === 18 && e.previous_error_code === code));
+    const output = JSON.stringify({ error, entries });
+    for (const value of [KEY, NONCE, OAUTH, 'private-response-marker', 'private-model-fixture', '127.0.0.1'])
+      assert.equal(output.includes(value), false, 'response and diagnostics must not expose configured or upstream data');
+  });
+}
+
+test('Local-only zero cooldown gives a new-request hint without inventing a wait', async t => {
+  const { calls, request } = await fixture(t, () => new Response('failure', { status: 503 }), {
+    provider: 'local', localOnly: true, localUrl: 'http://127.0.0.1:11434/v1/messages',
+    localModel: 'fixture-local', now: () => 1000, cooldownMs: 0 });
+  const failed = await request(requestBody(SONNET), { headers: proHeaders });
+  assert.equal(failed.status, 400);
+  const message = (await failed.json()).error.message;
+  assert.match(message, /Send a new request to check Local recovery/);
+  assert.doesNotMatch(message, /Wait 0/);
+  assert.equal((await request(requestBody(SONNET), { headers: proHeaders })).status, 400);
+  assert.equal(calls.length, 2);
+});
+
+test('Local-only cooldown tracks the latest failure after a failed probe and later recovery', async t => {
+  let time = 1000, status = 500;
+  const { calls, request } = await fixture(t, (url, options) => status === 200 ? jsonResponse(url, options) : new Response('private-error-marker', { status }), {
+    provider: 'local', localOnly: true, localUrl: 'http://127.0.0.1:11434/v1/messages',
+    localModel: 'fixture-local', now: () => time, cooldownMs: 10 });
+  const send = () => request(requestBody(SONNET), { headers: proHeaders });
+  assert.match((await (await send()).json()).error.message, /^\[local_upstream_error\]/);
+  time += 11; status = 401;
+  assert.match((await (await send()).json()).error.message, /^\[local_authentication_failed\]/);
+  assert.match((await (await send()).json()).error.message, /^\[local_cooldown\].*authentication failed/);
+  time += 11; status = 200;
+  assert.equal((await send()).status, 200);
+  status = 500;
+  assert.match((await (await send()).json()).error.message, /^\[local_upstream_error\]/);
+  const waiting = (await (await send()).json()).error.message;
+  assert.match(waiting, /^\[local_cooldown\].*request failed/);
+  assert.doesNotMatch(waiting, /authentication failed/);
+  assert.equal(calls.length, 4);
+});
 
 for (const localOnly of [false, true]) {
   test(`thinking/effort beta compatibility is limited to Local-only mode (${localOnly})`, async t => {

@@ -126,9 +126,33 @@ node --test --test-name-pattern="Local-only body timeout|client cancellation clo
 
 TTY의 초기 키 확인은 프록시용 임시 키에만 적용했고, 사용자 설정이나 실제 서버 키를 변경하지 않았습니다. 입력 전달에는 붙여넣기 구분과 Enter 키의 CSI-u 표현을 사용했습니다. 실제 Windows Terminal 창의 시각적 배치, 창 강제 닫기와 OS 종료는 이 시험에 포함하지 않았습니다. 임시 CLI 이력·설정·작업 폴더는 정리했으며, 개인 환경 정보는 공개하지 않습니다. 실제 LLM 서버 내부 연산 취소는 계속 미검증입니다.
 
+## Local 오류 안내 점검
+
+Local 전용 모드의 오류 안내를 타임아웃, 인증·접근 실패(401/403), 빈 응답, 기타 upstream 실패로 구분했습니다. 재요청 대기 안내에는 직전 실패 원인과 남은 초를 표시하고, 다른 요청의 복구 확인이 진행 중이면 별도 안내를 표시합니다. HTTP 400·`api_error` 응답 형식, Local 단일 시도, 기본 대기시간 30초와 요청 제한 120초는 유지합니다. 기존 실행 명령과 Plan 전환 차단도 유지합니다.
+
+공개 회귀 테스트는 HTTP 401/403/500, 연결 실패, 잘못된 JSON, 빈 HTTP 본문·공백 본문·204, 빈 content·공백 text, 연결·본문 타임아웃을 확인합니다. 남은 대기시간의 올림, 대기시간 0, 단일 복구 확인, 복구 실패 후 원인 갱신과 성공 후 새 실패, 기존 네이티브 기능 거절 문구도 검사합니다. 오류 응답과 로그에 합성 키·모델·주소·서버 본문이 포함되지 않는지 확인합니다. 전체 Node 테스트 257개, Python 설정 테스트 25개, Python 자체 검사와 Node 구문 검사가 통과했습니다.
+
+실제 CLI 표시 검증은 Claude Code 2.1.304와 Windows ConPTY의 대화형 TTY에서 수행했습니다. 격리한 임시 설정과 합성 작업 폴더에서 기존 Local 실행 경로와 기본 권한 확인을 사용했습니다. upstream은 합성 응답으로 대체했고, 시험용 제한 25ms와 주입한 시계로 대기 만료를 앞당겼습니다. 실제 서버 인증 실패나 120초 타임아웃을 다시 일으킨 시험은 아닙니다.
+
+| 항목 | 관찰 결과 |
+|---|---|
+| 인증 실패 | 키·접근 권한 확인과 설정 변경 후 재시작 안내 표시 |
+| 재요청 대기 | 직전 인증 실패 원인 유지, 남은 시간 30초·18초 표시, 대기 중 upstream 추가 호출 없음 |
+| 빈 응답 | 대기 안내에도 빈 응답 원인 표시 |
+| 타임아웃 | 대기 안내에도 시간 초과 원인 표시 |
+| 복구 확인 중 동시 요청 | `local_recovery_in_progress` 표시, 임의의 남은 초 표시 없음 |
+| 대기 만료 후 새 요청 | 같은 CLI·프록시에서 합성 성공 응답 `LOCAL_ERROR_RECOVERED` 확인 |
+| 종료와 라우팅 | `/exit` 종료 코드 0, CLI·프록시 종료와 리스너 닫힘 확인, Plan 호출 0회 |
+
+CLI가 추가 요청을 보내면서 최초 오류 대신 대기 안내를 마지막에 표시하는 동작을 관찰했습니다. 따라서 대기 안내에도 직전 원인을 유지합니다. 복구 확인 중 동시 요청은 확인 중 안내가 마지막에 표시될 수 있으며, 최종 원인은 후속 요청이나 `local_mode_rejected` 로그에서 확인합니다. 개인 환경 정보와 원시 대화 이력은 공개하지 않습니다. 실제 LLM 서버 내부 연산 취소는 계속 미검증입니다.
+
 ## English
 
 This document contains reusable validation procedures and a limited synthetic-input run summary. Keep machine details, credentials, account usage, billing records, session identifiers, and raw diagnostics private. Separate synthetic regression checks from explicitly authorized live validation; metadata checks do not prove inference or full native-feature compatibility.
+
+Local-only error guidance distinguishes timeouts, HTTP 401/403 authentication/access failures, empty responses, other upstream failures, cooldowns with the previous cause and rounded remaining seconds, and an active recovery probe. HTTP 400, the `api_error` envelope, one upstream attempt, the 30-second cooldown, the 120-second production deadline, existing launch commands, and zero Plan fallback remain unchanged. All 257 Node tests, 25 Python configuration tests, Python self-tests, and Node syntax checks passed. Regression cases include empty/blank HTTP bodies, HTTP 204, empty content, blank text, invalid JSON, connection/body timeouts, wait rounding, zero cooldown, concurrent probes, cause updates, and redaction.
+
+Interactive Claude Code 2.1.304 in Windows ConPTY displayed authentication, empty-response, timeout, 30/18-second cooldown, and recovery-in-progress guidance. CLI follow-up requests sometimes made cooldown guidance the final visible error; it retained the previous cause. After the injected clock passed the cooldown, the same CLI/proxy returned the exact synthetic recovery reply. Plan calls were zero; `/exit` returned 0, both processes stopped, and the listener closed. This UI test used synthetic upstream responses and a test-only 25ms deadline, not new real-server failures or another 120-second wait. Personal settings were unchanged. Actual LLM computation cancellation remains unverified.
 
 At commit `5401a96`, Claude Code 2.1.304 kept one CLI process and one Local-only proxy running for 3,621.83 seconds using stream-json input, a 100k auto-compaction window, and an 8,192 output budget. The run completed 11 large automatic compactions (out of 22 automatic boundaries), 40 Read/Edit/Bash rounds, and 52 retention checks. Of 157 upstream requests, none timed out at 120 seconds; the slowest completed in 114.416 seconds. There were no Plan routes. One HTTP 200 response had empty content; a short request after a 35-second cooldown recovered in the same process, and subsequent work continued. This was a run with a recovered failure, not an error-free pass. Timeout recovery was not exercised during that run; a separate injected-stall test is described below. Visual interactive-terminal behavior and longer runs remain unverified. A separate setup run had an unresolved recall-check failure and is excluded from these counts.
 

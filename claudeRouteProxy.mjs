@@ -110,7 +110,8 @@ function localEndpoint(value, allowRemote, httpUrl) {
 }
 
 async function bufferedResponse(upstream, model, clientModel, stream, signal) {
-  if (!upstream.ok || !upstream.body) throw new Error('External request failed');
+  if (!upstream.ok) throw new Error('External request failed');
+  if (!upstream.body) throw new Error('Empty message response');
   const sse = (upstream.headers.get('content-type') || '').includes('text/event-stream');
   if (stream === true && !sse) throw new Error('Invalid response');
   const reader = upstream.body.getReader();
@@ -148,6 +149,7 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal) {
     reader.releaseLock();
   }
   const text = Buffer.concat(chunks).toString('utf8');
+  if (!text.trim()) throw new Error('Empty message response');
   if (!sse) {
     const response = JSON.parse(text);
     if (response.type !== 'message' || response.model !== model || !Array.isArray(response.content) ||
@@ -301,7 +303,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   if (!isSonnet(fallbackModel)) throw new Error('Fallback must be a native Sonnet model');
   for (const value of [retryDelayMs, cooldownMs, attemptTimeoutMs])
     if (!Number.isFinite(value) || value < 0) throw new Error('Invalid routing timeout');
-  let openUntil = 0, probing = false, generation = 0;
+  let openUntil = 0, probing = false, generation = 0, lastLocalFailure = 'upstream_error';
   const server = http.createServer(async (req, res) => {
     const reject = (status, message) => {
       if (res.destroyed) return;
@@ -337,9 +339,33 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           /^[a-z][a-z0-9-]{0,63}-20\d{2}-[01]\d-[0-3]\d$/.test(value) &&
           !/(?:^|-)(?:sk|key|token|secret|password|bearer)(?:-|$)/.test(value) ? value : '[redacted]');
         if (localOnly) {
+          let message = 'Local-only mode cannot route this request; Plan fallback disabled';
+          let code, retryAfterSeconds, previousErrorCode;
+          if (reason === 'fallback' || reason === 'circuit_open') {
+            const remaining = Math.max(0, Math.ceil((openUntil - now()) / 1000));
+            const recoveryInProgress = reason === 'circuit_open' && probing && remaining === 0;
+            const descriptions = {
+              timeout: ['local_timeout', 'Local request timed out.'],
+              authentication_failed: ['local_authentication_failed', 'Local server authentication failed. Check the Local API key and access permissions; restart the Local session after changing credentials.'],
+              empty_response: ['local_empty_response', 'Local server returned an empty response.'],
+              upstream_error: ['local_upstream_error', 'Local server request failed. Check the local routing log.'],
+            };
+            let description;
+            [code, description] = reason === 'fallback' ? descriptions[detail] || descriptions.upstream_error :
+              recoveryInProgress ? ['local_recovery_in_progress', 'Local recovery check is in progress. Wait for it to finish before sending a new request.'] :
+                ['local_cooldown', `Local retry cooldown is active. Previous failure: ${(descriptions[lastLocalFailure] || descriptions.upstream_error)[1]}`];
+            if (reason === 'circuit_open') previousErrorCode = (descriptions[lastLocalFailure] || descriptions.upstream_error)[0];
+            if (!recoveryInProgress) retryAfterSeconds = remaining;
+            const retryHint = recoveryInProgress ? '' : remaining > 0 ?
+              ` Wait ${remaining} second${remaining === 1 ? '' : 's'} before a new request.` :
+              ' Send a new request to check Local recovery.';
+            message = `[${code}] ${description}${retryHint} Plan fallback disabled.`;
+          }
           console.error(JSON.stringify({ event: 'local_mode_rejected', provider: 'local', reason, ...(detail ? { detail } : {}),
+            ...(code ? { code } : {}), ...(retryAfterSeconds !== undefined ? { retry_after_seconds: retryAfterSeconds } : {}),
+            ...(previousErrorCode ? { previous_error_code: previousErrorCode } : {}),
             ...(betas.length ? { beta_features: betaFeatures, unsupported_beta_count: betas.length } : {}) }));
-          return reject(400, 'Local-only mode cannot route this request; Plan fallback disabled');
+          return reject(400, message);
         }
         if (!oauthOK) return reject(403, 'Saved subscription OAuth required');
         client.signal.throwIfAborted();
@@ -382,7 +408,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       const probe = Boolean(openUntil);
       if (probe) probing = true;
       const claimedGeneration = generation;
-      let succeeded = false;
+      let succeeded = false, localFailure = 'upstream_error';
       try {
         const externalModel = provider === 'local' ? localModel : DEEPSEEK;
         const externalBody = { ...body, model: externalModel };
@@ -452,6 +478,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               'Empty message response': 'empty_response', 'Invalid message response': 'invalid_message',
               'Invalid stream metadata': 'invalid_stream_metadata', 'Expected JSON Local response': 'expected_json', 'Unsupported Local response content': 'unsupported_local_content',
               'Local thinking response disabled': 'thinking_response', 'Unsupported Local response fields': 'unsupported_content_fields' }[error?.message];
+            if (localOnly) localFailure = controller.signal.reason === 'attempt_timeout' ? 'timeout' :
+              status === 401 || status === 403 ? 'authentication_failed' : validation === 'empty_response' ? 'empty_response' : 'upstream_error';
             console.error(JSON.stringify({ event: 'external_attempt_failed', provider, attempt: attempt + 1,
               ...(Number.isInteger(status) ? { status } : {}), ...(validation ? { validation } : {}),
               category: controller.signal.reason === 'attempt_timeout' ? 'timeout' : 'upstream' }));
@@ -466,12 +494,13 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           }), client.signal);
         }
         generation++;
+        if (localOnly) lastLocalFailure = localFailure;
         openUntil = now() + cooldownMs;
         console.error(JSON.stringify({ event: 'circuit_open', provider }));
       } finally {
         if (probe) probing = false;
       }
-      if (!succeeded) await sendPro('fallback');
+      if (!succeeded) await sendPro('fallback', localOnly ? localFailure : undefined);
     } catch {
       if (!client.signal.aborted) {
         console.error(JSON.stringify({ event: 'route_failed', category: 'upstream' }));
