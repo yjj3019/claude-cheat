@@ -177,26 +177,45 @@ class LocalCliModeTests(LocalTestCase):
         with mock.patch.object(route.Path, "home", return_value=self.root), mock.patch.object(route.shutil, "which", return_value="synthetic-cli"), mock.patch.object(route.subprocess, "Popen", return_value=proxy) as start:
             with route.routed_session("local", local_only=True) as env:
                 self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:12345")
-                self.assertNotEqual(env["ANTHROPIC_API_KEY"], "private-api-key")
+                self.assertNotEqual(env["ANTHROPIC_AUTH_TOKEN"], "private-plan-key")
+                self.assertEqual(env["ANTHROPIC_CUSTOM_HEADERS"], "X-Local-Route-Token: " + env["ANTHROPIC_AUTH_TOKEN"])
+                self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(self.root / ".claude"))
                 self.assertEqual(env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "1")
                 self.assertEqual(env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"], "1")
+                self.assertEqual(env["CLAUDE_CODE_AUTO_CONNECT_IDE"], "false")
+                self.assertEqual(env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "1")
+                self.assertEqual(env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"], "1")
                 for name in ("LOCAL_LLM_API_KEY", "LOCAL_LLM_URL", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODEL",
-                             "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "OPENROUTER_API_KEY"):
+                             "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENROUTER_API_KEY"):
                     self.assertNotIn(name, env)
                 proxy_env = start.call_args.kwargs["env"]
                 self.assertEqual(proxy_env["LOCAL_ROUTE_ONLY"], "1")
                 self.assertEqual(proxy_env["LOCAL_LLM_API_KEY"], "private-local-key")
                 self.assertNotIn("ANTHROPIC_API_KEY", proxy_env)
+                self.assertNotIn("ANTHROPIC_AUTH_TOKEN", proxy_env)
         proxy.terminate.assert_called_once()
 
-    def test_local_cli_command_requires_supported_bare_version_and_retains_permission_checks(self):
+    def test_local_cli_command_isolates_customizations_without_hiding_file_tools_or_permission_rules(self):
         for version in ("2.1.304", "2.1.305"):
             with self.subTest(version=version), mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout=version + " (Claude Code)")):
                 command = route.local_cli_command("synthetic-cli")
-                self.assertIn("--bare", command)
-                self.assertIn("default", command)
+                self.assertIn("--safe-mode", command)
+                self.assertNotIn("--bare", command)
+                self.assertEqual(command[command.index("--permission-mode") + 1], "default")
                 self.assertNotIn("--dangerously-skip-permissions", command)
-                self.assertIn("Read", command[command.index("--tools") + 1])
+                self.assertNotIn("--allowedTools", command)
+                self.assertNotIn("--setting-sources", command)
+                self.assertEqual(command[command.index("--tools") + 1], "Bash,Read,Edit,Write,Glob,Grep")
+                self.assertIn("--strict-mcp-config", command)
+                self.assertEqual(json.loads(command[command.index("--mcp-config") + 1]), {"mcpServers": {}})
+                self.assertEqual(command[command.index("--disallowedTools") + 1], "mcp__*")
+                self.assertNotIn("--disable-slash-commands", command)  # Keep built-in /compact and /exit.
+                self.assertIn("--no-chrome", command)
+                settings = json.loads(command[command.index("--settings") + 1])
+                self.assertTrue(settings["disableAllHooks"])
+                self.assertFalse(settings["autoMemoryEnabled"])
+                self.assertEqual(settings["apiKeyHelper"], "")
+                self.assertNotIn("permissions", settings)
         for version in ("2.1.183", "2.1.286", "2.1.303", "invalid-version"):
             with self.subTest(version=version), mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout=version)):
                 with self.assertRaisesRegex(RuntimeError, "requires Claude Code 2.1.304 or later"):

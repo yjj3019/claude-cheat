@@ -61,8 +61,11 @@ function externalExclusion(body, beta, localOnly = false) {
   // Unknown betas/fields and native history belong to the subscription API. Never strip them.
   if (unsupportedBetas(beta, localOnly).length) return 'unsupported_beta';
   if (Object.keys(body).some(name => !BASIC_FIELDS.has(name))) return 'unsupported_request_field';
+  // Local CLI adds plain system reminders; preserve their role and text without stripping.
   if (!Array.isArray(body.messages) || body.messages.some(message => !message ||
-      !['user', 'assistant'].includes(message.role) || Object.keys(message).some(name => !['role', 'content'].includes(name)))) return 'unsupported_message_shape';
+      (!['user', 'assistant'].includes(message.role) && !(localOnly && message.role === 'system' &&
+        typeof message.content === 'string' && message.content.trim())) ||
+      Object.keys(message).some(name => !['role', 'content'].includes(name)))) return 'unsupported_message_shape';
   if (body.thinking && (!['enabled', 'disabled', 'adaptive'].includes(body.thinking.type) || Object.keys(body.thinking).some(name => !['type', 'budget_tokens'].includes(name)))) return 'unsupported_thinking_config';
   if (body.output_config && Object.keys(body.output_config).some(name => name !== 'effort')) return 'unsupported_output_config';
   if (body.tool_choice && Object.keys(body.tool_choice).some(name => !['type', 'name', 'disable_parallel_tool_use'].includes(name))) return 'unsupported_tool_choice';

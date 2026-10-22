@@ -49,7 +49,7 @@ def spawn(args,**kwargs):
     global proxy
     if args[0] == 'synthetic-cli':
         env=kwargs['env']
-        child=original([sys.executable,'-u','-c',cli_code,mode,env['ANTHROPIC_BASE_URL'],env['ANTHROPIC_API_KEY'],bash],stdin=sys.stdin,stdout=sys.stdout,stderr=sys.stderr,**kwargs)
+        child=original([sys.executable,'-u','-c',cli_code,mode,env['ANTHROPIC_BASE_URL'],env['ANTHROPIC_AUTH_TOKEN'],bash],stdin=sys.stdin,stdout=sys.stdout,stderr=sys.stderr,**kwargs)
         print(json.dumps({'proxy_pid':proxy.pid,'cli_pid':child.pid,'guardian_pid':a.localProcessTree._guardian.pid,'port':urlsplit(env['ANTHROPIC_BASE_URL']).port}),flush=True)
         return child
     proxy=original(args,**kwargs)

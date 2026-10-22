@@ -214,9 +214,71 @@ Node 257개와 Python 41개(설정·시작 오류·감시 36개, Windows 종료 
 
 임시 설정·원시 이력·작업 폴더는 정리하고 주소·API 키·모델명·세션 식별자는 공개 기록에서 제외했습니다. 실제 LLM 서버 내부 연산 취소는 이번 시험 범위에서 제외했습니다. 이 시험으로 긴 대화·압축·다른 CLI 버전을 다시 검증한 것은 아닙니다.
 
+## Local 모드 Write·Glob·Grep와 한글·공백 경로 점검 (2026-10-23)
+
+**이전 버전의 판정: 해당 도구 미제공으로 경로 조합 검증을 진행하지 못했습니다.** `0bce716`의 기존 Local 실행 함수·운영 프록시와 실제 Claude Code 2.1.304 Windows ConPTY를 사용했습니다. 실제 설정의 Local 서버로만 요청했고 Plan 로그인이나 전환은 사용하지 않았습니다. 이 최초 점검에서는 실행 코드를 변경하지 않았습니다. 이후 개선 결과는 다음 절에 기록했습니다.
+
+한글과 공백이 들어간 임시 작업 폴더에 영문 기준·공백·한글·한글과 공백의 네 경로를 준비했습니다. Write로 파일을 만든 뒤 Glob 일치·미일치와 Grep 한글 검색·미일치를 확인할 계획이었으나, 영문 최소 경로의 Write 요청부터 도구를 사용할 수 없다는 응답을 받았습니다. Glob·Grep 명시 요청도 같은 결과였습니다. Bash나 Edit로 대체하지 않았으며 파일 생성 성공으로 집계하지 않았습니다.
+
+모델의 설명만으로 판정하지 않고, 진단용 fetch 관측 모듈로 운영 프록시가 실제 서버에 전달하는 도구 이름을 확인했습니다. 원래 fetch와 요청·응답·취소 신호는 그대로 사용하고 이름만 집계했습니다. 관측한 사용자 요청 3개에는 모두 Bash/Edit/Read만 있었고 Write/Glob/Grep는 없었습니다. 프록시는 요청 도구의 스키마를 보정할 뿐 이름을 제거하지 않습니다.
+
+[공식 bare 모드 문서](https://code.claude.com/docs/en/headless#start-faster-with-bare-mode)와 [환경 변수 문서의 `CLAUDE_CODE_SIMPLE`](https://code.claude.com/docs/en/env-vars)는 bare 모드가 Bash·파일 읽기·파일 편집으로 도구를 제한한다고 설명합니다. 이번 실제 요청과 일치합니다. 실행기에 여섯 도구 이름을 지정해도 이 bare 제한이 확장되지는 않았습니다. 앞선 README의 여섯 도구 사용 가능 안내를 Bash/Read/Edit로 정정했습니다.
+
+| 확인 항목 | 결과 |
+|---|---|
+| 실제 Local 라우팅 | 사용자 요청 3개와 배경 요청 1개, 총 4회 성공 |
+| 사용자 요청의 제공 도구 | Bash/Edit/Read만 관측, Write/Glob/Grep 미제공 |
+| 실제 도구 호출·대상 파일 생성 | 각각 0회·0개, 사전 준비한 비교 파일 변경 없음 |
+| 네 경로의 UTF-8 내용·Glob·Grep 결과 | 도구 미제공으로 미검증 |
+| upstream 실패·회로 열림·Local 거절·Plan 라우팅 | 모두 0회 |
+| 공개 도구·스키마·Local HTTP 회귀 테스트 | 48개 통과, 실제 CLI 도구 제공 검증과는 구분 |
+| 종료 | 단일 세션에서 `/exit` 코드 0, 보관한 핸들로 실행기·CLI·프록시·감시 종료와 포트 닫힘 확인 |
+
+관측 모듈의 Windows 경로를 URI로 교정하기 전 준비 실패는 위 실행 결과에 포함하지 않았습니다. 최초 점검에서는 기존 실행 명령, `--bare`, 기본 권한 확인, 120초 제한과 Plan 전환 차단을 유지했습니다. 아래 호환성 개선 전의 결과입니다.
+
+임시 설정·원시 이력·작업 폴더는 정리하고, 실제 서버 주소·API 키·모델명·세션 식별자는 공개 기록에 포함하지 않았습니다. 서버 내부 연산 취소와 다른 CLI 버전은 이번 점검 범위에서 제외했습니다.
+
+## Local 모드 파일 도구 호환성 개선 (2026-10-23)
+
+**판정: 실제 CLI·Local 서버에서 Write·Glob·Grep와 네 경로 조합이 통과했습니다.** 기존 명령의 `-LocalMode`에만 `--safe-mode`를 적용해 bare 모드의 세 도구 제한을 해결했습니다. 일반 실행·진단 모드, 최소 CLI 2.1.304, 기본 권한 확인, 출력 예산 하한 8,192, 120초 제한, 실패 후 대기 30초, 프록시의 단일 시도와 Plan 전환 차단은 유지했습니다.
+
+Safe 모드는 사용자·프로젝트의 플러그인·skills·subagents·CLAUDE.md 자동 탐색을 제한합니다. hooks·자동 메모리 비활성화, 빈 strict MCP 설정과 MCP 도구 차단, IDE 자동 연결·Chrome·배경 작업 제한도 명시했습니다. 기존 설정 소스와 config 디렉터리를 보존해 deny/ask 권한 규칙을 계속 읽습니다. 관리 정책의 hooks·명령 예외는 CLI 정책을 따르며, 이번 호스트의 검증으로 그 예외까지 차단했다고 판단하지 않습니다. [공식 CLI 문서](https://code.claude.com/docs/en/cli-reference)를 참고하세요.
+
+CLI 인증에는 프록시 전용 임시 Bearer 토큰을 사용합니다. 저장된 OAuth와 API 키 helper를 넣은 합성 설정에서도 관측한 요청 16개 모두 이 토큰을 사용했습니다. Bearer 우선순위만으로 helper의 시작 시 실행까지 막지는 못해, 이 실행의 `apiKeyHelper`를 빈 값으로 덮어썼습니다. 개인 설정 파일은 수정하지 않습니다. [공식 인증 우선순위](https://code.claude.com/docs/en/authentication#authentication-precedence)를 참고하세요.
+
+실제 CLI는 `messages` 배열 중간에도 문자열 system 안내를 넣었습니다. Local 전용 검증 경계에서 비어 있지 않은 문자열이며 role/content만 가진 경우에 한해 그대로 전달합니다. 역할 변경·상단 이동·내용 삭제는 하지 않습니다. 블록 배열·도구·thinking·추가 필드·빈 값·다른 역할은 계속 거절하며, 일반 모드의 네이티브 제외 판단도 유지합니다. 실제 서버에 이 메시지 형태를 보내 모델과 응답을 확인한 뒤 CLI 검증을 진행했습니다.
+
+Windows ConPTY의 실제 Claude Code 2.1.304와 운영 실행 함수·프록시를 사용했습니다. 추론은 실제 설정의 Local 서버로만 보냈고, 임시 설정·작업 폴더에는 합성 데이터만 넣었습니다. CLI는 단일 세션·단일 프로세스로 유지했고 print 모드·자동 승인·권한 우회는 사용하지 않았습니다. 관측 모듈은 요청·응답·취소 신호를 바꾸지 않고 도구 이름·인증 일치 여부·구조만 확인했습니다.
+
+| 확인 항목 | 결과 |
+|---|---|
+| 경로 행렬 | 영문, 공백, 한글, 한글과 공백의 4종. 작업 루트에도 한글·공백 포함 |
+| Write | 네 대상 파일의 UTF-8 바이트가 기대값과 일치 |
+| Glob | 네 대상 일치 및 없는 파일 패턴의 미일치 확인, 비교용 `.log` 파일 미포함 |
+| Grep | 네 대상의 한글 표식과 기대값 검색, 없는 표식의 미일치 확인 |
+| 권한 보존 | Write는 매번 1회 승인, 기존 Grep ask 규칙도 승인 요청. Read deny와 Edit deny에 해당하는 Write는 거절, 보호 파일 변경·내용 노출 없음 |
+| 압축 후 연속 작업 | `/compact` 경계 1회 뒤 같은 세션에서 새 한글·공백 파일의 Write·Glob·Grep 성공 |
+| 도구 집계 | 성공 18건: Write 5·Glob 6·Grep 7. 의도한 Read·Write 거절 2건은 성공에서 제외 |
+| 추가 Grep | 압축 후 CLI 이력 조회 1건 포함. 원래 경로 행렬이나 자동 메모리 로딩으로 집계하지 않음 |
+| 네이티브 격리 | 실행 가능한지 사전 확인한 hook/helper/MCP 표식의 실행 0회, CLAUDE.md·skill 안내의 프롬프트 유입 0회 |
+| 라우팅 | Local 성공 15회, upstream 실패·회로 열림·Plan 전환 0회 |
+| 네이티브 요청 거절 | 압축 과정의 `fallback-credit-2026-06-01` beta 1회 차단 후 호환 요청으로 압축 완료. 무오류 실행으로 집계하지 않음 |
+| 정상 종료 | `/exit` 코드 0. 보관한 핸들로 실행기·CLI·프록시·감시 종료 및 포트 닫힘 확인 |
+| 공개 회귀 검증 | Node 266개·Python Local 41개 통과, Python self-test·Node 구문 검사 통과 |
+
+새 공개 테스트 9개는 plain system 전달 보존 1개, 잘못된 system 메시지 차단 7개, 일반 모드 제외 유지 1개입니다. 실행 설정·자격 정보 분리·종료 fixture도 새 임시 Bearer 방식에 맞춰 검증했습니다. 준비 중 발견한 helper 실행, 관측 파일 교체 충돌, 수정 전 system 메시지 거절은 위 통과 결과에서 제외했습니다. Glob은 상대 경로를 반환하므로 관측 검증기도 절대 경로만 기대하던 조건을 교정했습니다.
+
+임시 설정·원시 이력·작업 폴더를 정리하고 공개 기록에서 내부 주소·키·모델명·세션 식별자를 제외했습니다. 다른 CLI 버전, 관리 정책 환경, 이번 변경을 적용한 시간 단위 장시간 실행·반복 자동 압축·새 120초 타임아웃 시험은 미검증입니다. 기존 장시간·타임아웃 기록은 해당 버전의 이력으로 유지합니다. 실제 LLM 서버 내부 연산 취소도 계속 미검증입니다.
+
 ## English
 
+The updated Local-only mode uses safe mode to expose all six file/shell tools while retaining existing deny/ask rules and explicitly restricting native integrations. Real Claude Code 2.1.304 in Windows ConPTY and the configured Local server passed all four Write/Glob/Grep path cases, negative searches, UTF-8 byte checks, permission denials, and Write/Glob/Grep continuation after one manual compaction. There were 18 successful tool results and two intentional permission denials; Local routes succeeded 15 times with no upstream failure or Plan route. One unsupported fallback-credit beta request was rejected before a compatible compaction request succeeded. All 16 observed CLI requests used the synthetic proxy Bearer token; hook/helper/MCP canaries did not execute. `/exit` returned zero, retained handles confirmed the owned tree exited, and the listener closed. All 266 Node tests, 41 Python Local tests, self-tests, and Node syntax checks passed. Temporary test data was removed and private configuration remains unpublished. Other versions, managed-policy exceptions, new hour-long/repeated-auto-compaction runs, and new 120-second timeout runs were not checked. Actual backend computation cancellation remains unverified.
+
 This document contains reusable validation procedures and a limited synthetic-input run summary. Keep machine details, credentials, account usage, billing records, session identifiers, and raw diagnostics private. Separate synthetic regression checks from explicitly authorized live validation; metadata checks do not prove inference or full native-feature compatibility.
+
+The following bare-mode result is historical (`0bce716`), before the compatibility fix above.
+
+The 2026-10-23 Write/Glob/Grep path check could not proceed: real Claude Code 2.1.304 in the existing Local bare mode offered only Bash/Edit/Read. A name-only fetch observer confirmed this on three actual user requests to the configured Local server; a background request also succeeded. No requested tool ran and no target file was created, so the four ASCII/space/Korean/combined path cases remain unverified. The [official bare-mode reference](https://code.claude.com/docs/en/headless#start-faster-with-bare-mode) documents the same restricted tool set. The README's earlier six-tool availability claim was corrected. All 48 selected tool/schema/Local-HTTP regression tests passed, but do not prove CLI tool availability. Upstream failures, circuit openings, Local rejections, and Plan routes were zero. `/exit` returned 0 and retained handles confirmed the full owned tree exited and the listener closed. The observer URI setup failure is excluded. Production code, default permissions, native restrictions, the 120-second deadline, and zero Plan fallback were preserved. Temporary settings/history/workspaces were removed; private configuration values remain unpublished. Server computation cancellation and other CLI versions were outside this check.
 
 The isolated Ctrl+C recheck on 2026-10-22 used real Claude Code 2.1.304 in Windows ConPTY with the existing Job-protected Local launch function and production proxy. Exactly one matching user/tool request stalled after a partial JSON body; background requests succeeded immediately. Ctrl+C closed that connection. The next user request reached the test relay 4.598 seconds later, without cooldown, and actual configured Local inference completed in 0.779 seconds with the configured model and exact reply confirmed. The CLI restored the cancelled input into its editor, and the follow-up instruction was appended before submission. The same CLI/proxy/guardian and a single session history were maintained. Incidental errors, upstream failures, circuit openings, Local rejections, and Plan routes were all zero. `/exit` returned 0; retained handles confirmed all four owned processes exited and the proxy listener closed. Both public HTTP cancellation tests passed. Production code, the 120-second deadline, and the 30-second failure cooldown were unchanged. Misclassified-background and sandbox-network setup runs are excluded from the passing result. Temporary settings/history/workspaces were removed, and private configuration values remain unpublished. Actual server computation cancellation was excluded; this check does not repeat compaction, long-run, or other-version validation.
 

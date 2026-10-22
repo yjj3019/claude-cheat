@@ -404,8 +404,11 @@ def routed_session(provider: str = "openrouter", local_only: bool = False):
         env.update({"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
                     "ANTHROPIC_CUSTOM_HEADERS": (headers + "\n" if headers else "") + f"X-Local-Route-Token: {nonce}"})
         if local_only:
-            env.update(ANTHROPIC_API_KEY=nonce, CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="1",
-                       CLAUDE_CODE_DISABLE_ADVISOR_TOOL="1", MAX_THINKING_TOKENS="0")
+            # A proxy Bearer token takes precedence over saved OAuth and API-key helpers.
+            env.update(ANTHROPIC_AUTH_TOKEN=nonce, CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="1",
+                       CLAUDE_CODE_DISABLE_ADVISOR_TOOL="1", MAX_THINKING_TOKENS="0",
+                       CLAUDE_CODE_AUTO_CONNECT_IDE="false", CLAUDE_CODE_DISABLE_BACKGROUND_TASKS="1",
+                       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
         yield env
     finally:
         proxy.terminate()
@@ -473,11 +476,15 @@ def local_cli_command(claude: str) -> list:
         raise LocalStartupError("local_output_budget_invalid") from None
     if not output_tokens.is_integer() or output_tokens <= 0:
         raise LocalStartupError("local_output_budget_invalid")
-    # Set the budget before the CLI computes compaction and remaining context space.
-    settings = {"alwaysThinkingEnabled": False, "env": {
+    # Set the budget before context calculation; safe mode still probes API-key helpers at startup.
+    settings = {"alwaysThinkingEnabled": False, "disableAllHooks": True, "autoMemoryEnabled": False,
+                "apiKeyHelper": "", "env": {
         "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(max(8192, int(output_tokens)))}}
-    return [claude, "--bare", "--model", "sonnet", "--permission-mode", "default",
-            "--tools", "Bash,Read,Edit,Write,Glob,Grep", "--settings", json.dumps(settings)]
+    # Safe mode keeps all file tools; retain setting sources so deny/ask rules still apply.
+    return [claude, "--safe-mode", "--model", "sonnet", "--permission-mode", "default",
+            "--tools", "Bash,Read,Edit,Write,Glob,Grep", "--disallowedTools", "mcp__*",
+            "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+            "--no-chrome", "--settings", json.dumps(settings)]
 
 
 def launch(provider: str = "openrouter", local_only: bool = False) -> int:

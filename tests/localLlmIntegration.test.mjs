@@ -292,6 +292,49 @@ test('Local-only body timeout closes HTTP, blocks cooldown and concurrent probes
   assert.equal(f.proCalls.length, 0, 'no failure, cooldown, probe or tool turn may invoke Plan');
 });
 
+test('Local-only preserves plain system text between user and tool turns', { timeout: 5000 }, async t => {
+  const messages = [
+    { role: 'user', content: '한글 자료/검색 결과.txt를 확인하세요.' },
+    { role: 'system', content: 'Keep the existing permission checks and use only the offered tools.' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'fixture-search', name: 'Grep', input: { path: '한글 자료/검색 결과.txt', pattern: '검색표식=' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'fixture-search', content: '검색표식=fixture' }] },
+  ];
+  const f = await fixture(t, (_req, res) => json(res, message()), { localOnly: true });
+  const response = await f.request({ messages });
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.deepEqual(f.localCalls[0].body.messages, messages, 'do not strip, relocate, or downgrade system messages');
+  assert.equal(f.proCalls.length, 0);
+});
+
+for (const [label, system] of [
+  ['text blocks', { role: 'system', content: [{ type: 'text', text: 'fixture' }] }],
+  ['tool blocks', { role: 'system', content: [{ type: 'tool_use', id: 'fixture', name: 'Write', input: {} }] }],
+  ['thinking blocks', { role: 'system', content: [{ type: 'thinking', thinking: 'fixture' }] }],
+  ['extra fields', { role: 'system', content: 'fixture', metadata: {} }],
+  ['blank text', { role: 'system', content: ' \n ' }],
+  ['null content', { role: 'system', content: null }],
+  ['other role', { role: 'developer', content: 'fixture' }],
+]) {
+  test(`Local-only rejects non-plain system messages: ${label}`, { timeout: 5000 }, async t => {
+    const f = await fixture(t, (_req, res) => json(res, message()), { localOnly: true });
+    const response = await f.request({ messages: [{ role: 'user', content: 'fixture' }, system] });
+    assert.equal(response.status, 400);
+    assert.match(await response.text(), /Plan fallback disabled/);
+    assert.equal(f.localCalls.length, 0);
+    assert.equal(f.proCalls.length, 0);
+  });
+}
+
+test('ordinary routing retains native exclusion for plain system messages', { timeout: 5000 }, async t => {
+  const f = await fixture(t, (_req, res) => json(res, message()));
+  const response = await f.request({ messages: [{ role: 'user', content: 'fixture' }, { role: 'system', content: 'fixture' }] });
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.equal(f.localCalls.length, 0);
+  assert.equal(f.proCalls.length, 1);
+});
+
 for (const localOnly of [false, true]) {
   test(`client cancellation closes the local HTTP request without retry or fallback (Local-only ${localOnly})`, { timeout: 5000 }, async t => {
     let entered, closed;

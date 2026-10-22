@@ -197,11 +197,13 @@ URL 내 사용자명·비밀번호·쿼리·fragment, redirect, 잘못된 인증
 .\startClaudeOpenRouter.ps1 -Provider Local -LocalMode
 ```
 
-일반 Claude CLI를 Local 서버로 실행하는 별도 모드입니다. Claude Code **2.1.304 이상**이 필요하며, 2.1.304로 검증했습니다. 이전 버전은 프록시와 세션을 시작하기 전에 차단합니다. `--bare`와 Bash/Read/Edit/Write/Glob/Grep 도구를 사용하고, 기본 권한 확인(`default`)을 유지합니다. 권한 우회나 Auto 모드를 켜지 않습니다. 기존 실행 명령은 그대로 유지합니다.
+일반 Claude CLI를 Local 서버로 실행하는 별도 모드입니다. Claude Code **2.1.304 이상**이 필요하며, 2.1.304로 검증했습니다. 이전 버전은 프록시와 세션을 시작하기 전에 차단합니다. `--safe-mode`에서 Bash/Read/Edit/Write/Glob/Grep를 제공하며, 기본 권한 확인(`default`)과 기존 사용자·프로젝트의 deny/ask 규칙을 유지합니다. 권한 우회나 Auto 모드를 켜지 않습니다. 기존 실행 명령은 그대로 유지합니다.
 
-이 세션에서는 네이티브 beta·advisor·thinking을 제한합니다. Bare 모드는 hooks·플러그인·MCP·skills·subagents·자동 메모리·CLAUDE.md의 자동 로딩을 생략하므로, 필요한 프로젝트 지침은 명시적으로 제공하세요. [공식 bare 모드 문서](https://code.claude.com/docs/en/headless#start-faster-with-bare-mode)를 참고하세요.
+기존 `--bare`의 세 도구 제한을 해결했습니다. 2026-10-23 실제 CLI·Local 서버에서 Write/Glob/Grep의 영문·공백·한글·한글과 공백 경로 조합을 확인했습니다. [호환성 개선과 검증 결과](docs/LIVE-VALIDATION.ko.md#local-모드-파일-도구-호환성-개선-2026-10-23)를 참고하세요.
 
-Plan 로그인을 조회하지 않으며 CLI에는 로컬 프록시용 임시 키만 전달합니다. Local 서버 키는 프록시만 보유합니다. 미지원 기능이나 Local 실패를 Plan으로 전환하지 않고 명시적으로 거절합니다. 프록시의 외부 시도는 한 번이며 CLI 자체 재시도는 별도입니다.
+이 세션에서는 네이티브 beta·advisor·thinking을 제한합니다. Safe 모드로 사용자·프로젝트의 hooks·플러그인·skills·subagents·CLAUDE.md 자동 로딩을 생략하고, 빈 strict MCP 설정과 MCP 도구 차단, hooks·자동 메모리·IDE·Chrome·배경 작업 제한을 적용합니다. API 키 helper도 이 실행에서 비활성화합니다. 필요한 프로젝트 지침은 명시적으로 제공하세요. 관리 정책의 hooks·명령 예외는 CLI 정책을 따르며 이번 검증 범위에 포함하지 않았습니다. [공식 CLI 문서](https://code.claude.com/docs/en/cli-reference)를 참고하세요.
+
+Plan 로그인을 조회하지 않으며 CLI에는 로컬 프록시용 임시 Bearer 토큰만 전달합니다. Local 서버 키는 프록시만 보유합니다. 미지원 기능이나 Local 실패를 Plan으로 전환하지 않고 명시적으로 거절합니다. 프록시의 외부 시도는 한 번이며 CLI 자체 재시도는 별도입니다. Local 모드에서는 CLI의 비어 있지 않은 문자열 system 메시지만 추가로 허용하고 역할·내용을 그대로 전달합니다. 알 수 없는 메시지 필드와 네이티브 콘텐츠는 계속 거절합니다.
 
 Local 실패 안내는 아래 코드로 구분합니다. 실패 뒤 기본 대기시간은 30초이며, 안내에 남은 초를 올림해 표시합니다. 대기가 끝나면 새 요청으로 복구를 확인하세요. 실패한 작업이 자동으로 완료되지는 않습니다.
 
