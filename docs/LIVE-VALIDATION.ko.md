@@ -194,9 +194,31 @@ Node 회귀 테스트 257개, Python 설정·시작 오류 테스트 30개, Wind
 
 Node 257개와 Python 41개(설정·시작 오류·감시 36개, Windows 종료 5개), 자체 검사와 구문 검사가 통과했습니다. 실제 LLM 서버나 개인 주소·키는 사용하지 않았습니다. 임시 CLI 설정·작업 폴더는 정리하고 원시 이력·프로세스 식별자는 공개하지 않습니다. 기존 실행 중인 세션에는 소급 적용되지 않으며 새 Local 세션부터 보호합니다. Windows Terminal 창 닫기·OS 종료·전원 장애 자체는 직접 시험하지 않았고, 서비스나 작업 스케줄러에 위임한 외부 작업은 이 자식 트리의 범위가 아닙니다.
 
+## Local 모드 Ctrl+C 단독 재검증 (2026-10-22)
+
+`a516479`의 Windows Job 보호가 적용된 실제 Claude Code 2.1.304를 Windows ConPTY에서 실행했습니다. 기존 Local 실행 함수·운영 프록시·기본 권한 확인을 사용하고, 운영 코드나 실행 옵션은 변경하지 않았습니다. 설정·이력은 임시 폴더에 격리했습니다.
+
+이전 시험은 여러 동시 요청을 함께 정지시켜 별도 연결의 수신 제한까지 발생했습니다. 이번에는 고유한 합성 입력이 포함된 사용자 도구 요청 하나만 선택해 JSON 본문 일부를 보낸 뒤 대기했습니다. 배경 요청은 즉시 정상 응답했습니다. Ctrl+C 이후 후속 사용자 요청 하나는 기존 설정의 실제 Local LLM 서버로 전달했고, 서버가 반환한 모델과 정확한 응답을 확인했습니다. 취소 대상의 연결 종료와 실제 서버의 후속 추론을 구분한 시험입니다.
+
+| 확인 항목 | 결과 |
+|---|---|
+| 대상 요청 정지·Ctrl+C HTTP 연결 취소 | 각각 1회 |
+| 취소 관측 후 다음 요청이 시험 중계 서버에 도달한 시간 | 4.598초, 30초 대기 없이 수락 |
+| 후속 실제 Local 추론 | 0.779초, 설정 모델 일치·정확한 응답 확인 |
+| 부수 연결 오류·upstream 실패·회로 열림·Local 거절·Plan 라우팅 | 모두 0회 |
+| 세션 유지 | 같은 CLI·프록시·감시 프로세스 유지, 단일 CLI 세션 이력과 화면 응답 확인 |
+| 정상 종료 | `/exit` 코드 0, 보관한 핸들로 실행기·CLI·프록시·감시 종료와 프록시 포트 닫힘 확인 |
+| 공개 HTTP 취소 회귀 테스트 | 일반·Local 전용 경로 2개 통과 |
+
+4.598초에는 TTY 입력 전달과 CLI 처리 시간이 포함되며, 즉시 수락은 재요청 대기시간이 부과되지 않았다는 뜻입니다. CLI는 취소한 입력을 편집란에 복원했으며 후속 지시를 그 입력 뒤에 붙여 제출했습니다. 운영 요청 제한 120초와 실패 후 대기시간 30초는 그대로 유지했습니다. 배경 요청을 취소 대상으로 고른 준비 실행과 샌드박스 네트워크 제한이 있던 준비 실행은 통과 결과에 포함하지 않았습니다. 실제 서버 접근을 확인한 환경에서 수행한 위 단독 시험만 통과로 집계했습니다.
+
+임시 설정·원시 이력·작업 폴더는 정리하고 주소·API 키·모델명·세션 식별자는 공개 기록에서 제외했습니다. 실제 LLM 서버 내부 연산 취소는 이번 시험 범위에서 제외했습니다. 이 시험으로 긴 대화·압축·다른 CLI 버전을 다시 검증한 것은 아닙니다.
+
 ## English
 
 This document contains reusable validation procedures and a limited synthetic-input run summary. Keep machine details, credentials, account usage, billing records, session identifiers, and raw diagnostics private. Separate synthetic regression checks from explicitly authorized live validation; metadata checks do not prove inference or full native-feature compatibility.
+
+The isolated Ctrl+C recheck on 2026-10-22 used real Claude Code 2.1.304 in Windows ConPTY with the existing Job-protected Local launch function and production proxy. Exactly one matching user/tool request stalled after a partial JSON body; background requests succeeded immediately. Ctrl+C closed that connection. The next user request reached the test relay 4.598 seconds later, without cooldown, and actual configured Local inference completed in 0.779 seconds with the configured model and exact reply confirmed. The CLI restored the cancelled input into its editor, and the follow-up instruction was appended before submission. The same CLI/proxy/guardian and a single session history were maintained. Incidental errors, upstream failures, circuit openings, Local rejections, and Plan routes were all zero. `/exit` returned 0; retained handles confirmed all four owned processes exited and the proxy listener closed. Both public HTTP cancellation tests passed. Production code, the 120-second deadline, and the 30-second failure cooldown were unchanged. Misclassified-background and sandbox-network setup runs are excluded from the passing result. Temporary settings/history/workspaces were removed, and private configuration values remain unpublished. Actual server computation cancellation was excluded; this check does not repeat compaction, long-run, or other-version validation.
 
 The Windows standalone Local CLI entry point now enrolls its launcher in a kill-on-close Job before spawning the proxy or CLI. A hidden guardian outside that Job owns its non-inheritable handle and waits on an explicitly inherited real launcher handle. Closing the Job removes remaining CLI, proxy, Git Bash, and descendants without PID searches or global kills. The guardian receives only OS environment values. Startup preparation failure blocks unmanaged execution with `local_process_cleanup_failed`; guardian failure ends that Local tree. Imported library calls, ordinary launches, diagnostics, and non-Windows behavior remain unchanged.
 
