@@ -403,7 +403,44 @@ Windows ConPTY의 실제 Claude Code 2.1.304와 운영 실행 함수·프록시�
 
 임시 설정·원시 이력·작업 파일은 정리하고 내부 서버 주소·API 키·모델명·세션 식별자는 공개 기록에서 제외했습니다. 이번 시험은 한글·공백의 합성 파일 다섯 개와 자동 압축 전후 한 번씩의 수정·거절 사례입니다. 한 시간 기본 승인 TTY, 더 많은 반복 압축, 기존 Local 이력 재개, 실행 중 cwd 변경, 다른 CLI·서버·관리 정책 환경은 미검증입니다. 이번 실행에서 새 타임아웃 복구나 실제 서버 내부 연산 취소를 검증하지 않았습니다.
 
+## Local 대화 종료 후 같은 폴더·다른 폴더 재개 검증 (2026-10-24)
+
+**판정: 같은 작업 폴더에서는 재개 후 상대 경로와 도구 작업이 유지됐습니다. 다른 작업 폴더에서는 Claude Code 2.1.304가 재개 자체를 거절했습니다.** 기준 코드는 `48b7830`입니다. 다른 폴더에서 재개된 상태의 추론·경로 정확도가 통과한 것으로 집계하지 않습니다.
+
+실제 Local 서버와 Windows ConPTY의 Claude Code **2.1.304**를 사용했습니다. 임시 Local 대화를 생성해 정상 종료한 다음, 같은 폴더 A와 다른 폴더 B에서 순서대로 운영 Local 실행 경로를 다시 시작했습니다. 두 폴더 모두 한글·공백을 포함하며 같은 상대 경로에 서로 다른 기준 표식과 기존 문서를 준비했습니다. 임시 설정·이력만 공유했고, 개인 대화나 기존 Plan 이력은 사용하지 않았습니다. 기본 권한 모드와 Write·Edit 개별 승인, 네이티브 제한, 기존 실행 방식 및 Plan 전환 차단을 유지했습니다. 실행기에 재개 옵션을 추가하거나 이력 파일을 다른 프로젝트 폴더로 복사하지 않았습니다.
+
+처음 대화에서만 합성 작업 표식을 알려 주고 파일에는 저장하지 않았습니다. 같은 폴더에서 `/resume <시험 세션>`으로 재개한 뒤 표식을 다시 제공하지 않고 회상시켰습니다. 파일 요청은 한글·공백 상대 경로만 사용했습니다. Bash는 정확히 `pwd`만 실행하고, Read로 기준 파일과 기존 문서를 읽은 뒤 Write·Edit를 개별 승인했습니다. 실제 도구 입력·결과와 파일 바이트, 보존 줄, Glob·Grep 결과를 대조했습니다.
+
+| 항목 | 결과 |
+| --- | --- |
+| 첫 Local 대화 | 여섯 도구의 호출 7개 성공 후 정상 종료 |
+| 같은 폴더 재개 | 원래 대화 식별자 유지, 원래 작업 표식 회상 성공 |
+| 재개 후 도구 | Bash 1·Read 2·Write 1·Edit 1·Glob 1·Grep 1 모두 성공 |
+| 상대 경로 기준 | Bash 실제 cwd·이력 cwd·파일 도구 대상이 모두 A와 일치 |
+| 작업 경로 안내 | 같은 폴더 재개의 주 요청에 A 안내 한 번 유지, 기본 system도 보존 |
+| 다른 폴더의 직접 재개 | `/resume <시험 세션>`은 `No conversations found to resume` 안내 |
+| 전체 프로젝트 선택기 | A의 시험 대화를 찾았으나 선택 후 `This conversation is from a different directory`로 거절 |
+| 다른 폴더 시도 중 추론 | Local 요청 **0건**, 재개된 도구 작업 없음 |
+| 파일 보존 | B는 초기 바이트 그대로, 다른 폴더 재개 시도 전후 A도 동일 |
+| 전체 도구 결과 | 원래 대화의 고유 호출·결과 **14개 성공**, 오류 0; 이력의 중복 기록은 중복 집계하지 않음 |
+| 라우팅 | 최초 대화 6건·같은 폴더 재개 5건·다른 폴더 시도 0건의 Local 성공, upstream 실패·Plan 전환 0 |
+| 종료 | 실행 3회 모두 `/exit` 코드 0, CLI·프록시 종료와 리스너 닫힘 확인 |
+
+다른 폴더의 `/resume` 목록은 기본적으로 현재 프로젝트를 조회했습니다. `Ctrl+A`로 전체 프로젝트를 표시하면 원래 시험 대화가 보였지만, 선택하면 CLI가 원래 폴더로 이동해 재개하라고 안내했습니다. 선택기 사용 전에는 임시 설정 폴더의 이력이 시험 세션 두 개뿐이며 개인 자격 정보 파일이 없음을 확인했습니다. 두 번째 세션은 다른 폴더의 재개 명령만 기록한 세션으로, 원래 대화의 도구 이력과 구분했습니다.
+
+현재 검증된 재개 절차는 **원래 작업 폴더로 돌아가 Local 실행기를 기존 `-Provider Local -LocalMode` 옵션으로 실행한 뒤, CLI 안에서 `/resume`으로 해당 Local 대화를 선택하는 방식**입니다. CLI가 복사해 주는 `claude --resume …` 명령은 Local 실행기를 거치지 않으므로 이번에 검증한 Local 재개 절차로 사용하지 않았습니다. 다른 폴더에서 재개를 거절한 결과를 프록시의 upstream 실패나 Plan 전환으로 분류하지 않습니다.
+
+별도 증거 검증기가 세 실행의 종료·리스너 정리, 원래 대화 식별자, 고유 도구 ID·성공 결과, 실제 `pwd`, cwd와 파일 대상, 표식 회상, native CLI의 두 거절 안내 및 두 폴더의 바이트를 대조했습니다. 공개 Python 설정 회귀 테스트 **37개**, 관측기 구문 검사와 `git diff --check`도 통과했습니다. 운영 코드는 변경하지 않았습니다.
+
+임시 작업 폴더·설정·원시 이력은 정리하고 내부 서버 주소·API 키·모델명·세션 식별자는 공개 기록에서 제외했습니다. 이번 결과는 압축하지 않은 합성 Local 이력의 같은 폴더 재개와 다른 폴더의 명시적 거절입니다. 자동 압축된 이력의 종료·재개, 재개 후 장시간 실행, 실행 중 cwd 변경과 다른 CLI·서버 조합은 미검증입니다. 다른 작업 폴더에서의 재개 지원은 별도 검토가 필요합니다.
+
 ## English
+
+At `48b7830`, real Claude Code 2.1.304 in Windows ConPTY resumed an owned Local conversation after a normal exit from the same workspace. The original conversation identifier and memory-only synthetic marker were retained. Seven tool calls succeeded before exit and seven after resume: Bash `pwd`, two Reads, Write, Edit, Glob and Grep per round. Relative user paths contained Korean and spaces; actual cwd, tool targets, preserved content and UTF-8 bytes matched workspace A. The resumed main requests retained one A workspace binding and the base system instructions. All fourteen unique calls matched successful results; duplicate transcript records were not counted twice.
+
+From workspace B, `/resume <test session>` reported no conversation in the current project. The all-project picker exposed the original test conversation, but selecting it returned “This conversation is from a different directory” and instructed returning to A. No Local inference or resumed tool work occurred in B, and both workspaces remained unchanged during this attempt. This establishes a native CLI refusal, not successful cross-directory resume. The procedure verified here is to return to the original workspace, start the existing Local launcher, then use `/resume` inside that CLI. The bare `claude --resume …` command copied by the CLI was not executed because it bypasses that launcher.
+
+Three CLI/proxy starts exited normally and closed their listeners. Successful Local routes were six for initial setup, five for same-folder resume and zero for the cross-folder attempt; upstream failures and Plan routes were zero. Default permissions and per-action approvals remained enabled, and production launch code was unchanged. Independent evidence checks, 37 public Python configuration regressions, observer syntax and diff checks passed. Only owned temporary history was selected; raw data and settings were removed and private values remain unpublished. Compacted-history resume, long-running resumed sessions, live cwd changes and other CLI/server combinations remain unverified.
 
 At `c33ebae`, real Claude Code 2.1.304 and the configured Local server passed existing-file overwrite/edit and permission checks before and after automatic compaction in one Windows ConPTY session. The production Local launch path retained default permissions, native restrictions, the 120-second deadline and zero Plan fallback. Only synthetic project settings added explicit Write/Edit ask rules and one Edit deny rule; each approval selected “Yes” once. No print mode, pre-approved tools, permission bypass or session-wide automatic editing was enabled. User requests used Korean-and-space relative paths; resolved tool targets and actual bytes were checked independently.
 
