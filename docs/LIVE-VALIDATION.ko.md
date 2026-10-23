@@ -268,11 +268,49 @@ Windows ConPTY의 실제 Claude Code 2.1.304와 운영 실행 함수·프록시�
 
 새 공개 테스트 9개는 plain system 전달 보존 1개, 잘못된 system 메시지 차단 7개, 일반 모드 제외 유지 1개입니다. 실행 설정·자격 정보 분리·종료 fixture도 새 임시 Bearer 방식에 맞춰 검증했습니다. 준비 중 발견한 helper 실행, 관측 파일 교체 충돌, 수정 전 system 메시지 거절은 위 통과 결과에서 제외했습니다. Glob은 상대 경로를 반환하므로 관측 검증기도 절대 경로만 기대하던 조건을 교정했습니다.
 
-임시 설정·원시 이력·작업 폴더를 정리하고 공개 기록에서 내부 주소·키·모델명·세션 식별자를 제외했습니다. 다른 CLI 버전, 관리 정책 환경, 이번 변경을 적용한 시간 단위 장시간 실행·반복 자동 압축·새 120초 타임아웃 시험은 미검증입니다. 기존 장시간·타임아웃 기록은 해당 버전의 이력으로 유지합니다. 실제 LLM 서버 내부 연산 취소도 계속 미검증입니다.
+임시 설정·원시 이력·작업 폴더를 정리하고 공개 기록에서 내부 주소·키·모델명·세션 식별자를 제외했습니다. 이 최초 호환성 점검에서는 다른 CLI 버전, 관리 정책 환경, 시간 단위 장시간 실행·반복 자동 압축·새 120초 타임아웃 시험을 검증하지 않았습니다. 이후 장시간 검증은 다음 절에 기록했습니다. 기존 타임아웃 기록은 해당 버전의 이력으로 유지하며, 실제 LLM 서버 내부 연산 취소도 계속 미검증입니다.
+
+## Local 파일 도구 장시간·반복 자동 압축 검증 (2026-10-23)
+
+**판정: 빈 응답 1건의 복구를 포함해 1시간 연속 실행과 반복 자동 압축 후 Write·Glob·Grep가 유지됐습니다.** `fc0493a`의 실제 Claude Code 2.1.304와 설정된 Local 서버를 사용했습니다. 같은 CLI·프록시와 대화 세션 하나로 3,633.89초 동안 실행했고, 한 시간 이후의 최종 도구·보존 검사까지 통과했습니다. 무오류 실행으로 분류하지 않습니다.
+
+운영 실행기·프록시 코드는 변경하지 않았습니다. 현재 Local 전용 실행 함수와 safe 모드 명령을 사용하고, 기존 부모 파이프·Windows Job 준비를 적용했습니다. 네이티브 기능 제한, 최소 버전, 출력 예산 하한 8,192, 단일 upstream 시도, 120초 제한, 실패 대기 30초, Plan 전환 차단을 유지했습니다. 관측 모듈은 운영 프록시를 그대로 로드해 요청·응답·취소 신호를 변경하지 않고 이름·수치·일치 여부만 집계했습니다. 응답 시간은 본문 완료까지 측정했습니다.
+
+장시간 자동 실행을 위해 이 시험 세션에만 stream-json 입력·출력과 `dontAsk`, Write·Glob·Grep 사전 허용을 적용했습니다. 합성 설정과 작업 폴더만 사용했으며 사용자·프로젝트 설정 파일이나 일반 실행기의 기본 승인 방식을 바꾸지 않았습니다. 수동 TTY 권한 확인을 한 시간 동안 재검증한 결과는 아닙니다. 자동 압축 창은 시험용 100k로 지정하고, 약 5분 간격의 대용량 합성 입력 10회로 반복 압축을 유도했습니다.
+
+한글·공백이 있는 작업 루트 아래 영문·공백·한글·한글과 공백의 네 경로를 매 라운드 새 파일명으로 검사했습니다. 요청에는 정확한 절대 경로를 명시했습니다. Write 입력·결과와 실제 UTF-8 바이트, Glob의 경로·패턴·일치/미일치, Grep의 경로·한글 표식·일치/미일치를 대조했습니다. 외부에서 새로 만든 probe 값을 Grep로 읽어 현재 도구 실행을 확인했고, 대화에만 둔 작업 정보와 비교용 파일도 확인했습니다.
+
+| 확인 항목 | 결과 |
+|---|---|
+| 연속 실행 | 3,633.89초, 같은 CLI·프록시·대화 세션 유지 |
+| 자동 압축 | `trigger:auto` 20회, 이 중 토큰 감소가 50,000을 넘는 압축 10회 |
+| 압축 후 도구 유지 | 각 대규모 압축 뒤 네 경로의 Write·Glob·Grep 검증 통과 |
+| 완료 라운드 | 59회, 네 경로 검사 236회, 해당 라운드의 성공 도구 결과 885건 |
+| 전체 실제 도구 결과 | Write 240·Glob 300·Grep 362, 총 902건 성공·도구 오류 0건 |
+| 대화·probe 보존 확인 | 61회 통과, 비교 파일 변경 없음 |
+| 실제 upstream | 263회 중 Local 라우팅 성공 262회, 빈 응답 실패 1회 |
+| 장애 후 복구 | 35초 대기 후 같은 CLI·프록시에서 복구, 후속 도구 작업 유지 |
+| 120초 타임아웃 | 0회, 가장 긴 응답 49.272초. 제한 자체는 변경하지 않음 |
+| Local 거절 | 미지원 beta 20회와 빈 응답 후 fallback 차단 1회, 총 21회 |
+| Plan 라우팅 | 0회 |
+| 인증·네이티브 검사 | 관측한 CLI 요청 283개 모두 임시 프록시 Bearer 일치, 네이티브 안내 표식 유입 0회 |
+| 종료 | CLI 코드 0, 실행기·CLI·프록시 종료와 루프백 포트 닫힘 확인 |
+
+빈 응답은 두 번째 대규모 압축 뒤의 한 라운드에서 발생했습니다. 해당 라운드의 도구 15건은 성공했지만 마지막 서버 응답이 비어 있어 요청 완료·내용 검증 통과 라운드로 집계하지 않았습니다. 전체 902건에는 이 15건과 복구·최종 확인의 Grep 2건이 포함됩니다. 기본 대기시간을 넘긴 35초 후 실제 Local 추론으로 복구했고, 이후 압축·도구 작업도 계속됐습니다. 미지원 beta 차단 역시 공개 집계에 남겼습니다.
+
+별도 결과 검증기가 자동 압축의 실제 토큰 감소, 압축 이후 성공 라운드, 호출별 성공 결과, 단일 세션, 요청·실패·복구 수를 원시 이력과 대조해 통과했습니다. 관련 system 메시지 공개 회귀 테스트 9개, 시험 자체 검사 5개, 관측 모듈 구문 검사도 통과했습니다. 기존 Node 266개·Python Local 41개 전체 검증을 이번 문서 변경만으로 재실행하지는 않았습니다.
+
+앞선 준비 실행 두 개는 이 한 시간 집계에 포함하지 않았습니다. 첫 실행은 관측기의 이력 폴더 연결 오류로 결과를 집계하지 못했습니다. 두 번째는 압축 후 모델이 상대 경로 기준을 CLI 이력 폴더로 오인해 다른 임시 위치에 파일을 만들었고 경로 정확도 검증이 실패했습니다. 이후 매 요청에 절대 작업 경로를 명시한 별도 세션이 위 한 시간 시험입니다. **상대 경로 오인은 이번 시험 도구의 입력 명확화로 분리했으며, 운영 코드에서 해결한 문제로 표현하지 않습니다.**
+
+임시 설정·원시 이력·작업 파일은 정리하고 내부 서버 주소·API 키·모델명·세션 식별자는 공개 기록에서 제외했습니다. 이번 결과는 절대 경로의 새 파일 작성 기준입니다. 압축 후 상대 경로 자동 해석, 기존 파일 덮어쓰기, 수동 TTY의 시간 단위 실행, 관리 정책 환경, 다른 CLI·서버와 더 긴 실행은 별도 검증이 필요합니다. 120초 타임아웃이 자연 발생하지 않아 이번 실행 자체로 타임아웃 복구를 검증한 것은 아닙니다. 실제 서버 내부 연산 취소도 계속 미검증입니다.
 
 ## English
 
-The updated Local-only mode uses safe mode to expose all six file/shell tools while retaining existing deny/ask rules and explicitly restricting native integrations. Real Claude Code 2.1.304 in Windows ConPTY and the configured Local server passed all four Write/Glob/Grep path cases, negative searches, UTF-8 byte checks, permission denials, and Write/Glob/Grep continuation after one manual compaction. There were 18 successful tool results and two intentional permission denials; Local routes succeeded 15 times with no upstream failure or Plan route. One unsupported fallback-credit beta request was rejected before a compatible compaction request succeeded. All 16 observed CLI requests used the synthetic proxy Bearer token; hook/helper/MCP canaries did not execute. `/exit` returned zero, retained handles confirmed the owned tree exited, and the listener closed. All 266 Node tests, 41 Python Local tests, self-tests, and Node syntax checks passed. Temporary test data was removed and private configuration remains unpublished. Other versions, managed-policy exceptions, new hour-long/repeated-auto-compaction runs, and new 120-second timeout runs were not checked. Actual backend computation cancellation remains unverified.
+At `fc0493a`, the updated Local-only mode ran for 3,633.89 seconds in one real Claude Code 2.1.304 CLI/proxy/session against the configured Local server. All 20 compaction boundaries were automatic; 10 reduced context by more than 50,000 tokens. Each large compaction was followed by successful four-path Write/Glob/Grep checks. There were 59 fully verified rounds, 236 path-case checks, and 61 retention/probe checks. Actual successful tool results totalled 902: Write 240, Glob 300, Grep 362, with zero CLI tool errors. One empty final response failed a round after its 15 tool calls had succeeded; after a 35-second wait, the same session recovered and continued. This is a run with recovery, not an error-free pass. Of 263 upstream requests, 262 produced successful Local routes. Timeout and Plan counts were zero; the longest body-complete response took 49.272 seconds. Local rejections totalled 21: 20 unsupported beta requests and one failure fallback block. Final tools after one hour succeeded; CLI exit was zero and the listener closed. Independent evidence checks, nine public system-message regressions, five harness checks, and observer syntax checks passed.
+
+The run used temporary stream-json settings, a three-tool allowlist, and a 100k auto-compaction window; production commands, default interactive permissions, native restrictions, and the 120-second deadline remained unchanged. Exact absolute paths were supplied for ASCII, space, Korean, and combined cases, using new files each round. Two preceding runs are excluded: one had a transcript-observer path error; the other exposed a model's relative-path confusion after compaction and wrote into another owned temporary directory. That relative-path issue remains unresolved in production. Temporary raw data was removed and private values remain unpublished. Relative-path interpretation, overwrites, hour-long manual TTY use, other versions/servers, managed policies, longer runs, timeout recovery in this particular run, and backend computation cancellation remain outside the successful scope.
+
+The earlier short compatibility check used safe mode to expose all six file/shell tools while retaining existing deny/ask rules and explicitly restricting native integrations. Real Claude Code 2.1.304 in Windows ConPTY and the configured Local server passed all four Write/Glob/Grep path cases, negative searches, UTF-8 byte checks, permission denials, and Write/Glob/Grep continuation after one manual compaction. There were 18 successful tool results and two intentional permission denials; Local routes succeeded 15 times with no upstream failure or Plan route. One unsupported fallback-credit beta request was rejected before a compatible compaction request succeeded. All 16 observed CLI requests used the synthetic proxy Bearer token; hook/helper/MCP canaries did not execute. `/exit` returned zero, retained handles confirmed the owned tree exited, and the listener closed. All 266 Node tests, 41 Python Local tests, self-tests, and Node syntax checks passed. Temporary test data was removed and private configuration remains unpublished. That initial short check did not cover other versions, managed-policy exceptions, hour-long/repeated auto-compaction, or new timeout runs; the later hour-long run is reported above. Actual backend computation cancellation remains unverified.
 
 This document contains reusable validation procedures and a limited synthetic-input run summary. Keep machine details, credentials, account usage, billing records, session identifiers, and raw diagnostics private. Separate synthetic regression checks from explicitly authorized live validation; metadata checks do not prove inference or full native-feature compatibility.
 
