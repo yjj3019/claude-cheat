@@ -370,7 +370,46 @@ Windows ConPTY의 실제 Claude Code 2.1.304와 운영 실행 함수·프록시�
 
 임시 설정·원시 이력·작업 파일은 정리하고 내부 서버 주소·API 키·모델명·세션 식별자는 공개 기록에서 제외했습니다. 이번 범위는 새 Local 세션과 새 파일 작성입니다. 기존 파일 덮어쓰기, 한 시간 수동 TTY, 다른 cwd의 snapshot 재개, 실행 중 cwd 변경, 다른 CLI·서버, 관리 정책 환경과 더 긴 실행은 미검증입니다. 이번 실행에서 120초 타임아웃은 발생하지 않아 새로운 타임아웃 복구 검증으로 표현하지 않습니다. 실제 LLM 서버 내부 연산 취소도 계속 미검증입니다.
 
+## 기존 파일 수정·덮어쓰기와 기본 승인·거절의 자동 압축 전후 검증 (2026-10-24)
+
+**판정: 실제 TTY의 기본 권한 모드에서 기존 파일 Write·Edit와 승인·거절이 자동 압축 전후 모두 유지됐습니다.** 기준 코드는 `c33ebae`이며 Claude Code **2.1.304**와 설정된 실제 Local 서버를 사용했습니다. 기존 실행 명령·운영 코드·네이티브 제한·120초 제한과 Plan 전환 차단은 변경하지 않았습니다. 앞 절에서 미검증으로 남긴 기존 파일 수정 범위를 이번 합성 파일 사례에서 확인했습니다.
+
+운영 `launch('local', local_only=True)` 경로를 Windows ConPTY에서 실행하고 stdin·stdout·stderr가 실제 TTY인지 확인했습니다. print 모드, `dontAsk`, 사전 도구 허용이나 권한 우회를 사용하지 않았습니다. 임시 프로젝트에 Write·Edit의 ask 규칙과 보호 파일의 Edit deny 규칙을 넣고, 수정 승인 화면에서는 매번 **이번 한 번 승인**만 선택했습니다. 세션 전체 자동 편집 승인을 선택하지 않았으며 개인 설정은 수정하지 않았습니다. 자동 압축을 유도하기 위해 시험 CLI에만 100k 압축 창과 큰 합성 보관 자료를 사용했습니다. `/compact`는 호출하지 않았습니다.
+
+사용자 요청에는 `한글 자료/덮어쓰기 문서.txt` 같은 **한글·공백 상대 경로만** 사용했습니다. 압축 전 모델이 도구 인자를 작업 폴더의 절대 경로로 변환한 경우와 압축 후 상대 경로를 그대로 사용한 경우 모두 실제 대상 위치를 대조했습니다. 사전에 준비한 전체 교체 파일, 부분 수정 파일, 직접 거절할 Write·Edit 파일, 정책 보호 파일의 다섯 파일만 검사했습니다.
+
+| 항목 | 결과 |
+| --- | --- |
+| 세션 | 하나의 실제 CLI·프록시·대화 유지, 총 **1,171.20초** |
+| 자동 압축 | 자동 경계 **2회**; 그중 한 번은 **102,678 → 3,014토큰** |
+| 승인 전 보존 | 압축 전·후 각각 승인 대기 중에도 기존 두 파일의 바이트 유지 |
+| Write 승인 | 압축 전·후 각각 전체 덮어쓰기 성공, 오래된 내용 제거·최종 UTF-8 바이트 일치 |
+| Edit 승인 | 압축 전·후 각각 지정한 한 줄만 수정, 앞뒤 보존 줄과 나머지 바이트 유지 |
+| 직접 거절 | Write 2건·Edit 2건을 화면에서 거절, 두 파일의 원본 바이트 유지 |
+| 정책 거절 | 보호 파일 Edit가 압축 전·후 각각 deny 규칙으로 차단, 원본 유지 |
+| 후속 도구 | 승인된 파일의 Glob·Grep 일치, 거절 후 같은 세션의 최종 검색과 응답 성공 |
+| 실제 도구 집계 | 호출 **27개**: Read 10·Write 4·Edit 6·Glob 4·Grep 3 |
+| 결과 구분 | 성공 **21개**, 의도한 거절 **6개**; 예상하지 않은 도구 오류 0 |
+| 경로·파일 대조 | 체크포인트 **12회** 통과, Write·Edit 대상은 예정된 작업 파일만 사용 |
+| Local 라우팅 | 성공 **28건**, upstream 실패·Plan 전환 **0건** |
+| 네이티브 차단 | 미지원 beta **2건** 차단 후 호환 요청으로 자동 압축 완료 |
+| 종료 | `/exit` 코드 0, CLI·프록시 종료와 리스너 닫힘 확인 |
+
+총 시간에는 대용량 입력 분할과 승인 대기가 포함되므로 응답 지연이나 장시간 부하 성능 지표로 해석하지 않습니다. 단일 대용량 터미널 입력은 도구의 크기 검토 제한으로 거절돼 작은 입력으로 나눠 보냈습니다. 이력에서 합성 보관 자료 6,000줄이 한 사용자 요청으로 전달된 것을 확인했으며, 이 전송 제한은 Local 서버 실패로 집계하지 않았습니다.
+
+별도 검증기가 원시 이력의 단일 세션, 모든 호출 ID·결과, 압축 경계 전후의 수정·거절, 검색 결과, 실제 파일 바이트와 설정 폴더의 시험 파일 부재를 대조했습니다. 처음에는 설정 폴더의 모든 텍스트 파일을 오기록으로 간주해 실패했습니다. 독립 검토로 붙여넣기 캐시와 정확한 세 marketplace 라이선스 경로를 구분한 뒤 통과했으며, 실제 도구 쓰기 대상 검사는 유지했습니다. 설정 폴더의 plugins 전체를 허용한 것은 아닙니다.
+
+공개 Python 설정 회귀 테스트 **37개**, 관련 Node system 메시지 회귀 테스트 **9개**, 시험 fixture 자체 검사 3개와 `git diff --check`가 통과했습니다. Node 검사 결과 수집용 PowerShell 보고식의 오류는 단독 재실행으로 종료 코드 0을 확인했으며, Local 런타임 실패로 집계하지 않았습니다.
+
+임시 설정·원시 이력·작업 파일은 정리하고 내부 서버 주소·API 키·모델명·세션 식별자는 공개 기록에서 제외했습니다. 이번 시험은 한글·공백의 합성 파일 다섯 개와 자동 압축 전후 한 번씩의 수정·거절 사례입니다. 한 시간 기본 승인 TTY, 더 많은 반복 압축, 기존 Local 이력 재개, 실행 중 cwd 변경, 다른 CLI·서버·관리 정책 환경은 미검증입니다. 이번 실행에서 새 타임아웃 복구나 실제 서버 내부 연산 취소를 검증하지 않았습니다.
+
 ## English
+
+At `c33ebae`, real Claude Code 2.1.304 and the configured Local server passed existing-file overwrite/edit and permission checks before and after automatic compaction in one Windows ConPTY session. The production Local launch path retained default permissions, native restrictions, the 120-second deadline and zero Plan fallback. Only synthetic project settings added explicit Write/Edit ask rules and one Edit deny rule; each approval selected “Yes” once. No print mode, pre-approved tools, permission bypass or session-wide automatic editing was enabled. User requests used Korean-and-space relative paths; resolved tool targets and actual bytes were checked independently.
+
+Two automatic boundaries included a reduction from 102,678 to 3,014 tokens. Four approved modifications succeeded: one full Write replacement and one single-line Edit before and after compaction. Files remained unchanged while approval was pending. Four explicit UI rejections and two policy denials preserved the protected originals. All 27 tool calls matched results: 21 successes and six intentional denials, with no unexpected tool error. The final Glob/Grep request succeeded after denial in the same session. Twelve byte checkpoints passed; all Write/Edit targets were the five planned workspace files, with no test-file miswrite under configuration/history. There were 28 successful Local routes, no upstream failure or Plan route, and two unsupported-beta rejections. `/exit` returned zero, both processes stopped and the listener closed.
+
+The 1,171.20-second duration includes split paste input and approval waits, not a load/latency measurement. A test-only 100k window and 6,000 disposable archive lines triggered compaction without `/compact`. Oversized terminal input was split after the tool rejected it; all archive lines reached one user request. The evidence checker initially mistook paste caches and three specific marketplace license files for miswrites; its classification was corrected after independent review while retaining strict tool-target checks. Thirty-seven public Python configuration tests, nine related Node tests, three fixture checks and diff checks passed. A Node test-report wrapper error was resolved by a standalone run confirming exit zero. Production code and personal settings were unchanged. Temporary raw data was removed and private values remain unpublished. Hour-long default-permission TTY use, further compaction cycles, Local-history resume, live cwd changes and other environments remain unverified.
 
 At `f5a764d`, real Claude Code 2.1.304 and the configured Local server ran for **3,648.54 seconds** in one CLI/proxy/conversation session using relative user paths only. Twenty automatic compaction boundaries included ten reductions exceeding 50,000 tokens, each followed by successful relative-path tools. All 62 four-path rounds passed: 248 path cases and 930 tool results. An explicit alternate-base check added three results, followed by restoration of the default base. All **933 actual tool results** succeeded (Write 249, Glob 311, Grep 373). Task retention and fresh probes passed 62/62, and all 231 upstream requests retained one startup-workspace binding and the base system instructions. Of these, 225 contained transcript-folder hints; shadow-file changes and writes into configuration/history were zero.
 
