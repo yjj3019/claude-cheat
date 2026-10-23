@@ -336,9 +336,49 @@ Windows ConPTY의 실제 Claude Code 2.1.304와 운영 실행 함수·프록시�
 
 최종 실행 전에는 반복 압축 뒤 네 경로가 통과한 준비 실행도 있었습니다. 다만 인용하지 않은 다른 기준 폴더 표현을 모델이 기본 workspace로 처리해 그 추가 검사는 실패했습니다. 폴더 이름을 명확히 인용한 뒤 단독 실행과 위 최종 실행에서 기준 선택·복귀를 확인했습니다. 또 다른 준비 실행은 JSON 코드 블록 뒤의 설명 때문에 보존 값 검사에서 중단됐으나 실제 값은 일치했습니다. 보존 값과 부가 설명 형식을 분리했고, 최종 실행의 5라운드는 원래 엄격한 응답 형식 검사도 모두 통과했습니다. 준비 실행은 최종 327.39초 집계에 포함하지 않았습니다.
 
-임시 설정·원시 이력·작업 폴더를 정리하고 내부 서버 주소·API 키·모델명·세션 식별자는 공개 기록에서 제외했습니다. 이번 변경을 적용한 한 시간 재시험, 장시간 수동 TTY, 다른 cwd에서 기존 snapshot 세션 재개, 실행 중 cwd 변경, 다른 CLI·서버와 관리 정책 환경은 미검증입니다. 앞선 한 시간 결과는 변경 전 버전의 이력으로 유지합니다. 시스템 안내만으로 모든 모델의 경로 판단을 보장하지는 않습니다.
+임시 설정·원시 이력·작업 폴더를 정리하고 내부 서버 주소·API 키·모델명·세션 식별자는 공개 기록에서 제외했습니다. 이 짧은 실행 당시에는 변경을 적용한 한 시간 재시험이 미검증이었으며, 후속 결과는 다음 절에 기록했습니다. 장시간 수동 TTY, 다른 cwd에서 기존 snapshot 세션 재개, 실행 중 cwd 변경, 다른 CLI·서버와 관리 정책 환경은 계속 미검증입니다. 앞선 한 시간 결과는 변경 전 버전의 이력으로 유지합니다. 시스템 안내만으로 모든 모델의 경로 판단을 보장하지는 않습니다.
+
+## 상대 경로 기준 개선 후 Local 장시간·반복 자동 압축 검증 (2026-10-23~24)
+
+**판정: 같은 Local 세션에서 한 시간 이상 실행하고 반복 자동 압축 후에도 한글·공백 상대 경로의 Write·Glob·Grep가 유지됐습니다. 빈 응답 1건을 복구한 실행이며, 오류 없는 통과로 집계하지 않습니다.** 기준 코드는 `f5a764d`입니다. 실제 Claude Code **2.1.304**와 설정된 Local LLM 서버를 사용했습니다. 한국 시간 10월 23일 밤에 시작해 24일 새벽에 종료했습니다.
+
+기존 실행 명령과 운영 코드는 변경하지 않았습니다. 시작 cwd의 system 안내, 네이티브 제한, 출력 예산 하한 8,192, 요청당 120초 제한, Local 모드의 Plan 전환 차단을 유지했습니다. 시험에만 stream-json 입력·출력, `dontAsk`, Write·Glob·Grep 사전 허용, 100k 자동 압축 창을 적용했습니다. 합성 설정과 소유한 임시 작업 폴더만 사용했으며, 일반 실행기의 기본 승인 방식은 바꾸지 않았습니다. 한 시간 동안 수동 TTY의 권한 프롬프트를 조작한 시험은 아닙니다.
+
+한글·공백과 하위 디렉터리가 포함된 작업 폴더에서 사용자 요청에는 **상대 경로만** 넣었습니다. 매 라운드 새 파일을 영문·공백·한글·한글과 공백의 네 경로 조합에 작성했습니다. 실제 도구 호출 ID와 성공 결과, UTF-8 바이트, Glob 존재·부재 결과, Grep 한글 표식·부재 결과·외부에서 바뀐 새 probe 값을 대조했습니다. 대화에만 저장한 원래 작업 정보도 매번 확인했습니다. 실제 CLI 이력 폴더에는 같은 이름의 비교 파일을 두어 경로 오인에 따른 변경을 탐지했습니다.
+
+| 항목 | 결과 |
+| --- | --- |
+| 연속 실행 | **3,648.54초**, 하나의 CLI·프록시·대화 세션 유지 |
+| 자동 압축 | 자동 경계 **20회**, 그중 **10회**는 토큰 50,000개 초과 감소 |
+| 압축 후 도구 작업 | 대용량 압축 10회 모두 후속 상대 경로 라운드 통과 |
+| 상대 경로 행렬 | **62라운드·248개 경로 검사·930개 도구 결과** 통과 |
+| 전체 실제 도구 결과 | **933개 성공**: Write 249, Glob 311, Grep 373; 도구 오류 0 |
+| 명시적 기준 선택·복귀 | 인용한 하위 기준 폴더에서 3개 도구 성공, 다음 라운드 기본 작업 폴더 복귀 |
+| 작업 정보·새 probe 보존 | **62/62** 통과, 엄격한 JSON 응답 형식도 모두 일치 |
+| 작업 경로 system 안내 | upstream **231/231** 요청에 한 번씩 유지, 기본 system 지침도 보존 |
+| 이력 경로 혼동 감시 | 이력 폴더 경로가 포함된 요청 **225건**, 비교 파일 변경 0·설정/이력 폴더 오기록 0 |
+| Local 요청 | upstream 231건 중 Local 성공 라우팅 **230건**, 실패 1건 |
+| 실패·복구 | 빈 응답 **1건**, 35초 대기 후 같은 세션의 새 도구 요청으로 복구 |
+| 타임아웃·Plan | 120초 타임아웃 **0건**, Plan 라우팅 **0건** |
+| 본문 수신 완료 최장 시간 | **46.122초** |
+| Local 차단 | **21건**: 미지원 beta 20건, 실패 시 fallback 차단 1건 |
+| 종료 | CLI 종료 코드 0, CLI·프록시 종료, 리스너 닫힘 확인 |
+
+약 40분 40초에 여덟 번째 대용량 요청이 HTTP 200이지만 빈 content로 실패했습니다. 실패한 요청의 Write 호출이 없고 비교 파일이 그대로임을 확인한 뒤 35초를 기다렸습니다. 같은 프로세스·대화에서 새 상대 경로 도구 요청이 성공했고 이후 압축과 도구 작업도 계속됐습니다. 실패한 대용량 요청 자체를 자동으로 완료한 결과는 아닙니다. 한 시간 이후의 최종 라운드, 명시적 다른 기준 선택, 기본 기준 복귀까지 통과했습니다.
+
+원시 이력의 모든 도구 호출·결과와 단일 세션을 별도 검증기로 대조했습니다. seed·대용량·실패 요청의 쓰기 안전성 감사 11회도 통과했습니다. 관련 공개 Node 회귀 테스트 **12개**, 시험 helper 자체 검사 5개, 관측기 구문 검사와 `git diff --check`가 통과했습니다. 운영 코드 변경이 없는 검증·문서 갱신이며, 앞선 버전의 전체 회귀 결과를 이번에 다시 실행한 것으로 집계하지 않습니다.
+
+임시 설정·원시 이력·작업 파일은 정리하고 내부 서버 주소·API 키·모델명·세션 식별자는 공개 기록에서 제외했습니다. 이번 범위는 새 Local 세션과 새 파일 작성입니다. 기존 파일 덮어쓰기, 한 시간 수동 TTY, 다른 cwd의 snapshot 재개, 실행 중 cwd 변경, 다른 CLI·서버, 관리 정책 환경과 더 긴 실행은 미검증입니다. 이번 실행에서 120초 타임아웃은 발생하지 않아 새로운 타임아웃 복구 검증으로 표현하지 않습니다. 실제 LLM 서버 내부 연산 취소도 계속 미검증입니다.
 
 ## English
+
+At `f5a764d`, real Claude Code 2.1.304 and the configured Local server ran for **3,648.54 seconds** in one CLI/proxy/conversation session using relative user paths only. Twenty automatic compaction boundaries included ten reductions exceeding 50,000 tokens, each followed by successful relative-path tools. All 62 four-path rounds passed: 248 path cases and 930 tool results. An explicit alternate-base check added three results, followed by restoration of the default base. All **933 actual tool results** succeeded (Write 249, Glob 311, Grep 373). Task retention and fresh probes passed 62/62, and all 231 upstream requests retained one startup-workspace binding and the base system instructions. Of these, 225 contained transcript-folder hints; shadow-file changes and writes into configuration/history were zero.
+
+One HTTP 200 response had empty content during the eighth pressure request. Its write-safety audit passed; after a 35-second wait, a new relative-path tool request recovered in the same session, and subsequent compactions and tools succeeded. This is a run with recovery, not an error-free pass or automatic completion of the failed request. Local routes succeeded on 230 of 231 upstream requests; timeout and Plan-route counts were zero. The longest body-complete response took 46.122 seconds. Local rejections totalled 21: twenty unsupported-beta requests and one failure fallback block. CLI exit was zero, both processes stopped, and the listener closed. Independent transcript/evidence checks, eleven write-safety audits, twelve related public Node regressions, five harness checks, observer syntax checks, and diff checks passed.
+
+Production code and launch behavior were unchanged. Temporary stream-json settings, a three-tool allowlist and a 100k compaction window applied only to synthetic test data. Raw temporary data was removed and private values remain unpublished. This follow-up verifies the updated one-hour relative-path scope left open by the earlier short run. Overwrites, hour-long manual TTY use, resume from another cwd, live cwd changes, other versions/servers, managed policies and longer runs remain unverified. No new timeout recovery or actual backend computation cancellation was established.
+
+The following paragraphs preserve earlier validation scopes and their limitations at the time; the updated relative-path hour result above supersedes the earlier pending status for that scope.
 
 The relative-path follow-up appends the actual startup cwd as a JSON string to the default system instructions for fresh Local sessions. Transcript/config/log paths do not change the default base, and an explicitly selected user base applies to that request. The ordinary launch path, permissions, native restrictions, timeout/budget settings, and zero Plan fallback remain unchanged. This supplies model context without rewriting tool paths or replacing filesystem permissions.
 
