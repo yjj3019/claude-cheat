@@ -480,11 +480,17 @@ def local_cli_command(claude: str) -> list:
     settings = {"alwaysThinkingEnabled": False, "disableAllHooks": True, "autoMemoryEnabled": False,
                 "apiKeyHelper": "", "env": {
         "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(max(8192, int(output_tokens)))}}
+    # Keep the inherited workspace explicit when compaction exposes transcript paths.
+    workspace_context = (
+        f"Local session workspace directory (JSON string): {json.dumps(str(Path.cwd()), ensure_ascii=False)}\n"
+        "Resolve relative file-tool paths from this workspace unless the user explicitly specifies another base. "
+        "Paths mentioned for transcripts, history, configuration or logs do not change that default base. "
+        "Retain this workspace context after compaction. Existing tool permissions still apply.")
     # Safe mode keeps all file tools; retain setting sources so deny/ask rules still apply.
     return [claude, "--safe-mode", "--model", "sonnet", "--permission-mode", "default",
             "--tools", "Bash,Read,Edit,Write,Glob,Grep", "--disallowedTools", "mcp__*",
             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-            "--no-chrome", "--settings", json.dumps(settings)]
+            "--no-chrome", "--settings", json.dumps(settings), "--append-system-prompt", workspace_context]
 
 
 def launch(provider: str = "openrouter", local_only: bool = False) -> int:

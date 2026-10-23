@@ -221,6 +221,23 @@ class LocalCliModeTests(LocalTestCase):
                 with self.assertRaisesRegex(RuntimeError, "requires Claude Code 2.1.304 or later"):
                     route.local_cli_command("synthetic-cli")
 
+    def test_local_workspace_context_uses_cwd_and_preserves_the_default_system_prompt(self):
+        for workspace in (self.root / "separate-workspace", self.root / "한글 작업 공간" / "프로젝트 하위"):
+            with self.subTest(workspace=workspace), mock.patch.object(route.Path, "cwd", return_value=workspace), \
+                 mock.patch.dict(os.environ, {"PWD": str(self.root / "wrong-pwd"), "CLAUDE_CONFIG_DIR": str(self.root / "history")}), \
+                 mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.304 (Claude Code)")):
+                command = route.local_cli_command("synthetic-cli")
+                self.assertNotIn("--system-prompt", command)
+                self.assertNotIn("--system-prompt-file", command)
+                self.assertIn("--append-system-prompt", command)
+                prompt = command[command.index("--append-system-prompt") + 1]
+                label = "Local session workspace directory (JSON string): "
+                self.assertEqual(prompt.count(label), 1)
+                line = next(line for line in prompt.splitlines() if line.startswith(label))
+                self.assertEqual(json.loads(line[len(label):]), str(workspace))
+                self.assertNotIn(json.dumps(str(self.root / "wrong-pwd")), prompt)
+                self.assertNotIn(json.dumps(str(self.root / "history")), prompt)
+
     def test_unsupported_local_cli_is_rejected_before_starting_proxy_or_session(self):
         with mock.patch.object(route.shutil, "which", return_value="synthetic-cli"), mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.303 (Claude Code)")), mock.patch.object(route, "routed_session") as session, mock.patch.object(route.subprocess, "call") as child:
             with self.assertRaisesRegex(RuntimeError, "requires Claude Code 2.1.304 or later"):

@@ -304,7 +304,47 @@ Windows ConPTY의 실제 Claude Code 2.1.304와 운영 실행 함수·프록시�
 
 임시 설정·원시 이력·작업 파일은 정리하고 내부 서버 주소·API 키·모델명·세션 식별자는 공개 기록에서 제외했습니다. 이번 결과는 절대 경로의 새 파일 작성 기준입니다. 압축 후 상대 경로 자동 해석, 기존 파일 덮어쓰기, 수동 TTY의 시간 단위 실행, 관리 정책 환경, 다른 CLI·서버와 더 긴 실행은 별도 검증이 필요합니다. 120초 타임아웃이 자연 발생하지 않아 이번 실행 자체로 타임아웃 복구를 검증한 것은 아닙니다. 실제 서버 내부 연산 취소도 계속 미검증입니다.
 
+## Local 모드 자동 압축 후 상대 경로 기준 개선 (2026-10-23)
+
+**판정: 새 Local 세션에 초기 작업 디렉터리 안내를 추가하고, 반복 자동 압축 후 상대 경로 작업을 확인했습니다.** `d2356af` 이후의 작업 트리 변경입니다. `local_cli_command()`가 실행 당시의 실제 `Path.cwd()`를 JSON 문자열로 인코딩해 `--append-system-prompt`로 전달합니다. 실행기 파일 위치·설정 폴더·환경변수 `PWD`에서 작업 기준을 추측하지 않습니다. 기본 system 지침은 유지하며 요청 본문이나 도구 경로를 다시 쓰지 않습니다.
+
+추가 안내는 초기 workspace를 상대 경로의 기본 기준으로 정하고, 문맥에 나온 이력·설정·로그 경로가 이 기준을 바꾸지 않도록 명시합니다. 사용자가 다른 기준 디렉터리를 명확히 선택하면 해당 요청에는 그 기준을 적용합니다. 모델의 경로 해석을 보강하는 안내이며, 기존 권한 검사를 대체하거나 파일 시스템 경계를 강제하는 기능은 아닙니다. 같은 실행 명령으로 **새 Local 세션**을 시작해야 적용됩니다.
+
+기존 실행 명령, 일반·진단 모드, 최소 CLI 버전, 네이티브 기능 제한, 기본 권한과 deny/ask 설정, 120초 제한, 30초 실패 대기, 출력 예산 하한 8,192, Plan 전환 차단은 유지했습니다. 실제 Claude Code 2.1.304와 설정된 Local 서버에서 합성 입력만 사용했습니다. 임시 stream-json 세션에서 세 도구만 사전 허용하고 100k 창의 자동 압축을 유도했으며, 운영 기본 승인 방식은 바꾸지 않았습니다.
+
+한글·공백과 하위 디렉터리가 들어간 workspace에서 사용자 요청에는 절대 작업 경로를 넣지 않았습니다. 영문·공백·한글·한글과 공백의 상대 경로 4종을 압축 전후에 검사했습니다. 실제 CLI 이력 폴더에도 같은 이름의 비교 파일을 두고 변경 여부를 확인했습니다. 도구 입력·성공 결과와 실제 UTF-8 바이트, Glob 일치/미일치, Grep 한글 표식·미일치·새 probe 값을 대조했습니다.
+
+| 확인 항목 | 결과 |
+|---|---|
+| 실제 실행 | 327.39초, 같은 CLI·프록시·대화 세션 유지 |
+| 자동 압축 | `trigger:auto` 6회, 이 중 토큰 감소가 50,000을 넘는 압축 3회 |
+| 상대 경로 행렬 | 5라운드·20개 경로 검사·75건의 도구 결과 통과 |
+| 실제 도구 전체 | Write 21·Glob 26·Grep 31, 총 78건 성공·도구 오류 0건 |
+| 명시한 다른 기준 | 폴더 이름을 명확히 인용한 요청의 Write·Glob·Grep 성공, 다음 요청에서 기본 workspace 복귀 |
+| system 안내 유지 | 실제 upstream 요청 30개 모두 workspace 안내 1회 포함, 기본 system 지침 유지 |
+| 이력 경로 문맥 | 요청 25개에 이력 폴더 경로가 있었지만 작업 기준 오인 없음 |
+| 잘못된 위치 쓰기 | 이력·설정 폴더에 시험 대상 파일 오작성 0건, 비교 파일 변경 없음 |
+| 라우팅·오류 | Local 성공 30회, upstream 실패·Plan 전환 0회, 최장 응답 35.197초 |
+| 네이티브 차단 | 미지원 beta 6회 거절. 기존 제한을 완화하지 않았으며 무거절 실행으로 집계하지 않음 |
+| 인증·격리 | CLI 요청 36개 모두 임시 프록시 Bearer 일치, 네이티브 안내 표식 유입 0회 |
+| 종료 | CLI 코드 0, 실행기·CLI·프록시 종료와 루프백 포트 닫힘 확인 |
+| 회귀 검사 | Python Local 42개·관련 Node 9개·Python 자체 검사·diff 공백 검사 통과 |
+
+새 공개 테스트는 실제 cwd가 실행기·설정 위치와 다른 경우 및 한글·공백의 하위 경로를 검사합니다. 기본 system을 교체하지 않고 JSON 인코딩한 cwd를 추가하는지 확인하며, 수정 전 실패·수정 후 통과했습니다. 별도 결과 검증기는 원시 이력의 단일 세션·호출별 결과·압축 감소량·잘못된 위치 쓰기·기준 변경 후 복귀를 대조해 통과했습니다. 전체 78건에는 경로 행렬 75건 외에 다른 기준 폴더의 도구 3건이 포함됩니다.
+
+수정 전 비교 실행에서는 system 영역의 요청 14건 모두에 workspace 안내가 없었습니다. 이 짧은 실행에서 이전 장시간 시험의 경로 오인 자체는 재현되지 않았습니다. 최초 관측기가 정상적인 Glob의 workspace 기준 전체 상대 패턴을 잘못 실패로 판정한 부분은 원시 결과로 교정했고, 이를 경로 오인 재현으로 집계하지 않았습니다.
+
+최종 실행 전에는 반복 압축 뒤 네 경로가 통과한 준비 실행도 있었습니다. 다만 인용하지 않은 다른 기준 폴더 표현을 모델이 기본 workspace로 처리해 그 추가 검사는 실패했습니다. 폴더 이름을 명확히 인용한 뒤 단독 실행과 위 최종 실행에서 기준 선택·복귀를 확인했습니다. 또 다른 준비 실행은 JSON 코드 블록 뒤의 설명 때문에 보존 값 검사에서 중단됐으나 실제 값은 일치했습니다. 보존 값과 부가 설명 형식을 분리했고, 최종 실행의 5라운드는 원래 엄격한 응답 형식 검사도 모두 통과했습니다. 준비 실행은 최종 327.39초 집계에 포함하지 않았습니다.
+
+임시 설정·원시 이력·작업 폴더를 정리하고 내부 서버 주소·API 키·모델명·세션 식별자는 공개 기록에서 제외했습니다. 이번 변경을 적용한 한 시간 재시험, 장시간 수동 TTY, 다른 cwd에서 기존 snapshot 세션 재개, 실행 중 cwd 변경, 다른 CLI·서버와 관리 정책 환경은 미검증입니다. 앞선 한 시간 결과는 변경 전 버전의 이력으로 유지합니다. 시스템 안내만으로 모든 모델의 경로 판단을 보장하지는 않습니다.
+
 ## English
+
+The relative-path follow-up appends the actual startup cwd as a JSON string to the default system instructions for fresh Local sessions. Transcript/config/log paths do not change the default base, and an explicitly selected user base applies to that request. The ordinary launch path, permissions, native restrictions, timeout/budget settings, and zero Plan fallback remain unchanged. This supplies model context without rewriting tool paths or replacing filesystem permissions.
+
+Real Claude Code 2.1.304 and the configured Local server completed a 327.39-second single-session run using relative user paths only. Six automatic compactions included three reductions exceeding 50,000 tokens. Five four-path rounds passed, covering 20 cases and 75 tool results; an explicit alternate-base check added three more. All 78 actual results succeeded: Write 21, Glob 26, Grep 31. The next request returned to the default workspace. All 30 upstream requests retained one workspace binding, including 25 with transcript-folder hints. Shadow files were unchanged and no test file was written under configuration/history. Upstream failures and Plan routes were zero; six unsupported beta requests were rejected. CLI exit was zero and the listener closed. Independent evidence checks, 42 Python Local tests, nine related Node tests, and self-tests passed.
+
+The earlier short baseline had no workspace system context on 14 requests but did not reproduce the historical path miswrite; its overly narrow Glob observer check was corrected separately. Preparation runs also exposed an unquoted alternate-folder ambiguity and a reply-format-only mismatch; they are excluded from the final counts. The final quoted alternate-base request passed, and all five final rounds met the original strict reply format as well. Temporary stream-json allowlisting was limited to synthetic test settings. Private values and raw data remain unpublished. Fresh-session compaction was verified; an updated one-hour run, hour-long manual TTY, resume from another cwd, live cwd changes, other versions/servers, and managed-policy environments remain unverified.
 
 At `fc0493a`, the updated Local-only mode ran for 3,633.89 seconds in one real Claude Code 2.1.304 CLI/proxy/session against the configured Local server. All 20 compaction boundaries were automatic; 10 reduced context by more than 50,000 tokens. Each large compaction was followed by successful four-path Write/Glob/Grep checks. There were 59 fully verified rounds, 236 path-case checks, and 61 retention/probe checks. Actual successful tool results totalled 902: Write 240, Glob 300, Grep 362, with zero CLI tool errors. One empty final response failed a round after its 15 tool calls had succeeded; after a 35-second wait, the same session recovered and continued. This is a run with recovery, not an error-free pass. Of 263 upstream requests, 262 produced successful Local routes. Timeout and Plan counts were zero; the longest body-complete response took 49.272 seconds. Local rejections totalled 21: 20 unsupported beta requests and one failure fallback block. Final tools after one hour succeeded; CLI exit was zero and the listener closed. Independent evidence checks, nine public system-message regressions, five harness checks, and observer syntax checks passed.
 
