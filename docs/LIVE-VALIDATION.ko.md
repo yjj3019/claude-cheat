@@ -4,6 +4,32 @@
 
 개인 테스트 환경, 계정 사용량·청구 내역, 세션 식별자, 실제 대화·설정 파일·진단 로그는 공개하지 않습니다. 이 문서는 재현 가능한 점검 절차와 합성 입력을 사용한 제한된 검증 결과를 담습니다.
 
+## Local 호환 모드 검증 (2026-10-24)
+
+`-Provider Local -LocalCompat`을 별도 선택 모드로 추가했습니다. 기존 일반 실행과 `-LocalMode`는 유지합니다. 현재 설정 서버·모델과 실제 Claude Code 2.1.304 TTY에서, 개인 플러그인·MCP 설정을 실행하는 대신 격리된 합성 플러그인과 stdio MCP를 사용했습니다.
+
+| 항목 | 확인한 범위 |
+| --- | --- |
+| 플러그인·스킬 | 테스트 플러그인의 이름공간 명령으로 스킬 로드 및 MCP 도구 실행 |
+| MCP | stdio 도구 검색·승인·호출·결과 왕복; ToolSearch의 정의된 도구 참조 이력 보존 |
+| hooks | SessionStart·PreToolUse·PostToolUse 실행 표식 |
+| 하위 에이전트 | 플러그인 에이전트 시작·백그라운드 실행·MCP 승인·완료 알림·주 대화 응답 |
+| 압축 후 유지 | 같은 세션에서 `/compact` 완료 후 MCP·스킬·하위 에이전트 반복 성공; 각 도구 표식 총 2회 |
+| 추론 설정 | `/effort low`·`/effort high`가 요청의 `output_config.effort`에 반영되고 응답 성공 |
+| 인증·모델 | CLI에는 임시 프록시 인증만 전달; 모든 모델 역할은 설정한 같은 Local 모델로 매핑; Plan 라우팅 0회 |
+
+호환 모드에서는 CLI의 알려진 beta, per-turn system 메시지와 출력 설정, `context_management`, thinking 표시 설정, custom 도구의 deferred/strict 설정을 검증한 뒤 보존해 전달합니다. 이전 Local 모드의 네이티브 제한을 완화하지 않습니다. 서명과 공급자 메타데이터는 타입을 확인하고 보존하며, 합성 회귀 테스트에서 thinking·도구 이력의 후속 요청 왕복을 확인했습니다. 토큰 계산 API는 명시적으로 거절하며, 실제 CLI는 해당 거절 이후에도 위 작업과 압축을 진행했습니다.
+
+저장된 `settings.json.env`에 합성 주소·API 키·Bearer·사용자 정의 인증 헤더·잘못된 모델을 넣은 별도 TTY 실행에서도 최상위 실행 설정이 프록시 경로와 임시 인증을 유지했습니다. 실제 Local MCP 호출과 응답에 성공했고 기본 승인 프롬프트도 유지됐습니다. 서버 키를 CLI에 넘겨 해결하지 않았습니다.
+
+ToolSearch 참조 보존까지 적용한 마지막 실행은 Local 라우팅 4회, Plan 라우팅·네이티브 거절·외부 시도 실패 0회였습니다. CLI 종료 코드 0과 CLI·프록시 종료를 확인했고, 생성한 임시 CLI 설정과 대화 이력은 삭제했습니다.
+
+현재 서버의 JSON 응답은 설정 모델과 일치했으나 직접 SSE 추론 응답의 `message_start.model`은 일치하지 않았습니다. 이를 우회해 허용하지 않고, JSON 응답 전체를 검증한 뒤 CLI용 SSE로 변환합니다. 실시간 토큰 전달은 제공하지 않습니다. 120초 전체 요청 제한·외부 시도 1회·30초 cooldown과 Plan fallback 차단을 유지합니다.
+
+추론 강도 값 수용과 실제 모델 내부 추론량의 변화는 구분합니다. 직접 추론 점검에서는 low/high·adaptive/enabled 설정이 수용됐지만 별도 서명된 thinking 블록은 확인하지 못했습니다. HTTP/SSE 방식의 원격 MCP, 임의의 개인 플러그인 조합, 모든 hooks 이벤트, IDE·Chrome, 서버 고유 기능, 이 호환 모드의 시간 단위 연속 실행·반복 자동 압축은 이번 검증 범위에 포함하지 않았습니다. 실제 LLM 서버 내부 연산 취소도 계속 미검증입니다.
+
+공개 회귀 테스트는 Node 286개, Python Local 설정·수명주기 47개가 통과했고 실행기 자체 점검과 diff 공백 검사도 통과했습니다. 서버 주소·키·실제 모델 이름·세션 식별자·원본 요청/응답은 공개 파일에 포함하지 않았습니다.
+
 ## 외부 호출 없는 점검
 
 ```powershell
@@ -434,7 +460,13 @@ Windows ConPTY의 실제 Claude Code 2.1.304와 운영 실행 함수·프록시�
 
 임시 작업 폴더·설정·원시 이력은 정리하고 내부 서버 주소·API 키·모델명·세션 식별자는 공개 기록에서 제외했습니다. 이번 결과는 압축하지 않은 합성 Local 이력의 같은 폴더 재개와 다른 폴더의 명시적 거절입니다. 자동 압축된 이력의 종료·재개, 재개 후 장시간 실행, 실행 중 cwd 변경과 다른 CLI·서버 조합은 미검증입니다. 다른 작업 폴더에서의 재개 지원은 별도 검토가 필요합니다.
 
+### 커밋 후 실서버 재검증 (2026-10-24)
+
+`f5b4da7`에서 같은 실서버·실제 TTY 검증을 새 합성 Local 대화로 다시 실행했습니다. 같은 폴더의 재개, 원래 작업 표식 보존, 상대 경로와 여섯 도구 작업이 다시 통과했습니다. 실제 도구 결과 14개가 모두 성공했고, Local 성공 라우팅은 최초 대화 5건·같은 폴더 재개 4건·다른 폴더 시도 0건이었습니다. 다른 폴더에서는 직접 지정과 전체 프로젝트 선택 모두 CLI가 거절했으며, 재개된 상태의 추론 성공으로 집계하지 않았습니다. 해당 시도 전후 두 작업 폴더의 파일 보존, Plan 전환 0건, upstream 실패 0건, 실행 3회의 정상 종료와 리스너 닫힘을 확인했습니다. 증거 검증기도 통과했고, 개인 환경 값과 원시 이력은 공개하지 않았습니다. 이번 실서버 재검증에서는 전체 공개 회귀 테스트를 다시 실행하지 않았습니다.
+
 ## English
+
+A fresh live-server/TTY rerun at `f5b4da7` reproduced the same result: same-folder resume retained the original marker and relative workspace base, and all fourteen actual tool results succeeded. Successful Local routes were five for the initial conversation, four after same-folder resume and zero for the other-folder attempt. Both direct lookup and all-project selection from the other folder were refused by the CLI; cross-folder inference was not counted as passed. Both workspaces were preserved during that attempt, upstream failures and Plan routes remained zero, and all three starts exited normally with closed listeners. The evidence checker passed. Private values and raw history remain unpublished; the complete public regression suite was not rerun for this live-only check.
 
 At `48b7830`, real Claude Code 2.1.304 in Windows ConPTY resumed an owned Local conversation after a normal exit from the same workspace. The original conversation identifier and memory-only synthetic marker were retained. Seven tool calls succeeded before exit and seven after resume: Bash `pwd`, two Reads, Write, Edit, Glob and Grep per round. Relative user paths contained Korean and spaces; actual cwd, tool targets, preserved content and UTF-8 bytes matched workspace A. The resumed main requests retained one A workspace binding and the base system instructions. All fourteen unique calls matched successful results; duplicate transcript records were not counted twice.
 

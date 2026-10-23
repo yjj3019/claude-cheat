@@ -143,6 +143,122 @@ class LocalDiagnosticTests(LocalTestCase):
 
 
 class LocalCliModeTests(LocalTestCase):
+    def test_compat_command_restores_client_integrations_with_default_permissions(self):
+        with mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.304")):
+            command = route.local_cli_command("synthetic-cli", compat=True)
+        for flag in ("--safe-mode", "--tools", "--disallowedTools", "--strict-mcp-config", "--mcp-config",
+                     "--no-chrome", "--setting-sources", "--dangerously-skip-permissions"):
+            self.assertNotIn(flag, command)
+        self.assertEqual(command[command.index("--permission-mode") + 1], "default")
+        self.assertEqual(command[command.index("--model") + 1], "sonnet")
+        self.assertIn("--append-system-prompt", command)
+        settings = json.loads(command[command.index("--settings") + 1])
+        self.assertEqual(settings, {"apiKeyHelper": "", "env": {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "8192"}})
+
+    def test_compat_environment_is_opt_in_preserves_preferences_and_keeps_credentials_private(self):
+        self.configure(LOCAL_LLM_API_KEY="private-local-key")
+        preferences = {"CLAUDE_CONFIG_DIR": str(self.root / "custom-config"), "CLAUDE_CODE_EFFORT_LEVEL": "high",
+                       "MAX_THINKING_TOKENS": "2048", "CLAUDE_CODE_AUTOCOMPACT_PCT_OVERRIDE": "65"}
+        os.environ.update(preferences)
+        os.environ.update(ANTHROPIC_API_KEY="private-api-key", CLAUDE_CODE_OAUTH_TOKEN="private-oauth",
+                          ANTHROPIC_DEFAULT_OPUS_MODEL="private-model", LOCAL_ROUTE_COMPAT="1")
+        for compat in (False, True):
+            with self.subTest(compat=compat):
+                proxy = mock.Mock()
+                proxy.stdout.readline.return_value = '{"port":12345}'
+                with mock.patch.object(route.Path, "home", return_value=self.root), mock.patch.object(route.shutil, "which", return_value="synthetic-cli"), mock.patch.object(route.subprocess, "Popen", return_value=proxy) as spawn:
+                    with route.routed_session("local", local_only=True, local_compat=compat) as env:
+                        self.assertNotIn("LOCAL_ROUTE_COMPAT", env)
+                        for name in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "LOCAL_LLM_API_KEY"):
+                            self.assertNotIn(name, env)
+                        self.assertNotEqual(env["ANTHROPIC_AUTH_TOKEN"], "private-api-key")
+                        if compat:
+                            for name, value in preferences.items():
+                                self.assertEqual(env[name], value)
+                            for name in ("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "CLAUDE_CODE_DISABLE_ADVISOR_TOOL",
+                                         "CLAUDE_CODE_AUTO_CONNECT_IDE", "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"):
+                                self.assertNotIn(name, env)
+                            for name, model in {
+                                "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-5-5",
+                                "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5-5",
+                                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-5-5",
+                                "ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5-1",
+                                "ANTHROPIC_SMALL_FAST_MODEL": "claude-haiku-5-5",
+                                "CLAUDE_CODE_SUBAGENT_MODEL": "claude-sonnet-5-5",
+                            }.items():
+                                self.assertEqual(env[name], model)
+                        else:
+                            self.assertEqual(env["MAX_THINKING_TOKENS"], "0")
+                        proxy_env = spawn.call_args.kwargs["env"]
+                        self.assertEqual(proxy_env.get("LOCAL_ROUTE_COMPAT"), "1" if compat else None)
+                        self.assertEqual(proxy_env["LOCAL_ROUTE_ONLY"], "1")
+                        self.assertEqual(proxy_env["LOCAL_LLM_API_KEY"], "private-local-key")
+                        self.assertEqual(spawn.call_args.args[0][-1], "--parent-pipe")
+                proxy.terminate.assert_called_once()
+                proxy.stdin.close.assert_called_once()
+
+    def test_compat_invalid_combinations_fail_before_startup(self):
+        for args in (["--local-compat"], ["--provider", "local", "--local-compat", "--local-mode"],
+                     ["--provider", "local", "--local-compat", "--check-local"],
+                     ["--provider", "local", "--local-compat", "--diagnose-local"]):
+            result = route.subprocess.run([route.sys.executable, SPEC.origin, *args], capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("--local-compat requires --provider local", result.stderr)
+        for provider, local_only in (("local", False), ("openrouter", True)):
+            with self.assertRaises(ValueError):
+                with route.routed_session(provider, local_only=local_only, local_compat=True):
+                    self.fail("Invalid compatibility session started")
+            with self.assertRaises(ValueError):
+                route.launch(provider, local_only=local_only, local_compat=True)
+
+    def test_compat_launch_uses_separate_opt_in_session(self):
+        output = io.StringIO()
+        pinned = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:12345", "ANTHROPIC_AUTH_TOKEN": "synthetic-nonce",
+                  "ANTHROPIC_CUSTOM_HEADERS": "X-Local-Route-Token: synthetic-nonce",
+                  "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-5-5", "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5-5",
+                  "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-5-5", "ANTHROPIC_DEFAULT_FABLE_MODEL": "claude-fable-5-1",
+                  "ANTHROPIC_SMALL_FAST_MODEL": "claude-haiku-5-5", "CLAUDE_CODE_SUBAGENT_MODEL": "claude-sonnet-5-5"}
+        with contextlib.redirect_stdout(output), mock.patch.object(route.shutil, "which", return_value="synthetic-cli"), mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.304")), mock.patch.object(route, "routed_session", return_value=contextlib.nullcontext(pinned)) as session, mock.patch.object(route.subprocess, "call", return_value=0) as child:
+            self.assertEqual(route.launch("local", local_only=True, local_compat=True), 0)
+        session.assert_called_once_with("local", local_only=True, local_compat=True)
+        self.assertIn("compatibility mode", output.getvalue())
+        self.assertIn("No Plan fallback", output.getvalue())
+        command = child.call_args.args[0]
+        settings = json.loads(command[command.index("--settings") + 1])
+        # Simulate lower-priority saved settings.env trying to replace routing and credentials.
+        saved_env = {name: "private-saved-override" for name in settings["env"]}
+        effective = {**saved_env, **settings["env"]}
+        for name, value in pinned.items():
+            self.assertEqual(effective[name], value)
+        for name in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENROUTER_API_KEY",
+                     "ANTHROPIC_MODEL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+                     "CLAUDE_CODE_USE_FOUNDRY", "LOCAL_LLM_API_KEY", "LOCAL_LLM_URL"):
+            self.assertEqual(effective[name], "")
+        self.assertEqual(settings["apiKeyHelper"], "")
+        self.assertEqual(effective["CLAUDE_CODE_MAX_OUTPUT_TOKENS"], "8192")
+        self.assertNotIn("private-saved-override", json.dumps(settings))
+
+    def test_compat_retains_version_budget_and_cleanup_startup_guards(self):
+        with mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.303")):
+            with self.assertRaises(route.LocalStartupError) as result:
+                route.local_cli_command("synthetic-cli", compat=True)
+        self.assertEqual(result.exception.code, "local_cli_unsupported")
+        os.environ["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = "2048"
+        with mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.304")):
+            command = route.local_cli_command("synthetic-cli", compat=True)
+        settings = json.loads(command[command.index("--settings") + 1])
+        self.assertEqual(settings["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"], "8192")
+        self.guard.side_effect = RuntimeError("private-exception-marker")
+        err = io.StringIO()
+        with mock.patch.object(sys, "argv", [str(SPEC.origin), "--provider", "local", "--local-compat"]), \
+             mock.patch("shutil.which", side_effect=AssertionError("No CLI before cleanup readiness")), \
+             contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as result:
+                runpy.run_path(str(SPEC.origin), run_name="__main__")
+        self.assertEqual(result.exception.code, 1)
+        self.assertEqual(json.loads(err.getvalue())["code"], "local_process_cleanup_failed")
+        self.assertNotIn("private-exception-marker", err.getvalue())
+
     def test_cleanup_preparation_failure_stops_before_cli_and_hides_exception(self):
         self.guard.side_effect = RuntimeError("private-exception-marker")
         err = io.StringIO()

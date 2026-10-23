@@ -191,6 +191,18 @@ URL 내 사용자명·비밀번호·쿼리·fragment, redirect, 잘못된 인증
 
 다시 OpenRouter를 쓰려면 세션을 종료하고 기본 명령으로 재실행합니다. 실행 중인 세션에서 `/model`은 Claude 모델을 선택하며 OpenRouter/Local 제공자를 바꾸는 메뉴가 아닙니다.
 
+### Claude CLI Local 호환 모드
+
+```powershell
+.\startClaudeOpenRouter.ps1 -Provider Local -LocalCompat
+```
+
+Claude Code 2.1.304 이상에서 플러그인·스킬·MCP·hooks·하위 에이전트와 추론 설정을 사용하는 별도 선택 모드입니다. 일반 설정과 프로젝트 지침을 로드하며 기본 승인·거절 규칙을 유지합니다. API 키 helper는 비활성화하고, 실행 시 설정으로 프록시 주소와 임시 인증을 고정합니다. 기존 실행과 아래 `-LocalMode`의 제한은 바뀌지 않습니다. `-LocalCompat`은 `-LocalMode`·진단 옵션과 함께 사용할 수 없습니다.
+
+주 모델·빠른 모델·하위 에이전트의 Claude 모델 선택은 **모두 설정한 같은 Local 모델**로 전달합니다. Plan 로그인과 Plan fallback은 사용하지 않습니다. `/effort low`·`/effort high`와 thinking 설정은 서버에 보존해 전달하지만, 제3자 모델의 추론 효과가 Sonnet과 같다는 의미는 아닙니다. 지원하지 않는 beta·본문 필드·토큰 계산 API는 명시적으로 거절합니다.
+
+현재 서버는 SSE 응답의 모델 식별자가 설정과 일치하지 않아 JSON 응답을 완전히 검증한 뒤 CLI용 SSE로 변환합니다. 실시간 토큰 전달은 제공하지 않으며 120초 전체 요청 제한·1회 외부 시도·30초 재요청 대기를 유지합니다. 서명과 공급자 메타데이터는 새로 만들지 않고 보존합니다. 모든 네이티브 서버 기능과 임의의 플러그인 조합을 지원한다고 보장하지 않습니다. [실서버 검증 범위](docs/LIVE-VALIDATION.ko.md#local-호환-모드-검증-2026-10-24)를 참고하세요.
+
 ### Claude CLI Local 전용 모드
 
 ```powershell

@@ -60,6 +60,18 @@ For `native_feature`, `detail` reports the first exclusion: `token_count`, `plan
 
 The CLI or HUD can still display Sonnet/Plan for a replacement response. That label and its cost estimate do not prove the inference provider or actual OpenRouter billing. Check the safe `route_selected` metadata: `replacement`, `native_feature`, `fallback`, or `circuit_open`.
 
+## Local compatibility mode
+
+```powershell
+.\startClaudeOpenRouter.ps1 -Provider Local -LocalCompat
+```
+
+This separate opt-in mode restores normal plugin, skill, MCP, hook, subagent, project-instruction and thinking/effort settings on Claude Code 2.1.304 or later. Default permissions and deny/ask rules remain active. The API-key helper stays disabled; per-launch settings pin the loopback route and temporary authentication above saved environment settings. Existing commands and `-LocalMode` retain their behavior. Do not combine `-LocalCompat` with `-LocalMode` or diagnostics.
+
+All Claude main/fast/subagent model roles use the same configured Local model. No Plan login or Plan fallback is used. Effort and thinking parameters are preserved, without claiming Sonnet-equivalent reasoning effects. Unknown betas, unsupported fields and token counting fail explicitly.
+
+The current server returns an SSE model identifier that does not match the configured model. Compatibility mode therefore validates complete JSON replies and converts them into CLI SSE frames, preserving signatures and provider metadata without inventing them. Tokens are buffered; the existing 120-second whole-request deadline, one upstream attempt and 30-second cooldown remain. Arbitrary plugins and every native server feature are not guaranteed. See the [live validation scope](docs/LIVE-VALIDATION.ko.md#local-호환-모드-검증-2026-10-24).
+
 ## Local-only Claude CLI mode
 
 ```powershell

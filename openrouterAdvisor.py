@@ -326,9 +326,9 @@ def file_mcp_sources() -> list[str]:
 
 
 @contextlib.contextmanager
-def routed_session(provider: str = "openrouter", local_only: bool = False):
+def routed_session(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False):
     """Own one loopback proxy; ordinary sessions alone use the subscription login."""
-    if local_only and provider != "local":
+    if (local_only and provider != "local") or (local_compat and not local_only):
         raise ValueError("Local CLI mode requires the local provider")
     claude = shutil.which("claude")
     if not claude:
@@ -336,6 +336,17 @@ def routed_session(provider: str = "openrouter", local_only: bool = False):
             raise LocalStartupError("local_cli_not_found")
         raise FileNotFoundError("Claude Code executable not found")
     env = clean_env() if local_only else os.environ.copy()
+    if local_compat:
+        # Preserve client preferences, never inherited provider routing or credentials.
+        for name in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_EFFORT_LEVEL", "MAX_THINKING_TOKENS",
+                     "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+                     "CLAUDE_CODE_MAX_CONTEXT_TOKENS", "CLAUDE_CODE_AUTOCOMPACT_PCT_OVERRIDE"):
+            if name in os.environ:
+                env[name] = os.environ[name]
+        env.update(ANTHROPIC_DEFAULT_SONNET_MODEL="claude-sonnet-5-5", ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-5-5",
+                   ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-haiku-5-5", ANTHROPIC_DEFAULT_FABLE_MODEL="claude-fable-5-1",
+                   ANTHROPIC_SMALL_FAST_MODEL="claude-haiku-5-5", CLAUDE_CODE_SUBAGENT_MODEL="claude-sonnet-5-5")
+    env.pop("LOCAL_ROUTE_COMPAT", None)
     for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER"):
         env.pop(name, None)
     # Remove only provider credentials/routing left by the former OpenRouter setup.
@@ -371,6 +382,9 @@ def routed_session(provider: str = "openrouter", local_only: bool = False):
             raise LocalStartupError("local_configuration_invalid") from None
         raise
     proxy_env.update(config, LOCAL_ROUTE_TOKEN=nonce, LOCAL_ROUTE_ONLY="1" if local_only else "0")
+    proxy_env.pop("LOCAL_ROUTE_COMPAT", None)
+    if local_compat:
+        proxy_env["LOCAL_ROUTE_COMPAT"] = "1"
     proxy_command = [node, str(ROOT / "claudeRouteProxy.mjs")]
     if local_only:
         proxy_command.append("--parent-pipe")
@@ -405,7 +419,9 @@ def routed_session(provider: str = "openrouter", local_only: bool = False):
                     "ANTHROPIC_CUSTOM_HEADERS": (headers + "\n" if headers else "") + f"X-Local-Route-Token: {nonce}"})
         if local_only:
             # A proxy Bearer token takes precedence over saved OAuth and API-key helpers.
-            env.update(ANTHROPIC_AUTH_TOKEN=nonce, CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="1",
+            env.update(ANTHROPIC_AUTH_TOKEN=nonce, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
+        if local_only and not local_compat:
+            env.update(CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="1",
                        CLAUDE_CODE_DISABLE_ADVISOR_TOOL="1", MAX_THINKING_TOKENS="0",
                        CLAUDE_CODE_AUTO_CONNECT_IDE="false", CLAUDE_CODE_DISABLE_BACKGROUND_TASKS="1",
                        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
@@ -462,7 +478,7 @@ def diagnose_local() -> int:
     return subprocess.call([node, str(ROOT / "claudeRouteProxy.mjs"), "--diagnose-local"], env=env)
 
 
-def local_cli_command(claude: str) -> list:
+def local_cli_command(claude: str, compat: bool = False) -> list:
     try:
         version = subprocess.run([claude, "--version"], capture_output=True, text=True, timeout=10, check=True)
     except (OSError, subprocess.SubprocessError, ValueError):
@@ -480,6 +496,9 @@ def local_cli_command(claude: str) -> list:
     settings = {"alwaysThinkingEnabled": False, "disableAllHooks": True, "autoMemoryEnabled": False,
                 "apiKeyHelper": "", "env": {
         "CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(max(8192, int(output_tokens)))}}
+    if compat:
+        for name in ("alwaysThinkingEnabled", "disableAllHooks", "autoMemoryEnabled"):
+            settings.pop(name)
     # Keep the inherited workspace explicit when compaction exposes transcript paths.
     workspace_context = (
         f"Local session workspace directory (JSON string): {json.dumps(str(Path.cwd()), ensure_ascii=False)}\n"
@@ -487,22 +506,44 @@ def local_cli_command(claude: str) -> list:
         "Paths mentioned for transcripts, history, configuration or logs do not change that default base. "
         "Retain this workspace context after compaction. Existing tool permissions still apply.")
     # Safe mode keeps all file tools; retain setting sources so deny/ask rules still apply.
+    if compat:
+        return [claude, "--model", "sonnet", "--permission-mode", "default",
+                "--settings", json.dumps(settings), "--append-system-prompt", workspace_context]
     return [claude, "--safe-mode", "--model", "sonnet", "--permission-mode", "default",
             "--tools", "Bash,Read,Edit,Write,Glob,Grep", "--disallowedTools", "mcp__*",
             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
             "--no-chrome", "--settings", json.dumps(settings), "--append-system-prompt", workspace_context]
 
 
-def launch(provider: str = "openrouter", local_only: bool = False) -> int:
+def launch(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False) -> int:
+    if (local_only and provider != "local") or (local_compat and not local_only):
+        raise ValueError("Local CLI mode requires the local provider")
     claude = shutil.which("claude")
     if not claude:
         if local_only:
             raise LocalStartupError("local_cli_not_found")
         raise FileNotFoundError("Claude Code executable not found")
     if local_only:
-        print("Local CLI mode: built-in file/shell tools; native integrations disabled. No Plan fallback.")
-        command = local_cli_command(claude)
-        with routed_session(provider, local_only=True) as env:
+        print("Local compatibility mode: client integrations enabled. No Plan fallback." if local_compat else
+              "Local CLI mode: built-in file/shell tools; native integrations disabled. No Plan fallback.")
+        command = local_cli_command(claude, compat=True) if local_compat else local_cli_command(claude)
+        session = routed_session(provider, local_only=True, local_compat=True) if local_compat else routed_session(provider, local_only=True)
+        with session as env:
+            if local_compat:
+                # CLI settings.env outranks process env: pin the same isolated route at that boundary.
+                settings_index = command.index("--settings") + 1
+                settings = json.loads(command[settings_index])
+                for name in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS",
+                             "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                             "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL",
+                             "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"):
+                    settings["env"][name] = env[name]
+                for name in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENROUTER_API_KEY",
+                             "ANTHROPIC_MODEL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+                             "CLAUDE_CODE_USE_FOUNDRY", "LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY",
+                             "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER"):
+                    settings["env"][name] = ""
+                command[settings_index] = json.dumps(settings)
             try:
                 return subprocess.call(command, env=env)
             except OSError:
@@ -711,7 +752,10 @@ if __name__ == "__main__":
             parser.add_argument("--check-local", action="store_true", help="Check local model metadata without inference or Plan login")
             parser.add_argument("--diagnose-local", action="store_true", help="One synthetic Local inference without CLI, native features or Plan fallback")
             parser.add_argument("--local-mode", action="store_true", help="Interactive Local-only CLI with native integrations disabled and no Plan fallback")
+            parser.add_argument("--local-compat", action="store_true", help="Opt-in Local-only CLI compatibility mode with client integrations and no Plan fallback")
             options = parser.parse_args()
+            if options.local_compat and (options.provider != "local" or options.local_mode or options.check_local or options.diagnose_local):
+                parser.error("--local-compat requires --provider local and cannot be combined with --local-mode or diagnostic checks")
             if options.local_mode and (options.provider != "local" or options.check_local or options.diagnose_local):
                 parser.error("--local-mode requires --provider local and cannot be combined with diagnostic checks")
             if options.diagnose_local and (options.provider != "local" or options.check_local):
@@ -722,12 +766,12 @@ if __name__ == "__main__":
                 result = check_local()
                 print(json.dumps(result))
                 sys.exit(0 if result["local_check"] else 1)
-            if options.local_mode:
+            if options.local_mode or options.local_compat:
                 try:
                     localProcessTree.ensure_windows_local_tree()
                 except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
                     raise LocalStartupError("local_process_cleanup_failed") from None
-            sys.exit(launch(options.provider, local_only=options.local_mode))
+            sys.exit(launch(options.provider, local_only=options.local_mode or options.local_compat, local_compat=options.local_compat))
     except LocalStartupError as exc:
         print(json.dumps({"event": "openrouter_start_failed", "kind": type(exc).__name__,
                           "code": exc.code, "message": str(exc)}), file=sys.stderr)
