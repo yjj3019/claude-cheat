@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import test from 'node:test';
+import { listenSafe } from './listenSafe.mjs';
 import { createProxy, checkConnection } from '../claudeRouteProxy.mjs';
 
 const MODEL = 'fixture-vendor/fixture-model', KEY = 'sk-or-synthetic-key', NONCE = 'synthetic-route-token';
@@ -13,7 +14,7 @@ async function session(t, upstream = () => reply(), options = {}) {
     openrouterModel: MODEL, ...options, fetchImpl: async (url, request) => {
       calls.push({ url, ...request, parsed: JSON.parse(request.body) }); return upstream(url, request);
     } });
-  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  await listenSafe(server);
   t.after(() => { server.closeAllConnections(); server.close(); });
   return { calls, send: (extra = {}, path = '', beta = 'interleaved-thinking-2025-05-14,effort-2025-11-24', signal) => fetch(
     `http://127.0.0.1:${server.address().port}/v1/messages${path}`, { method: 'POST', signal,
@@ -62,7 +63,7 @@ for (const [kind, failure, code] of [
 ]) {
   test(`OpenRouter ${kind} fails once, stays off Plan during cooldown and recovers`, async t => {
     let healthy = false, time = 1000;
-    const s = await session(t, () => healthy ? reply() : failure(), { attemptTimeoutMs: 30, cooldownMs: 1000, now: () => time });
+    const s = await session(t, () => healthy ? reply() : failure(), { attemptTimeoutMs: 300, cooldownMs: 1000, now: () => time });
     const r = await s.send(); const body = await r.text(); assert.equal(r.status, 400); assert.match(body, new RegExp(code));
     assert.doesNotMatch(body, /private-body|sk-or-synthetic-key/); assert.equal(s.calls.length, 1);
     assert.equal((await s.send()).status, 400); assert.equal(s.calls.length, 1);

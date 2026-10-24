@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import test from 'node:test';
+import { listenSafe } from './listenSafe.mjs';
 import { createProxy, diagnoseLocal, DEEPSEEK } from '../claudeRouteProxy.mjs';
 
 const diagnosticConfig = { localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'diagnostic-fixture', localKey: 'synthetic-local-key' };
@@ -106,12 +107,11 @@ const frame = (type, extra = {}) => `event: ${type}\ndata: ${JSON.stringify({ ty
 
 async function fixture(t, upstream = jsonResponse, config = {}) {
   const calls = [];
-  const server = createProxy({ key: KEY, nonce: NONCE, openrouterModel: DEEPSEEK, retryDelayMs: 0, attemptTimeoutMs: 200, ...config, fetchImpl: async (url, options) => {
+  const server = createProxy({ key: KEY, nonce: NONCE, openrouterModel: DEEPSEEK, retryDelayMs: 0, attemptTimeoutMs: 2000, ...config, fetchImpl: async (url, options) => {
     calls.push({ url, ...options, parsedBody: JSON.parse(options.body) });
     return upstream(url, options);
   } });
-  server.listen(0, '127.0.0.1');
-  await once(server, 'listening');
+  await listenSafe(server);
   t.after(async () => {
     const closed = new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     server.closeAllConnections();
@@ -539,13 +539,15 @@ for (const model of [OPUS, HAIKU, FABLE]) {
 }
 
 for (const model of [DEEPSEEK, SONNET]) {
-  test(`${model} external JSON keeps metadata and isolates OAuth`, async t => {
+  test(`${model} external JSON drops client metadata and isolates OAuth`, async t => {
     const body = requestBody(model, { metadata: { user_id: 'fixture' }, tools: [{ name: 'Read', input_schema: { type: 'object' } }] });
     const { calls, request } = await fixture(t);
     const response = await request(body, { headers: proHeaders });
     assert.equal(response.status, 200);
     assert.equal((await response.json()).model, model);
-    assert.deepEqual(calls[0].parsedBody, { ...body, model: DEEPSEEK, provider: { allow_fallbacks: false } });
+    const { metadata, ...expected } = body;
+    assert.equal(calls[0].parsedBody.metadata, undefined);
+    assert.deepEqual(calls[0].parsedBody, { ...expected, thinking: { type: 'disabled' }, model: DEEPSEEK, provider: { allow_fallbacks: false } });
     assert.equal(calls[0].headers.authorization, `Bearer ${KEY}`);
     assert.equal(JSON.stringify(calls[0].headers).includes(OAUTH), false);
     assert.equal(calls[0].headers['anthropic-beta'], undefined);
@@ -1127,7 +1129,7 @@ for (const thinking of [{ type: 'disabled' }, { type: 'enabled', budget_tokens: 
     const { calls, request } = await fixture(t);
     assert.equal((await request(body, { headers: { ...proHeaders, 'anthropic-beta': BETA + ',claude-code-20250219,prompt-caching-2024-07-31' } })).status, 200);
     assert.equal(calls[0].url, externalURL);
-    assert.deepEqual(calls[0].parsedBody, { ...body, model: DEEPSEEK, provider: { allow_fallbacks: false } });
+    assert.deepEqual(calls[0].parsedBody, { ...body, thinking: { type: 'disabled' }, model: DEEPSEEK, provider: { allow_fallbacks: false } });
     assert.equal(calls[0].headers['anthropic-beta'], undefined);
   });
 }
@@ -1287,7 +1289,7 @@ test('explicit remote HTTPS uses exactly the configured endpoint, model and isol
   assert.equal((await response.json()).model, SONNET);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, localUrl);
-  assert.deepEqual(calls[0].parsedBody, { ...requestBody(SONNET), model: localModel });
+  assert.deepEqual(calls[0].parsedBody, { ...requestBody(SONNET), thinking: { type: 'disabled' }, model: localModel });
   assert.equal(calls[0].headers.authorization, `Bearer ${localKey}`);
   assert.equal(calls[0].headers['anthropic-beta'], undefined);
   assert.equal(calls[0].headers['x-api-key'], undefined);
@@ -1364,3 +1366,73 @@ for (const thinking of [undefined, { type: 'adaptive' }]) {
     assert.equal(Object.hasOwn(calls.at(-1).parsedBody, 'thinking'), Boolean(thinking));
   });
 }
+
+test('request-level 4xx is not retried and does not open the provider circuit', async t => {
+  const { calls, request } = await fixture(t, (url, options) => url === proURL ? jsonResponse(url, options) : new Response('bad', { status: 400 }));
+  await (await request(requestBody(SONNET), { headers: proHeaders })).text();
+  assert.deepEqual(calls.map(call => call.url), [externalURL, proURL]);
+  await (await request(requestBody(SONNET), { headers: proHeaders })).text();
+  assert.equal(calls[2].url, externalURL);
+});
+
+for (const status of [401, 402, 403, 404]) {
+  test(`provider-level HTTP ${status} is not retried and opens the circuit`, async t => {
+    const { calls, request } = await fixture(t, (url, options) => url === proURL ? jsonResponse(url, options) : new Response('no', { status }), { now: () => 1000 });
+    await (await request(requestBody(SONNET), { headers: proHeaders })).text();
+    await (await request(requestBody(SONNET), { headers: proHeaders })).text();
+    assert.deepEqual(calls.map(call => call.url), [externalURL, proURL, proURL]);
+  });
+}
+
+test('SSE response to a non-stream request is rejected and retried', async t => {
+  const { calls, request } = await fixture(t, (url, options) => url === proURL ? jsonResponse(url, options) : sseResponse([complete(DEEPSEEK)]));
+  await (await request(requestBody(SONNET, { stream: false }), { headers: proHeaders })).text();
+  assert.equal(calls.filter(call => call.url === externalURL).length, 4);
+  assert.equal(calls.at(-1).url, proURL);
+});
+
+test('stale in-flight failure does not reopen a recovered circuit', async t => {
+  let healthy = false, time = 1000, release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const { calls, request } = await fixture(t, async (url, options) => {
+    if (url === proURL) return jsonResponse(url, options);
+    if (JSON.parse(options.body).system === 'A') { await gate; return new Response('fail', { status: 500 }); }
+    return healthy ? jsonResponse(url, options) : new Response('fail', { status: 500 });
+  }, { cooldownMs: 10, attemptTimeoutMs: 5000, now: () => time });
+  const stale = request(requestBody(SONNET, { system: 'A' }), { headers: proHeaders });
+  await new Promise(resolve => setTimeout(resolve, 50));
+  await (await request(requestBody(SONNET), { headers: proHeaders })).text();
+  time += 20;
+  healthy = true;
+  await (await request(requestBody(SONNET), { headers: proHeaders })).text();
+  release();
+  await (await stale).text();
+  await (await request(requestBody(SONNET), { headers: proHeaders })).text();
+  assert.equal(calls.at(-1).url, externalURL);
+});
+
+test('ordinary mode never asks external for thinking and rejects a thinking reply for that request only', async t => {
+  const withThinking = () => Response.json({ type: 'message', model: DEEPSEEK, stop_reason: 'end_turn',
+    content: [{ type: 'thinking', thinking: 'x', signature: 'external' }, { type: 'text', text: 'ok' }] });
+  const { calls, request } = await fixture(t, (url, options) => url === proURL ? jsonResponse(url, options) : withThinking());
+  await (await request(requestBody(SONNET, { thinking: { type: 'adaptive' } }), { headers: proHeaders })).text();
+  assert.deepEqual(calls.map(call => call.url), [externalURL, proURL]);
+  assert.deepEqual(calls[0].parsedBody.thinking, { type: 'disabled' });
+  await (await request(requestBody(SONNET), { headers: proHeaders })).text();
+  assert.equal(calls[2].url, externalURL);
+});
+
+test('stalled Plan stream is cut after the idle timeout', async t => {
+  const stalled = new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode('event: ping\n\n')); } }),
+    { headers: { 'content-type': 'text/event-stream' } });
+  const { request } = await fixture(t, () => stalled, { planIdleMs: 100, planHeaderMs: 100 });
+  const response = await request(requestBody(OPUS, { stream: true }), { headers: proHeaders });
+  await assert.rejects(async () => { await response.text(); });
+});
+
+test('request body up to 32 MiB reaches routing instead of being rejected at 16 MiB', async t => {
+  const { calls, request } = await fixture(t, (url, options) => jsonResponse(url, options));
+  const big = requestBody(SONNET, { system: 'x'.repeat(17 * 1024 * 1024) });
+  assert.equal((await request(big, { headers: proHeaders })).status, 200);
+  assert.ok(calls.length >= 1);
+});

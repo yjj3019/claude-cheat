@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import test from 'node:test';
+import { listenSafe } from './listenSafe.mjs';
 import { createProxy } from '../claudeRouteProxy.mjs';
 
 const config = { nonce: 'fixture-route', provider: 'local', localOnly: true, localCompat: true,
@@ -14,7 +15,7 @@ async function session(t, fetchImpl, overrides = {}) {
     calls.push({ url, ...options });
     return fetchImpl(url, options);
   } });
-  server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  await listenSafe(server);
   t.after(() => { server.closeAllConnections(); server.close(); });
   return { calls, send: (extra = {}, path = '', beta = 'interleaved-thinking-2025-05-14,effort-2025-11-24') => fetch(`http://127.0.0.1:${server.address().port}/v1/messages${path}`, {
     method: 'POST', headers: { 'x-local-route-token': config.nonce, 'content-type': 'application/json',

@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { once } from 'node:events';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 
 // Historical client alias only; the upstream model must be configured explicitly.
@@ -177,6 +178,7 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal) {
   if (!upstream.body) throw new Error('Empty message response');
   const sse = (upstream.headers.get('content-type') || '').includes('text/event-stream');
   if (stream === true && !sse) throw new Error('Invalid response');
+  if (stream !== true && sse) throw new Error('Unexpected SSE response');
   const reader = upstream.body.getReader();
   const chunks = [];
   let size = 0, eventPending = '';
@@ -377,7 +379,7 @@ export async function checkConnection({ provider, key, openrouterModel, fetchImp
 
 export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrouter', openrouterModel, localUrl,
   localModel, localKey, localAllowRemote = false, localHttpUrl, localOnly = false, localCompat = false, openrouterCompat = false, fallbackModel = 'claude-sonnet-5-5', retryDelayMs = 1000,
-  cooldownMs = 30000, attemptTimeoutMs = localOnly || openrouterCompat ? 120000 : 30000, now = Date.now }) {
+  cooldownMs = 30000, attemptTimeoutMs = localOnly || openrouterCompat ? 120000 : 30000, planHeaderMs = 120000, planIdleMs = 300000, now = Date.now }) {
   if (typeof localOnly !== 'boolean' || (localOnly && provider !== 'local')) throw new Error('Local-only mode requires local provider');
   if (typeof localCompat !== 'boolean' || (localCompat && (!localOnly || provider !== 'local')))
     throw new Error('Local compatibility requires Local-only mode');
@@ -386,6 +388,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   const noPlan = localOnly || openrouterCompat, compatProfile = localCompat || openrouterCompat;
   const label = openrouterCompat ? 'OpenRouter' : 'Local', errorPrefix = openrouterCompat ? 'openrouter' : 'local';
   if (!nonce || (provider === 'openrouter' && !key)) throw new Error('Proxy credentials required');
+  const nonceDigest = createHash('sha256').update(nonce).digest();
+  const tokenMatches = value => typeof value === 'string' && timingSafeEqual(createHash('sha256').update(value).digest(), nonceDigest);
   if (!['openrouter', 'local'].includes(provider)) throw new Error('Unsupported Sonnet provider');
   if (provider === 'openrouter' && !validOpenRouterModel(openrouterModel))
     throw new Error('OpenRouter model required; no default model is selected');
@@ -394,7 +398,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   const externalUrl = provider === 'local' ? localEndpoint(localUrl, localAllowRemote, localHttpUrl) : 'https://openrouter.ai/api/v1/messages';
   if (provider === 'local' && (typeof localModel !== 'string' || !localModel.trim())) throw new Error('Local model required');
   if (!isSonnet(fallbackModel)) throw new Error('Fallback must be a native Sonnet model');
-  for (const value of [retryDelayMs, cooldownMs, attemptTimeoutMs])
+  for (const value of [retryDelayMs, cooldownMs, attemptTimeoutMs, planHeaderMs, planIdleMs])
     if (!Number.isFinite(value) || value < 0) throw new Error('Invalid routing timeout');
   let openUntil = 0, probing = false, generation = 0, lastLocalFailure = 'upstream_error';
   const server = http.createServer(async (req, res) => {
@@ -404,7 +408,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       res.writeHead(status, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message } }));
     };
-    if (req.headers['x-local-route-token'] !== nonce) return reject(403, 'Local authorization required');
+    if (!tokenMatches(req.headers['x-local-route-token'])) return reject(403, 'Local authorization required');
     if (req.method === 'HEAD' && req.url === '/api/hello') { res.writeHead(200); res.end(); return; }
     if (req.method !== 'POST' || !/^\/v1\/messages(?:\/count_tokens)?(?:\?beta=true)?$/.test(req.url)) return reject(403, 'Endpoint blocked');
     const client = new AbortController();
@@ -415,7 +419,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       let size = 0;
       for await (const chunk of req) {
         size += chunk.length;
-        if (size > 16 * 1024 * 1024) return reject(413, 'Request too large');
+        if (size > MAX_RESPONSE) return reject(413, 'Request too large');
         chunks.push(chunk);
       }
       const raw = Buffer.concat(chunks);
@@ -471,8 +475,16 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           if (typeof value === 'string' && !['host', 'content-length', 'accept-encoding', 'connection',
             'transfer-encoding', 'x-local-route-token', 'x-api-key'].includes(name)) headers[name] = value;
         const proBody = model === DEEPSEEK || (configuredAlias && !isPro(model) && !isSonnet(model)) ? JSON.stringify({ ...body, model: fallbackModel }) : raw;
+        // Bound a stalled Plan upstream; user cancellation still flows through client.signal.
+        const plan = new AbortController();
+        const cancelPlan = () => plan.abort('client_close');
+        client.signal.addEventListener('abort', cancelPlan, { once: true });
+        let stall;
+        const arm = ms => { clearTimeout(stall); stall = setTimeout(() => plan.abort('plan_timeout'), ms); };
+        if (body.stream === true) arm(planHeaderMs);
+        try {
         const upstream = await abortable(fetchImpl('https://api.anthropic.com' + req.url,
-          { method: 'POST', headers, body: proBody, redirect: 'error', signal: client.signal }), client.signal);
+          { method: 'POST', headers, body: proBody, redirect: 'error', signal: plan.signal }), plan.signal);
         const responseHeaders = {};
         for (const [name, value] of upstream.headers)
           if (!['connection', 'transfer-encoding', 'content-length', 'content-encoding'].includes(name)) responseHeaders[name] = value;
@@ -483,7 +495,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           client.signal.addEventListener('abort', cancel, { once: true });
           try {
             while (true) {
-              const { done, value } = await abortable(reader.read(), client.signal);
+              arm(planIdleMs);
+              const { done, value } = await abortable(reader.read(), plan.signal);
               client.signal.throwIfAborted();
               if (done) break;
               if (!res.write(value)) await once(res, 'drain', { signal: client.signal });
@@ -495,6 +508,10 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           }
         }
         res.end();
+        } finally {
+          clearTimeout(stall);
+          client.signal.removeEventListener('abort', cancelPlan);
+        }
       };
       const nativeDetail = req.url.startsWith('/v1/messages/count_tokens') ? 'token_count' : compatProfile ?
         compatExclusion(body, req.headers['anthropic-beta']) : isPro(model) ? 'plan_model' : externalExclusion(body, req.headers['anthropic-beta'], localOnly);
@@ -507,10 +524,12 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       try {
         const externalModel = provider === 'local' ? localModel : openrouterModel;
         const externalBody = { ...body, model: externalModel };
+        delete externalBody.metadata; // client account/session identifiers stay off third-party providers
         if (noPlan) {
           externalBody.stream = false;
-          if (!compatProfile) externalBody.thinking = { type: 'disabled' };
         }
+        // Ordinary mode: external thinking blocks would pin the next turn to Plan (unsigned history), so never request them.
+        if (!compatProfile) externalBody.thinking = { type: 'disabled' };
         if (body.tools) externalBody.tools = body.tools.map(tool => ({ ...tool, input_schema: compatibleSchema(tool.input_schema) }));
         if (provider === 'openrouter') externalBody.provider = { allow_fallbacks: false };
         const headers = { 'content-type': 'application/json', 'anthropic-version': req.headers['anthropic-version'] || '2023-06-01' };
@@ -518,6 +537,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         const credential = provider === 'local' ? localKey : key;
         if (credential) headers.authorization = `Bearer ${credential}`;
         const attempts = noPlan ? 1 : 4;
+        // Permanent 4xx will not change on retry; request-level ones must not open the provider-wide circuit.
+        let requestRejected = false;
         for (let attempt = 0; attempt < attempts; attempt++) {
           client.signal.throwIfAborted();
           const controller = new AbortController();
@@ -564,6 +585,9 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
                   throw new Error('Unsupported Local response fields');
                 }
               }
+              // shortcut: textual match can false-positive on a tool_use input object containing this literal; refine if seen.
+              if (!compatProfile && !localOnly && /"type"\s*:\s*"(?:redacted_thinking|thinking|thinking_delta|signature_delta)"/.test(validated.text))
+                throw new Error('Thinking response in ordinary mode');
               return noPlan && body.stream === true ? jsonMessageStream(validated.text) : validated;
             })();
             const response = await abortable(operation, controller.signal);
@@ -580,17 +604,19 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           } catch (error) {
             client.signal.throwIfAborted();
             const validation = { 'Wrong response model': 'wrong_model', 'Invalid content block': 'invalid_content_block',
-              'Incomplete message': 'incomplete_message', 'Invalid response': 'expected_sse',
+              'Incomplete message': 'incomplete_message', 'Invalid response': 'expected_sse', 'Unexpected SSE response': 'unexpected_sse',
               'Invalid content delta': 'invalid_delta', 'Truncated stream': 'truncated_stream',
               'Empty message response': 'empty_response', 'Invalid message response': 'invalid_message',
               'Invalid stream metadata': 'invalid_stream_metadata', 'Expected JSON Local response': 'expected_json', 'Unsupported Local response content': 'unsupported_local_content',
-              'Local thinking response disabled': 'thinking_response', 'Unsupported Local response fields': 'unsupported_content_fields' }[error?.message];
+              'Local thinking response disabled': 'thinking_response', 'Thinking response in ordinary mode': 'thinking_response', 'Unsupported Local response fields': 'unsupported_content_fields' }[error?.message];
             if (noPlan) localFailure = controller.signal.reason === 'attempt_timeout' ? 'timeout' :
               status === 401 || status === 403 ? 'authentication_failed' : validation === 'empty_response' ? 'empty_response' : 'upstream_error';
             console.error(JSON.stringify({ event: 'external_attempt_failed', provider, attempt: attempt + 1,
               ...(Number.isInteger(status) ? { status } : {}), ...(validation ? { validation } : {}),
               category: controller.signal.reason === 'attempt_timeout' ? 'timeout' : 'upstream' }));
             controller.abort('attempt_failed');
+            if ([400, 413, 422].includes(status) || error?.message === 'Thinking response in ordinary mode') requestRejected = true;
+            if (requestRejected || [401, 402, 403, 404].includes(status)) break;
           } finally {
             clearTimeout(timer);
             client.signal.removeEventListener('abort', cancel);
@@ -600,10 +626,12 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             client.signal.addEventListener('abort', () => { clearTimeout(timeout); resolve(); }, { once: true });
           }), client.signal);
         }
-        generation++;
-        if (noPlan) lastLocalFailure = localFailure;
-        openUntil = now() + cooldownMs;
-        console.error(JSON.stringify({ event: 'circuit_open', provider }));
+        if (!requestRejected && claimedGeneration === generation) {
+          generation++;
+          if (noPlan) lastLocalFailure = localFailure;
+          openUntil = now() + cooldownMs;
+          console.error(JSON.stringify({ event: 'circuit_open', provider }));
+        }
       } finally {
         if (probe) probing = false;
       }
@@ -646,9 +674,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     }
   } else {
     const server = createProxy(config);
-    if ((config.localOnly || config.openrouterCompat) && process.argv.slice(2).includes('--parent-pipe')) {
+    if (process.argv.slice(2).includes('--parent-pipe')) {
       const parentClosed = () => {
-        console.error(JSON.stringify({ event: config.openrouterCompat ? 'openrouter_parent_disconnected' : 'local_parent_disconnected', provider: config.provider }));
+        console.error(JSON.stringify({ event: config.openrouterCompat ? 'openrouter_parent_disconnected' : config.localOnly ? 'local_parent_disconnected' : 'parent_disconnected', provider: config.provider }));
         process.exit(0);
       };
       process.stdin.once('end', parentClosed);

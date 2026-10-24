@@ -11,7 +11,6 @@ import tempfile
 import contextlib
 import queue
 import secrets
-import shlex
 import threading
 import argparse
 import localProcessTree
@@ -21,9 +20,7 @@ import urllib.error
 
 ROOT = Path(__file__).resolve().parent
 LEGACY_MODEL = "deepseek/deepseek-v4.1-flash-1017"
-PRO_MODELS = {"opus": "claude-opus-5-5", "haiku": "claude-haiku-5-5", "fable": "claude-fable-5-1"}
 PRO_SESSION_GATE = "CLAUDE_PRO_CONSULT_ENABLED"
-TOOL_NAME = "pro_consult"
 LOCAL_STARTUP_MESSAGES = {
     "local_cli_not_found": "Claude Code executable not found. Install it or check PATH, then restart Local mode.",
     "local_node_not_found": "Node.js executable not found. Install it or check PATH, then restart Local mode.",
@@ -52,26 +49,6 @@ class OpenRouterStartupError(LocalStartupError):
 class OpenRouterConfigError(ValueError):
     def __init__(self):
         super().__init__("Set a valid ANTHROPIC_AUTH_TOKEN and OPENROUTER_MODEL in .env.openrouter beside openrouterAdvisor.py. No default model is selected. Values hidden.")
-
-
-TOOL = {
-    "name": TOOL_NAME,
-    "description": (
-        "Ask Opus, Haiku or Fable using the existing Claude Plan login, with no API fallback. "
-        "Model availability and usage credits are managed by Claude and the account plan. "
-        "Include relevant evidence and prior advice; this advisor has no file access or memory. "
-        "Do not include secrets."
-    ),
-    "inputSchema": {
-        "type": "object",
-        "properties": {"question": {"type": "string", "minLength": 1, "maxLength": 64000},
-                       "model": {"type": "string", "enum": list(PRO_MODELS)}},
-        "required": ["model", "question"],
-        "additionalProperties": False,
-    },
-    "annotations": {"readOnlyHint": True, "destructiveHint": False,
-                    "idempotentHint": False, "openWorldHint": True},
-}
 
 
 def read_env(path: Path) -> dict:
@@ -236,114 +213,6 @@ def run_owned(args: list, env: dict, cwd: str, prompt: str = "", timeout: int = 
     return result
 
 
-def pro_command() -> tuple[list, dict]:
-    claude = shutil.which("claude")
-    if not claude:
-        raise FileNotFoundError("Claude Code executable not found")
-    env = clean_env()
-    # Verified saved Plan login location; credentials are read only by the official CLI.
-    env["CLAUDE_CONFIG_DIR"] = str(Path.home() / ".claude")
-    settings = {"forceLoginMethod": "claudeai", "fastMode": False,
-                "availableModels": list(PRO_MODELS.values()), "enforceAvailableModels": True}
-    return [claude, "--safe-mode", "--setting-sources", "", "--settings", json.dumps(settings)], env
-
-
-def consult(model: str, question: str) -> dict:
-    if not isinstance(model, str) or model not in PRO_MODELS:
-        raise ValueError("Unsupported consultation model")
-    if not isinstance(question, str) or not question.strip() or len(question) > 64000:
-        raise ValueError("question must contain 1 to 64000 characters")
-    if os.environ.get(PRO_SESSION_GATE) != "launcher-enabled":
-        raise RuntimeError("Start through the launcher to enable Plan consultation")
-    command, env = pro_command()
-    with tempfile.TemporaryDirectory(prefix="claude-pro-consult-") as cwd:
-        auth = run_owned(command + ["auth", "status", "--json"], env, cwd, timeout=30)
-        if not (auth.get("loggedIn") is True and auth.get("authMethod") == "claude.ai"
-                and auth.get("apiProvider") == "firstParty" and auth.get("subscriptionType") == "pro"):
-            raise RuntimeError("Existing first-party Plan login required; no API fallback")
-        data = run_owned(command + ["-p", "--model", PRO_MODELS[model], "--tools", "",
-                         "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
-                         "--disable-slash-commands", "--no-chrome", "--no-session-persistence",
-                         "--output-format", "json", "--permission-mode", "dontAsk",
-                         "--system-prompt", "Give concise independent advice using only the supplied evidence. No tools or file access. Distinguish evidence from assumptions."],
-                         env, cwd, prompt=question)
-    if data.get("is_error") is not False or data.get("subtype") != "success":
-        raise RuntimeError("Plan consultation failed; no fallback attempted")
-    if set(data.get("modelUsage", {})) != {PRO_MODELS[model]}:
-        raise ValueError("Response did not confirm the exact requested Plan model")
-    advice = data.get("result")
-    if not isinstance(advice, str) or not advice.strip():
-        raise ValueError("Claude returned no textual advice")
-    return {"status": "ok", "model": PRO_MODELS[model], "auth": "Claude Plan",
-            "credits_state": "managed-by-claude", "advice": advice}
-
-
-def handle(request: dict) -> dict | None:
-    request_id = request.get("id")
-    if "id" not in request:
-        return None
-    method = request.get("method")
-    if method == "initialize":
-        result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
-                  "serverInfo": {"name": "claude_pro_advisor", "version": "2.0.0"}}
-    elif method == "ping":
-        result = {}
-    elif method == "tools/list":
-        result = {"tools": [TOOL]}
-    elif method == "tools/call":
-        try:
-            params = request.get("params", {})
-            arguments = params.get("arguments", {})
-            if not isinstance(arguments, dict):
-                raise ValueError("Expected tool arguments")
-            if params.get("name") == TOOL_NAME and set(arguments) == {"model", "question"}:
-                answer = consult(arguments["model"], arguments["question"])
-            else:
-                raise ValueError("Unknown tool or invalid arguments")
-            result = {"content": [{"type": "text", "text": json.dumps(answer, ensure_ascii=False)}]}
-        except (OSError, RuntimeError, subprocess.SubprocessError, ValueError, KeyError, IndexError, TypeError) as exc:
-            detail = type(exc).__name__
-            print(json.dumps({"event": "advisor_error", "kind": detail}), file=sys.stderr, flush=True)
-            result = {"isError": True, "content": [{"type": "text", "text": f"Plan consultation stopped ({detail}); no successful advice. Check Claude login and account availability. No API or OpenRouter fallback was attempted."}]}
-    else:
-        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Method not found"}}
-    return {"jsonrpc": "2.0", "id": request_id, "result": result}
-
-
-def serve() -> None:
-    for line in sys.stdin.buffer:
-        try:
-            request = json.loads(line)
-            if not isinstance(request, dict) or request.get("jsonrpc") != "2.0":
-                raise ValueError("Expected JSON-RPC object")
-            response = handle(request)
-        except (ValueError, TypeError, AttributeError):
-            response = {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid JSON-RPC request"}}
-        if response is not None:
-            print(json.dumps(response, ensure_ascii=True), flush=True)
-
-
-def file_mcp_sources() -> list[str]:
-    # Reference original files, so MCP credentials never enter CLI JSON or new files.
-    sources = []
-    user_config = Path.home() / ".claude.json"
-    if user_config.exists():
-        data = json.loads(user_config.read_text(encoding="utf-8-sig"))
-        if not isinstance(data, dict) or not isinstance(data.get("mcpServers", {}), dict):
-            raise ValueError("Invalid user MCP registration structure; values hidden")
-        if data.get("mcpServers"):
-            sources.append(str(user_config))
-    current = Path.cwd().resolve()
-    for directory in (current, *current.parents):
-        project_config = directory / ".mcp.json"
-        if project_config.is_file():
-            sources.append(str(project_config))
-            break
-        if (directory / ".git").exists():
-            break
-    return sources
-
-
 @contextlib.contextmanager
 def routed_session(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False, openrouter_compat: bool = False):
     """Own one loopback proxy; ordinary sessions alone use the subscription login."""
@@ -370,6 +239,9 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
         env.update(ANTHROPIC_DEFAULT_SONNET_MODEL="claude-sonnet-5-5", ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-5-5",
                    ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-haiku-5-5", ANTHROPIC_DEFAULT_FABLE_MODEL="claude-fable-5-1",
                    ANTHROPIC_SMALL_FAST_MODEL="claude-haiku-5-5", CLAUDE_CODE_SUBAGENT_MODEL="claude-sonnet-5-5")
+    # The user's own Git Bash location is needed by the Bash tool; it is not provider routing.
+    if isolated and "CLAUDE_CODE_GIT_BASH_PATH" in os.environ:
+        env["CLAUDE_CODE_GIT_BASH_PATH"] = os.environ["CLAUDE_CODE_GIT_BASH_PATH"]
     env.pop("LOCAL_ROUTE_COMPAT", None)
     env.pop("OPENROUTER_ROUTE_COMPAT", None)
     for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER"):
@@ -421,13 +293,11 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
         proxy_env["LOCAL_ROUTE_COMPAT"] = "1"
     if openrouter_compat:
         proxy_env["OPENROUTER_ROUTE_COMPAT"] = "1"
-    proxy_command = [node, str(ROOT / "claudeRouteProxy.mjs")]
-    if isolated:
-        proxy_command.append("--parent-pipe")
+    # Every mode ties the proxy (and its API key) to this launcher: it exits when the pipe closes.
+    proxy_command = [node, str(ROOT / "claudeRouteProxy.mjs"), "--parent-pipe"]
     try:
         proxy = subprocess.Popen(proxy_command, env=proxy_env,
-                                 **({"stdin": subprocess.PIPE} if isolated else {}),
-                                 stdout=subprocess.PIPE, text=True, encoding="utf-8")
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8")
     except OSError:
         if isolated:
             raise startup_error("local_proxy_start_failed") from None
@@ -470,37 +340,7 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
             proxy.kill()
             proxy.wait(timeout=5)
         proxy.stdout.close()
-        if isolated:
-            proxy.stdin.close()
-
-
-def hud_configuration() -> tuple[dict, list[str]]:
-    """Load only the installed HUD, without importing provider settings or other plugins."""
-    plugin_base = Path.home() / ".claude-openrouter" / "plugins"
-    registry = plugin_base / "installed_plugins.json"
-    if not registry.is_file():
-        return {}, []
-    data = json.loads(registry.read_text(encoding="utf-8-sig"))
-    if not isinstance(data, dict) or not isinstance(data.get("plugins", {}), dict):
-        raise ValueError("Invalid HUD plugin registry")
-    entries = data.get("plugins", {}).get("claude-hud@claude-hud", [])
-    if not isinstance(entries, list) or any(not isinstance(item, dict) for item in entries):
-        raise ValueError("Invalid HUD installation records")
-    entry = next((item for item in entries if item.get("scope") == "user"), None)
-    if entry is None:
-        return {}, []
-    if not isinstance(entry.get("installPath"), str):
-        raise ValueError("Invalid HUD installation path")
-    plugin = Path(entry["installPath"]).resolve()
-    if not plugin.is_relative_to((plugin_base / "cache").resolve()):
-        raise ValueError("HUD installation must remain within its plugin cache")
-    renderer = plugin / "dist" / "index.js"
-    node = shutil.which("node")
-    if not node or not renderer.is_file() or not (plugin / ".claude-plugin" / "plugin.json").is_file():
-        raise RuntimeError("Installed HUD renderer or Node.js is unavailable")
-    # Claude Code uses the installed Git Bash for status lines on this Windows host.
-    command = f'{shlex.quote(Path(node).resolve().as_posix())} {shlex.quote(renderer.as_posix())}'
-    return {"statusLine": {"type": "command", "command": command}}, ["--plugin-dir", str(plugin)]
+        proxy.stdin.close()
 
 
 def diagnose_local() -> int:
@@ -609,21 +449,26 @@ def launch(provider: str = "openrouter", local_only: bool = False, local_compat:
         session = routed_session(provider, openrouter_compat=True) if openrouter_compat else (
             routed_session(provider, local_only=True, local_compat=True) if local_compat else routed_session(provider, local_only=True))
         with session as env:
-            if compat:
-                # CLI settings.env outranks process env: pin the same isolated route at that boundary.
-                settings_index = command.index("--settings") + 1
-                settings = json.loads(command[settings_index])
-                for name in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS",
-                             "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
-                             "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL",
-                             "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"):
+            # CLI settings.env outranks process env: pin the same isolated route at that boundary.
+            settings_index = command.index("--settings") + 1
+            settings = json.loads(command[settings_index])
+            for name in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS"):
+                settings["env"][name] = env[name]
+            # Model and hardening pins exist only in the modes that set them.
+            for name in ("ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                         "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL",
+                         "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL",
+                         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
+                         "CLAUDE_CODE_DISABLE_ADVISOR_TOOL", "MAX_THINKING_TOKENS", "CLAUDE_CODE_AUTO_CONNECT_IDE",
+                         "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"):
+                if name in env:
                     settings["env"][name] = env[name]
-                for name in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "OPENROUTER_ROUTE_COMPAT",
-                             "ANTHROPIC_MODEL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
-                             "CLAUDE_CODE_USE_FOUNDRY", "LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY",
-                             "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER", PRO_SESSION_GATE):
-                    settings["env"][name] = ""
-                command[settings_index] = json.dumps(settings)
+            for name in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "OPENROUTER_ROUTE_COMPAT",
+                         "ANTHROPIC_MODEL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+                         "CLAUDE_CODE_USE_FOUNDRY", "LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY",
+                         "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER", PRO_SESSION_GATE):
+                settings["env"][name] = ""
+            command[settings_index] = json.dumps(settings)
             try:
                 return subprocess.call(command, env=env)
             except OSError:
@@ -640,115 +485,12 @@ def self_test() -> None:
     import io
     from unittest.mock import Mock, patch
 
-    assert handle({"id": 1, "method": "initialize"})["result"]["protocolVersion"] == "2025-06-18"
-    assert handle({"id": 2, "method": "tools/list"})["result"]["tools"][0]["name"] == TOOL_NAME
-    assert handle({"method": "notifications/initialized"}) is None
-    assert handle({"id": 3, "method": "unknown"})["error"]["code"] == -32601
     auth = {"loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "pro"}
     original_env = os.environ.copy()
-    with tempfile.TemporaryDirectory() as directory:
-        home = Path(directory)
-        with patch("pathlib.Path.home", return_value=home), patch("shutil.which", return_value="node"):
-            assert hud_configuration() == ({}, [])
-            plugin_base = home / ".claude-openrouter" / "plugins"
-            plugin = plugin_base / "cache" / "claude-hud" / "claude-hud" / "test"
-            (plugin / "dist").mkdir(parents=True)
-            (plugin / ".claude-plugin").mkdir()
-            (plugin / "dist" / "index.js").touch()
-            (plugin / ".claude-plugin" / "plugin.json").write_text('{}')
-            registry = plugin_base / "installed_plugins.json"
-            data = {"plugins": {"claude-hud@claude-hud": [{"scope": "user", "installPath": str(plugin)}]}}
-            registry.write_text(json.dumps(data))
-            hud, plugin_args = hud_configuration()
-            assert hud["statusLine"]["type"] == "command" and plugin_args == ["--plugin-dir", str(plugin.resolve())]
-            data["plugins"]["claude-hud@claude-hud"][0]["installPath"] = str(home / "untrusted")
-            registry.write_text(json.dumps(data))
-            try:
-                hud_configuration()
-                raise AssertionError("HUD path outside plugin cache accepted")
-            except ValueError:
-                pass
-    with tempfile.TemporaryDirectory() as directory:
-        base = Path(directory)
-        home = base / "home"
-        home.mkdir()
-        user_config = home / ".claude.json"
-        user_config.write_text(json.dumps({"mcpServers": {"existing": {"type": "http", "url": "https://example.invalid", "headers": {"Authorization": "test-secret"}}}}))
-        project = base / "project"
-        project.mkdir()
-        (project / ".git").mkdir()
-        nested = project / "nested"
-        nested.mkdir()
-        outer = base / ".mcp.json"
-        outer.write_text('{"mcpServers":{}}')
-        with patch("pathlib.Path.home", return_value=home), patch("pathlib.Path.cwd", return_value=nested):
-            assert file_mcp_sources() == [str(user_config)]  # stop at repository boundary
-            project_config = project / ".mcp.json"
-            project_config.write_text('{"mcpServers":{"project-server":{"command":"test"}}}')
-            assert file_mcp_sources() == [str(user_config), str(project_config)]
-            local_config = nested / ".mcp.json"
-            local_config.write_text('{"mcpServers":{}}')
-            assert file_mcp_sources() == [str(user_config), str(local_config)]
-            user_config.write_text('[]')
-            try:
-                file_mcp_sources()
-                raise AssertionError("Invalid MCP source accepted")
-            except ValueError:
-                pass
     with tempfile.TemporaryDirectory() as directory, patch.dict(globals(), ROOT=Path(directory)):
         for quote in ('"', "'", ""):
             (Path(directory) / ".env.openrouter").write_text("ANTHROPIC_AUTH_TOKEN=" + quote + "sk-or-test-placeholder" + quote)
             assert read_key() == "sk-or-test-placeholder"
-    with contextlib.redirect_stderr(io.StringIO()), patch("subprocess.Popen") as spawn:
-        for model in ("unknown", "sonnet", "opus[1m]", "anthropic/claude-opus-5.5", None):
-            failure = handle({"id": 4, "method": "tools/call", "params": {"name": TOOL_NAME, "arguments": {"model": model, "question": "check"}}})
-            assert failure["result"]["isError"] is True
-        with patch.dict(os.environ, {PRO_SESSION_GATE: ""}):
-            failure = handle({"id": 4, "method": "tools/call", "params": {"name": TOOL_NAME, "arguments": {"model": "opus", "question": "check"}}})
-            assert failure["result"]["isError"] is True
-        spawn.assert_not_called()
-    hostile = {"ANTHROPIC_AUTH_TOKEN": "test-secret", "ANTHROPIC_BASE_URL": "https://openrouter.ai/api",
-               "CLAUDE_CODE_OAUTH_TOKEN": "test-oauth", "OPENROUTER_API_KEY": "test-secret",
-               "CLAUDE_CONFIG_DIR": "other", "CLAUDECODE": "1", PRO_SESSION_GATE: "launcher-enabled"}
-    with patch.dict(os.environ, hostile), patch("shutil.which", return_value="claude"):
-        for model, actual in PRO_MODELS.items():
-            response = {"is_error": False, "subtype": "success", "result": "4", "modelUsage": {actual: {}}}
-            with patch(__name__ + ".run_owned", side_effect=[auth, response]) as run:
-                answer = consult(model, "2 + 2?")
-                assert answer["model"] == actual
-                assert answer["auth"] == "Claude Plan"
-                assert answer["credits_state"] == "managed-by-claude"
-                assert run.call_count == 2
-                args, env, cwd = run.call_args.args
-                assert "--bare" not in args and "--fallback-model" not in args
-                assert "--safe-mode" in args and "--strict-mcp-config" in args
-                assert all(not key.startswith(("ANTHROPIC_", "CLAUDE_CODE_", "OPENROUTER_")) for key in env)
-                assert env["CLAUDE_CONFIG_DIR"] == str(Path.home() / ".claude")
-                assert "test-secret" not in repr(run.call_args_list)
-            for bad_auth in ({}, dict(auth, authMethod="api_key"), dict(auth, subscriptionType="max"), dict(auth, apiProvider="thirdParty")):
-                with patch(__name__ + ".run_owned", return_value=bad_auth) as run:
-                    try:
-                        consult(model, "check")
-                        raise AssertionError("bad auth accepted")
-                    except RuntimeError:
-                        pass
-                    assert run.call_count == 1
-            for bad in ({}, dict(response, is_error=True), dict(response, modelUsage={"claude-sonnet-5-5": {}}), dict(response, result="")):
-                with patch(__name__ + ".run_owned", side_effect=[auth, bad]) as run:
-                    try:
-                        consult(model, "check")
-                        raise AssertionError("bad response accepted")
-                    except (ValueError, RuntimeError):
-                        pass
-                    assert run.call_count == 2
-        for failure in (RuntimeError("quota exceeded"), subprocess.TimeoutExpired("claude", 120), OSError("offline")):
-            with patch(__name__ + ".run_owned", side_effect=[auth, failure]) as run:
-                try:
-                    consult("opus", "check")
-                    raise AssertionError("failed call accepted")
-                except (RuntimeError, subprocess.SubprocessError, OSError):
-                    pass
-                assert run.call_count == 2  # one auth check, one attempt; no fallback or retry
     process = Mock(pid=123, returncode=0)
     process.communicate.side_effect = [subprocess.TimeoutExpired("claude", 1), ("", "")]
     with patch("subprocess.Popen", return_value=process), patch("subprocess.run") as terminate:
@@ -760,10 +502,9 @@ def self_test() -> None:
         process.kill.assert_called_once()
         if os.name == "nt":
             terminate.assert_called_once()
-    with contextlib.redirect_stdout(io.StringIO()) as launch_output, patch("shutil.which", return_value="claude"), patch("builtins.input", side_effect=AssertionError("Launch must not ask for input")), patch(__name__ + ".routed_session", return_value=contextlib.nullcontext({PRO_SESSION_GATE: "launcher-enabled"})), patch("subprocess.call", return_value=0) as child:
+    with contextlib.redirect_stdout(io.StringIO()) as launch_output, patch("shutil.which", return_value="claude"), patch("builtins.input", side_effect=AssertionError("Launch must not ask for input")), patch(__name__ + ".routed_session", return_value=contextlib.nullcontext({})), patch("subprocess.call", return_value=0) as child:
         assert launch() == 0
         child.assert_called_once()
-        assert child.call_args.kwargs["env"][PRO_SESSION_GATE] == "launcher-enabled"
         args = child.call_args.args[0]
         assert args == ["claude", "--model", "sonnet"]
         assert "sk-or-test-placeholder" not in repr(args)
@@ -819,14 +560,12 @@ def self_test() -> None:
         except RuntimeError:
             pass
         start.assert_not_called()
-    print("PASS: MCP discovery, key parser, isolated consultation, app-managed credits, Plan auth gate, native feature environment preservation, local/OpenRouter credential separation and launcher lifecycle")
+    print("PASS: key parser, app-managed credits, Plan auth gate, native feature environment preservation, local/OpenRouter credential separation and launcher lifecycle")
 
 
 if __name__ == "__main__":
     try:
-        if sys.argv[1:] == ["--serve"]:
-            serve()
-        elif sys.argv[1:] == ["--self-test"]:
+        if sys.argv[1:] == ["--self-test"]:
             self_test()
         else:
             parser = argparse.ArgumentParser(description="Sonnet replacement with Plan fallback")

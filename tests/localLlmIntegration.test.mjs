@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
 import test from 'node:test';
+import { listenSafe } from './listenSafe.mjs';
 import { createProxy } from '../claudeRouteProxy.mjs';
 
 // Synthetic credentials only; local transport is real HTTP and Pro never leaves this process.
@@ -21,8 +22,7 @@ async function listen(t, server) {
     server.closeAllConnections();
     await closed;
   });
-  server.listen(0, '127.0.0.1');
-  await once(server, 'listening');
+  await listenSafe(server);
   return `http://127.0.0.1:${server.address().port}`;
 }
 
@@ -72,7 +72,7 @@ for (const localKey of [undefined, 'synthetic-local-key']) {
     const received = f.localCalls[0];
     assert.equal(received.method, 'POST');
     assert.equal(received.path, '/v1/messages');
-    assert.deepEqual(received.body, { ...body({ tools }), model: MODEL });
+    assert.deepEqual(received.body, { ...body({ tools }), thinking: { type: 'disabled' }, model: MODEL });
     assert.equal(received.headers.authorization, localKey ? `Bearer ${localKey}` : undefined);
     for (const name of ['anthropic-beta', 'x-api-key', 'x-local-route-token']) assert.equal(received.headers[name], undefined);
     assert.equal(JSON.stringify(received).includes(OAUTH), false);

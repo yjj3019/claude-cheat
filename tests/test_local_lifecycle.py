@@ -219,7 +219,7 @@ class LocalLifecycleTests(unittest.TestCase):
         self.assertFalse(self.listener_open(info["port"]))
         self.assertIsNone(unrelated.poll())
 
-    def test_parent_pipe_option_does_not_change_ordinary_mode(self):
+    def test_parent_pipe_closes_ordinary_mode_proxy_when_launcher_exits(self):
         env = {**os.environ, "SONNET_PROVIDER": "local", "LOCAL_ROUTE_TOKEN": "synthetic-lifecycle-nonce",
                "LOCAL_ROUTE_ONLY": "0", "LOCAL_LLM_URL": "http://127.0.0.1:9/v1/messages",
                "LOCAL_LLM_MODEL": "synthetic-model", "LOCAL_LLM_API_KEY": "synthetic-key"}
@@ -229,9 +229,8 @@ class LocalLifecycleTests(unittest.TestCase):
         try:
             info = json.loads(process.stdout.readline())
             process.stdin.close()
-            with self.assertRaises(subprocess.TimeoutExpired):
-                process.wait(timeout=.2)
-            self.assertTrue(self.listener_open(info["port"]))
+            self.assertEqual(process.wait(timeout=5), 0)
+            self.assertFalse(self.listener_open(info["port"]))
         finally:
             if process.poll() is None:
                 process.kill()

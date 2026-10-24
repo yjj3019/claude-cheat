@@ -240,6 +240,21 @@ class LocalCliModeTests(LocalTestCase):
         self.assertEqual(effective["CLAUDE_CODE_MAX_OUTPUT_TOKENS"], "8192")
         self.assertNotIn("private-saved-override", json.dumps(settings))
 
+    def test_local_mode_pins_route_against_saved_settings_env(self):
+        pinned = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:12345", "ANTHROPIC_AUTH_TOKEN": "synthetic-nonce",
+                  "ANTHROPIC_CUSTOM_HEADERS": "X-Local-Route-Token: synthetic-nonce",
+                  "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "MAX_THINKING_TOKENS": "0"}
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(route.shutil, "which", return_value="synthetic-cli"), mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.304")), mock.patch.object(route, "routed_session", return_value=contextlib.nullcontext(pinned)), mock.patch.object(route.subprocess, "call", return_value=0) as child:
+            self.assertEqual(route.launch("local", local_only=True), 0)
+        command = child.call_args.args[0]
+        settings = json.loads(command[command.index("--settings") + 1])
+        effective = {**{name: "private-saved-override" for name in settings["env"]}, **settings["env"]}
+        for name, value in pinned.items():
+            self.assertEqual(effective[name], value)
+        for name in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", route.PRO_SESSION_GATE):
+            self.assertEqual(effective[name], "")
+        self.assertNotIn("ANTHROPIC_DEFAULT_SONNET_MODEL", settings["env"])
+
     def test_compat_retains_version_budget_and_cleanup_startup_guards(self):
         with mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.303")):
             with self.assertRaises(route.LocalStartupError) as result:
@@ -276,8 +291,6 @@ class LocalCliModeTests(LocalTestCase):
 
     def test_missing_cli_keeps_ordinary_errors_and_classifies_only_local_mode(self):
         with mock.patch.object(route.shutil, "which", return_value=None):
-            with self.assertRaises(FileNotFoundError):
-                route.pro_command()
             with self.assertRaises(FileNotFoundError):
                 with route.routed_session("local"):
                     self.fail("Missing CLI must fail before session")
