@@ -223,7 +223,7 @@ A **read-only** page bound to `127.0.0.1`, refreshed every two seconds. The defa
 
 | Panel | Content |
 | --- | --- |
-| Now | **OpenRouter serving / Plan bypass / idle**, from the newest `route_selected` |
+| Now | **OpenRouter serving / Plan bypass / idle**, the **model that actually answered**, age, reason |
 | Alerts | Shown when Plan bypass reaches 50% within ten minutes, a circuit opens, a 400/413/422 rejection repeats, or the balance drops below 10% |
 | Last 60 minutes | Replacement versus Plan counts, circuit opens |
 | Bypass reasons | Counts per `native_feature` `detail`, external failure statuses and validation classes |
@@ -232,7 +232,7 @@ A **read-only** page bound to `127.0.0.1`, refreshed every two seconds. The defa
 | Hourly tokens | The last 24 hours as replacement versus Plan bars |
 | Per session | Turns, replacement/Plan turns, replacement tokens, **estimated cost**, model |
 
-Estimated cost uses the model rates from OpenRouter `/api/v1/models`; confirm actual charges against the provider's own records.
+Estimated cost uses the model rates from OpenRouter `/api/v1/models`; confirm actual charges against the provider's own records. The **model that actually answered** is recorded by the proxy just before a response is delivered; the name the CLI shows is the request alias (`claude-sonnet-5-5` and so on), so this value is the real provider model.
 
 The page shows no key, prompt or request body, and the server writes nothing. It is a separate process, so it can run beside the routing session.
 

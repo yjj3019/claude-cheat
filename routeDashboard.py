@@ -128,6 +128,7 @@ def routing_state(events, now=None, idle_after=300):
         counts = {"external": 0, "plan": 0}
         plan_reasons = {}
         failures = {}
+        models = {}
         circuits = 0
         kept = []
         for event in events:
@@ -143,6 +144,9 @@ def routing_state(events, now=None, idle_after=300):
                     detail = event.get("detail")
                     label = f"{reason}:{detail}" if detail else reason
                     plan_reasons[label] = plan_reasons.get(label, 0) + 1
+                served = event.get("model")
+                if isinstance(served, str) and served and len(served) <= 200:
+                    models[f"{key}:{served}"] = models.get(f"{key}:{served}", 0) + 1
             elif name == "external_attempt_failed":
                 status = event.get("status")
                 label = str(status) if isinstance(status, int) else (event.get("category") or "unknown")
@@ -155,21 +159,26 @@ def routing_state(events, now=None, idle_after=300):
         return {"counts": counts,
                 "plan_reasons": sorted(plan_reasons.items(), key=lambda item: -item[1])[:6],
                 "failures": sorted(failures.items(), key=lambda item: -item[1])[:6],
+                "models": sorted(models.items(), key=lambda item: -item[1])[:6],
                 "circuit_opens": circuits, "events": kept}
 
     wide, short = aggregate(ROUTE_WINDOW), aggregate(SHORT_WINDOW)
     starts = [e for e in events if e.get("event") == "proxy_start"]
+    last_model = last.get("model") if last and isinstance(last.get("model"), str) and 0 < len(last["model"]) <= 200 else None
     return {
         "state": state,
         "last": {"ts": last["ts"], "provider": last.get("provider"), "reason": last.get("reason"),
-                 "detail": last.get("detail"), "age_seconds": round(age, 1) if age is not None else None} if last else None,
+                 "detail": last.get("detail"), "model": last_model,
+                 "age_seconds": round(age, 1) if age is not None else None} if last else None,
         "window_minutes": ROUTE_WINDOW,
         "counts": wide["counts"],
         "plan_reasons": wide["plan_reasons"],
         "failures": wide["failures"],
+        "models": wide["models"],
         "circuit_opens": wide["circuit_opens"],
         "short": {"minutes": SHORT_WINDOW, "counts": short["counts"], "plan_reasons": short["plan_reasons"],
-                  "failures": short["failures"], "circuit_opens": short["circuit_opens"]},
+                  "failures": short["failures"], "models": short["models"],
+                  "circuit_opens": short["circuit_opens"]},
         "proxy_started_at": starts[-1]["ts"] if starts else None,
         "recent": [{"ts": e["ts"], "event": e.get("event"), "provider": e.get("provider"),
                     "reason": e.get("reason"), "detail": e.get("detail"),
@@ -596,7 +605,8 @@ function card(title, body, cls) {
 function render(data) {
   const r = data.routing, u = data.usage, a = data.account;
   document.getElementById('stamp').textContent =
-    `갱신 ${new Date(data.generated_at).toLocaleTimeString('ko-KR')} · 모델 ${data.model || '미설정'} · 읽기 전용 · 이 페이지는 자동 새로고침됩니다`;
+    `갱신 ${new Date(data.generated_at).toLocaleTimeString('ko-KR')} · 설정 모델 ${data.model || '미설정'}`
+    + ` · 최근 응답 모델 ${r.last?.model || '—'} · 읽기 전용`;
   const age = r.last?.age_seconds;
   const ageText = age === null || age === undefined ? '아직 기록 없음'
     : age < 60 ? `${Math.round(age)}초 전` : `${Math.round(age / 60)}분 전`;
@@ -605,16 +615,20 @@ function render(data) {
     `<div><span class="badge ${stateClass[r.state] || 'unknown'}">${stateText[r.state] || r.state}</span></div>
      <div class="kv"><span>마지막 결정</span><b>${esc(ageText)}</b></div>
      <div class="kv"><span>사유</span><b>${esc(lastDetail)}</b></div>
+     <div class="kv"><span>실제 사용 모델</span><b class="mono">${esc(r.last?.model || '—')}</b></div>
      <div class="kv"><span>프록시 시작</span><b>${esc(r.proxy_started_at ? new Date(r.proxy_started_at).toLocaleString('ko-KR') : '—')}</b></div>`);
 
   const total = r.counts.external + r.counts.plan;
   const pct = total ? Math.round(r.counts.external / total * 100) : 0;
+  const modelRows = (r.models || []).slice(0, 3)
+    .map(([label, count]) => `<div class="kv"><span class="mono">${esc(label)}</span><b>${num(count)}</b></div>`).join('');
   const split = card(`최근 ${r.window_minutes}분 라우팅`,
     `<div class="big">${pct}% <span class="muted" style="font-size:13px">OpenRouter</span></div>
      <div class="bar"><i style="width:${pct}%"></i></div>
      <div class="kv"><span>OpenRouter</span><b>${num(r.counts.external)}건</b></div>
      <div class="kv"><span>Plan</span><b>${num(r.counts.plan)}건</b></div>
-     <div class="kv"><span>회로 차단</span><b>${num(r.circuit_opens)}회</b></div>`);
+     <div class="kv"><span>회로 차단</span><b>${num(r.circuit_opens)}회</b></div>
+     ${modelRows || '<div class="muted">모델 기록 없음</div>'}`);
 
   const reasons = r.plan_reasons.length
     ? r.plan_reasons.map(([k, v]) => `<div class="kv"><span class="mono">${esc(k)}</span><b>${num(v)}</b></div>`).join('')

@@ -507,13 +507,16 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         }
         if (!oauthOK) return reject(403, 'Saved subscription OAuth required');
         client.signal.throwIfAborted();
+        // The model that actually serves a Plan request may differ from the client alias.
+        const planModel = model === DEEPSEEK || (configuredAlias && !isPro(model) && !isSonnet(model)) ? fallbackModel : model;
         console.error(JSON.stringify({ event: 'route_selected', provider: 'plan', reason, ...(detail ? { detail } : {}),
+          model: planModel,
           ...(betas.length ? { beta_features: betaFeatures, unsupported_beta_count: betas.length } : {}) }));
         const headers = {};
         for (const [name, value] of Object.entries(req.headers))
           if (typeof value === 'string' && !['host', 'content-length', 'accept-encoding', 'connection',
             'transfer-encoding', 'x-local-route-token', 'x-api-key'].includes(name)) headers[name] = value;
-        const proBody = model === DEEPSEEK || (configuredAlias && !isPro(model) && !isSonnet(model)) ? JSON.stringify({ ...body, model: fallbackModel }) : raw;
+        const proBody = planModel === model ? raw : JSON.stringify({ ...body, model: planModel });
         // Bound a stalled Plan upstream; user cancellation still flows through client.signal.
         const plan = new AbortController();
         const cancelPlan = () => plan.abort('client_close');
@@ -643,7 +646,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               if (openUntil) console.error(JSON.stringify({ event: 'circuit_recovered', provider }));
               openUntil = 0;
             }
-            console.error(JSON.stringify({ event: 'route_selected', provider, reason: 'replacement' }));
+            console.error(JSON.stringify({ event: 'route_selected', provider, reason: 'replacement', model: externalModel }));
             res.writeHead(200, { 'content-type': response.contentType, 'cache-control': 'no-store' });
             res.end(response.text);
             return;

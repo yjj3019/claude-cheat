@@ -176,6 +176,7 @@ for (const [detail, extra, headers = proHeaders, path = '/v1/messages'] of exclu
     assert.deepEqual(calls[0].parsedBody, body);
     const entries = log.mock.calls.map(call => JSON.parse(call.arguments[0]));
     assert.deepEqual(entries, [{ event: 'route_selected', provider: 'plan', reason: 'native_feature', detail,
+      model: SONNET,
       ...(detail === 'unsupported_beta' ? { beta_features: ['[redacted]'], unsupported_beta_count: 1 } : {}) }]);
     assert.equal(JSON.stringify(entries).includes('private-'), false);
     assert.equal(JSON.stringify(entries).includes(OAUTH), false);
@@ -208,6 +209,20 @@ test('a reasoning-only turn keeps its position with a neutral placeholder', asyn
   assert.equal((await request(body, { headers: proHeaders })).status, 200);
   assert.equal(calls[0].url, 'https://openrouter.ai/api/v1/messages');
   assert.deepEqual(calls[0].parsedBody.messages[1].content, [{ type: 'text', text: '(reasoning omitted)' }]);
+});
+
+test('replacement route logs the model that actually served the request', async t => {
+  const log = t.mock.method(console, 'error', () => {});
+  const { calls, request } = await fixture(t);
+  const response = await request(requestBody(SONNET), { headers: proHeaders });
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.equal(calls[0].parsedBody.model, DEEPSEEK);
+  const entries = log.mock.calls.map(call => JSON.parse(call.arguments[0]));
+  const selected = entries.find(entry => entry.event === 'route_selected');
+  assert.equal(selected.provider, 'openrouter');
+  assert.equal(selected.reason, 'replacement');
+  assert.equal(selected.model, DEEPSEEK);
 });
 
 test('beta diagnostics show bounded feature identifiers and redact nonstandard or credential-like values', async t => {

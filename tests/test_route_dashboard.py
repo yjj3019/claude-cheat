@@ -32,12 +32,15 @@ class RouteLogTests(unittest.TestCase):
                          {"event": "route_selected", "provider": "openrouter", "reason": "replacement"})
             + route_line((now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
                          {"event": "route_selected", "provider": "plan", "reason": "native_feature",
-                          "detail": "plan_model"}),
+                          "detail": "plan_model", "model": "claude-opus-5-5"}),
             encoding="utf-8")
         state = dash.routing_state(dash.parse_route_log(), now=now)
         self.assertEqual(state["state"], "plan")
         self.assertEqual(state["counts"], {"external": 1, "plan": 1})
         self.assertEqual(state["plan_reasons"], [("native_feature:plan_model", 1)])
+        self.assertEqual(state["last"]["model"], "claude-opus-5-5")
+        self.assertEqual(state["models"], [("plan:claude-opus-5-5", 1)])
+        self.assertEqual(state["short"]["models"], [("plan:claude-opus-5-5", 1)])
         self.assertEqual(state["proxy_started_at"], now.isoformat().replace("+00:00", "Z"))
         self.assertIsNotNone(state["last"]["age_seconds"])
 
@@ -73,6 +76,22 @@ class RouteLogTests(unittest.TestCase):
         state = dash.routing_state([])
         self.assertEqual(state["state"], "unknown")
         self.assertIsNone(state["last"])
+        self.assertEqual(state["models"], [])
+
+    def test_events_without_a_model_keep_the_totals(self):
+        now = datetime(2026, 10, 25, 3, 0, 0, tzinfo=timezone.utc)
+        self.log.write_text(
+            route_line(now.isoformat().replace("+00:00", "Z"),
+                       {"event": "route_selected", "provider": "openrouter", "reason": "replacement"})
+            + route_line(now.isoformat().replace("+00:00", "Z"),
+                         {"event": "route_selected", "provider": "openrouter", "reason": "replacement",
+                          "model": "x" * 500}),
+            encoding="utf-8")
+        state = dash.routing_state(dash.parse_route_log(), now=now)
+        self.assertEqual(state["counts"]["external"], 2)
+        # Legacy lines have no model, and an oversized identifier is ignored rather than shown.
+        self.assertEqual(state["models"], [])
+        self.assertIsNone(state["last"]["model"])
 
 
 class SessionScanTests(unittest.TestCase):
