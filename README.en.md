@@ -4,7 +4,7 @@
 
 [MIT License](LICENSE) · [License selection review](LICENSE-REVIEW.md)
 
-A local router that preserves the existing Claude Code Plan login and settings while sending compatible Sonnet requests to OpenRouter DeepSeek or a local LLM. The repository includes the launcher, proxy, and synthetic regression tests. It does not contain API keys, OAuth credentials, personal settings, or private diagnostic scripts.
+A local router that preserves the existing Claude Code Plan login and settings while sending compatible Sonnet requests to the configured OpenRouter model or a local LLM. The repository includes the launcher, proxy, and synthetic regression tests. It does not contain API keys, OAuth credentials, personal settings, or private diagnostic scripts.
 
 **Status: provider selection, retries, Plan fallback, and recovery are implemented. Preserving every native feature while actually replacing the main Sonnet model is not fully achieved.**
 
@@ -19,14 +19,19 @@ For OpenRouter, create `.env.openrouter` in this checkout's root:
 
 ```dotenv
 ANTHROPIC_AUTH_TOKEN=YOUR_OPENROUTER_API_KEY
+OPENROUTER_MODEL=REPLACE_WITH_OPENROUTER_MODEL_ID
 ```
 
 Replace the placeholder with a real OpenRouter key. This file is read next to `openrouterAdvisor.py`, not relative to the current working directory. Use one KEY=VALUE per line; blank lines, full-line comments and matching quotes are supported, but multiline values and shell expansion are not. Do not add inline comments after a key. This value is read only by the router. It does not replace the CLI's subscription login. `.env` and `.env.*` are ignored by Git; do not publish credentials.
 
+Set `OPENROUTER_MODEL` to a concrete ID from the [OpenRouter model list](https://openrouter.ai/models). Existing key-only files must add it. Missing, empty, malformed or placeholder models fail startup without default-model selection or Plan fallback. Both file settings are proxy-only; inherited OpenRouter environment values do not override this file.
+
+The selected model must support the [Messages API](https://openrouter.ai/docs/api/api-reference/anthropic-messages/create-messages?explorer=true) and the tools you need. Model selection does not guarantee every model or native feature is compatible. Response model identity remains strict; dynamic aliases or presets returning another ID can fail and are unverified. Endpoint and retry policy remain fixed as documented in the example.
+
 From the checkout root:
 
 ```powershell
-# Default: OpenRouter DeepSeek
+# Default provider: OpenRouter; model comes from .env.openrouter
 .\startClaudeOpenRouter.ps1
 # Local Messages API, after configuring a real local service
 .\startClaudeOpenRouter.ps1 -Provider Local
@@ -38,12 +43,12 @@ If you install a global launcher separately, configuration is read beside its ta
 
 | Request | Route |
 | --- | --- |
-| Compatible Sonnet request | Selected OpenRouter DeepSeek or local model |
+| Compatible Sonnet request | Configured OpenRouter model or local model |
 | Unsupported native Sonnet feature or conversation history | Original Plan Sonnet request, unchanged |
 | Opus, Haiku, Fable | Existing Plan OAuth path |
 | External provider fails all four attempts | One request to the original Plan Sonnet model |
 
-- OpenRouter uses `deepseek/deepseek-v4.1-flash-1017`.
+- OpenRouter uses the required `OPENROUTER_MODEL` setting, with no default model.
 - OpenRouter and Local are selected at launch; the router does not switch between them automatically. Select Sonnet in `/model` for eligible replacement requests.
 - The external provider receives the initial attempt plus three retries. Each attempt has a 30-second limit, with a one-second delay between attempts.
 - Four full timeouts plus retry delays can take approximately 123 seconds before the Plan request begins. Plan response time and the CLI's own retries may add further time. Cancelling stops router retries and fallback.
@@ -236,7 +241,7 @@ The tests cover payload preservation, authentication isolation, tool-result roun
 - A real Local service still requires separate authentication, inference, and tool-call validation.
 - Unsupported native features or signed history stay on the Plan route. External usage can be zero, and native history may prevent a safe return to the external provider in the same conversation.
 - Running only a native advisor on the subscription path during external inference is not implemented. Full native-feature equivalence, including remote managed settings and organization policy with a custom `ANTHROPIC_BASE_URL`, is not guaranteed.
-- Request bodies above 16 MiB receive HTTP 413 before fallback. Only versioned `claude-sonnet-*`, `claude-opus-*`, `claude-haiku-*`, `claude-fable-*` names whose version starts with a digit, and the specified DeepSeek ID, are accepted. Unknown models receive HTTP 403.
+- Request bodies above 16 MiB receive HTTP 413 before fallback. Only versioned `claude-sonnet-*`, `claude-opus-*`, `claude-haiku-*`, `claude-fable-*` names whose version starts with a digit, the configured OpenRouter model ID, and the historical client alias are accepted. Unknown models receive HTTP 403.
 - Allowed paths are POST `/v1/messages` and `/v1/messages/count_tokens` (optionally `?beta=true`), plus local readiness HEAD `/api/hello`. Other paths are rejected, not forwarded to the subscription route.
 - A custom `CLAUDE_CONFIG_DIR` is preserved unless absent or set to the historical `~/.claude-openrouter`, in which case the child uses `~/.claude`. Old MCP/plugin registrations are not automatically migrated; directories are not copied or deleted.
 - Diagnose HTTP 429 using the affected account's Usage screen and response. Account-specific limits and reset schedules are not published here.

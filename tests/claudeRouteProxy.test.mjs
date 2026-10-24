@@ -106,7 +106,7 @@ const frame = (type, extra = {}) => `event: ${type}\ndata: ${JSON.stringify({ ty
 
 async function fixture(t, upstream = jsonResponse, config = {}) {
   const calls = [];
-  const server = createProxy({ key: KEY, nonce: NONCE, retryDelayMs: 0, attemptTimeoutMs: 200, ...config, fetchImpl: async (url, options) => {
+  const server = createProxy({ key: KEY, nonce: NONCE, openrouterModel: DEEPSEEK, retryDelayMs: 0, attemptTimeoutMs: 200, ...config, fetchImpl: async (url, options) => {
     calls.push({ url, ...options, parsedBody: JSON.parse(options.body) });
     return upstream(url, options);
   } });
@@ -403,6 +403,42 @@ const complete = model => frame('message_start', { message: { model } }) +
   frame('content_block_delta', { index: 0, delta: { type: 'text_delta', text: 'fixture answer' } }) +
   frame('content_block_stop', { index: 0 }) + frame('message_delta') + frame('message_stop');
 const native = (url, options) => url.startsWith('https://api.anthropic.com') ? jsonResponse(url, options) : null;
+
+for (const openrouterModel of ['vendor-a/model-a', 'vendor-b/model-b:free', '~vendor-c/latest']) {
+  test(`explicit OpenRouter model routes and validates independently of DeepSeek: ${openrouterModel}`, async t => {
+    const { calls, request } = await fixture(t, jsonResponse, { openrouterModel });
+    for (const clientModel of [SONNET, openrouterModel, DEEPSEEK]) {
+      const response = await request(requestBody(clientModel));
+      assert.equal(response.status, 200);
+      assert.equal((await response.json()).model, clientModel);
+      assert.equal(calls.at(-1).parsedBody.model, openrouterModel);
+      assert.deepEqual(calls.at(-1).parsedBody.provider, { allow_fallbacks: false });
+    }
+    assert.equal(calls.length, 3);
+  });
+}
+for (const openrouterModel of [undefined, '', ' ', 'YOUR_MODEL', 'REPLACE_WITH_OPENROUTER_MODEL_ID', 'vendor/model\n', 'vendor/model name']) {
+  test('OpenRouter model must be explicitly configured with no implicit default', () => {
+    assert.throws(() => createProxy({ key: KEY, nonce: NONCE, openrouterModel }), /OpenRouter model required/);
+  });
+}
+test('configured OpenRouter model failures rewrite direct model aliases to Plan Sonnet', async t => {
+  const model = 'vendor-a/model-a';
+  const { calls, request } = await fixture(t, (url, options) => native(url, options) || new Response('fixture-failure', { status: 500 }), { openrouterModel: model });
+  assert.equal((await request(requestBody(model), { headers: proHeaders })).status, 200);
+  assert.equal(calls.length, 5);
+  assert.equal(calls.at(-1).url, proURL);
+  assert.equal(calls.at(-1).parsedBody.model, 'claude-sonnet-5-5');
+});
+test('response model mismatch uses configured identity rather than accepting the former fixed model', async t => {
+  const model = 'vendor-a/model-a';
+  const { calls, request } = await fixture(t, (url, options) => native(url, options) || Response.json({
+    type: 'message', model: DEEPSEEK, content: [{ type: 'text', text: 'fixture' }], stop_reason: 'end_turn' }), { openrouterModel: model });
+  assert.equal((await request(requestBody(SONNET), { headers: proHeaders })).status, 200);
+  assert.equal(calls.length, 5);
+  assert.ok(calls.slice(0, 4).every(call => call.parsedBody.model === model));
+  assert.equal(calls.at(-1).parsedBody.model, SONNET);
+});
 
 for (const [label, content] of [
   ['no blocks', []],

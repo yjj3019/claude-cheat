@@ -20,7 +20,7 @@ import urllib.request
 import urllib.error
 
 ROOT = Path(__file__).resolve().parent
-DEEPSEEK = "deepseek/deepseek-v4.1-flash-1017"
+LEGACY_MODEL = "deepseek/deepseek-v4.1-flash-1017"
 PRO_MODELS = {"opus": "claude-opus-5-5", "haiku": "claude-haiku-5-5", "fable": "claude-fable-5-1"}
 PRO_SESSION_GATE = "CLAUDE_PRO_CONSULT_ENABLED"
 TOOL_NAME = "pro_consult"
@@ -41,6 +41,11 @@ class LocalStartupError(RuntimeError):
     def __init__(self, code):
         self.code = code
         super().__init__(LOCAL_STARTUP_MESSAGES[code])
+
+
+class OpenRouterConfigError(ValueError):
+    def __init__(self):
+        super().__init__("Set a valid ANTHROPIC_AUTH_TOKEN and OPENROUTER_MODEL in .env.openrouter beside openrouterAdvisor.py. No default model is selected. Values hidden.")
 
 
 TOOL = {
@@ -80,8 +85,9 @@ def read_env(path: Path) -> dict:
     return values
 
 
-def read_key() -> str:
-    values = read_env(ROOT / ".env.openrouter")
+def read_key(values: dict | None = None) -> str:
+    if values is None:
+        values = read_env(ROOT / ".env.openrouter")
     token = values.get("ANTHROPIC_AUTH_TOKEN", "")
     if not re.fullmatch(r"sk-or-[A-Za-z0-9_-]+", token):
         raise ValueError("Invalid OpenRouter ANTHROPIC_AUTH_TOKEN; value hidden")
@@ -107,7 +113,14 @@ def local_endpoint(url: str, allow_remote: bool, http_url: str = "") -> tuple:
 
 def provider_config(provider: str, require_model: bool = True) -> dict:
     if provider == "openrouter":
-        return {"SONNET_PROVIDER": provider, "OPENROUTER_API_KEY": read_key()}
+        try:
+            values = read_env(ROOT / ".env.openrouter")
+            model = values.get("OPENROUTER_MODEL", "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9~@][A-Za-z0-9._:/@+~-]{0,255}", model) or model.startswith(("REPLACE_WITH_", "YOUR_")):
+                raise ValueError("Invalid OpenRouter model")
+            return {"SONNET_PROVIDER": provider, "OPENROUTER_API_KEY": read_key(values), "OPENROUTER_MODEL": model}
+        except (OSError, ValueError):
+            raise OpenRouterConfigError() from None
     if provider != "local":
         raise ValueError("Unknown Sonnet provider")
     path = ROOT / ".env.local-llm"
@@ -351,11 +364,11 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
         env.pop(name, None)
     # Remove only provider credentials/routing left by the former OpenRouter setup.
     for name in ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",
-                 "OPENROUTER_API_KEY", "ANTHROPIC_BASE_URL", PRO_SESSION_GATE]:
+                 "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "ANTHROPIC_BASE_URL", PRO_SESSION_GATE]:
         env.pop(name, None)
     for name in ["ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
                  "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"]:
-        if env.get(name) == DEEPSEEK:
+        if env.get(name) == LEGACY_MODEL:
             env.pop(name)
     config_dir = env.get("CLAUDE_CONFIG_DIR")
     if not config_dir or Path(config_dir).resolve() == (Path.home() / ".claude-openrouter").resolve():
@@ -381,6 +394,11 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
         if local_only:
             raise LocalStartupError("local_configuration_invalid") from None
         raise
+    if provider == "openrouter":
+        for name in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
+                     "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"):
+            if env.get(name) == config["OPENROUTER_MODEL"]:
+                env.pop(name)
     proxy_env.update(config, LOCAL_ROUTE_TOKEN=nonce, LOCAL_ROUTE_ONLY="1" if local_only else "0")
     proxy_env.pop("LOCAL_ROUTE_COMPAT", None)
     if local_compat:
@@ -538,7 +556,7 @@ def launch(provider: str = "openrouter", local_only: bool = False, local_compat:
                              "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL",
                              "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"):
                     settings["env"][name] = env[name]
-                for name in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENROUTER_API_KEY",
+                for name in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENROUTER_API_KEY", "OPENROUTER_MODEL",
                              "ANTHROPIC_MODEL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
                              "CLAUDE_CODE_USE_FOUNDRY", "LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY",
                              "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER"):
@@ -692,7 +710,7 @@ def self_test() -> None:
     assert dict(os.environ) == original_env
     proxy = Mock()
     proxy.stdout.readline.return_value = '{"port": 12345}\n'
-    with patch(__name__ + ".run_owned", return_value=auth), patch("shutil.which", return_value="executable"), patch(__name__ + ".read_key", return_value="sk-or-test-placeholder"), patch("subprocess.Popen", return_value=proxy) as start:
+    with patch(__name__ + ".run_owned", return_value=auth), patch("shutil.which", return_value="executable"), patch(__name__ + ".read_env", return_value={"ANTHROPIC_AUTH_TOKEN": "sk-or-test-placeholder", "OPENROUTER_MODEL": "fixture/model"}), patch("subprocess.Popen", return_value=proxy) as start:
         with routed_session() as env:
             assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
             assert env.get("CLAUDE_CODE_DISABLE_ADVISOR_TOOL") == os.environ.get("CLAUDE_CODE_DISABLE_ADVISOR_TOOL")
@@ -701,6 +719,8 @@ def self_test() -> None:
             assert "ANTHROPIC_AUTH_TOKEN" not in env and "ANTHROPIC_API_KEY" not in env
             assert "OPENROUTER_API_KEY" not in env and "CLAUDE_CODE_OAUTH_TOKEN" not in env
             assert start.call_args.kwargs["env"]["OPENROUTER_API_KEY"] == "sk-or-test-placeholder"
+            assert start.call_args.kwargs["env"]["OPENROUTER_MODEL"] == "fixture/model"
+            assert "OPENROUTER_MODEL" not in env
             assert "sk-or-test-placeholder" not in repr(start.call_args.args)
         proxy.terminate.assert_called_once()
     assert dict(os.environ) == original_env
@@ -772,9 +792,9 @@ if __name__ == "__main__":
                 except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
                     raise LocalStartupError("local_process_cleanup_failed") from None
             sys.exit(launch(options.provider, local_only=options.local_mode or options.local_compat, local_compat=options.local_compat))
-    except LocalStartupError as exc:
+    except (LocalStartupError, OpenRouterConfigError) as exc:
         print(json.dumps({"event": "openrouter_start_failed", "kind": type(exc).__name__,
-                          "code": exc.code, "message": str(exc)}), file=sys.stderr)
+                          "code": exc.code if isinstance(exc, LocalStartupError) else "openrouter_configuration_invalid", "message": str(exc)}), file=sys.stderr)
         sys.exit(1)
     except (OSError, RuntimeError, EOFError, ValueError, subprocess.SubprocessError) as exc:
         print(json.dumps({"event": "openrouter_start_failed", "kind": type(exc).__name__}), file=sys.stderr)

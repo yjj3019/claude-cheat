@@ -2,6 +2,7 @@ import http from 'node:http';
 import { once } from 'node:events';
 import { pathToFileURL } from 'node:url';
 
+// Historical client alias only; the upstream model must be configured explicitly.
 export const DEEPSEEK = 'deepseek/deepseek-v4.1-flash-1017';
 const isPro = model => typeof model === 'string' && /^claude-(opus|haiku|fable)-[0-9][a-zA-Z0-9.-]*$/.test(model);
 const isSonnet = model => typeof model === 'string' && /^claude-sonnet-[0-9][a-zA-Z0-9.-]*$/.test(model);
@@ -356,7 +357,7 @@ export async function diagnoseLocal({ localUrl, localModel, localKey, localHttpU
   }
 }
 
-export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrouter', localUrl,
+export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrouter', openrouterModel, localUrl,
   localModel, localKey, localAllowRemote = false, localHttpUrl, localOnly = false, localCompat = false, fallbackModel = 'claude-sonnet-5-5', retryDelayMs = 1000,
   cooldownMs = 30000, attemptTimeoutMs = localOnly ? 120000 : 30000, now = Date.now }) {
   if (typeof localOnly !== 'boolean' || (localOnly && provider !== 'local')) throw new Error('Local-only mode requires local provider');
@@ -364,6 +365,9 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     throw new Error('Local compatibility requires Local-only mode');
   if (!nonce || (provider === 'openrouter' && !key)) throw new Error('Proxy credentials required');
   if (!['openrouter', 'local'].includes(provider)) throw new Error('Unsupported Sonnet provider');
+  if (provider === 'openrouter' && (typeof openrouterModel !== 'string' ||
+      !/^[A-Za-z0-9~@][A-Za-z0-9._:/@+~-]{0,255}$/.test(openrouterModel) || /^(REPLACE_WITH_|YOUR_)/.test(openrouterModel)))
+    throw new Error('OpenRouter model required; no default model is selected');
   if (typeof localAllowRemote !== 'boolean') throw new Error('Remote Local setting must be boolean');
   if (localKey !== undefined && (typeof localKey !== 'string' || /[\x00-\x1f\x7f]/.test(localKey))) throw new Error('Invalid Local credential');
   const externalUrl = provider === 'local' ? localEndpoint(localUrl, localAllowRemote, localHttpUrl) : 'https://openrouter.ai/api/v1/messages';
@@ -399,7 +403,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       if (!body || typeof body !== 'object' || Array.isArray(body)) return reject(403, 'Unsupported request fields');
       const model = body.model;
       const compatAlias = localCompat && ['sonnet', 'opus', 'haiku', 'fable'].includes(model);
-      if (!compatAlias && !isPro(model) && !isSonnet(model) && model !== DEEPSEEK) return reject(403, 'Model blocked');
+      const configuredAlias = provider === 'openrouter' && model === openrouterModel;
+      if (!compatAlias && !configuredAlias && !isPro(model) && !isSonnet(model) && model !== DEEPSEEK) return reject(403, 'Model blocked');
       const oauthOK = /^Bearer\s+sk-ant-oat/.test(req.headers.authorization || '') && !req.headers['x-api-key'] &&
         (req.headers['anthropic-beta'] || '').includes('oauth-');
       const sendPro = async (reason = 'native_feature', detail) => {
@@ -444,7 +449,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         for (const [name, value] of Object.entries(req.headers))
           if (typeof value === 'string' && !['host', 'content-length', 'accept-encoding', 'connection',
             'transfer-encoding', 'x-local-route-token', 'x-api-key'].includes(name)) headers[name] = value;
-        const proBody = model === DEEPSEEK ? JSON.stringify({ ...body, model: fallbackModel }) : raw;
+        const proBody = model === DEEPSEEK || (configuredAlias && !isPro(model) && !isSonnet(model)) ? JSON.stringify({ ...body, model: fallbackModel }) : raw;
         const upstream = await abortable(fetchImpl('https://api.anthropic.com' + req.url,
           { method: 'POST', headers, body: proBody, redirect: 'error', signal: client.signal }), client.signal);
         const responseHeaders = {};
@@ -479,7 +484,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       const claimedGeneration = generation;
       let succeeded = false, localFailure = 'upstream_error';
       try {
-        const externalModel = provider === 'local' ? localModel : DEEPSEEK;
+        const externalModel = provider === 'local' ? localModel : openrouterModel;
         const externalBody = { ...body, model: externalModel };
         if (localOnly) {
           externalBody.stream = false;
@@ -593,11 +598,11 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const config = { key: process.env.OPENROUTER_API_KEY, nonce: process.env.LOCAL_ROUTE_TOKEN,
+  const config = { key: process.env.OPENROUTER_API_KEY, openrouterModel: process.env.OPENROUTER_MODEL, nonce: process.env.LOCAL_ROUTE_TOKEN,
     provider: process.env.SONNET_PROVIDER || 'openrouter', localUrl: process.env.LOCAL_LLM_URL,
     localModel: process.env.LOCAL_LLM_MODEL, localKey: process.env.LOCAL_LLM_API_KEY,
     localOnly: process.env.LOCAL_ROUTE_ONLY === '1', localCompat: process.env.LOCAL_ROUTE_COMPAT === '1', localHttpUrl: process.env.LOCAL_LLM_HTTP_URL, localAllowRemote: process.env.LOCAL_LLM_ALLOW_REMOTE === 'true' };
-  for (const name of ['OPENROUTER_API_KEY', 'LOCAL_ROUTE_TOKEN', 'LOCAL_ROUTE_ONLY', 'LOCAL_ROUTE_COMPAT', 'SONNET_PROVIDER', 'LOCAL_LLM_URL',
+  for (const name of ['OPENROUTER_API_KEY', 'OPENROUTER_MODEL', 'LOCAL_ROUTE_TOKEN', 'LOCAL_ROUTE_ONLY', 'LOCAL_ROUTE_COMPAT', 'SONNET_PROVIDER', 'LOCAL_LLM_URL',
     'LOCAL_LLM_MODEL', 'LOCAL_LLM_API_KEY', 'LOCAL_LLM_ALLOW_REMOTE', 'LOCAL_LLM_HTTP_URL', 'LOCAL_LLM_MODELS_URL']) delete process.env[name];
   if (process.argv.slice(2).includes('--diagnose-local')) {
     try {

@@ -1,8 +1,8 @@
-# Claude Code: Sonnet을 DeepSeek 또는 Local LLM으로 사용하기
+# Claude Code: Sonnet을 OpenRouter 또는 Local LLM으로 사용하기
 
 **한국어** | [English](README.en.md) · [MIT License](LICENSE)
 
-기존 Claude Code의 **Plan 로그인과 사용자 설정을 사용하면서**, 호환되는 Sonnet 요청만 OpenRouter의 DeepSeek 또는 지정한 Local LLM으로 보내는 로컬 라우터입니다. 외부 모델 요청이 실패하면 기존 Plan Sonnet으로 fallback하고, 연결이 복구되면 다시 외부 모델을 시도합니다.
+기존 Claude Code의 **Plan 로그인과 사용자 설정을 사용하면서**, 호환되는 Sonnet 요청만 OpenRouter에서 지정한 모델 또는 지정한 Local LLM으로 보내는 로컬 라우터입니다. 외부 모델 요청이 실패하면 기존 Plan Sonnet으로 fallback하고, 연결이 복구되면 다시 외부 모델을 시도합니다.
 
 **현재 상태:** 라우팅·재시도·fallback·복구·Local 설정은 구현했습니다. 다만 **모든 Claude 고유 기능을 유지하면서 모든 Sonnet 요청을 외부 모델로 대체하는 것은 아직 달성하지 못했습니다.** 지원되지 않는 기능이나 대화 이력이 포함된 요청은 원본 Plan 경로를 사용합니다. [검증 범위와 한계](#8-검증-방법과-남은-한계)를 먼저 확인하세요.
 
@@ -10,7 +10,7 @@
 
 1. [어떤 요청이 어디로 가나요?](#1-어떤-요청이-어디로-가나요)
 2. [준비와 설정 파일 위치](#2-준비와-설정-파일-위치)
-3. [OpenRouter DeepSeek 시작하기](#3-openrouter-deepseek-시작하기)
+3. [OpenRouter 모델 시작하기](#3-openrouter-모델-시작하기)
 4. [Local LLM으로 전환하기](#4-local-llm으로-전환하기)
 5. [재시도·fallback·복구 원리](#5-재시도fallback복구-원리)
 6. [실제로 사용한 모델 확인하기](#6-실제로-사용한-모델-확인하기)
@@ -23,14 +23,14 @@
 ```text
 Claude Code — 기존 Plan 로그인·사용자 설정
   └─ 이 PC의 로컬 라우터
-       ├─ 호환되는 Sonnet 요청 → 선택한 OpenRouter DeepSeek 또는 Local LLM
+       ├─ 호환되는 Sonnet 요청 → 선택한 OpenRouter 모델 또는 Local LLM
        ├─ 외부 요청이 총 4회 실패 → 기존 Plan Sonnet
        └─ Opus·Haiku·Fable / 외부 미지원 기능 → 기존 Plan 경로
 ```
 
 | 선택 또는 상황 | 실제 처리 경로 | 인증과 사용량 |
 | --- | --- | --- |
-| Sonnet + OpenRouter 모드 + 호환 요청 | `deepseek/deepseek-v4.1-flash-1017` | OpenRouter 키와 별도 API 사용량 |
+| Sonnet + OpenRouter 모드 + 호환 요청 | `OPENROUTER_MODEL`로 지정한 모델 | OpenRouter 키와 별도 API 사용량 |
 | Sonnet + Local 모드 + 호환 요청 | 직접 지정한 서버·모델 | 해당 서버 전용 인증과 사용 정책 |
 | Opus·Haiku·Fable | Anthropic | 저장된 Plan OAuth와 계정 사용량 |
 | Sonnet에 외부 미지원 기능·이력이 포함됨 | 원본 Plan Sonnet | Plan 계정 사용량 |
@@ -71,7 +71,7 @@ claude auth status
 
 `.env`는 한 줄에 `KEY=VALUE` 하나를 사용합니다. 빈 줄·`#`으로 시작하는 주석·값 전체를 감싼 따옴표는 허용하며, 여러 줄 값·셸 변수 확장은 지원하지 않습니다. 키 뒤에 같은 줄 주석을 붙이지 마세요. 실제 `.env*`는 Git에서 제외합니다. 예제에는 실제 인증값을 넣지 마세요.
 
-## 3. OpenRouter DeepSeek 시작하기
+## 3. OpenRouter 모델 시작하기
 
 ### ① 라우터 전용 키 파일 만들기
 
@@ -85,9 +85,14 @@ notepad .env.openrouter
 
 ```dotenv
 ANTHROPIC_AUTH_TOKEN=YOUR_OPENROUTER_API_KEY
+OPENROUTER_MODEL=REPLACE_WITH_OPENROUTER_MODEL_ID
 ```
 
 `YOUR_OPENROUTER_API_KEY`를 본인의 실제 OpenRouter 키로 바꿉니다. 이 변수명은 **라우터가 파일에서 읽는 항목**입니다. Claude Code의 전역 환경변수에 OpenRouter 키를 넣거나 Plan 로그인을 API 키 로그인으로 바꾸라는 뜻이 아닙니다. 키를 화면·로그·커밋에 공유하지 마세요.
+
+`OPENROUTER_MODEL`에는 [OpenRouter 모델 목록](https://openrouter.ai/models)의 구체적인 모델 ID를 입력합니다. 기존에 키만 설정했다면 이 항목을 추가해야 합니다. 누락·빈 값·예제 플레이스홀더는 시작 오류로 종료하며 다른 모델이나 Plan으로 자동 대체하지 않습니다. 이 파일의 두 항목만 읽고, 값은 프록시에만 전달합니다.
+
+모델 선택이 가능해도 모든 모델의 도구 호출과 네이티브 기능을 보장하지 않습니다. 선택 모델이 [Messages API](https://openrouter.ai/docs/api/api-reference/anthropic-messages/create-messages?explorer=true)와 필요한 도구 호출을 지원하는지 확인하세요. 응답의 모델 ID를 설정값과 정확히 비교하므로, 다른 ID로 응답하는 동적 별칭·프리셋은 실패할 수 있으며 미검증입니다. API 주소와 재시도 정책은 예제 파일에 고정값으로 구분했습니다.
 
 ### ② 실행하고 Sonnet 선택하기
 
@@ -96,7 +101,7 @@ ANTHROPIC_AUTH_TOKEN=YOUR_OPENROUTER_API_KEY
 .\startClaudeOpenRouter.ps1
 ```
 
-Claude Code에서 `/model`로 **Sonnet**을 선택합니다. 호환되는 요청은 OpenRouter의 `https://openrouter.ai/api/v1/messages`로 보내며, 현재 대체 모델 ID는 `deepseek/deepseek-v4.1-flash-1017`로 고정되어 있습니다.
+Claude Code에서 `/model`로 **Sonnet**을 선택합니다. 호환되는 요청은 OpenRouter의 `https://openrouter.ai/api/v1/messages`로 보내며, 대체 모델은 `.env.openrouter`의 `OPENROUTER_MODEL`로 지정합니다. 특정 모델을 기본값으로 선택하지 않습니다.
 
 기존 전역 실행기가 설치된 PC에서는 다른 작업 폴더에서도 다음처럼 실행할 수 있습니다.
 
@@ -104,7 +109,7 @@ Claude Code에서 `/model`로 **Sonnet**을 선택합니다. 호환되는 요청
 startClaudeOpenRouter.ps1
 ```
 
-실행기는 해당 Claude 프로세스의 연결 주소만 로컬 라우터로 설정하고 기존 Plan 인증을 검사합니다. 저장된 로그인·사용자 설정을 API용 설정으로 덮어쓰지 않습니다. `/status`의 Plan 로그인 표시는 인증 상태이며 **현재 응답을 DeepSeek가 만들었다는 증거는 아닙니다.**
+실행기는 해당 Claude 프로세스의 연결 주소만 로컬 라우터로 설정하고 기존 Plan 인증을 검사합니다. 저장된 로그인·사용자 설정을 API용 설정으로 덮어쓰지 않습니다. `/status`의 Plan 로그인 표시는 인증 상태이며 **현재 응답을 OpenRouter 모델이 만들었다는 증거는 아닙니다.**
 
 ## 4. Local LLM으로 전환하기
 
@@ -344,7 +349,7 @@ node --check claudeRouteProxy.mjs
 - 실제 Local 서버의 인증·추론·도구 호출은 별도 검증이 필요합니다.
 - 미지원 네이티브 기능이나 서명된 이력이 있으면 Plan 경로를 사용합니다. 따라서 외부 모델 사용률이 0%일 수 있고, 같은 대화에서 외부 경로로 돌아오지 못할 수도 있습니다.
 - 외부 추론의 네이티브 advisor만 별도로 구독 경로에서 실행하는 기능은 구현하지 않았습니다. custom `ANTHROPIC_BASE_URL`에서 원격 managed settings·organization policy를 포함한 모든 네이티브 기능의 동등성을 보장하지 않습니다.
-- 요청 본문은 16MiB로 제한하며 초과 시 fallback 전에 HTTP 413을 반환합니다. 버전이 숫자로 시작하는 `claude-sonnet-*`, `claude-opus-*`, `claude-haiku-*`, `claude-fable-*`와 지정 DeepSeek ID만 허용하며, 미등록 모델은 HTTP 403으로 거부합니다.
+- 요청 본문은 16MiB로 제한하며 초과 시 fallback 전에 HTTP 413을 반환합니다. 버전이 숫자로 시작하는 `claude-sonnet-*`, `claude-opus-*`, `claude-haiku-*`, `claude-fable-*`, 설정한 OpenRouter 모델 ID와 과거 클라이언트 모델 별칭을 허용하며, 미등록 모델은 HTTP 403으로 거부합니다.
 - 경로는 POST `/v1/messages`, `/v1/messages/count_tokens`(선택적 `?beta=true`)와 로컬 확인 HEAD `/api/hello`만 허용합니다. 다른 경로는 구독으로 우회하지 않고 거부합니다.
 - 사용자 지정 `CLAUDE_CONFIG_DIR`는 유지하되, 미설정 또는 과거 전용 `~/.claude-openrouter`이면 자식에서 `~/.claude`를 사용합니다. 과거 폴더의 MCP·플러그인을 자동 이전하거나 폴더를 복사·삭제하지 않습니다.
 - HTTP 429가 발생하면 해당 계정의 Usage 화면과 응답을 직접 확인해야 합니다. 특정 계정의 한도·초기화 일정은 저장소에서 관리하지 않습니다.
