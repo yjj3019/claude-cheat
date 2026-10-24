@@ -236,7 +236,20 @@ A **read-only** page bound to `127.0.0.1`, refreshed every two seconds. The port
 
 Estimated cost uses the model rates from OpenRouter `/api/v1/models`; confirm actual charges against the provider's own records. The **model that actually answered** is recorded by the proxy just before a response is delivered; the name the CLI shows is the request alias (`claude-sonnet-5-5` and so on), so this value is the real provider model.
 
-The page shows no key, prompt or request body, and the server writes nothing. It is a separate process, so it can run beside the routing session.
+The page shows no key, prompt or request body. It writes only `.env.openrouter` and `.env.local-llm` beside the launcher, and only when a save is requested. It is a separate process, so it can run beside the routing session.
+
+### Editing settings and testing connections
+
+The top of the page edits both providers.
+
+| Behaviour | Detail |
+| --- | --- |
+| Save | Only the managed keys change; comments and unrelated entries stay, and the previous file is kept as `.env.*.bak` |
+| Secrets | Never sent back to the browser (`sk-or-…cd0` style). Leaving the field empty keeps the stored value; only a new value replaces it |
+| Validation | Model ID shape, key shape and Local URL rules (loopback, HTTPS, same origin) are checked before writing; a failure leaves the file untouched |
+| Protection | POST requires the session token embedded in the page and a same-origin request, so other sites cannot call it |
+| Tests | **Model check** reads the model list only; **inference test** sends one 16-token request (may cost a small amount) |
+| When it applies | Saved settings take effect in the **next** session; restart a running one |
 
 ### Status API for scripts and agents
 

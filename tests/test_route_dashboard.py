@@ -578,6 +578,107 @@ class ServerTests(unittest.TestCase):
             first.server_close()
 
 
+class ConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.files = {
+            "openrouter": {"path": self.root / ".env.openrouter", "secret": {"ANTHROPIC_AUTH_TOKEN"},
+                           "required": ("ANTHROPIC_AUTH_TOKEN", "OPENROUTER_MODEL"),
+                           "fields": ("OPENROUTER_MODEL", "ANTHROPIC_AUTH_TOKEN")},
+            "local": {"path": self.root / ".env.local-llm", "secret": {"LOCAL_LLM_API_KEY"},
+                      "required": ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL"),
+                      "fields": ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY",
+                                 "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL")},
+        }
+        self.enterContext(mock.patch.object(dash, "CONFIG_FILES", self.files))
+
+    def write(self, provider, text):
+        self.files[provider]["path"].write_text(text, encoding="utf-8")
+
+    def test_snapshot_masks_secrets_and_reports_which_are_set(self):
+        self.write("openrouter", "# comment\nANTHROPIC_AUTH_TOKEN=sk-or-v1-abcdefghijkl\nOPENROUTER_MODEL=vendor/model\n")
+        snapshot = dash.config_snapshot()
+        entries = snapshot["openrouter"]["fields"]
+        self.assertTrue(entries["ANTHROPIC_AUTH_TOKEN"]["secret"])
+        self.assertTrue(entries["ANTHROPIC_AUTH_TOKEN"]["set"])
+        self.assertEqual(entries["ANTHROPIC_AUTH_TOKEN"]["value"], "")
+        self.assertIn("…", entries["ANTHROPIC_AUTH_TOKEN"]["preview"])
+        self.assertNotIn("abcdefghijkl", json.dumps(snapshot))
+        self.assertEqual(entries["OPENROUTER_MODEL"]["value"], "vendor/model")
+
+    def test_save_keeps_comments_unrelated_keys_and_the_stored_secret(self):
+        self.write("openrouter", "# keep me\nANTHROPIC_AUTH_TOKEN=sk-or-v1-abcdefghijkl\n"
+                                 "OPENROUTER_MODEL=vendor/old\nUNRELATED=1\n")
+        dash.save_config("openrouter", {"OPENROUTER_MODEL": "vendor/new", "ANTHROPIC_AUTH_TOKEN": ""})
+        text = self.files["openrouter"]["path"].read_text(encoding="utf-8")
+        self.assertIn("# keep me", text)
+        self.assertIn("UNRELATED=1", text)
+        self.assertIn("OPENROUTER_MODEL=vendor/new", text)
+        self.assertIn("ANTHROPIC_AUTH_TOKEN=sk-or-v1-abcdefghijkl", text)
+        self.assertTrue((self.root / ".env.openrouter.bak").is_file())
+
+    def test_save_writes_a_new_secret_when_provided(self):
+        self.write("openrouter", "ANTHROPIC_AUTH_TOKEN=sk-or-v1-abcdefghijkl\nOPENROUTER_MODEL=vendor/a\n")
+        dash.save_config("openrouter", {"OPENROUTER_MODEL": "vendor/a", "ANTHROPIC_AUTH_TOKEN": "sk-or-v1-zzzzzzzzzzzz"})
+        text = self.files["openrouter"]["path"].read_text(encoding="utf-8")
+        self.assertIn("ANTHROPIC_AUTH_TOKEN=sk-or-v1-zzzzzzzzzzzz", text)
+        self.assertEqual(text.count("ANTHROPIC_AUTH_TOKEN="), 1)
+
+    def test_invalid_values_are_rejected_before_writing(self):
+        self.write("openrouter", "ANTHROPIC_AUTH_TOKEN=sk-or-v1-abcdefghijkl\nOPENROUTER_MODEL=vendor/a\n")
+        before = self.files["openrouter"]["path"].read_text(encoding="utf-8")
+        for values, reason in [
+            ({"OPENROUTER_MODEL": "REPLACE_WITH_MODEL", "ANTHROPIC_AUTH_TOKEN": ""}, "invalid_model"),
+            ({"OPENROUTER_MODEL": "vendor/a", "ANTHROPIC_AUTH_TOKEN": "nope"}, "invalid_key"),
+            ({"OPENROUTER_MODEL": "", "ANTHROPIC_AUTH_TOKEN": ""}, "missing_openrouter_model"),
+        ]:
+            with self.subTest(reason=reason):
+                with self.assertRaises(ValueError) as caught:
+                    dash.save_config("openrouter", values)
+                self.assertEqual(str(caught.exception), reason)
+        self.assertEqual(self.files["openrouter"]["path"].read_text(encoding="utf-8"), before)
+
+    def test_local_validation_covers_url_mode_and_origin(self):
+        base = {"LOCAL_LLM_URL": "http://127.0.0.1:11434/v1/messages", "LOCAL_LLM_MODEL": "fixture"}
+        dash._validate_local(base)
+        self.assertRaises(ValueError, dash._validate_local, {**base, "LOCAL_LLM_URL": "http://example.com/v1/messages"})
+        self.assertRaises(ValueError, dash._validate_local, {**base, "LOCAL_LLM_URL": "http://127.0.0.1:11434/v1/chat"})
+        self.assertRaises(ValueError, dash._validate_local, {**base, "LOCAL_LLM_ALLOW_REMOTE": "yes"})
+        self.assertRaises(ValueError, dash._validate_local, {**base, "LOCAL_LLM_MODEL": ""})
+        self.assertRaises(ValueError, dash._validate_local,
+                          {**base, "LOCAL_LLM_MODELS_URL": "https://other.example/v1/models"})
+
+    def test_connection_test_reports_metadata_and_inference_safely(self):
+        self.write("openrouter", "ANTHROPIC_AUTH_TOKEN=sk-or-v1-abcdefghijkl\nOPENROUTER_MODEL=vendor/a\n")
+        with mock.patch.object(dash, "_http_json", return_value=(200, {"data": [{"id": "vendor/a"}]})):
+            metadata = dash.run_connection_test("openrouter", "metadata")
+        self.assertTrue(metadata["ok"])
+        self.assertEqual(metadata["reason"], "model_found")
+        self.assertNotIn("sk-or", json.dumps(metadata))
+
+        reply = {"model": "vendor/a", "content": [{"type": "text", "text": "OK"}]}
+        with mock.patch.object(dash, "_http_json", return_value=(200, reply)):
+            inference = dash.run_connection_test("openrouter", "inference")
+        self.assertTrue(inference["ok"])
+        self.assertEqual(inference["reason"], "ready")
+
+        with mock.patch.object(dash, "_http_json", return_value=(200, {**reply, "model": "other/model"})):
+            wrong = dash.run_connection_test("openrouter", "inference")
+        self.assertFalse(wrong["ok"])
+        self.assertEqual(wrong["reason"], "wrong_model")
+
+    def test_connection_test_missing_configuration_and_http_errors(self):
+        self.write("openrouter", "OPENROUTER_MODEL=vendor/a\n")
+        self.assertEqual(dash.run_connection_test("openrouter")["reason"], "configuration_missing")
+        self.write("openrouter", "ANTHROPIC_AUTH_TOKEN=sk-or-v1-abcdefghijkl\nOPENROUTER_MODEL=vendor/a\n")
+        import urllib.error
+        with mock.patch.object(dash, "_http_json", side_effect=urllib.error.HTTPError(
+                "u", 401, "denied", {}, None)):
+            self.assertEqual(dash.run_connection_test("openrouter")["status"], 401)
+        with mock.patch.object(dash, "_http_json", side_effect=dash.urllib.error.URLError("down")):
+            self.assertEqual(dash.run_connection_test("openrouter")["reason"], "connection_failed")
+
+
 class SnapshotTests(unittest.TestCase):
     def test_snapshot_shape_and_loopback_only_binding(self):
         with mock.patch.object(dash, "scan_sessions", return_value=dash._empty_usage()), \

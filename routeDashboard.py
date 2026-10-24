@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import secrets
 import signal
 import socket
 import threading
@@ -39,6 +40,19 @@ SHORT_WINDOW = 10
 TIMELINE_HOURS = 24
 BYTES_CAP = 65536
 SOURCE_LABELS = {"external": "OpenRouter", "plan": "Plan(Anthropic)"}
+# Writing settings is limited to these two files and these keys; nothing else is touched.
+CONFIG_FILES = {
+    "openrouter": {"path": ROOT / ".env.openrouter",
+                   "secret": {"ANTHROPIC_AUTH_TOKEN"},
+                   "required": ("ANTHROPIC_AUTH_TOKEN", "OPENROUTER_MODEL"),
+                   "fields": ("OPENROUTER_MODEL", "ANTHROPIC_AUTH_TOKEN")},
+    "local": {"path": ROOT / ".env.local-llm",
+              "secret": {"LOCAL_LLM_API_KEY"},
+              "required": ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL"),
+              "fields": ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY",
+                         "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL")},
+}
+TOKEN = os.environ.pop("DASHBOARD_TOKEN", "") or secrets.token_urlsafe(24)
 
 _LOCK = threading.Lock()
 _SESSIONS = {}
@@ -602,6 +616,242 @@ def build_alerts(routing, usage, account, pricing):
     return alerts
 
 
+def _config_path(provider):
+    return Path(CONFIG_FILES[provider]["path"])
+
+
+def _mask(value):
+    if not value:
+        return ""
+    return f"{value[:6]}…{value[-4:]}" if len(value) > 12 else "•" * len(value)
+
+
+def config_snapshot():
+    """Current settings with secrets masked; the browser never receives a stored key."""
+    result = {}
+    for provider, spec in CONFIG_FILES.items():
+        path = _config_path(provider)
+        values = read_env(path)
+        fields = {}
+        for name in spec["fields"]:
+            raw = values.get(name, "")
+            if name in spec["secret"]:
+                fields[name] = {"secret": True, "set": bool(raw), "preview": _mask(raw), "value": ""}
+            else:
+                fields[name] = {"secret": False, "set": bool(raw), "value": raw}
+        result[provider] = {"path": str(path), "exists": path.is_file(), "fields": fields}
+    return result
+
+
+def _validate_local(values):
+    from urllib.parse import urlsplit
+
+    url = (values.get("LOCAL_LLM_URL") or "").strip()
+    remote = (values.get("LOCAL_LLM_ALLOW_REMOTE") or "false").strip().lower()
+    http_url = (values.get("LOCAL_LLM_HTTP_URL") or "").strip()
+    if remote not in ("true", "false"):
+        raise ValueError("invalid_allow_remote")
+    if not url or any(ord(char) < 33 or ord(char) == 127 for char in url):
+        raise ValueError("invalid_local_url")
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("invalid_local_url") from None
+    loopback = parsed.hostname in ("127.0.0.1", "::1")
+    internal = parsed.scheme == "http" and http_url and url == http_url
+    if (parsed.scheme not in ("http", "https") or not parsed.hostname or port == 0
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment or parsed.path != "/v1/messages"
+            or (not loopback and not internal and (remote != "true" or parsed.scheme != "https"))):
+        raise ValueError("invalid_local_url")
+    model = (values.get("LOCAL_LLM_MODEL") or "").strip()
+    if not model or any(ord(char) < 32 for char in model):
+        raise ValueError("invalid_local_model")
+    key = values.get("LOCAL_LLM_API_KEY") or ""
+    if any(ord(char) < 32 or ord(char) == 127 for char in key):
+        raise ValueError("invalid_local_key")
+    models_url = (values.get("LOCAL_LLM_MODELS_URL") or "").strip()
+    if models_url:
+        if any(ord(char) < 33 or ord(char) == 127 for char in models_url):
+            raise ValueError("invalid_models_url")
+        try:
+            other = urlsplit(models_url)
+            other_port = other.port
+        except ValueError:
+            raise ValueError("invalid_models_url") from None
+        origin = (parsed.scheme, parsed.hostname, port if port is not None else (443 if parsed.scheme == "https" else 80))
+        other_origin = (other.scheme, other.hostname, other_port if other_port is not None else (443 if other.scheme == "https" else 80))
+        if (other_origin != origin or other.username is not None or other.password is not None
+                or other.query or other.fragment or not other.path.startswith("/")):
+            raise ValueError("invalid_models_url")
+
+
+def _validate_config(provider, values):
+    if provider == "openrouter":
+        model = (values.get("OPENROUTER_MODEL") or "").strip()
+        if (not re.fullmatch(r"[A-Za-z0-9~@][A-Za-z0-9._:/@+~-]{0,255}", model)
+                or model.startswith(("REPLACE_WITH_", "YOUR_"))):
+            raise ValueError("invalid_model")
+        token = values.get("ANTHROPIC_AUTH_TOKEN")
+        if token and not re.fullmatch(r"sk-or-[A-Za-z0-9_-]+", token):
+            raise ValueError("invalid_key")
+        return
+    _validate_local(values)
+
+
+def _write_env(path, updates):
+    """Update managed keys in place, keeping comments and unrelated entries; atomic replace."""
+    path = Path(path)
+    try:
+        original = path.read_text(encoding="utf-8")
+    except OSError:
+        original = ""
+    lines = original.splitlines()
+    written = set()
+    output = []
+    for line in lines:
+        match = re.fullmatch(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)", line)
+        if match and match.group(1) in updates:
+            name = match.group(1)
+            if name in written:
+                continue
+            written.add(name)
+            value = updates[name]
+            output.append(line if value is None else f"{name}={value}")
+            continue
+        output.append(line)
+    for name, value in updates.items():
+        if name in written or value is None:
+            continue
+        output.append(f"{name}={value}")
+        written.add(name)
+    text = "\n".join(output).rstrip("\n") + "\n"
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(text, encoding="utf-8")
+    if path.is_file():
+        path.with_suffix(path.suffix + ".bak").write_text(original, encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def save_config(provider, values):
+    """Validate and persist one provider's settings; an empty secret keeps the stored value."""
+    spec = CONFIG_FILES.get(provider)
+    if spec is None:
+        raise ValueError("unknown_provider")
+    clean = {}
+    for name in spec["fields"]:
+        if name not in values:
+            continue
+        value = values[name]
+        if not isinstance(value, str):
+            raise ValueError("invalid_value")
+        clean[name] = value.strip()
+    for name in spec["required"]:
+        if name in spec["secret"]:
+            if not clean.get(name) and not read_env(_config_path(provider)).get(name):
+                raise ValueError(f"missing_{name.lower()}")
+        elif not clean.get(name):
+            raise ValueError(f"missing_{name.lower()}")
+    _validate_config(provider, clean)
+    updates = {}
+    for name in spec["fields"]:
+        if name in spec["secret"]:
+            updates[name] = clean.get(name) or None
+        elif name in clean:
+            updates[name] = clean[name]
+    _write_env(_config_path(provider), updates)
+    return config_snapshot()
+
+
+def _http_json(url, headers, body=None, timeout=12):
+    import urllib.error
+    import urllib.request
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    request = urllib.request.Request(url, data=data, headers=headers,
+                                     method="POST" if body is not None else "GET")
+    with opener.open(request, timeout=timeout) as response:
+        return response.status, json.loads(response.read(4 * 1024 * 1024 + 1))
+
+
+def run_connection_test(provider, mode="metadata"):
+    """One safe connectivity check for the settings page; no prompts, keys or bodies are returned."""
+    import urllib.error
+    from urllib.parse import urlsplit
+
+    base = {"provider": provider, "mode": mode, "ok": False}
+    values = read_env(_config_path(provider))
+    headers = {"content-type": "application/json", "anthropic-version": "2023-06-01"}
+    try:
+        if provider == "openrouter":
+            key = values.get("ANTHROPIC_AUTH_TOKEN", "")
+            model = values.get("OPENROUTER_MODEL", "")
+            if not key or not model:
+                return {**base, "reason": "configuration_missing"}
+            headers["authorization"] = "Bearer " + key
+            if mode == "metadata":
+                status, data = _http_json("https://openrouter.ai/api/v1/models",
+                                          {"authorization": "Bearer " + key})
+                rows = data.get("data") if isinstance(data, dict) else None
+                ids = [row.get("id") for row in rows or [] if isinstance(row, dict)]
+                found = model in ids
+                return {**base, "ok": found, "reason": "model_found" if found else "model_not_found",
+                        "model": model, "model_count": len(ids)}
+            status, data = _http_json("https://openrouter.ai/api/v1/messages", headers,
+                                      {"model": model, "max_tokens": 16, "stream": False,
+                                       "messages": [{"role": "user", "content": "Reply with exactly OK"}]})
+            content = data.get("content") if isinstance(data, dict) else None
+            text = "".join(block.get("text", "") for block in content or []
+                           if isinstance(block, dict) and block.get("type") == "text").strip()
+            if data.get("model") != model:
+                return {**base, "reason": "wrong_model", "model": model, "status": status}
+            if not text:
+                return {**base, "reason": "empty_reply", "model": model, "status": status}
+            return {**base, "ok": True, "reason": "ready", "model": model, "status": status}
+
+        url = values.get("LOCAL_LLM_URL", "")
+        model = values.get("LOCAL_LLM_MODEL", "")
+        if not url or not model:
+            return {**base, "reason": "configuration_missing"}
+        try:
+            _validate_local(values)
+        except ValueError:
+            return {**base, "reason": "invalid_configuration"}
+        key = values.get("LOCAL_LLM_API_KEY", "")
+        if key:
+            headers["authorization"] = "Bearer " + key
+        if mode == "metadata":
+            models_url = values.get("LOCAL_LLM_MODELS_URL", "")
+            if not models_url:
+                parsed = urlsplit(url)
+                models_url = f"{parsed.scheme}://{parsed.netloc}/v1/models"
+            status, data = _http_json(models_url, headers)
+            entries = data.get("data", data.get("models")) if isinstance(data, dict) else None
+            ids = [entry.get("id", entry.get("name", entry.get("model"))) for entry in entries or []
+                   if isinstance(entry, dict)]
+            found = model in ids
+            return {**base, "ok": found, "reason": "model_found" if found else "model_not_found",
+                    "model": model, "model_count": len(ids)}
+        status, data = _http_json(url, headers,
+                                  {"model": model, "max_tokens": 16, "stream": False,
+                                   "messages": [{"role": "user", "content": "Reply with exactly OK"}]})
+        content = data.get("content") if isinstance(data, dict) else None
+        text = "".join(block.get("text", "") for block in content or []
+                       if isinstance(block, dict) and block.get("type") == "text").strip()
+        if not text:
+            return {**base, "reason": "empty_reply", "model": model, "status": status}
+        return {**base, "ok": True, "reason": "ready", "model": model, "status": status}
+    except urllib.error.HTTPError as error:
+        error.close()
+        return {**base, "reason": "http_error", "status": error.code}
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return {**base, "reason": "connection_failed"}
+    except ValueError:
+        return {**base, "reason": "invalid_response"}
+
+
 def snapshot():
     """Everything the page renders, in one JSON document."""
     now = datetime.now(timezone.utc)
@@ -713,10 +963,21 @@ summary{cursor:pointer;color:#b9c4d6;font-size:12px;margin:4px 0}
 .code{background:#0e1526;border:1px solid #24304a;border-radius:8px;padding:10px 12px;overflow-x:auto;
  font-family:ui-monospace,Consolas,monospace;font-size:11px;line-height:1.7;color:#c8d2e4;margin:8px 0 4px;
  white-space:pre}
+.row{display:flex;gap:8px;align-items:center;margin:6px 0;color:#b9c4d6;font-size:12px}
+.row span{min-width:132px}
+.row input[type=text],.row input[type=password]{flex:1;background:#0e1526;border:1px solid #24304a;border-radius:8px;
+ padding:6px 8px;color:#e6ebf5;font:12px ui-monospace,Consolas,monospace}
+.row input[type=checkbox]{width:16px;height:16px}
+.actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+.actions button{background:#2b4b8f;border:1px solid #3a63b8;color:#e6ebf5;border-radius:8px;
+ padding:6px 12px;font-size:12px;cursor:pointer}
+.actions button.ghost{background:#1a2438;border-color:#2c3b58}
+.result{margin-top:8px;color:#8b97ad;white-space:pre-wrap;word-break:break-all}
 </style></head><body>
 <h1>OpenRouter 라우팅 대시보드</h1>
 <div class="sub" id="stamp">불러오는 중…</div>
 <div class="alerts" id="alerts"></div>
+<div class="grid" id="settings"></div>
 <div class="grid" id="grid"></div>
 <script>
 const esc = value => String(value ?? '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
@@ -726,6 +987,84 @@ const usd4 = value => value === null || value === undefined ? '—' : '$' + Numb
 const tokens = row => row ? (row[0] + row[1] + row[2] + row[3]) : 0;
 const stateText = {external:'OpenRouter 사용 중', plan:'Plan 우회 중', idle:'유휴', unknown:'기록 없음'};
 const stateClass = {external:'ext', plan:'plan', idle:'idle', unknown:'unknown'};
+const TOKEN = "__DASHBOARD_TOKEN__";
+const CONFIG_SPEC = {
+  openrouter: {title:'OpenRouter', note:'.env.openrouter', fields:[
+    ['OPENROUTER_MODEL','모델 ID','text','vendor/model'],
+    ['ANTHROPIC_AUTH_TOKEN','API 키','password','저장됨 — 변경할 때만 입력']]},
+  local: {title:'Local LLM', note:'.env.local-llm', fields:[
+    ['LOCAL_LLM_URL','Messages URL','text','http://127.0.0.1:11434/v1/messages'],
+    ['LOCAL_LLM_MODEL','모델 ID','text','설치된 모델 ID'],
+    ['LOCAL_LLM_API_KEY','서버 키 (선택)','password','저장됨 — 변경할 때만 입력'],
+    ['LOCAL_LLM_ALLOW_REMOTE','원격 HTTPS 허용','checkbox',''],
+    ['LOCAL_LLM_HTTP_URL','내부 HTTP 예외 URL','text',''],
+    ['LOCAL_LLM_MODELS_URL','모델 목록 URL','text','']]},
+};
+let CONFIG = null;
+
+function renderSettings(force) {
+  if (!CONFIG) return;
+  const host = document.getElementById('settings');
+  if (!force && host.contains(document.activeElement)) return;
+  host.innerHTML = Object.entries(CONFIG_SPEC).map(([provider, spec]) => {
+    const current = (CONFIG[provider] || {}).fields || {};
+    const inputs = spec.fields.map(([name, label, type, placeholder]) => {
+      const field = current[name] || {value:'', set:false, preview:''};
+      const id = `cfg-${provider}-${name}`;
+      if (type === 'checkbox')
+        return `<label class="row"><input type="checkbox" id="${id}" ${field.value === 'true' ? 'checked' : ''}><span>${esc(label)}</span></label>`;
+      const hint = field.secret && field.set
+        ? ` placeholder="저장됨 (${esc(field.preview)}) — 변경할 때만 입력"`
+        : ` placeholder="${esc(placeholder)}"`;
+      return `<label class="row"><span>${esc(label)}</span><input type="${type}" id="${id}" value="${field.secret ? '' : esc(field.value || '')}"${hint} autocomplete="off"></label>`;
+    }).join('');
+    return `<div class="card">
+      <h2>${esc(spec.title)} 설정 <span class="muted" style="text-transform:none">${esc(spec.note)}</span></h2>
+      ${inputs}
+      <div class="actions">
+        <button onclick="saveConfig('${provider}')">저장</button>
+        <button class="ghost" onclick="testConfig('${provider}','metadata')">모델 확인</button>
+        <button class="ghost" onclick="testConfig('${provider}','inference')">추론 테스트</button>
+      </div>
+      <div class="mono result" id="cfg-result-${provider}">변경 사항은 새 세션부터 적용됩니다.</div>
+    </div>`;
+  }).join('');
+}
+
+async function loadConfig() {
+  try {
+    CONFIG = await (await fetch('/api/config', {cache:'no-store'})).json();
+    renderSettings();
+  } catch (error) { /* keep the previous view */ }
+}
+
+async function postConfig(path, payload) {
+  const response = await fetch(path, {method:'POST',
+    headers:{'content-type':'application/json', 'x-dashboard-token':TOKEN},
+    body: JSON.stringify(payload)});
+  return response.json();
+}
+
+async function saveConfig(provider) {
+  const values = {};
+  for (const [name, , type] of CONFIG_SPEC[provider].fields) {
+    const element = document.getElementById(`cfg-${provider}-${name}`);
+    if (!element) continue;
+    values[name] = type === 'checkbox' ? (element.checked ? 'true' : 'false') : element.value;
+  }
+  const result = await postConfig('/api/config', {provider, values});
+  document.getElementById(`cfg-result-${provider}`).textContent =
+    result.saved ? '저장했습니다. 새 세션부터 적용됩니다.' : `오류: ${result.error}`;
+  await loadConfig();
+  renderSettings(true);
+}
+
+async function testConfig(provider, mode) {
+  const target = document.getElementById(`cfg-result-${provider}`);
+  target.textContent = '확인 중…';
+  target.textContent = JSON.stringify(await postConfig('/api/test', {provider, mode}));
+}
+loadConfig();
 
 function card(title, body, cls) {
   return `<div class="card ${cls || ''}"><h2>${title}</h2>${body}</div>`;
@@ -735,7 +1074,7 @@ function render(data) {
   const r = data.routing, u = data.usage, a = data.account;
   document.getElementById('stamp').innerHTML =
     `갱신 ${new Date(data.generated_at).toLocaleTimeString('ko-KR')} · 설정 모델 ${esc(data.model || '미설정')}`
-    + ` · 최근 응답 모델 ${esc(r.last?.model || '—')} · 읽기 전용 · <a href="#help">도움말 ↓</a>`;
+    + ` · 최근 응답 모델 ${esc(r.last?.model || '—')} · 읽기 전용 뷰 · 설정 저장 가능 · <a href="#help">도움말 ↓</a>`;
   const age = r.last?.age_seconds;
   const ageText = age === null || age === undefined ? '아직 기록 없음'
     : age < 60 ? `${Math.round(age)}초 전` : `${Math.round(age / 60)}분 전`;
@@ -890,7 +1229,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
-            self._send(200, "text/html; charset=utf-8", PAGE)
+            self._send(200, "text/html; charset=utf-8", PAGE.replace("__DASHBOARD_TOKEN__", TOKEN))
+        elif self.path.split("?")[0] == "/api/config":
+            try:
+                self._send(200, "application/json; charset=utf-8",
+                           json.dumps(config_snapshot(), ensure_ascii=False))
+            except Exception:
+                self._send(500, "application/json; charset=utf-8", json.dumps({"error": "config_failed"}))
         elif self.path.split("?")[0] == "/api/snapshot":
             try:
                 self._send(200, "application/json; charset=utf-8", json.dumps(cached_snapshot(), ensure_ascii=False))
@@ -905,6 +1250,55 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(500, "application/json; charset=utf-8", json.dumps({"error": "status_failed"}))
         else:
             self._send(404, "application/json; charset=utf-8", json.dumps({"error": "not_found"}))
+
+    def _authorized(self):
+        token = self.headers.get("x-dashboard-token") or ""
+        return bool(token) and secrets.compare_digest(token, TOKEN)
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        if path not in ("/api/config", "/api/test"):
+            return self._send(404, "application/json; charset=utf-8", json.dumps({"error": "not_found"}))
+        if not self._authorized():
+            return self._send(403, "application/json; charset=utf-8", json.dumps({"error": "token_required"}))
+        origin = self.headers.get("origin")
+        port = self.server.server_address[1]
+        if origin and origin not in (f"http://127.0.0.1:{port}", f"http://localhost:{port}"):
+            return self._send(403, "application/json; charset=utf-8", json.dumps({"error": "origin_rejected"}))
+        try:
+            length = int(self.headers.get("content-length") or 0)
+        except ValueError:
+            return self._send(400, "application/json; charset=utf-8", json.dumps({"error": "invalid_length"}))
+        if length > BYTES_CAP:
+            return self._send(413, "application/json; charset=utf-8", json.dumps({"error": "request_too_large"}))
+        try:
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            return self._send(400, "application/json; charset=utf-8", json.dumps({"error": "invalid_json"}))
+        if not isinstance(payload, dict):
+            return self._send(400, "application/json; charset=utf-8", json.dumps({"error": "invalid_payload"}))
+        provider = payload.get("provider")
+        if provider not in CONFIG_FILES:
+            return self._send(400, "application/json; charset=utf-8", json.dumps({"error": "unknown_provider"}))
+        if path == "/api/config":
+            values = payload.get("values")
+            if not isinstance(values, dict):
+                return self._send(400, "application/json; charset=utf-8", json.dumps({"error": "invalid_values"}))
+            try:
+                saved = save_config(provider, values)
+            except ValueError as error:
+                return self._send(400, "application/json; charset=utf-8",
+                                  json.dumps({"error": str(error)}))
+            except OSError:
+                return self._send(500, "application/json; charset=utf-8", json.dumps({"error": "write_failed"}))
+            return self._send(200, "application/json; charset=utf-8",
+                              json.dumps({"saved": True, "provider": provider, "config": saved},
+                                         ensure_ascii=False))
+        mode = payload.get("mode") or "metadata"
+        if mode not in ("metadata", "inference"):
+            return self._send(400, "application/json; charset=utf-8", json.dumps({"error": "invalid_mode"}))
+        return self._send(200, "application/json; charset=utf-8",
+                          json.dumps(run_connection_test(provider, mode), ensure_ascii=False))
 
     def log_message(self, *args):
         pass
