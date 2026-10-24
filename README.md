@@ -177,7 +177,7 @@ LOCAL_LLM_ALLOW_REMOTE=true
 | `LOCAL_LLM_HTTP_URL` | Optional exact HTTP Messages URL pin; empty by default. Plaintext HTTP is allowed only when it exactly matches `LOCAL_LLM_URL`. Keep real values in ignored `.env.local-llm`; prefer HTTPS. |
 | `LOCAL_LLM_MODELS_URL` | 같은 origin의 `/v1/models`; 모델 목록 점검에만 사용 |
 
-같은 이름의 **프로세스 환경변수가 파일보다 우선**합니다. `localhost` 대신 허용되는 주소 리터럴 `127.0.0.1` 또는 `[::1]`을 사용하세요. 원격 HTTP는 LAN 주소여도 거부합니다. 해당 서버에 HTTPS를 제공하거나 별도로 준비한 loopback 터널이 필요합니다.
+같은 이름의 **프로세스 환경변수가 파일보다 우선**합니다. `localhost` 대신 허용되는 주소 리터럴 `127.0.0.1` 또는 `[::1]`을 사용하세요. 원격 HTTP는 `LOCAL_LLM_HTTP_URL`이 `LOCAL_LLM_URL`과 정확히 일치할 때만 허용하며, 이 경우 프롬프트와 `LOCAL_LLM_API_KEY` Bearer 키가 암호화 없이 전송됩니다. 그 외에는 HTTPS 또는 별도로 준비한 loopback 터널이 필요합니다.
 
 URL 내 사용자명·비밀번호·쿼리·fragment, redirect, 잘못된 인증 헤더는 거부하고 TLS 인증서 검증을 끄지 않습니다. 원격 허용은 지정한 DNS 이름과 해석 결과를 신뢰한다는 뜻입니다.
 
@@ -294,6 +294,9 @@ Local 응답은 JSON으로 받아 설정한 모델을 검증한 뒤 CLI용 SSE�
 ```text
 호환 Sonnet 요청
   → 외부 제공자 최초 시도 + 재시도 3회 = 최대 4회
+  → 401·402·403·404는 재시도 없이 즉시 Plan + 30초 대기, 400·413·422는 해당 요청만 Plan(대기 없음)
+  → 외부로 보내는 요청에서 `metadata`(계정·세션 식별자)는 제거, 일반 모드에서는 thinking을 요청하지 않음(외부 응답에 thinking이 오면 그 요청만 Plan)
+  → Plan 전달은 스트림 요청의 헤더 120초·청크 간 무응답 300초를 넘기면 끊음, 요청 본문 상한은 32MiB
   → 모두 실패하면 원본 Plan Sonnet으로 1회 전달
   → 이후 30초 동안 들어오는 요청은 Plan로 전달
   → 30초 후 호환되는 실제 요청 1개로 외부 복구 확인
@@ -359,7 +362,7 @@ claude
 
 ```powershell
 node --test tests/*.test.mjs
-python -m unittest discover -s tests -p 'test_local_*.py' -v
+python -m unittest discover -s tests -p 'test_*.py' -v
 python openrouterAdvisor.py --self-test
 node --check claudeRouteProxy.mjs
 ```
@@ -381,7 +384,7 @@ node --check claudeRouteProxy.mjs
 | 파일 | 역할 |
 | --- | --- |
 | [startClaudeOpenRouter.ps1](startClaudeOpenRouter.ps1) | 제공자 선택과 Python 실행기 호출 |
-| [openrouterAdvisor.py](openrouterAdvisor.py) | Plan 인증 검사·환경 격리·프록시 수명 관리·Local 목록 점검·별도 격리 상담 도구 |
+| [openrouterAdvisor.py](openrouterAdvisor.py) | Plan 인증 검사·환경 격리·프록시 수명 관리·Local 목록 점검 |
 | [localProcessTree.py](localProcessTree.py) | Windows Local 전용 진입점의 Job 소유권·프로세스 트리 종료 감시 |
 | [claudeRouteProxy.mjs](claudeRouteProxy.mjs) | 모델별 라우팅·응답 검증·재시도·fallback·복구 |
 | [.env.local-llm.example](.env.local-llm.example) | 키가 없는 Local 설정 예제 |
@@ -391,7 +394,7 @@ node --check claudeRouteProxy.mjs
 | [tests/test_local_lifecycle.py](tests/test_local_lifecycle.py) | Windows 합성 CLI·실행기 강제 종료 후 프록시·연결 정리 검사 |
 | [docs/HISTORY.ko.md](docs/HISTORY.ko.md) | 이전 구현·진단 기록; 현재 정책과 구분 |
 
-`openrouterAdvisor.py`라는 이름은 이전 구현에서 유지한 이름입니다. 별도 상담 도구와 Claude Code의 네이티브 advisor는 같은 기능이 아닙니다. 개인 진단 스크립트·로그인 파일·실제 API 키·개인 설정은 배포하지 않습니다.
+`openrouterAdvisor.py`라는 이름은 이전 구현에서 유지한 이름입니다. 이 파일에는 별도의 상담(MCP) 도구가 없으며, Claude Code의 네이티브 advisor와도 무관합니다. 개인 진단 스크립트·로그인 파일·실제 API 키·개인 설정은 배포하지 않습니다.
 
 소스와 문서는 [MIT License](LICENSE)를 적용합니다. 저작권·허가 고지를 유지하는 조건으로 사용·수정·배포할 수 있습니다. 추적 소스 검토에서 Node.js·Python 표준 라이브러리와 별도 설치 Claude CLI를 사용하며, 번들 외부 패키지나 별도 소스 라이선스 고지는 발견하지 못했습니다. 선택 범위와 Apache-2.0 비교는 [라이선스 검토](LICENSE-REVIEW.md)에 기록했습니다.
 

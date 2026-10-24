@@ -120,7 +120,7 @@ Before inference starts, Local-only failures add a fixed `code` and action messa
 
 On Windows, the existing `-LocalMode` CLI entry point puts its launcher in a [Windows Job Object](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects) before creating the CLI or proxy. One hidden guardian waits for the launcher to exit, then closes the Job to clean the CLI, proxy, Bash, and descendants. It does not search process names or kill global processes. Failure to prepare ownership blocks CLI startup.
 
-The existing proxy parent-pipe guard remains. Ordinary launches, diagnostics, imported library calls, and non-Windows shutdown behavior are unchanged. Start a new Local session to acquire this protection; existing sessions are not retroactively enrolled. Prefer normal exit or Ctrl+C. See the [process-tree verification scope](docs/LIVE-VALIDATION.ko.md#windows-local-프로세스-트리-정리).
+The existing proxy parent-pipe guard remains and now also covers ordinary launches (the proxy exits when the launcher's pipe closes). Diagnostics, imported library calls, and non-Windows shutdown behavior are unchanged; the Windows job-object tree guard still applies to Local and OpenRouter compatibility modes only. Start a new Local session to acquire this protection; existing sessions are not retroactively enrolled. Prefer normal exit or Ctrl+C. See the [process-tree verification scope](docs/LIVE-VALIDATION.ko.md#windows-local-프로세스-트리-정리).
 
 To prevent low output budgets from truncating compaction, this mode supplies `CLAUDE_CODE_MAX_OUTPUT_TOKENS` through its per-launch settings, defaulting to 8192. A larger positive whole-number value from the parent environment is preserved; a smaller value is raised to 8192. These per-launch settings take precedence over budget values in user/project files; use the parent environment for a larger budget. Neither the files nor the parent environment is changed. The budget applies to ordinary replies in this Local session as well as compaction. The CLI still applies model caps and remaining-context adjustments; the proxy does not raise request `max_tokens`. Your server must support the output budget. Launches without `-LocalMode` and diagnostic modes are unchanged.
 
@@ -191,9 +191,9 @@ By default, only literal loopback (`127.0.0.1` or `::1`) HTTP/HTTPS endpoints ar
 
 Local mode does not read the OpenRouter key. Real `.env*` settings are ignored by Git; only the credential-free `.env.local-llm.example` template is distributed. The server and model still need real validation later.
 
-Run real loopback HTTP integration tests with `node --test tests/*.test.mjs` and configuration/metadata tests with `python -m unittest discover -s tests -p test_local_config.py -v`. Their servers and Plan responses are synthetic; they do not contact real LLM providers or accounts.
+Run real loopback HTTP integration tests with `node --test tests/*.test.mjs` and configuration/metadata tests with `python -m unittest discover -s tests -p 'test_*.py' -v`. Their servers and Plan responses are synthetic; they do not contact real LLM providers or accounts.
 
-Independent validation after these Local additions passed **138/138 Node tests**, **13/13 Python tests**, Python self-tests, Node/Python syntax checks, and PowerShell parsing. Real server/model/authentication/TLS deployment checks remain deferred.
+Independent validation after these Local additions passed Node tests, Python tests (counts change per release; run the commands below), Python self-tests, Node/Python syntax checks, and PowerShell parsing. Real server/model/authentication/TLS deployment checks remain deferred.
 
 ## OpenRouter compatibility mode and startup checks
 
@@ -245,7 +245,7 @@ Personal machine configurations, account usage, billing records, and live sessio
 
 ```powershell
 node --test tests/*.test.mjs
-python -m unittest discover -s tests -p 'test_local_*.py' -v
+python -m unittest discover -s tests -p 'test_*.py' -v
 python openrouterAdvisor.py --self-test
 node --check claudeRouteProxy.mjs
 ```
@@ -267,7 +267,7 @@ See the [connection and recovery checklist](docs/LIVE-VALIDATION.ko.md) for a ge
 | File | Purpose |
 | --- | --- |
 | `startClaudeOpenRouter.ps1` | PowerShell provider selector and launcher |
-| `openrouterAdvisor.py` | Plan authentication checks, environment isolation, proxy lifecycle, isolated consultation tool, self-tests |
+| `openrouterAdvisor.py` | Plan authentication checks, environment isolation, proxy lifecycle, self-tests |
 | `localProcessTree.py` | Windows Local CLI Job ownership and process-tree guardian |
 | `claudeRouteProxy.mjs` | Routing, response validation, retries, fallback, recovery |
 | `tests/claudeRouteProxy.test.mjs` | Synthetic proxy regression tests |
