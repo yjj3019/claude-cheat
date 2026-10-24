@@ -339,6 +339,24 @@ Sonnet 선택과 HUD의 모델·비용 표시는 실제 외부 라우팅이나 �
 
 `native_feature`의 `detail`은 처음 확인된 제외 사유입니다. `token_count`는 토큰 수 계산, `plan_model`은 Plan 전용 모델, `unsupported_beta`는 미지원 beta 헤더입니다. 나머지 `unsupported_*`는 요청 필드·메시지 형식·thinking/output/tool_choice 설정·콘텐츠·도구 정의 검사의 실패를 구분합니다. 로그는 고정 분류명만 기록하며 헤더 원문·질문·키를 기록하지 않습니다. `unsupported_beta`의 `beta_features`는 날짜 접미사가 있는 기능 식별자를 최대 16개 표시하고, `unsupported_beta_count`는 전체 개수를 표시합니다. 비표준 값과 인증정보 형태의 값은 마스킹합니다.
 
+### 실시간 대시보드
+
+```powershell
+.\startClaudeDashboard.ps1
+```
+
+`127.0.0.1`에만 열리는 **읽기 전용** 페이지로, 2초마다 자동 갱신됩니다. 기본 포트는 8787이며 사용 중이면 빈 포트로 자동 대체되고 실제 주소를 출력합니다.
+
+| 항목 | 내용 |
+| --- | --- |
+| 지금 상태 | 마지막 `route_selected` 기준 **OpenRouter 사용 중 / Plan 우회 중 / 유휴** |
+| 최근 60분 | OpenRouter 대 Plan 비율, 회로 차단 횟수 |
+| 우회 사유 | `native_feature`의 `detail`별 건수, 외부 실패 상태·검증 실패 분류 |
+| 크레딧 | 키 한도·이번 달 사용액·잔액·리셋일 (OpenRouter `/api/v1/key`) |
+| 세션별 사용 | 턴 수, 외부/Plan 턴 수, 외부 토큰, 사용 모델 |
+
+키·프롬프트·요청 본문은 표시하지 않고 서버는 아무것도 기록하지 않습니다. 대시보드는 세션과 별개 프로세스이므로 라우팅 세션과 함께 띄워 두면 됩니다.
+
 ## 7. 문제 해결과 일반 Claude로 돌아가기
 
 | 증상 | 먼저 확인할 내용 |

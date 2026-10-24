@@ -213,6 +213,24 @@ Every interactive launch now makes one minimal provider-only inference check bef
 
 `ready` confirms the configured model, exact diagnostic reply and normal completion. `timeout`, `authentication_failed`, `http_error` and `connection_failed` identify connection failures. `reply_mismatch`, `incomplete_response` and `invalid_response` identify response-validation failures: a reasoning model may exhaust this small budget or return extra text despite a working connection. The check does not prove complete CLI compatibility.
 
+## Live dashboard
+
+```powershell
+.\startClaudeDashboard.ps1
+```
+
+A **read-only** page bound to `127.0.0.1`, refreshed every two seconds. The default port is 8787; if it is taken or reserved the server picks a free loopback port and prints the real address.
+
+| Panel | Content |
+| --- | --- |
+| Now | **OpenRouter serving / Plan bypass / idle**, from the newest `route_selected` |
+| Last 60 minutes | Replacement versus Plan counts, circuit opens |
+| Bypass reasons | Counts per `native_feature` `detail`, external failure statuses and validation classes |
+| Credits | Key limit, spend this period, remaining, reset date (OpenRouter `/api/v1/key`) |
+| Per session | Turns, replacement/Plan turns, replacement tokens, model |
+
+The page shows no key, prompt or request body, and the server writes nothing. It is a separate process, so it can run beside the routing session.
+
 ## Understanding connection checks and troubleshooting
 
 `-CheckLocal` accepts model lists shaped as `data[].id` or `models[].name` / `models[].model`. It prints safe metadata, not model names or response bodies. Example output, not a real-server result:
