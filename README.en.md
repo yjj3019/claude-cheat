@@ -248,7 +248,7 @@ The page shows no key, prompt or request body. It writes only `.env.openrouter` 
 
 ### Editing settings and testing connections
 
-The top of the page edits both providers.
+Settings live on a **separate page** (`http://127.0.0.1:8787/settings`) reached from the top navigation; both pages share one server and session token.
 
 | Behaviour | Detail |
 | --- | --- |

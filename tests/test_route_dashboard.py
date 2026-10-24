@@ -455,23 +455,67 @@ class TransitionTests(unittest.TestCase):
 
 
 class PageTests(unittest.TestCase):
-    def test_embedded_script_is_valid_javascript(self):
-        """A stray escape in the Python string can break the page without failing any API test."""
+    def scripts(self):
         import re
+
+        return {
+            "dashboard": re.search(r"<script>(.*)</script>", dash.PAGE, re.S).group(1),
+            "settings": re.search(r"<script>(.*)</script>", dash.SETTINGS_PAGE, re.S).group(1),
+        }
+
+    def test_both_pages_are_valid_javascript(self):
+        """A stray escape in the Python string can break a page without failing any API test."""
         import shutil
         import subprocess
 
-        script = re.search(r"<script>(.*)</script>", dash.PAGE, re.S).group(1)
         node = shutil.which("node")
         if not node:
             self.skipTest("node is not available")
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "page.js"
-            path.write_text(script, encoding="utf-8")
-            result = subprocess.run([node, "--check", str(path)], capture_output=True, text=True, timeout=60)
-        self.assertEqual(result.returncode, 0, result.stderr[:400])
-        self.assertIn("help.commands", script)
-        self.assertIn("help.reasons", script)
+        for name, script in self.scripts().items():
+            with self.subTest(page=name):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "page.js"
+                    path.write_text(script, encoding="utf-8")
+                    result = subprocess.run([node, "--check", str(path)],
+                                            capture_output=True, text=True, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stderr[:400])
+
+    def test_pages_are_separated(self):
+        dashboard, settings = self.scripts()["dashboard"], self.scripts()["settings"]
+        self.assertIn("help.commands", dashboard)
+        self.assertIn("renderGrid", dashboard)
+        self.assertNotIn("saveSettings", dashboard)
+        self.assertIn("saveSettings", settings)
+        self.assertNotIn("renderGrid", settings)
+        for page in (dash.PAGE, dash.SETTINGS_PAGE):
+            self.assertIn('const TOKEN = "__DASHBOARD_TOKEN__"', page)
+            self.assertIn('href="/"', page)
+            self.assertIn('href="/settings"', page)
+
+    def test_routes_serve_the_matching_page(self):
+        import threading
+        import urllib.error
+        import urllib.request
+
+        server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            base = f"http://127.0.0.1:{port}"
+            dashboard = opener.open(base + "/", timeout=10).read().decode("utf-8")
+            settings = opener.open(base + "/settings", timeout=10).read().decode("utf-8")
+            with self.assertRaises(urllib.error.HTTPError) as missing:
+                opener.open(base + "/nope", timeout=10)
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(missing.exception.code, 404)
+        missing.exception.close()
+        self.assertIn("renderGrid", dashboard)
+        self.assertIn("saveSettings", settings)
+        self.assertNotIn("__DASHBOARD_TOKEN__", dashboard)
+        self.assertNotIn("__DASHBOARD_TOKEN__", settings)
 
 
 class ProxyStaleTests(unittest.TestCase):
