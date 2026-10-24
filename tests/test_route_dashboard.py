@@ -763,6 +763,64 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(dash.run_connection_test("openrouter")["reason"], "connection_failed")
 
 
+class RouteTailTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.path = self.root / ".route.log"
+        self.enterContext(mock.patch.object(dash, "_ROUTE_TAIL",
+                                            {"path": None, "events": [], "offset": 0}))
+
+    def write(self, lines, mode="w"):
+        with self.path.open(mode, encoding="utf-8") as handle:
+            handle.write("".join(lines))
+
+    def test_only_appended_lines_are_parsed(self):
+        self.write([route_line("2026-01-01T00:00:00+00:00",
+                              {"event": "route_selected", "provider": "openrouter", "reason": "replacement"}),
+                    route_line("2026-01-01T00:00:01+00:00",
+                               {"event": "route_selected", "provider": "plan", "reason": "native_feature"})])
+        first = dash.parse_route_log(self.path)
+        self.assertEqual(len(first), 2)
+        self.write([route_line("2026-01-01T00:00:02+00:00",
+                               {"event": "route_selected", "provider": "openrouter", "reason": "replacement"})],
+                   mode="a")
+        second = dash.parse_route_log(self.path)
+        self.assertEqual(len(second), 3)
+        self.assertEqual(second[-1]["ts"], "2026-01-01T00:00:02+00:00")
+        self.assertEqual(dash.parse_route_log(self.path), second)  # unchanged file: no growth
+
+    def test_truncation_starts_over(self):
+        self.write([route_line("2026-01-01T00:00:00+00:00", {"event": "route_selected", "provider": "plan"})])
+        self.assertEqual(len(dash.parse_route_log(self.path)), 1)
+        self.write([route_line("2026-01-01T00:00:05+00:00", {"event": "route_selected", "provider": "openrouter"})])
+        events = dash.parse_route_log(self.path)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["provider"], "openrouter")
+
+    def test_partial_trailing_line_waits_for_its_newline(self):
+        self.write([route_line("2026-01-01T00:00:00+00:00", {"event": "route_selected", "provider": "plan"})])
+        dash.parse_route_log(self.path)
+        self.write(['2026-01-01T00:00:01+00:00 {"event": "route_sel'], mode="a")
+        self.assertEqual(len(dash.parse_route_log(self.path)), 1)
+        self.write(['ected", "provider": "openrouter"}\n'], mode="a")
+        events = dash.parse_route_log(self.path)
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[-1]["provider"], "openrouter")
+
+    def test_full_read_ignores_the_parked_offset(self):
+        self.write([route_line("2026-01-01T00:00:00+00:00", {"event": "route_selected", "provider": "plan"})])
+        dash.parse_route_log(self.path)
+        self.assertEqual(len(dash.parse_route_log(self.path, incremental=False)), 1)
+
+    def test_limit_keeps_the_tail(self):
+        lines = [route_line(f"2026-01-01T00:00:{index:02d}+00:00",
+                            {"event": "route_selected", "provider": "openrouter"}) for index in range(30)]
+        self.write(lines)
+        events = dash.parse_route_log(self.path, limit=5)
+        self.assertEqual(len(events), 5)
+        self.assertEqual(events[-1]["ts"], "2026-01-01T00:00:29+00:00")
+
+
 class ProxyMetricsTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))

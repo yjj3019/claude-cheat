@@ -13,6 +13,7 @@ prompt text and never writes anything. Run it next to a routing session:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -124,34 +125,75 @@ def read_env(path):
     return values
 
 
-def parse_route_log(path=None, limit=5000):
-    """Return the tail of the route log as events with a UTC timestamp."""
+_ROUTE_TAIL = {"path": None, "events": [], "offset": 0, "digest": None}
+
+
+def _parse_route_line(line):
+    stamp, _, rest = line.partition(" ")
+    rest = rest.strip()
+    start = re.fullmatch(r"--- proxy start(?: code=(\S+))? ---", rest)
+    if start:
+        return {"ts": stamp, "event": "proxy_start", **({"code": start.group(1)} if start.group(1) else {})}
+    if not rest.startswith("{"):
+        return None
+    try:
+        payload = json.loads(rest)
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return {"ts": stamp, **payload}
+
+
+def parse_route_log(path=None, limit=5000, incremental=True):
+    """Return the tail of the route log as events with a UTC timestamp.
+
+    The log only grows during a session, so a parked byte offset keeps each refresh to
+    the lines appended since the previous one. A truncated or replaced file falls back
+    to a full read, a trailing partial line waits for its newline, and
+    `incremental=False` always reads everything.
+    """
     path = Path(path or ROUTE_LOG)
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
+        info = path.stat()
     except OSError:
+        _ROUTE_TAIL.update({"path": None, "events": [], "offset": 0, "digest": None})
         return []
-    events = []
-    for line in text.splitlines()[-limit:]:
-        if not line.strip():
-            continue
-        stamp, _, rest = line.partition(" ")
-        rest = rest.strip()
-        start = re.fullmatch(r"--- proxy start(?: code=(\S+))? ---", rest)
-        if start:
-            events.append({"ts": stamp, "event": "proxy_start",
-                           **({"code": start.group(1)} if start.group(1) else {})})
-            continue
-        if not rest.startswith("{"):
-            continue
-        try:
-            payload = json.loads(rest)
-        except ValueError:
-            continue
-        if not isinstance(payload, dict):
-            continue
-        events.append({"ts": stamp, **payload})
-    return events
+    path_key = str(path.resolve())
+    state = _ROUTE_TAIL
+    try:
+        with path.open("rb") as handle:
+            prefix = handle.read(256)
+            digest = hashlib.sha256(prefix).hexdigest()
+            # A rewritten or rotated file keeps its byte length often enough that size
+            # alone cannot tell it apart from an append; the leading bytes can.
+            if (incremental and state["path"] == path_key and state["digest"] == digest
+                    and state["offset"] <= info.st_size):
+                start = state["offset"]
+            else:
+                start = 0
+                state["events"] = []
+            if start <= len(prefix):
+                chunk = prefix[start:] + handle.read()
+            else:
+                handle.seek(start)
+                chunk = handle.read()
+    except OSError:
+        return list(state["events"])
+    if chunk:
+        end = chunk.rfind(b"\n")
+        if end < 0:
+            state.update({"path": path_key, "digest": digest})
+            return list(state["events"])
+        complete = chunk[: end + 1]
+        for raw in complete.splitlines():
+            parsed = _parse_route_line(raw.decode("utf-8", errors="replace"))
+            if parsed:
+                state["events"].append(parsed)
+        state["events"] = state["events"][-limit:]
+        start += len(complete)
+    state.update({"path": path_key, "digest": digest, "offset": start})
+    return list(state["events"])
 
 
 def _age_seconds(stamp, now):

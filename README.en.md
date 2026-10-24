@@ -351,7 +351,18 @@ Reference numbers (this development machine, Node 24, client and proxy in one pr
 | Body size | 1MB in 7.7–8.9ms (~120MB/s) |
 | Circuit | 4 failures → Plan fallback, Plan during cooldown, external again after recovery |
 
-What the measurements changed: the request body was serialized **four times inside the retry loop** and is now serialized once, and a history without signed reasoning no longer rebuilds its message array on every turn (~19% better on long sessions). The same commands re-measure it at any time.
+Dashboard refresh cost is measured the same way (a snapshot is rebuilt every two seconds):
+
+```powershell
+python tests/bench_dashboard.py            # 10MB log, 2,000 transcript files
+```
+
+| Metric | Value |
+| --- | --- |
+| `.route.log` parsing | 38–278ms for a full 10MB read → **2.9ms incremental tail** (3.2ms with 200 new lines) |
+| Transcript scan | 4.8s for the first 2,000-file scan (background), 40ms incremental afterwards |
+
+What the measurements changed: the request body was serialized **four times inside the retry loop** and is now serialized once, a history without signed reasoning no longer rebuilds its message array on every turn (~19% better on long sessions), and the routing log is **read incrementally from a parked offset** instead of re-parsed every refresh (rotation and truncation are detected from a leading-byte fingerprint). The same commands re-measure it at any time.
 
 - A real Local service still requires separate authentication, inference, and tool-call validation.
 - Unsupported native features or signed history stay on the Plan route. External usage can be zero, and native history may prevent a safe return to the external provider in the same conversation.
