@@ -307,8 +307,21 @@ test('Local-only preserves plain system text between user and tool turns', { tim
   assert.equal(f.proCalls.length, 0);
 });
 
+test('text-only system context turns are forwarded without rewriting', { timeout: 5000 }, async t => {
+  for (const localOnly of [false, true]) {
+    const messages = [{ role: 'user', content: 'fixture' },
+      { role: 'system', content: [{ type: 'text', text: 'fixture tool guidance' }] }];
+    const f = await fixture(t, (_req, res) => json(res, message()), { localOnly });
+    const response = await f.request({ messages });
+    assert.equal(response.status, 200);
+    await response.text();
+    assert.equal(f.localCalls.length, 1);
+    assert.deepEqual(f.localCalls[0].body.messages, messages);
+    assert.equal(f.proCalls.length, 0);
+  }
+});
+
 for (const [label, system] of [
-  ['text blocks', { role: 'system', content: [{ type: 'text', text: 'fixture' }] }],
   ['tool blocks', { role: 'system', content: [{ type: 'tool_use', id: 'fixture', name: 'Write', input: {} }] }],
   ['thinking blocks', { role: 'system', content: [{ type: 'thinking', thinking: 'fixture' }] }],
   ['extra fields', { role: 'system', content: 'fixture', metadata: {} }],
@@ -326,13 +339,15 @@ for (const [label, system] of [
   });
 }
 
-test('ordinary routing retains native exclusion for plain system messages', { timeout: 5000 }, async t => {
+test('ordinary routing forwards plain system messages to the replacement route', { timeout: 5000 }, async t => {
   const f = await fixture(t, (_req, res) => json(res, message()));
-  const response = await f.request({ messages: [{ role: 'user', content: 'fixture' }, { role: 'system', content: 'fixture' }] });
+  const messages = [{ role: 'user', content: 'fixture' }, { role: 'system', content: 'fixture' }];
+  const response = await f.request({ messages });
   assert.equal(response.status, 200);
   await response.text();
-  assert.equal(f.localCalls.length, 0);
-  assert.equal(f.proCalls.length, 1);
+  assert.equal(f.localCalls.length, 1);
+  assert.deepEqual(f.localCalls[0].body.messages, messages);
+  assert.equal(f.proCalls.length, 0);
 });
 
 for (const localOnly of [false, true]) {

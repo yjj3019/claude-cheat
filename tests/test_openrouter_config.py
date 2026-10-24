@@ -76,6 +76,23 @@ class OpenRouterConfigTests(unittest.TestCase):
                 self.assertEqual(spawn.call_args.kwargs["env"]["OPENROUTER_API_KEY"], "sk-or-synthetic-key")
         proxy.terminate.assert_called_once()
 
+    def test_routed_openrouter_sessions_disable_experimental_protocol(self):
+        self.write()
+        proxy = mock.Mock()
+        proxy.stdout.readline.return_value = '{"port":12345}\n'
+        auth = {"loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "pro"}
+        for flags, mode in (({}, "ordinary"), ({"openrouter_compat": True}, "compat")):
+            with self.subTest(mode=mode):
+                with mock.patch.object(route, "run_owned", return_value=auth), \
+                     mock.patch.object(route, "check_connection", return_value=0), \
+                     mock.patch.object(route.shutil, "which", return_value="synthetic-executable"), \
+                     mock.patch.object(route.subprocess, "Popen", return_value=proxy):
+                    with route.routed_session("openrouter", **flags) as env:
+                        self.assertEqual(env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "1")
+                        self.assertEqual(env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"], "1")
+                        # Thinking stays a per-request decision, so Plan fallback keeps its own settings.
+                        self.assertNotIn("MAX_THINKING_TOKENS", env)
+
     def test_missing_model_never_starts_proxy_or_falls_back_to_plan(self):
         self.write(model="")
         auth = {"loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "pro"}

@@ -55,6 +55,9 @@ const CONTENT_FIELDS = {
   tool_use: new Set(['type', 'id', 'name', 'input', 'cache_control', 'caller']),
   tool_result: new Set(['type', 'tool_use_id', 'content', 'is_error', 'cache_control']),
 };
+// Read-only fields a provider may add to a response block; request blocks never carry them.
+const RESPONSE_FIELDS = { text: new Set(['citations']) };
+const responseBlockField = (type, name) => Boolean(CONTENT_FIELDS[type]?.has(name) || RESPONSE_FIELDS[type]?.has(name));
 const COMPAT_BETAS = new Set(['interleaved-thinking-2025-05-14', 'redact-thinking-2026-02-12',
   'context-management-2025-06-27', 'prompt-caching-scope-2026-01-05', 'per-turn-control-2026-07-01',
   'mid-conversation-tool-changes-2026-07-01', 'inline-tools-2026-09-15', 'advisor-tool-2026-03-01',
@@ -64,7 +67,7 @@ const COMPAT_BETAS = new Set(['interleaved-thinking-2025-05-14', 'redact-thinkin
 function compatExclusion(body, beta) {
   // Check extensions separately; the original request, not this validation copy, is forwarded.
   if (!Array.isArray(body.messages)) return 'unsupported_message_shape';
-  if (unsupportedBetas(beta, true, true).length) return 'unsupported_beta';
+  if (unsupportedBetas(beta, true).length) return 'unsupported_beta';
   if (body.messages.some(message => !message || typeof message !== 'object')) return 'unsupported_message_shape';
   const copy = { ...body, messages: body.messages.map(message => {
     const result = { ...message, content: Array.isArray(message.content) ? message.content.filter(block =>
@@ -110,20 +113,24 @@ function compatExclusion(body, beta) {
   }
   return externalExclusion(copy, '', true, true);
 }
-function unsupportedBetas(beta, localOnly = false, localCompat = false) {
+// Claude Code 2.1.310 sends these on every request, even with experimental betas disabled. They only
+// steer reasoning hints this proxy rewrites per request, so a name alone must not divert traffic to Plan.
+const BASELINE_BETAS = new Set(['interleaved-thinking-2025-05-14', 'effort-2025-11-24']);
+function unsupportedBetas(beta, localCompat = false) {
   return (beta || '').split(',').map(x => x.trim()).filter(x => x &&
-    !(localCompat && COMPAT_BETAS.has(x)) &&
-    !/^oauth-\d{4}-\d{2}-\d{2}$/.test(x) && !['claude-code-20250219', 'prompt-caching-2024-07-31'].includes(x) &&
-    !(localOnly && ['interleaved-thinking-2025-05-14', 'effort-2025-11-24'].includes(x)));
+    !BASELINE_BETAS.has(x) && !(localCompat && COMPAT_BETAS.has(x)) &&
+    !/^oauth-\d{4}-\d{2}-\d{2}$/.test(x) && !['claude-code-20250219', 'prompt-caching-2024-07-31'].includes(x));
 }
 function externalExclusion(body, beta, localOnly = false, localCompat = false) {
   // Unknown betas/fields and native history belong to the subscription API. Never strip them.
-  if (unsupportedBetas(beta, localOnly).length) return 'unsupported_beta';
+  if (unsupportedBetas(beta).length) return 'unsupported_beta';
   if (Object.keys(body).some(name => !BASIC_FIELDS.has(name))) return 'unsupported_request_field';
-  // Local CLI adds plain system reminders; preserve their role and text without stripping.
+  // Claude Code sends a context turn with role "system" in messages; it carries text only.
+  const systemContentOK = content => typeof content === 'string' ? content.trim().length > 0 :
+    Array.isArray(content) && content.length > 0 && content.every(block => block?.type === 'text');
   if (!Array.isArray(body.messages) || body.messages.some(message => !message ||
-      (!['user', 'assistant'].includes(message.role) && !(localOnly && message.role === 'system' &&
-        typeof message.content === 'string' && message.content.trim())) ||
+      !['user', 'assistant', 'system'].includes(message.role) ||
+      (message.role === 'system' && !systemContentOK(message.content)) ||
       Object.keys(message).some(name => !['role', 'content'].includes(name)))) return 'unsupported_message_shape';
   if (body.thinking && (!['enabled', 'disabled', 'adaptive'].includes(body.thinking.type) || Object.keys(body.thinking).some(name => !['type', 'budget_tokens'].includes(name)))) return 'unsupported_thinking_config';
   if (body.output_config && Object.keys(body.output_config).some(name => name !== 'effort')) return 'unsupported_output_config';
@@ -440,7 +447,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       const oauthOK = /^Bearer\s+sk-ant-oat/.test(req.headers.authorization || '') && !req.headers['x-api-key'] &&
         (req.headers['anthropic-beta'] || '').includes('oauth-');
       const sendPro = async (reason = 'native_feature', detail) => {
-        const betas = detail === 'unsupported_beta' ? unsupportedBetas(req.headers['anthropic-beta'], localOnly, compatProfile) : [];
+        const betas = detail === 'unsupported_beta' ? unsupportedBetas(req.headers['anthropic-beta'], compatProfile) : [];
         const betaFeatures = betas.slice(0, 16).map(value =>
           /^[a-z][a-z0-9-]{0,63}-20\d{2}-[01]\d-[0-3]\d$/.test(value) &&
           !/(?:^|-)(?:sk|key|token|secret|password|bearer)(?:-|$)/.test(value) ? value : '[redacted]');
@@ -573,7 +580,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               if (compatProfile) {
                 const content = JSON.parse(validated.text).content;
                 if (content.some(block => Object.keys(block).some(name =>
-                    !(CONTENT_FIELDS[block.type]?.has(name) ||
+                    !(responseBlockField(block.type, name) ||
                       (['thinking', 'redacted_thinking'].includes(block.type) && ['type', 'thinking', 'signature', 'data', 'cache_control'].includes(name)) ||
                       (['thinking', 'redacted_thinking', 'tool_use'].includes(block.type) && name === 'provider_specific_fields'))) ||
                     (block.signature !== undefined && typeof block.signature !== 'string') ||
@@ -588,7 +595,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
                   throw new Error('Local thinking response disabled');
                 if (content.some(block => !['text', 'tool_use'].includes(block.type)))
                   throw new Error('Unsupported Local response content');
-                const extraFields = content.flatMap(block => Object.keys(block).filter(name => !CONTENT_FIELDS[block.type].has(name) &&
+                const extraFields = content.flatMap(block => Object.keys(block).filter(name => !responseBlockField(block.type, name) &&
                   !(block.type === 'tool_use' && name === 'provider_specific_fields')));
                 if (content.some(block => Object.hasOwn(block, 'provider_specific_fields') && block.provider_specific_fields !== null &&
                     (typeof block.provider_specific_fields !== 'object' || Array.isArray(block.provider_specific_fields))))

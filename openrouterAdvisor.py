@@ -239,6 +239,11 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
         env.update(ANTHROPIC_DEFAULT_SONNET_MODEL="claude-sonnet-5-5", ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-5-5",
                    ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-haiku-5-5", ANTHROPIC_DEFAULT_FABLE_MODEL="claude-fable-5-1",
                    ANTHROPIC_SMALL_FAST_MODEL="claude-haiku-5-5", CLAUDE_CODE_SUBAGENT_MODEL="claude-sonnet-5-5")
+    if provider == "openrouter":
+        # Claude Code 2.1.310 sends experimental betas whose request shape (inline tool_addition
+        # blocks, context_management, advisor tool) the Messages API providers reject with HTTP 400.
+        # Keep the routed session on the stable protocol; thinking and effort stay per request.
+        env.update(CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="1", CLAUDE_CODE_DISABLE_ADVISOR_TOOL="1")
     # The user's own Git Bash location is needed by the Bash tool; it is not provider routing.
     if isolated and "CLAUDE_CODE_GIT_BASH_PATH" in os.environ:
         env["CLAUDE_CODE_GIT_BASH_PATH"] = os.environ["CLAUDE_CODE_GIT_BASH_PATH"]
@@ -521,8 +526,9 @@ def self_test() -> None:
     with patch(__name__ + ".run_owned", return_value=auth), patch("shutil.which", return_value="executable"), patch(__name__ + ".read_env", return_value={"ANTHROPIC_AUTH_TOKEN": "sk-or-test-placeholder", "OPENROUTER_MODEL": "fixture/model"}), patch(__name__ + ".check_connection", return_value=0), patch("subprocess.Popen", return_value=proxy) as start:
         with routed_session() as env:
             assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
-            assert env.get("CLAUDE_CODE_DISABLE_ADVISOR_TOOL") == os.environ.get("CLAUDE_CODE_DISABLE_ADVISOR_TOOL")
-            assert env.get("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS") == os.environ.get("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS")
+            assert env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "1"
+            assert env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] == "1"
+            assert "MAX_THINKING_TOKENS" not in env
             assert env["CLAUDE_CONFIG_DIR"] == str(Path.home() / ".claude")
             assert "ANTHROPIC_AUTH_TOKEN" not in env and "ANTHROPIC_API_KEY" not in env
             assert "OPENROUTER_API_KEY" not in env and "CLAUDE_CODE_OAUTH_TOKEN" not in env

@@ -111,6 +111,8 @@ startClaudeOpenRouter.ps1
 
 실행기는 해당 Claude 프로세스의 연결 주소만 로컬 라우터로 설정하고 기존 Plan 인증을 검사합니다. 저장된 로그인·사용자 설정을 API용 설정으로 덮어쓰지 않습니다. `/status`의 Plan 로그인 표시는 인증 상태이며 **현재 응답을 OpenRouter 모델이 만들었다는 증거는 아닙니다.**
 
+라우팅 세션은 Claude Code의 실험 beta를 끄고 시작합니다(`CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`, `CLAUDE_CODE_DISABLE_ADVISOR_TOOL`). Claude Code 2.1.310이 기본으로 보내는 `tool_addition`·`context_management`·advisor 도구 요청은 외부 Messages API가 HTTP 400으로 거절하므로, 같은 세션의 Plan 요청도 안정 프로토콜로 전송됩니다. 그 결과 이 세션에서는 advisor·inline 도구·서버 문맥 편집이 사용되지 않습니다. thinking·effort 설정은 요청마다 따로 전달되며, 일반 모드에서는 아래 5절대로 외부 요청에 thinking을 요구하지 않습니다.
+
 ### OpenRouter 호환 모드: Plan 전환 차단
 
 ```powershell
@@ -242,7 +244,7 @@ Claude Code 2.1.304 이상에서 플러그인·스킬·MCP·hooks·하위 에이
 
 이 세션에서는 네이티브 beta·advisor·thinking을 제한합니다. Safe 모드로 사용자·프로젝트의 hooks·플러그인·skills·subagents·CLAUDE.md 자동 로딩을 생략하고, 빈 strict MCP 설정과 MCP 도구 차단, hooks·자동 메모리·IDE·Chrome·배경 작업 제한을 적용합니다. API 키 helper도 이 실행에서 비활성화합니다. 필요한 프로젝트 지침은 명시적으로 제공하세요. 관리 정책의 hooks·명령 예외는 CLI 정책을 따르며 이번 검증 범위에 포함하지 않았습니다. [공식 CLI 문서](https://code.claude.com/docs/en/cli-reference)를 참고하세요.
 
-Plan 로그인을 조회하지 않으며 CLI에는 로컬 프록시용 임시 Bearer 토큰만 전달합니다. Local 서버 키는 프록시만 보유합니다. 미지원 기능이나 Local 실패를 Plan으로 전환하지 않고 명시적으로 거절합니다. 프록시의 외부 시도는 한 번이며 CLI 자체 재시도는 별도입니다. Local 모드에서는 CLI의 비어 있지 않은 문자열 system 메시지만 추가로 허용하고 역할·내용을 그대로 전달합니다. 알 수 없는 메시지 필드와 네이티브 콘텐츠는 계속 거절합니다.
+Plan 로그인을 조회하지 않으며 CLI에는 로컬 프록시용 임시 Bearer 토큰만 전달합니다. Local 서버 키는 프록시만 보유합니다. 미지원 기능이나 Local 실패를 Plan으로 전환하지 않고 명시적으로 거절합니다. 프록시의 외부 시도는 한 번이며 CLI 자체 재시도는 별도입니다. CLI의 `system` 역할 컨텍스트 메시지(비어 있지 않은 문자열 또는 text 블록)는 모든 모드에서 역할·내용을 그대로 전달합니다. 도구·thinking 블록이 섞인 system 메시지와 알 수 없는 메시지 필드는 계속 거절합니다.
 
 Local 실패 안내는 아래 코드로 구분합니다. 실패 뒤 기본 대기시간은 30초이며, 안내에 남은 초를 올림해 표시합니다. 대기가 끝나면 새 요청으로 복구를 확인하세요. 실패한 작업이 자동으로 완료되지는 않습니다.
 
@@ -309,7 +311,7 @@ Local 응답은 JSON으로 받아 설정한 모델을 검증한 뒤 CLI용 SSE�
 - Plan 요청까지 실패하면 그 오류를 전달합니다. 다른 API 키·제공자로 연쇄 전환하거나 무한 반복하지 않습니다. CLI 자체의 재시도 표시는 라우터 내부의 재시도 횟수와 다를 수 있습니다.
 - 외부 응답은 완결성·실제 응답 모델·도구 JSON 등을 검증한 뒤 전달합니다. 외부 스트리밍 응답도 최대 32MiB까지 버퍼링하므로 첫 표시가 늦어질 수 있습니다. 실패한 부분 텍스트나 도구 호출을 전달한 뒤 중간에 Plan 응답을 이어 붙이지 않습니다.
 - 요청을 취소하면 재시도와 fallback도 중단합니다. 재시도된 외부 추론은 별도 사용량이 발생할 수 있습니다.
-- advisor·서버 도구·inline 도구·서명된 thinking 등 미지원 기능을 포함한 요청은 **처음부터 Plan로 우회**합니다. 기존 advisor·실험 기능을 강제로 끄거나 대화 이력을 삭제하지 않습니다. 이 우회는 외부 장애나 복구 성공으로 세지 않습니다.
+- Plan 전용 모델·토큰 수 계산·네이티브 thinking 이력처럼 외부가 표현할 수 없는 요청은 **처음부터 Plan로 우회**합니다. 라우팅 세션이 실험 beta를 끄므로 CLI는 advisor·inline 도구 요청을 만들지 않고, 대화 이력을 삭제하지도 않습니다. `system` 역할 컨텍스트 메시지(text 블록 포함)와 `interleaved-thinking-2025-05-14`·`effort-2025-11-24` beta는 모든 모드에서 허용합니다. 이 우회는 외부 장애나 복구 성공으로 세지 않습니다.
 
 ## 6. 실제로 사용한 모델 확인하기
 
@@ -345,7 +347,7 @@ Sonnet 선택과 HUD의 모델·비용 표시는 실제 외부 라우팅이나 �
 | OpenRouter 401 / `Missing Authentication header` | 전용 파일의 실제 키·유효성을 확인; HUD 플러그인 설치 성공은 API 인증 성공과 별개 |
 | Local 설정을 바꿔도 이전 서버 사용 | 프로세스 환경변수 우선순위와 전역 실행기 대상 확인 후 세션 재시작 |
 | Local 모델 목록 성공인데 추론 실패 | Messages API·모델 ID·도구/응답 형식 호환성을 별도 확인 |
-| Sonnet 선택 후 계속 Plan 사용 | `native_feature` 로그 확인; 네이티브 기능·이력을 유지하면 정상 우회일 수 있음 |
+| Sonnet 선택 후 계속 Plan 사용 | `-Debug`로 `route_selected` 확인; `native_feature`는 Plan 전용 모델·토큰 계산·네이티브 이력 때문에 정상일 수 있음. `unsupported_beta`가 반복되면 CLI가 라우터가 모르는 beta를 추가한 것이므로 실행기를 갱신 |
 | `503 ... restart required`가 반복됨 | 과거 실행기/프록시 잔존 여부·첫 upstream 오류를 확인하고 최신 실행기로 새 세션 시작; 후속 503만으로 원인 단정 금지 |
 | HUD·MCP 일부가 동작하지 않음 | 일반 Claude에서도 같은지 비교; 설정 로드와 서버 연결·권한 정상 여부는 별도 |
 | 응답 전 대기가 길어짐 | 외부 4회 시도와 버퍼링 여부 확인; 사용자가 취소하면 후속 시도도 중단 |

@@ -152,7 +152,7 @@ test('subscription routing logs use the Plan label', async t => {
 const exclusionCases = [
   ['unsupported_beta', {}, { ...proHeaders, 'anthropic-beta': BETA + ',private-beta-marker' }],
   ['unsupported_request_field', { private_field_marker: 'private-value-marker' }],
-  ['unsupported_message_shape', { messages: [{ role: 'system', content: 'private-value-marker' }] }],
+  ['unsupported_message_shape', { messages: [{ role: 'private-role-marker', content: 'private-value-marker' }] }],
   ['unsupported_thinking_config', { thinking: { type: 'private-value-marker' } }],
   ['unsupported_output_config', { output_config: { format: 'private-value-marker' } }],
   ['unsupported_tool_choice', { tool_choice: { private_field_marker: true } }],
@@ -241,13 +241,14 @@ for (const caller of [null, {}, [], 1, 'direct', { type: 'future' }, { type: 'co
   });
 }
 
-for (const nativeFeature of ['beta', 'system role', 'nested caller']) {
+for (const nativeFeature of ['beta', 'native thinking history', 'nested caller']) {
   test(`direct caller does not bypass ${nativeFeature} preservation`, async t => {
     const tool = { type: 'tool_use', id: 't1', name: 'ReadHistory', input: {}, caller: { type: 'direct' } };
     const body = requestBody(SONNET, { messages: [{ role: 'assistant', content: [tool] }] });
     const headers = { ...proHeaders };
     if (nativeFeature === 'beta') headers['anthropic-beta'] += ',future-native-2026-10-20';
-    if (nativeFeature === 'system role') body.messages.unshift({ role: 'system', content: 'synthetic instruction' });
+    if (nativeFeature === 'native thinking history')
+      body.messages[0].content.unshift({ type: 'thinking', thinking: 'synthetic', signature: 'synthetic-signature' });
     if (nativeFeature === 'nested caller') body.messages.push({ role: 'user', content: [
       { type: 'tool_result', tool_use_id: 't1', content: [{ ...tool, caller: { type: 'future' } }] },
     ] });
@@ -395,6 +396,30 @@ test('Pro forwards ArtifactData patterns and propertyNames without compatibility
 
 const proURL = 'https://api.anthropic.com/v1/messages';
 const externalURL = 'https://openrouter.ai/api/v1/messages';
+// Claude Code 2.1.310 sends these four names on every request.
+const CLI_BETA = 'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,effort-2025-11-24';
+
+test('baseline CLI betas and the system context turn stay on the replacement route', async t => {
+  const { calls, request } = await fixture(t);
+  const body = requestBody(SONNET, { messages: [{ role: 'user', content: 'fixture' },
+    { role: 'system', content: [{ type: 'text', text: 'fixture tool guidance' }] }] });
+  const response = await request(body, { headers: { ...proHeaders, 'anthropic-beta': CLI_BETA } });
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, externalURL);
+  assert.equal(calls[0].parsedBody.messages[1].role, 'system');
+  assert.equal(calls[0].headers['anthropic-beta'], undefined);
+});
+
+test('an unknown beta still bypasses the replacement route even beside baseline names', async t => {
+  const { calls, request } = await fixture(t);
+  const beta = CLI_BETA + ',future-native-2026-10-21';
+  assert.equal((await request(requestBody(SONNET), { headers: { ...proHeaders, 'anthropic-beta': beta } })).status, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, proURL);
+});
+
 const contentStream = (content, stopReason = 'end_turn') => frame('message_start') +
   content.map((block, index) => frame('content_block_start', { index, content_block: block }) +
     frame('content_block_stop', { index })).join('') +
@@ -755,17 +780,17 @@ test('Local-only cooldown tracks the latest failure after a failed probe and lat
 });
 
 for (const localOnly of [false, true]) {
-  test(`thinking/effort beta compatibility is limited to Local-only mode (${localOnly})`, async t => {
+  test(`thinking/effort beta compatibility applies to every replacement route (${localOnly})`, async t => {
     const { calls, request } = await fixture(t, jsonResponse, { provider: 'local', localOnly,
       localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-local' });
     const body = requestBody(SONNET, { thinking: { type: 'adaptive' }, output_config: { effort: 'medium' } });
     const beta = BETA + ',interleaved-thinking-2025-05-14,effort-2025-11-24';
     assert.equal((await request(body, { headers: { ...proHeaders, 'anthropic-beta': beta } })).status, 200);
     assert.equal(calls.length, 1);
-    assert.equal(calls[0].url, localOnly ? 'http://127.0.0.1:11434/v1/messages' : proURL);
-    assert.deepEqual(calls[0].parsedBody.thinking, localOnly ? { type: 'disabled' } : body.thinking);
+    assert.equal(calls[0].url, 'http://127.0.0.1:11434/v1/messages');
+    assert.deepEqual(calls[0].parsedBody.thinking, { type: 'disabled' });
     assert.deepEqual(calls[0].parsedBody.output_config, body.output_config);
-    if (localOnly) assert.equal(calls[0].headers['anthropic-beta'], undefined);
+    assert.equal(calls[0].headers['anthropic-beta'], undefined);
   });
 }
 
@@ -809,7 +834,7 @@ for (const [label, extra] of [
   ['missing usage', { usage: undefined }],
   ['negative usage', { usage: { input_tokens: -1, output_tokens: 2 } }],
   ['thinking history', { content: [{ type: 'thinking', thinking: 'native' }] }],
-  ['unrecognized content fields', { content: [{ type: 'text', text: 'x', citations: [] }] }],
+  ['unrecognized content fields', { content: [{ type: 'text', text: 'x', future_field_marker: true }] }],
   ['invalid provider metadata', { content: [{ type: 'tool_use', id: 't1', name: 'Read', input: {}, provider_specific_fields: [] }] }],
 ]) {
   test(`Local-only CLI rejects ${label} without silently changing content or routing to Plan`, async t => {
@@ -1276,9 +1301,9 @@ for (const [label, responseBody] of [
   });
 }
 
-test('native role system and unknown thinking configuration preserve original Pro', async t => {
+test('unknown thinking and output configuration preserve original Pro', async t => {
   const { calls, request } = await fixture(t);
-  for (const extra of [{ messages: [{ role: 'system', content: 'native inline system' }] }, { thinking: { type: 'adaptive', future_feature: true } }, { output_config: { format: { type: 'json_schema' } } }]) {
+  for (const extra of [{ thinking: { type: 'adaptive', future_feature: true } }, { output_config: { format: { type: 'json_schema' } } }]) {
     const body = requestBody(SONNET, extra);
     assert.equal((await request(body, { headers: proHeaders })).status, 200);
     assert.equal(calls.at(-1).url, proURL);

@@ -47,6 +47,14 @@ test('OpenRouter compatibility preserves native history, tool references and opa
   assert.equal((await s.send(fields)).status, 200);
   for (const field of Object.keys(fields)) assert.deepEqual(s.calls[0].parsed[field], fields[field]);
 });
+test('OpenRouter compatibility accepts provider citation fields on text blocks', async t => {
+  const s = await session(t, () => reply({ content: [{ type: 'text', text: 'OK', citations: [{ cited_text: 'fixture' }] }] }));
+  const r = await s.send({ stream: true });
+  assert.equal(r.status, 200);
+  const text = await r.text();
+  assert.match(text, /message_stop/);
+  assert.match(text, /citations/);
+});
 test('unsupported features and token counting never call OpenRouter or Plan', async t => {
   const s = await session(t);
   assert.equal((await s.send({}, '/count_tokens')).status, 400);
