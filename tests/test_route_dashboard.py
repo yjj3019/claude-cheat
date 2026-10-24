@@ -804,6 +804,107 @@ class ProxyMetricsTests(unittest.TestCase):
         self.assertEqual(data["proxy_metrics"]["latencyMs"]["external"]["p50"], 3.5)
 
 
+class ModelCatalogTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.files = {
+            "openrouter": {"path": self.root / ".env.openrouter", "secret": {"ANTHROPIC_AUTH_TOKEN"},
+                           "required": ("ANTHROPIC_AUTH_TOKEN", "OPENROUTER_MODEL"),
+                           "fields": ("OPENROUTER_MODEL", "ANTHROPIC_AUTH_TOKEN")},
+            "local": {"path": self.root / ".env.local-llm", "secret": {"LOCAL_LLM_API_KEY"},
+                      "required": ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL"),
+                      "fields": ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY",
+                                 "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL")},
+        }
+        self.enterContext(mock.patch.object(dash, "CONFIG_FILES", self.files))
+        self.enterContext(mock.patch.object(dash, "_MODELS_CACHE", {}))
+        (self.root / ".env.openrouter").write_text(
+            "ANTHROPIC_AUTH_TOKEN=sk-or-v1-abcdefghijkl\nOPENROUTER_MODEL=vendor/a\n", encoding="utf-8")
+
+    def test_openrouter_list_is_parsed_with_pricing_and_context(self):
+        payload = {"data": [
+            {"id": "vendor/b", "name": "Vendor B", "context_length": 131072,
+             "pricing": {"prompt": "0.0000005", "completion": "0.0000015"}},
+            {"id": "vendor/a", "name": "Vendor A"},
+        ]}
+        with mock.patch.object(dash, "_http_json", return_value=(200, payload)) as request:
+            catalog = dash.model_catalog("openrouter")
+        self.assertTrue(catalog["ok"])
+        self.assertEqual([row["id"] for row in catalog["models"]], ["vendor/a", "vendor/b"])
+        self.assertEqual(catalog["models"][1]["context_length"], 131072)
+        self.assertEqual(catalog["models"][1]["prompt_usd_per_m"], 0.5)
+        self.assertEqual(catalog["models"][1]["completion_usd_per_m"], 1.5)
+        self.assertNotIn("sk-or", json.dumps(catalog))
+        self.assertTrue(request.call_args.args[1]["authorization"].startswith("Bearer sk-or-"))
+
+    def test_local_endpoint_is_derived_from_the_messages_url(self):
+        url, _ = dash._models_endpoint("local", {"LOCAL_LLM_URL": "http://127.0.0.1:11434/v1/messages"})
+        self.assertEqual(url, "http://127.0.0.1:11434/v1/models")
+        url, _ = dash._models_endpoint("local", {"LOCAL_LLM_URL": "http://127.0.0.1:11434/v1/messages",
+                                                 "LOCAL_LLM_MODELS_URL": "http://127.0.0.1:11434/api/tags"})
+        self.assertEqual(url, "http://127.0.0.1:11434/api/tags")
+        with self.assertRaises(ValueError):
+            dash._models_endpoint("local", {"LOCAL_LLM_URL": "not a url"})
+
+    def test_ollama_style_list_is_accepted(self):
+        (self.root / ".env.local-llm").write_text(
+            "LOCAL_LLM_URL=http://127.0.0.1:11434/v1/messages\nLOCAL_LLM_MODEL=llama3:8b\n", encoding="utf-8")
+        with mock.patch.object(dash, "_http_json", return_value=(200, {"models": [{"name": "llama3:8b"}]})):
+            catalog = dash.model_catalog("local")
+        self.assertEqual(catalog["models"][0]["id"], "llama3:8b")
+
+    def test_results_are_cached_then_refreshed(self):
+        payload = {"data": [{"id": "vendor/a"}]}
+        with mock.patch.object(dash, "_http_json", return_value=(200, payload)) as request:
+            first = dash.model_catalog("openrouter", now=1000.0)
+            second = dash.model_catalog("openrouter", now=1010.0)
+            third = dash.model_catalog("openrouter", refresh=True, now=1011.0)
+        self.assertFalse(first.get("cached"))
+        self.assertTrue(second["cached"])
+        self.assertFalse(third.get("cached"))
+        self.assertEqual(request.call_count, 2)
+
+    def test_http_errors_become_reasons_without_leaking_the_key(self):
+        import urllib.error
+        with mock.patch.object(dash, "_http_json",
+                               side_effect=urllib.error.HTTPError("u", 401, "denied", {}, None)):
+            catalog = dash.model_catalog("openrouter")
+        self.assertFalse(catalog["ok"])
+        self.assertEqual(catalog["error"], "authentication_failed")
+        self.assertEqual(catalog["status"], 401)
+        self.assertNotIn("sk-or", json.dumps(catalog))
+
+    def test_empty_catalog_is_reported(self):
+        with mock.patch.object(dash, "_http_json", return_value=(200, {"data": []})):
+            catalog = dash.model_catalog("openrouter")
+        self.assertFalse(catalog["ok"])
+        self.assertEqual(catalog["error"], "empty_catalog")
+
+    def test_models_endpoint_requires_the_token(self):
+        import threading
+        import urllib.error
+        import urllib.request
+
+        server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            base = f"http://127.0.0.1:{port}/api/models?provider=openrouter"
+            with self.assertRaises(urllib.error.HTTPError) as denied:
+                opener.open(base, timeout=10)
+            denied.exception.close()
+            self.assertEqual(denied.exception.code, 403)
+            with mock.patch.object(dash, "model_catalog", return_value={"ok": True, "models": []}):
+                request = urllib.request.Request(base, headers={"x-dashboard-token": dash.TOKEN})
+                with opener.open(request, timeout=10) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(json.loads(response.read())["ok"], True)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
 class SnapshotTests(unittest.TestCase):
     def test_snapshot_shape_and_loopback_only_binding(self):
         with mock.patch.object(dash, "scan_sessions", return_value=dash._empty_usage()), \

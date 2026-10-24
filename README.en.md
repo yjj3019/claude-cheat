@@ -257,6 +257,7 @@ Settings live on a **separate page** (`http://127.0.0.1:8787/settings`) reached 
 | Validation | Model ID shape, key shape and Local URL rules (loopback, HTTPS, same origin) are checked before writing; a failure leaves the file untouched |
 | Protection | POST requires the session token embedded in the page and a same-origin request, so other sites cannot call it |
 | Tests | **Model check** reads the model list only; **inference test** sends one 16-token request (may cost a small amount) |
+| Model picker | **목록** opens a searchable list with context length and price and fills the field. `GET /api/models?provider=openrouter\|local` (session token required, 10 minute cache) |
 | When it applies | Saved settings take effect in the **next** session; restart a running one |
 
 ### Status API for scripts and agents
