@@ -109,6 +109,24 @@ class SessionScanTests(unittest.TestCase):
         # 02:10Z is 11:10 in KST, so it counts toward the local day and hour.
         self.assertEqual(usage["today"]["external"], [10, 2, 0, 4])
         self.assertEqual(usage["current_hour"], "2026-10-25T11")
+        self.assertEqual(len(usage["timeline"]), 24)
+        self.assertEqual(usage["timeline"][-1]["hour"], "2026-10-25T11")
+        self.assertEqual(usage["timeline"][-1]["external"], {"turns": 1, "tokens": [10, 2, 0, 4]})
+        self.assertEqual(usage["timeline"][-1]["plan"], {"turns": 1, "tokens": [10, 2, 0, 4]})
+        self.assertIsNone(usage["cost_usd"])
+
+    def test_estimated_cost_uses_external_tokens_and_model_rates(self):
+        self.append([self.assistant("msg_other", tokens=(1_000_000, 1_000_000, 1_000_000, 0)),
+                     self.assistant("msg_011ABC", tokens=(5, 5, 5, 5))])
+        pricing = {"ok": True, "prompt": 0.00000015, "completion": 0.0000006,
+                   "cache_read": 0.000000003, "cache_write": 0.0000009}
+        usage = dash.scan_sessions(projects=self.projects, now=datetime(2026, 10, 25, 11, 0), pricing=pricing)
+        # Only replacement tokens cost money on OpenRouter.
+        self.assertAlmostEqual(usage["cost_usd"], 0.15 + 0.6 + 0.003, places=6)
+        self.assertAlmostEqual(usage["sessions"][0]["cost_usd"], 0.15 + 0.6 + 0.003, places=6)
+        # A plan-only session has no OpenRouter cost.
+        self.assertEqual(dash._session_cost(usage["today"]["plan"], pricing),
+                         5 * 0.00000015 + 5 * 0.0000006 + 5 * 0.000000003 + 5 * 0.0000009)
 
     def test_appended_lines_are_counted_once_and_other_days_excluded(self):
         self.append([self.assistant("msg_other")])
@@ -176,16 +194,93 @@ class AccountTests(unittest.TestCase):
         self.assertNotIn("sk-or-synthetic", json.dumps(result))
 
 
+class PricingTests(unittest.TestCase):
+    def opener(self, payload):
+        body = io.BytesIO(json.dumps(payload).encode())
+        opener = mock.Mock()
+        opener.open.return_value.__enter__ = mock.Mock(return_value=mock.Mock(read=lambda *_: body.read()))
+        opener.open.return_value.__exit__ = mock.Mock(return_value=False)
+        return opener
+
+    def test_rates_are_parsed_and_cached(self):
+        payload = {"data": [{"id": "vendor/model",
+                             "pricing": {"prompt": "0.000001", "completion": "0.000002",
+                                         "input_cache_read": "0.0000001"}}]}
+        cache = {"at": 0.0, "data": None}
+        with mock.patch.object(dash.urllib.request, "build_opener",
+                               return_value=self.opener(payload)) as factory:
+            first = dash.model_pricing("sk-or-synthetic", "vendor/model", cache=cache, now=10.0)
+            self.assertTrue(first["ok"])
+            self.assertAlmostEqual(first["prompt"], 0.000001)
+            self.assertAlmostEqual(first["cache_read"], 0.0000001)
+            self.assertEqual(first["cache_write"], 0.0)
+            again = dash.model_pricing("sk-or-synthetic", "vendor/model", cache=cache, now=11.0)
+            self.assertEqual(again, first)
+            factory.assert_called_once()
+            dash.model_pricing("sk-or-synthetic", "vendor/model", cache=cache, now=10.0 + dash.PRICING_TTL + 1)
+            self.assertEqual(factory.call_count, 2)
+
+    def test_unknown_model_and_network_failures_stay_safe(self):
+        cache = {"at": 0.0, "data": None}
+        with mock.patch.object(dash.urllib.request, "build_opener", return_value=self.opener({"data": []})):
+            result = dash.model_pricing("sk-or-synthetic", "vendor/missing", cache=cache, now=1.0)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "model_not_found")
+        opener = mock.Mock()
+        opener.open.side_effect = dash.urllib.error.URLError("boom")
+        with mock.patch.object(dash.urllib.request, "build_opener", return_value=opener):
+            failed = dash.model_pricing("sk-or-synthetic", "vendor/model",
+                                        cache={"at": 0.0, "data": None}, now=1.0)
+        self.assertEqual(failed["error"], "connection_failed")
+        self.assertNotIn("sk-or-synthetic", json.dumps(failed))
+
+
+class AlertTests(unittest.TestCase):
+    def routing(self, external=0, plan=0, reasons=None, failures=None, circuits=0, state="external"):
+        return {"state": state,
+                "last": {"reason": "native_feature", "detail": "plan_model"},
+                "short": {"minutes": 10,
+                          "counts": {"external": external, "plan": plan},
+                          "plan_reasons": reasons or [],
+                          "failures": failures or [],
+                          "circuit_opens": circuits}}
+
+    def test_quiet_replacement_traffic_has_no_alerts(self):
+        alerts = dash.build_alerts(self.routing(external=8), {}, {"ok": True, "limit_usd": 50,
+                                                                  "remaining_usd": 40}, {"ok": True})
+        self.assertEqual(alerts, [])
+
+    def test_spike_circuit_rejection_and_plan_state_are_ordered(self):
+        alerts = dash.build_alerts(
+            self.routing(external=1, plan=5, reasons=[["native_feature:plan_model", 5]],
+                         failures=[["400:invalid_message", 2]], circuits=1, state="plan"),
+            {}, {"ok": True, "limit_usd": 50, "remaining_usd": 40}, {"ok": True})
+        self.assertEqual([alert["level"] for alert in alerts], ["critical", "warn", "warn", "info"])
+        self.assertEqual([alert["title"] for alert in alerts],
+                         ["외부 회로 차단", "Plan 우회 급증", "외부 요청 거부", "현재 Plan 경로"])
+        self.assertIn("native_feature:plan_model", alerts[1]["detail"])
+
+    def test_low_balance_and_pricing_failure_are_surfaced(self):
+        alerts = dash.build_alerts(self.routing(external=3), {},
+                                   {"ok": True, "limit_usd": 50, "remaining_usd": 2.0},
+                                   {"ok": False, "error": "connection_failed"})
+        titles = [alert["title"] for alert in alerts]
+        self.assertEqual(titles[0], "OpenRouter 잔액 부족")
+        self.assertIn("단가 조회 실패", titles)
+
+
 class SnapshotTests(unittest.TestCase):
     def test_snapshot_shape_and_loopback_only_binding(self):
         with mock.patch.object(dash, "scan_sessions", return_value=dash._empty_usage()), \
              mock.patch.object(dash, "parse_route_log", return_value=[]), \
              mock.patch.object(dash, "account_state", return_value={"ok": False, "error": "configuration_missing"}), \
+             mock.patch.object(dash, "model_pricing", return_value={"ok": False, "error": "configuration_missing"}), \
              mock.patch.object(dash, "read_env", return_value={"OPENROUTER_MODEL": "vendor/model"}):
             data = dash.snapshot()
-        self.assertEqual(sorted(data), ["account", "generated_at", "model", "routing", "usage"])
+        self.assertEqual(sorted(data), ["account", "alerts", "generated_at", "model", "pricing", "routing", "usage"])
         self.assertEqual(data["model"], "vendor/model")
         self.assertEqual(data["routing"]["state"], "unknown")
+        self.assertEqual(data["alerts"], [])
         self.assertNotIn("sk-or", json.dumps(data))
         with self.assertRaises(SystemExit):
             dash.main(["--host", "0.0.0.0"])
@@ -203,6 +298,8 @@ class SnapshotTests(unittest.TestCase):
         usage = dash._empty_usage()
         self.assertEqual(usage["totals"]["external"], [0, 0, 0, 0])
         self.assertEqual(usage["session_count"], 0)
+        self.assertEqual(usage["timeline"], [])
+        self.assertIsNone(usage["cost_usd"])
         self.assertRegex(usage["current_hour"], r"^\d{4}-\d{2}-\d{2}T\d{2}$")
 
 

@@ -224,10 +224,15 @@ A **read-only** page bound to `127.0.0.1`, refreshed every two seconds. The defa
 | Panel | Content |
 | --- | --- |
 | Now | **OpenRouter serving / Plan bypass / idle**, from the newest `route_selected` |
+| Alerts | Shown when Plan bypass reaches 50% within ten minutes, a circuit opens, a 400/413/422 rejection repeats, or the balance drops below 10% |
 | Last 60 minutes | Replacement versus Plan counts, circuit opens |
 | Bypass reasons | Counts per `native_feature` `detail`, external failure statuses and validation classes |
 | Credits | Key limit, spend this period, remaining, reset date (OpenRouter `/api/v1/key`) |
-| Per session | Turns, replacement/Plan turns, replacement tokens, model |
+| Today | Replacement and Plan tokens, input/output, cache, **estimated cost** |
+| Hourly tokens | The last 24 hours as replacement versus Plan bars |
+| Per session | Turns, replacement/Plan turns, replacement tokens, **estimated cost**, model |
+
+Estimated cost uses the model rates from OpenRouter `/api/v1/models`; confirm actual charges against the provider's own records.
 
 The page shows no key, prompt or request body, and the server writes nothing. It is a separate process, so it can run beside the routing session.
 
