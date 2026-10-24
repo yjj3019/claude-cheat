@@ -292,6 +292,9 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
         print(json.dumps({"event": "provider_connection_unavailable", "provider": provider,
                           "action": "continue", "plan_fallback": not isolated}), flush=True)
     proxy_env.update(config, LOCAL_ROUTE_TOKEN=nonce, LOCAL_ROUTE_ONLY="1" if local_only else "0")
+    if provider == "openrouter":
+        # Keep routing decisions for later diagnosis; -Debug only shows them live in the terminal.
+        proxy_env["ROUTE_LOG_PATH"] = str(ROOT / ".route.log")
     proxy_env.pop("LOCAL_ROUTE_COMPAT", None)
     proxy_env.pop("OPENROUTER_ROUTE_COMPAT", None)
     if local_compat:

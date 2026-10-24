@@ -1,7 +1,21 @@
 import http from 'node:http';
 import { once } from 'node:events';
 import { createHash, timingSafeEqual } from 'node:crypto';
+import { appendFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
+
+// Diagnostic mirror: routing events also land in a file so a session can be explained afterwards.
+// The launcher sets ROUTE_LOG_PATH for OpenRouter sessions; without it nothing is written.
+const routeLogPath = process.env.ROUTE_LOG_PATH;
+if (routeLogPath) {
+  delete process.env.ROUTE_LOG_PATH;
+  const emit = console.error.bind(console);
+  console.error = (...args) => {
+    emit(...args);
+    try { appendFileSync(routeLogPath, `${new Date().toISOString()} ${args.join(' ')}\n`); } catch {}
+  };
+  try { appendFileSync(routeLogPath, `${new Date().toISOString()} --- proxy start ---\n`); } catch {}
+}
 
 // Historical client alias only; the upstream model must be configured explicitly.
 export const DEEPSEEK = 'deepseek/deepseek-v4.1-flash-1017';

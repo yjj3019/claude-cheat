@@ -241,6 +241,8 @@ A failed check exits with code 1 and never invokes Plan fallback. A successful m
 | Repeated historical `503 ... restart required` | Stale session/proxy and first upstream error; restart with current launcher |
 | HUD or MCP failure | Compare ordinary Claude; loading settings does not prove server connectivity |
 
+A routed session also appends its routing events to `.route.log` beside the launcher: a `proxy start` line per session, then timestamped `route_selected`, `external_attempt_failed` and `circuit_open` entries. This explains past sessions that ran without `-Debug`, and the file is excluded from Git by the `*.log` rule.
+
 Exit and relaunch to change providers. `/model` selects Claude models, not OpenRouter versus Local. To return to ordinary Plan use `claude` in a clean terminal. This launcher does not modify the parent terminal, but old user/system `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` or `CLAUDE_CONFIG_DIR` variables may still be inherited. Do not delete saved login or MCP settings as a blanket fix.
 
 ## Validation and limitations
