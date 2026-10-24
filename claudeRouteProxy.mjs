@@ -64,13 +64,14 @@ const MAX_RESPONSE = 32 * 1024 * 1024;
 const BASIC_FIELDS = new Set(['model', 'messages', 'max_tokens', 'system', 'stream', 'temperature',
   'top_p', 'top_k', 'stop_sequences', 'tools', 'tool_choice', 'metadata', 'thinking', 'output_config', 'safeguards', 'cache_control']);
 const CONTENT_FIELDS = {
-  text: new Set(['type', 'text', 'cache_control']),
+  // citations is emitted by providers and echoed back in history by the CLI, so it must be accepted.
+  text: new Set(['type', 'text', 'cache_control', 'citations']),
   image: new Set(['type', 'source', 'cache_control']),
   tool_use: new Set(['type', 'id', 'name', 'input', 'cache_control', 'caller']),
   tool_result: new Set(['type', 'tool_use_id', 'content', 'is_error', 'cache_control']),
 };
-// Read-only fields a provider may add to a response block; request blocks never carry them.
-const RESPONSE_FIELDS = { text: new Set(['citations']) };
+// Fields only a provider may add to a response block; citations is also a request field today.
+const RESPONSE_FIELDS = {};
 const responseBlockField = (type, name) => Boolean(CONTENT_FIELDS[type]?.has(name) || RESPONSE_FIELDS[type]?.has(name));
 // Native reasoning stays on the subscription route: another provider cannot verify the Anthropic
 // signature, and forwarding it would ship the Plan model's internal reasoning to a third party.

@@ -211,6 +211,22 @@ test('a reasoning-only turn keeps its position with a neutral placeholder', asyn
   assert.deepEqual(calls[0].parsedBody.messages[1].content, [{ type: 'text', text: '(reasoning omitted)' }]);
 });
 
+test('citation fields echoed back in history keep the request on the replacement route', async t => {
+  const { calls, request } = await fixture(t);
+  const citations = [{ type: 'char_location', cited_text: 'fixture', document_index: 0,
+    document_title: 'fixture document', start_char_index: 0, end_char_index: 1 }];
+  const body = requestBody(SONNET, { messages: [
+    { role: 'user', content: 'fixture' },
+    { role: 'assistant', content: [{ type: 'text', text: 'fixture answer', citations }] },
+    { role: 'user', content: 'fixture follow-up' }] });
+  const response = await request(body, { headers: proHeaders });
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, 'https://openrouter.ai/api/v1/messages');
+  assert.deepEqual(calls[0].parsedBody.messages[1].content[0].citations, citations);
+});
+
 test('replacement route logs the model that actually served the request', async t => {
   const log = t.mock.method(console, 'error', () => {});
   const { calls, request } = await fixture(t);
