@@ -438,6 +438,33 @@ class TransitionTests(unittest.TestCase):
             self.assertTrue(all(isinstance(value, str) and value for value in values), code)
         for row in dash.HELP_SECTION["states"] + dash.HELP_SECTION["exit_codes"]:
             self.assertEqual(len(row), 2)
+        commands = dash.HELP_SECTION["commands"]
+        self.assertEqual(len(commands), 4)
+        self.assertTrue(all(len(row) == 2 and all(row) for row in commands))
+        joined = " ".join(row[0] for row in commands)
+        for flag in ("--status", "--pretty", "--usage", "--offline"):
+            self.assertIn(flag, joined)
+        self.assertEqual(len(dash.HELP_SECTION["endpoints"]), 2)
+
+
+class PageTests(unittest.TestCase):
+    def test_embedded_script_is_valid_javascript(self):
+        """A stray escape in the Python string can break the page without failing any API test."""
+        import re
+        import shutil
+        import subprocess
+
+        script = re.search(r"<script>(.*)</script>", dash.PAGE, re.S).group(1)
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not available")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "page.js"
+            path.write_text(script, encoding="utf-8")
+            result = subprocess.run([node, "--check", str(path)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr[:400])
+        self.assertIn("help.commands", script)
+        self.assertIn("help.reasons", script)
 
 
 class ServerTests(unittest.TestCase):

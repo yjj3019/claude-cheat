@@ -62,6 +62,16 @@ REASON_HELP = {
 }
 
 HELP_SECTION = {
+    "commands": [
+        ["python routeDashboard.py --status", "한 줄 JSON + 종료 코드"],
+        ["python routeDashboard.py --status --pretty", "읽기 좋게 들여쓰기"],
+        ["python routeDashboard.py --status --usage", "토큰·비용까지 집계 (느림)"],
+        ["python routeDashboard.py --status --offline", "OpenRouter 호출 생략"],
+    ],
+    "endpoints": [
+        ["GET /api/status", "위와 같은 요약 JSON"],
+        ["GET /api/snapshot", "이 페이지가 쓰는 전체 데이터"],
+    ],
     "states": [["external", "OpenRouter 사용 중"], ["plan", "Plan 우회 중"], ["idle", "유휴(5분 이상 결정 없음)"],
                ["unknown", "기록 없음"]],
     "exit_codes": [["0", "정상"], ["2", "현재 Plan 경로"], ["3", "심각 경고"], ["4", "라우팅 기록 없음"]],
@@ -662,6 +672,9 @@ summary{cursor:pointer;color:#b9c4d6;font-size:12px;margin:4px 0}
 .hint{font-size:11px;color:#8b97ad;line-height:1.5;margin-top:2px}
 .hint b{color:#c8d2e4}
 .reason{margin-bottom:8px}
+.code{background:#0e1526;border:1px solid #24304a;border-radius:8px;padding:10px 12px;overflow-x:auto;
+ font-family:ui-monospace,Consolas,monospace;font-size:11px;line-height:1.7;color:#c8d2e4;margin:8px 0 4px;
+ white-space:pre}
 </style></head><body>
 <h1>OpenRouter 라우팅 대시보드</h1>
 <div class="sub" id="stamp">불러오는 중…</div>
@@ -682,9 +695,9 @@ function card(title, body, cls) {
 
 function render(data) {
   const r = data.routing, u = data.usage, a = data.account;
-  document.getElementById('stamp').textContent =
-    `갱신 ${new Date(data.generated_at).toLocaleTimeString('ko-KR')} · 설정 모델 ${data.model || '미설정'}`
-    + ` · 최근 응답 모델 ${r.last?.model || '—'} · 읽기 전용`;
+  document.getElementById('stamp').innerHTML =
+    `갱신 ${new Date(data.generated_at).toLocaleTimeString('ko-KR')} · 설정 모델 ${esc(data.model || '미설정')}`
+    + ` · 최근 응답 모델 ${esc(r.last?.model || '—')} · 읽기 전용 · <a href="#help">도움말 ↓</a>`;
   const age = r.last?.age_seconds;
   const ageText = age === null || age === undefined ? '아직 기록 없음'
     : age < 60 ? `${Math.round(age)}초 전` : `${Math.round(age / 60)}분 전`;
@@ -783,16 +796,19 @@ function render(data) {
     `<tr><td class="mono">${esc(code)}</td><td>${esc(values[0])}</td><td>${esc(values[1])}</td></tr>`).join('');
   const listRows = rows => (rows || []).map(([left, right]) =>
     `<tr><td class="mono">${esc(left)}</td><td>${esc(right)}</td></tr>`).join('');
-  const helpCard = card('도움말 — 화면 읽는 법',
-    `<details open><summary>라우팅 사유 코드 (${Object.keys(help.reasons || {}).length}개)</summary>
+  const commandBlock = (help.commands || []).map(([command, description]) =>
+    `${command}${' '.repeat(Math.max(2, 52 - command.length))}# ${description}`).join('\\n');
+  const helpCard = `<div class="card wide" id="help"><h2>도움말 — 화면 읽는 법</h2>
+     <div class="hint">터미널에서 상태 확인 (복사해서 사용)</div>
+     <pre class="code">${esc(commandBlock)}</pre>
+     <table style="margin-top:8px"><tr><th>HTTP API</th><th>내용</th></tr>${listRows(help.endpoints)}</table>
+     <details open style="margin-top:10px"><summary>라우팅 사유 코드 (${Object.keys(help.reasons || {}).length}개)</summary>
        <table><tr><th>코드</th><th>의미</th><th>조치</th></tr>${reasonHelp}</table></details>
      <details><summary>상태 배지 / 종료 코드 / 데이터 출처</summary>
        <table><tr><th>상태</th><th>의미</th></tr>${listRows(help.states)}</table>
        <table style="margin-top:10px"><tr><th>종료 코드</th><th>의미</th></tr>${listRows(help.exit_codes)}</table>
        <table style="margin-top:10px"><tr><th>데이터</th><th>출처</th></tr>${listRows(help.sources)}</table></details>
-     <div class="hint" style="margin-top:8px">기계판독용: <a href="/api/status">/api/status</a> ·
-       <a href="/api/snapshot">/api/snapshot</a> · CLI <span class="mono">python routeDashboard.py --status</span></div>`,
-    'wide');
+     </div>`;
 
   const recent = r.recent.slice().reverse().map(e => `<tr>
       <td class="mono">${esc(new Date(e.ts).toLocaleTimeString('ko-KR'))}</td>

@@ -232,7 +232,7 @@ A **read-only** page bound to `127.0.0.1`, refreshed every two seconds. The defa
 | Hourly tokens | The last 24 hours as replacement versus Plan bars |
 | Route transitions | When the route changed, its reason, model, count and duration (last 12) |
 | Per session | Turns, replacement/Plan turns, replacement tokens, **estimated cost**, model |
-| Help | Reason code table (meaning/action), state badges, exit codes, data sources |
+| Help | CLI commands (`--status` and options), HTTP API, reason code table (meaning/action), state badges, exit codes, data sources |
 
 Estimated cost uses the model rates from OpenRouter `/api/v1/models`; confirm actual charges against the provider's own records. The **model that actually answered** is recorded by the proxy just before a response is delivered; the name the CLI shows is the request alias (`claude-sonnet-5-5` and so on), so this value is the real provider model.
 
