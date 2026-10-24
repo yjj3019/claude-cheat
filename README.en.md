@@ -238,7 +238,23 @@ Every interactive launch now makes one minimal provider-only inference check bef
 .\OpenClaudeDashboard.ps1
 ```
 
-A **read-only** page bound to `127.0.0.1`, refreshed every two seconds. The port is **fixed at 8787**; an older dashboard instance is stopped automatically so the same port is reused. If another program holds that port the server fails with a message instead of silently moving; pass `--allow-port-fallback` to pick a free port instead.
+A **read-only** page bound to `127.0.0.1`. The port is **fixed at 8787**; an older dashboard instance is stopped automatically so the same port is reused. If another program holds that port the server fails with a message instead of silently moving; pass `--allow-port-fallback` to pick a free port instead.
+
+The refresh interval follows the situation: two seconds while routing is active, ten seconds while idle, fifteen when the tab is hidden. The header shows a one-line summary (`오늘 43.8M토큰 · $1.42 · 남은 한도 $48.25 · 우선 확인: …`).
+
+The **insights** card ranks *what changed, why, and what to do next* instead of listing numbers, with the measurements it used as chips. A banner that shares an insight's cause is not repeated.
+
+| Insight | Trigger | Suggested action |
+| --- | --- | --- |
+| Launcher code is older than the source | proxy start stamp < source mtime | `.\OpenClaude.ps1` (copy button) |
+| External circuit open | a circuit opened inside the window | check network, key and model id |
+| Plan surge / Plan share rising | Plan ≥50% / ≥20% of the last 10 minutes | explain the top reason code and its fix |
+| External request rejected | repeated 400/413/422 | update the launcher |
+| Limit exhaustion forecast | today's burn rate exhausts the limit within 7 days | adjust model price or volume |
+| Burn rate | days of headroom estimate | reference |
+| Cache reuse low | ≥200k prompt tokens with <15% reuse | keep the prompt prefix stable |
+| Latency | session p95 ≥20s | check before the circuit opens |
+| Session idle | no decision for 30 minutes | reference |
 
 | Panel | Content |
 | --- | --- |

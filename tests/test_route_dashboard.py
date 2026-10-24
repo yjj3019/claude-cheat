@@ -489,6 +489,8 @@ class PageTests(unittest.TestCase):
         self.assertIn("help.commands", dashboard)
         self.assertIn("renderGrid", dashboard)
         self.assertIn("data-copy", dashboard)
+        self.assertIn("insightsCard", dashboard)
+        self.assertIn("function poll()", dashboard)
         self.assertNotIn("saveSettings", dashboard)
         self.assertIn("saveSettings", settings)
         self.assertNotIn("renderGrid", settings)
@@ -973,6 +975,111 @@ class ModelCatalogTests(unittest.TestCase):
             server.server_close()
 
 
+class InsightTests(unittest.TestCase):
+    NOW = datetime(2026, 10, 25, 12, 0)
+
+    def routing(self, **overrides):
+        routing = {"state": "external", "last": {"age_seconds": 10},
+                   "short": {"minutes": 10, "counts": {"external": 10, "plan": 0},
+                             "plan_reasons": [], "failures": [], "circuit_opens": 0},
+                   "counts": {"external": 10, "plan": 0}, "proxy_started_at": None}
+        routing.update(overrides)
+        return routing
+
+    def usage(self, cost=1.0, external=None):
+        return {"today": {"external": external or [1000, 100, 5000, 0], "plan": [0, 0, 0, 0]},
+                "cost_usd": cost}
+
+    def test_circuit_open_ranks_first(self):
+        routing = self.routing(short={"minutes": 10, "counts": {"external": 2, "plan": 8},
+                                      "plan_reasons": [["native_feature:unsupported_beta", 8]],
+                                      "failures": [], "circuit_opens": 2})
+        insights = dash.build_insights(routing, self.usage(), {"ok": True}, None, now=self.NOW)
+        self.assertEqual(insights[0]["title"], "외부 회로 차단")
+        self.assertEqual(insights[0]["level"], "critical")
+        self.assertIn("2회", insights[0]["detail"])
+
+    def test_plan_share_explains_the_top_reason(self):
+        routing = self.routing(short={"minutes": 10, "counts": {"external": 3, "plan": 9},
+                                      "plan_reasons": [["native_feature:unsupported_beta", 9]],
+                                      "failures": [], "circuit_opens": 0})
+        insights = dash.build_insights(routing, self.usage(), {"ok": False}, None, now=self.NOW)
+        surge = [item for item in insights if item["title"] == "Plan 우회 급증"][0]
+        self.assertEqual(surge["level"], "warn")
+        self.assertIn("unsupported_beta", surge["detail"])
+        self.assertIn(dash.REASON_HELP["native_feature:unsupported_beta"][1], surge["detail"])
+        self.assertEqual(surge["evidence"], ["native_feature:unsupported_beta: 9"])
+
+    def test_mild_plan_share_stays_informational(self):
+        routing = self.routing(short={"minutes": 10, "counts": {"external": 7, "plan": 3},
+                                      "plan_reasons": [["native_feature:token_count", 3]],
+                                      "failures": [], "circuit_opens": 0})
+        insights = dash.build_insights(routing, self.usage(), {"ok": False}, None, now=self.NOW)
+        titles = [item["title"] for item in insights]
+        self.assertIn("Plan 비중 상승", titles)
+        self.assertNotIn("Plan 우회 급증", titles)
+
+    def test_cost_projection_warns_before_the_limit_runs_out(self):
+        insights = dash.build_insights(self.routing(), self.usage(cost=2.4),
+                                       {"ok": True, "remaining_usd": 4.0, "limit_usd": 50}, None,
+                                       now=self.NOW)
+        burn = [item for item in insights if item["title"] == "한도 소진 예상"][0]
+        self.assertEqual(burn["level"], "critical")
+        self.assertIn("0.8일", burn["detail"])
+        self.assertIn("$4.80", burn["detail"])
+
+    def test_low_cache_reuse_is_flagged(self):
+        usage = self.usage(cost=1.0, external=[500_000, 20_000, 1_000, 0])
+        insights = dash.build_insights(self.routing(), usage, {"ok": False}, None, now=self.NOW)
+        cache = [item for item in insights if item["title"] == "캐시 재사용 저하"]
+        self.assertEqual(len(cache), 1)
+        self.assertIn("0%", cache[0]["detail"])
+
+    def test_latency_and_failures_come_from_proxy_metrics(self):
+        metrics = {"requests": 40, "failed": 2, "latencyMs": {"external": {"p50": 900, "p95": 25_000}}}
+        insights = dash.build_insights(self.routing(), self.usage(), {"ok": False}, None,
+                                       metrics=metrics, now=self.NOW)
+        titles = [item["title"] for item in insights]
+        self.assertIn("응답 지연", titles)
+        self.assertIn("실패 응답 누적", titles)
+        latency = [item for item in insights if item["title"] == "응답 지연"][0]
+        self.assertIn("25.0초", latency["detail"])
+
+    def test_idle_session_is_reported_but_not_alarming(self):
+        routing = self.routing(state="idle", last={"age_seconds": 3600})
+        insights = dash.build_insights(routing, self.usage(), {"ok": False}, None, now=self.NOW)
+        idle = [item for item in insights if item["title"] == "세션 유휴"]
+        self.assertEqual(idle[0]["level"], "info")
+
+    def test_insights_are_capped_and_sorted(self):
+        routing = self.routing(state="plan", last={"age_seconds": 3600},
+                               short={"minutes": 10, "counts": {"external": 1, "plan": 9},
+                                      "plan_reasons": [["native_feature:unsupported_beta", 9]],
+                                      "failures": [["400", 2]], "circuit_opens": 3})
+        usage = self.usage(cost=2.4, external=[500_000, 20_000, 1_000, 0])
+        metrics = {"requests": 10, "failed": 1, "latencyMs": {"external": {"p95": 30_000}}}
+        with mock.patch.object(dash, "proxy_stale", return_value=True):
+            insights = dash.build_insights(routing, usage, {"ok": True, "remaining_usd": 2.0}, None,
+                                           metrics=metrics, now=self.NOW)
+        self.assertLessEqual(len(insights), 5)
+        scores = [item["score"] for item in insights]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+        self.assertEqual(insights[0]["title"], "실행기 코드가 오래됨")
+
+    def test_summary_line_mentions_state_cost_and_next_step(self):
+        insights = dash.build_insights(self.routing(), self.usage(cost=1.5), {"ok": False}, None,
+                                       now=self.NOW)
+        line = dash.summary_line(self.routing(), self.usage(cost=1.5), {"ok": False}, insights)
+        self.assertIn("OpenRouter로 정상 처리 중", line)
+        self.assertIn("$1.500", line)
+
+    def test_refresh_interval_follows_activity(self):
+        self.assertEqual(dash.refresh_interval_ms({"state": "external"}), 2000)
+        self.assertEqual(dash.refresh_interval_ms({"state": "plan"}), 2000)
+        self.assertEqual(dash.refresh_interval_ms({"state": "idle"}), 10000)
+        self.assertEqual(dash.refresh_interval_ms({}), 10000)
+
+
 class SnapshotTests(unittest.TestCase):
     def test_snapshot_shape_and_loopback_only_binding(self):
         with mock.patch.object(dash, "scan_sessions", return_value=dash._empty_usage()), \
@@ -982,8 +1089,9 @@ class SnapshotTests(unittest.TestCase):
              mock.patch.object(dash, "read_env", return_value={"OPENROUTER_MODEL": "vendor/model"}):
             data = dash.snapshot()
         self.assertEqual(sorted(data),
-                         ["account", "alerts", "generated_at", "help", "model", "pricing", "proxy_metrics",
-                          "proxy_modified_at", "proxy_stale", "routing", "usage"])
+                         ["account", "alerts", "configured", "generated_at", "help", "insights", "model",
+                          "pricing", "proxy_metrics", "proxy_modified_at", "proxy_stale", "refresh_ms",
+                          "routing", "summary", "usage"])
         self.assertEqual(data["model"], "vendor/model")
         self.assertEqual(data["routing"]["state"], "unknown")
         self.assertEqual(data["alerts"], [])
