@@ -700,13 +700,38 @@ def _validate_config(provider, values):
     _validate_local(values)
 
 
-def _write_env(path, updates):
+def _effective_values(provider, values=None):
+    """Posted values win over stored ones; an empty secret keeps the stored value."""
+    stored = read_env(_config_path(provider))
+    spec = CONFIG_FILES[provider]
+    if not isinstance(values, dict):
+        return stored
+    merged = dict(stored)
+    for name in spec["fields"]:
+        if name not in values or not isinstance(values[name], str):
+            continue
+        value = values[name].strip()
+        if name in spec["secret"] and not value:
+            continue
+        merged[name] = value
+    return merged
+
+
+def _example_text(path):
+    example = Path(path).with_name(Path(path).name + ".example")
+    try:
+        return example.read_text(encoding="utf-8") if example.is_file() else None
+    except OSError:
+        return None
+
+
+def _write_env(path, updates, base=None):
     """Update managed keys in place, keeping comments and unrelated entries; atomic replace."""
     path = Path(path)
     try:
         original = path.read_text(encoding="utf-8")
     except OSError:
-        original = ""
+        original = base or ""
     lines = original.splitlines()
     written = set()
     output = []
@@ -760,7 +785,9 @@ def save_config(provider, values):
             updates[name] = clean.get(name) or None
         elif name in clean:
             updates[name] = clean[name]
-    _write_env(_config_path(provider), updates)
+    path = _config_path(provider)
+    # On first save, start from the shipped example so its comments stay in the new file.
+    _write_env(path, updates, base=None if path.is_file() else _example_text(path))
     return config_snapshot()
 
 
@@ -776,13 +803,13 @@ def _http_json(url, headers, body=None, timeout=12):
         return response.status, json.loads(response.read(4 * 1024 * 1024 + 1))
 
 
-def run_connection_test(provider, mode="metadata"):
-    """One safe connectivity check for the settings page; no prompts, keys or bodies are returned."""
+def run_connection_test(provider, mode="metadata", values=None):
+    """One safe connectivity check; unsaved form values may be supplied, nothing secret is returned."""
     import urllib.error
     from urllib.parse import urlsplit
 
     base = {"provider": provider, "mode": mode, "ok": False}
-    values = read_env(_config_path(provider))
+    values = _effective_values(provider, values)
     headers = {"content-type": "application/json", "anthropic-version": "2023-06-01"}
     try:
         if provider == "openrouter":
@@ -790,6 +817,9 @@ def run_connection_test(provider, mode="metadata"):
             model = values.get("OPENROUTER_MODEL", "")
             if not key or not model:
                 return {**base, "reason": "configuration_missing"}
+            if (not re.fullmatch(r"sk-or-[A-Za-z0-9_-]+", key)
+                    or not re.fullmatch(r"[A-Za-z0-9~@][A-Za-z0-9._:/@+~-]{0,255}", model)):
+                return {**base, "reason": "invalid_configuration"}
             headers["authorization"] = "Bearer " + key
             if mode == "metadata":
                 status, data = _http_json("https://openrouter.ai/api/v1/models",
@@ -1036,6 +1066,7 @@ td.id{font-family:var(--mono);font-size:11.5px;color:var(--fg-2)}
 .alert .icon{width:18px;height:18px;border-radius:50%;flex:0 0 auto;margin-top:1px;
  display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700}
 .alert b{display:block;font-size:12.5px;margin-bottom:1px}
+.alert .txt b{display:inline;font-size:inherit;margin:0;color:var(--fg);font-weight:650}
 .alert .txt{color:var(--fg-2)}
 .alert.critical{border-color:var(--bad-line);background:var(--bad-soft)}
 .alert.critical .icon{background:var(--bad);color:#3a0a13}
@@ -1043,6 +1074,11 @@ td.id{font-family:var(--mono);font-size:11.5px;color:var(--fg-2)}
 .alert.warn .icon{background:var(--warn);color:#3a2606}
 .alert.info{border-color:var(--accent-line);background:var(--accent-soft)}
 .alert.info .icon{background:var(--accent);color:#06152e}
+.alert code{font-family:var(--mono);font-size:11.5px;background:#080d15;border:1px solid var(--line);
+ padding:1px 5px;border-radius:5px;color:var(--fg-2)}
+.notice{border:1px solid var(--accent-line);background:var(--accent-soft);border-radius:var(--radius-sm);
+ padding:11px 13px;margin-bottom:14px;font-size:12.5px;color:var(--fg-2)}
+.notice b{color:var(--fg)}
 
 /* settings form */
 .setting-form{display:flex;flex-direction:column}
@@ -1266,6 +1302,8 @@ function renderSettings(force) {
           ${dirtyCount ? `저장되지 않은 변경 ${dirtyCount}` : '저장됨'}</span>
       </header>
       <div class="card-b">
+        ${providerReady(provider) ? '' : `<div class="notice"><b>아직 설정이 없습니다.</b>
+          값을 입력하고 <b>모델 확인</b>으로 검증한 뒤 <b>저장</b>하세요. 모델 확인은 저장 전 값으로도 실행됩니다.</div>`}
         <div class="setting-form">${rows}</div>
         <div class="actions">
           <button class="btn btn-primary" data-busy-key="${provider}" onclick="saveSettings('${provider}')">저장</button>
@@ -1373,7 +1411,7 @@ async function runTest(provider, mode) {
   setBusy(key, true);
   renderResult(provider, mode === 'inference' ? '추론을 확인하는 중…' : '모델 목록을 확인하는 중…');
   let result;
-  try { result = await post('/api/test', {provider, mode}); }
+  try { result = await post('/api/test', {provider, mode, values: collect(provider)}); }
   catch (error) { result = {ok:false, reason:'connection_failed', mode}; }
   setBusy(key, false);
   RESULTS[provider] = {...result, mode};
@@ -1428,10 +1466,24 @@ function renderHeader(data) {
     `${data.model || '모델 미설정'} · 마지막 결정 ${ageText} · 갱신 ${new Date(data.generated_at).toLocaleTimeString('ko-KR')}`;
 }
 
+function providerReady(provider) {
+  const fields = (CONFIG && CONFIG[provider] && CONFIG[provider].fields) || {};
+  return PROVIDERS[provider].fields
+    .filter(([, , , , , badge]) => badge === '필수')
+    .every(([name]) => {
+      const field = fields[name] || {};
+      return field.set || field.value;
+    });
+}
+
 function renderAlerts(data) {
   const host = document.getElementById('alerts');
   const alerts = data.alerts || [];
-  host.innerHTML = alerts.map(alert => {
+  const guide = Object.keys(PROVIDERS).some(providerReady) ? '' :
+    `<div class="alert info"><span class="icon">i</span><div><b>처음 설정하기</b>
+      <span class="txt">아래 설정에서 모델과 키를 입력하고 <b>모델 확인</b> → <b>저장</b>을 누른 뒤
+      <code>startClaudeOpenRouter.ps1</code>로 세션을 시작하세요. 저장한 값은 새 세션부터 적용됩니다.</span></div></div>`;
+  host.innerHTML = guide + alerts.map(alert => {
     const icon = alert.level === 'critical' ? '!' : alert.level === 'warn' ? '!' : 'i';
     return `<div class="alert ${esc(alert.level)}"><span class="icon">${icon}</span>
       <div><b>${esc(alert.title)}</b><span class="txt">${esc(alert.detail)}</span></div></div>`;
@@ -1696,8 +1748,11 @@ class Handler(BaseHTTPRequestHandler):
         mode = payload.get("mode") or "metadata"
         if mode not in ("metadata", "inference"):
             return self._send(400, "application/json; charset=utf-8", json.dumps({"error": "invalid_mode"}))
+        test_values = payload.get("values")
+        if test_values is not None and not isinstance(test_values, dict):
+            return self._send(400, "application/json; charset=utf-8", json.dumps({"error": "invalid_values"}))
         return self._send(200, "application/json; charset=utf-8",
-                          json.dumps(run_connection_test(provider, mode), ensure_ascii=False))
+                          json.dumps(run_connection_test(provider, mode, test_values), ensure_ascii=False))
 
     def log_message(self, *args):
         pass

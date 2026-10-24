@@ -39,6 +39,14 @@ From the checkout root:
 
 If you install a global launcher separately, configuration is read beside its target script. Cloning this repository neither installs a global command nor changes an existing launcher target. Run the script in the intended checkout explicitly.
 
+Configure OpenRouter once in the web console — it runs without a routing session and shows setup guidance while the settings are empty:
+
+```powershell
+.\startClaudeDashboard.ps1        # http://127.0.0.1:8787/ (fixed port)
+```
+
+Fill the OpenRouter card with a **model ID** and **API key**, press **Model check**, then **Save**, and start the session. The check also runs on unsaved values, and saving without an existing `.env.openrouter` seeds the file from the shipped example so its comments stay. Starting the launcher with missing or invalid settings exits with the console address instead of opening a session. Editing the files by hand still works exactly as before.
+
 A routed session starts Claude Code with experimental beta features disabled (`CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`, `CLAUDE_CODE_DISABLE_ADVISOR_TOOL`). The inline `tool_addition`, `context_management`, and advisor tool shape that Claude Code 2.1.310 sends by default is rejected by external Messages API providers with HTTP 400, so Plan requests in the same session also use the stable protocol. Advisor, inline tools, and server-side context editing are therefore unavailable in that session. Thinking and effort settings still travel per request, and ordinary mode still never asks the external provider for thinking.
 
 ## Routing, retries, and recovery

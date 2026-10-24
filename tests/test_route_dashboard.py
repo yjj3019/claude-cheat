@@ -667,6 +667,42 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(wrong["ok"])
         self.assertEqual(wrong["reason"], "wrong_model")
 
+    def test_connection_test_accepts_unsaved_values(self):
+        with mock.patch.object(dash, "_http_json", return_value=(200, {"data": [{"id": "vendor/b"}]})):
+            result = dash.run_connection_test(
+                "openrouter", "metadata",
+                {"OPENROUTER_MODEL": "vendor/b", "ANTHROPIC_AUTH_TOKEN": "sk-or-v1-unsavedkey1234"})
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["reason"], "model_found")
+        self.assertNotIn("unsavedkey", json.dumps(result))
+        # A blank secret falls back to the stored value, so a saved key still works.
+        self.write("openrouter", "ANTHROPIC_AUTH_TOKEN=sk-or-v1-storedkey1234\nOPENROUTER_MODEL=vendor/old\n")
+        with mock.patch.object(dash, "_http_json", return_value=(200, {"data": [{"id": "vendor/c"}]})):
+            fallback = dash.run_connection_test("openrouter", "metadata",
+                                                {"OPENROUTER_MODEL": "vendor/c", "ANTHROPIC_AUTH_TOKEN": ""})
+        self.assertTrue(fallback["ok"])
+
+    def test_unsaved_values_are_validated_before_any_request(self):
+        with mock.patch.object(dash, "_http_json") as request:
+            result = dash.run_connection_test("openrouter", "metadata",
+                                              {"OPENROUTER_MODEL": "vendor/b", "ANTHROPIC_AUTH_TOKEN": "bad"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "invalid_configuration")
+        request.assert_not_called()
+
+    def test_first_save_seeds_comments_from_the_example_file(self):
+        example = self.root / ".env.openrouter.example"
+        example.write_text("# shipped comment\nOPENROUTER_MODEL=REPLACE_WITH_OPENROUTER_MODEL_ID\n"
+                           "ANTHROPIC_AUTH_TOKEN=YOUR_OPENROUTER_API_KEY\n", encoding="utf-8")
+        self.assertFalse((self.root / ".env.openrouter").exists())
+        dash.save_config("openrouter", {"OPENROUTER_MODEL": "vendor/a",
+                                        "ANTHROPIC_AUTH_TOKEN": "sk-or-v1-abcdefghijkl"})
+        text = (self.root / ".env.openrouter").read_text(encoding="utf-8")
+        self.assertIn("# shipped comment", text)
+        self.assertIn("OPENROUTER_MODEL=vendor/a", text)
+        self.assertIn("ANTHROPIC_AUTH_TOKEN=sk-or-v1-abcdefghijkl", text)
+        self.assertNotIn("REPLACE_WITH_OPENROUTER_MODEL_ID", text)
+
     def test_connection_test_missing_configuration_and_http_errors(self):
         self.write("openrouter", "OPENROUTER_MODEL=vendor/a\n")
         self.assertEqual(dash.run_connection_test("openrouter")["reason"], "configuration_missing")

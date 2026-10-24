@@ -49,7 +49,10 @@ class OpenRouterStartupError(LocalStartupError):
 
 class OpenRouterConfigError(ValueError):
     def __init__(self):
-        super().__init__("Set a valid ANTHROPIC_AUTH_TOKEN and OPENROUTER_MODEL in .env.openrouter beside openrouterAdvisor.py. No default model is selected. Values hidden.")
+        super().__init__(
+            "Set a valid ANTHROPIC_AUTH_TOKEN and OPENROUTER_MODEL in .env.openrouter beside openrouterAdvisor.py. "
+            "No default model is selected. Values hidden. "
+            "Or run startClaudeDashboard.ps1, open http://127.0.0.1:8787/ and fill the OpenRouter settings there.")
 
 
 def read_env(path: Path) -> dict:
@@ -594,45 +597,59 @@ def self_test() -> None:
     print("PASS: key parser, app-managed credits, Plan auth gate, native feature environment preservation, local/OpenRouter credential separation and launcher lifecycle")
 
 
-if __name__ == "__main__":
+def main(argv=None) -> int:
     try:
-        if sys.argv[1:] == ["--self-test"]:
+        arguments = list(sys.argv[1:] if argv is None else argv)
+        if arguments == ["--self-test"]:
             self_test()
-        else:
-            parser = argparse.ArgumentParser(description="Sonnet replacement with Plan fallback")
-            parser.add_argument("--provider", choices=("openrouter", "local"), default="openrouter")
-            parser.add_argument("--check-local", action="store_true", help="Check local model metadata without inference or Plan login")
-            parser.add_argument("--diagnose-local", action="store_true", help="One synthetic Local inference without CLI, native features or Plan fallback")
-            parser.add_argument("--local-mode", action="store_true", help="Interactive Local-only CLI with native integrations disabled and no Plan fallback")
-            parser.add_argument("--local-compat", action="store_true", help="Opt-in Local-only CLI compatibility mode with client integrations and no Plan fallback")
-            parser.add_argument("--openrouter-compat", action="store_true", help="Opt-in OpenRouter-only CLI compatibility mode with client integrations and no Plan fallback")
-            parser.add_argument("--debug", action="store_true", help="Show proxy routing logs (route_selected, circuit_open, ...) on stderr")
-            options = parser.parse_args()
-            if options.openrouter_compat and (options.provider != "openrouter" or options.local_mode or options.local_compat or options.check_local or options.diagnose_local):
-                parser.error("--openrouter-compat requires --provider openrouter and cannot be combined with Local modes or diagnostic checks")
-            if options.local_compat and (options.provider != "local" or options.local_mode or options.check_local or options.diagnose_local):
-                parser.error("--local-compat requires --provider local and cannot be combined with --local-mode or diagnostic checks")
-            if options.local_mode and (options.provider != "local" or options.check_local or options.diagnose_local):
-                parser.error("--local-mode requires --provider local and cannot be combined with diagnostic checks")
-            if options.diagnose_local and (options.provider != "local" or options.check_local):
-                parser.error("--diagnose-local requires --provider local and cannot be combined with --check-local")
-            if options.diagnose_local:
-                sys.exit(diagnose_local())
-            if options.check_local:
-                result = check_local()
-                print(json.dumps(result))
-                sys.exit(0 if result["local_check"] else 1)
-            if options.local_mode or options.local_compat or options.openrouter_compat:
-                try:
-                    localProcessTree.ensure_windows_local_tree()
-                except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
-                    error = OpenRouterStartupError if options.openrouter_compat else LocalStartupError
-                    raise error("local_process_cleanup_failed") from None
-            sys.exit(launch(options.provider, local_only=options.local_mode or options.local_compat, local_compat=options.local_compat, openrouter_compat=options.openrouter_compat, debug=options.debug))
+            return 0
+        parser = argparse.ArgumentParser(description="Sonnet replacement with Plan fallback")
+        parser.add_argument("--provider", choices=("openrouter", "local"), default="openrouter")
+        parser.add_argument("--check-local", action="store_true", help="Check local model metadata without inference or Plan login")
+        parser.add_argument("--diagnose-local", action="store_true", help="One synthetic Local inference without CLI, native features or Plan fallback")
+        parser.add_argument("--local-mode", action="store_true", help="Interactive Local-only CLI with native integrations disabled and no Plan fallback")
+        parser.add_argument("--local-compat", action="store_true", help="Opt-in Local-only CLI compatibility mode with client integrations and no Plan fallback")
+        parser.add_argument("--openrouter-compat", action="store_true", help="Opt-in OpenRouter-only CLI compatibility mode with client integrations and no Plan fallback")
+        parser.add_argument("--debug", action="store_true", help="Show proxy routing logs (route_selected, circuit_open, ...) on stderr")
+        options = parser.parse_args(arguments)
+        if options.openrouter_compat and (options.provider != "openrouter" or options.local_mode or options.local_compat or options.check_local or options.diagnose_local):
+            parser.error("--openrouter-compat requires --provider openrouter and cannot be combined with Local modes or diagnostic checks")
+        if options.local_compat and (options.provider != "local" or options.local_mode or options.check_local or options.diagnose_local):
+            parser.error("--local-compat requires --provider local and cannot be combined with --local-mode or diagnostic checks")
+        if options.local_mode and (options.provider != "local" or options.check_local or options.diagnose_local):
+            parser.error("--local-mode requires --provider local and cannot be combined with diagnostic checks")
+        if options.diagnose_local and (options.provider != "local" or options.check_local):
+            parser.error("--diagnose-local requires --provider local and cannot be combined with --check-local")
+        if options.diagnose_local:
+            return diagnose_local()
+        if options.check_local:
+            result = check_local()
+            print(json.dumps(result))
+            return 0 if result["local_check"] else 1
+        if options.local_mode or options.local_compat or options.openrouter_compat:
+            try:
+                localProcessTree.ensure_windows_local_tree()
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+                error = OpenRouterStartupError if options.openrouter_compat else LocalStartupError
+                raise error("local_process_cleanup_failed") from None
+        return launch(options.provider, local_only=options.local_mode or options.local_compat, local_compat=options.local_compat, openrouter_compat=options.openrouter_compat, debug=options.debug)
     except (LocalStartupError, OpenRouterConfigError) as exc:
-        print(json.dumps({"event": "openrouter_start_failed", "kind": type(exc).__name__,
-                          "code": exc.code if isinstance(exc, LocalStartupError) else "openrouter_configuration_invalid", "message": str(exc)}), file=sys.stderr)
-        sys.exit(1)
+        payload = {"event": "openrouter_start_failed", "kind": type(exc).__name__,
+                   "code": exc.code if isinstance(exc, LocalStartupError) else "openrouter_configuration_invalid",
+                   "message": str(exc)}
+        if isinstance(exc, OpenRouterConfigError):
+            payload.update({"action": "open_dashboard", "dashboard": "http://127.0.0.1:8787/",
+                            "command": "powershell -File startClaudeDashboard.ps1"})
+            print("[setup required] .env.openrouter is missing or invalid", file=sys.stderr)
+            print("  powershell -File startClaudeDashboard.ps1   ->  http://127.0.0.1:8787/", file=sys.stderr)
+            print("  fill the OpenRouter settings there, save, then run startClaudeOpenRouter.ps1 again",
+                  file=sys.stderr)
+        print(json.dumps(payload), file=sys.stderr)
+        return 1
     except (OSError, RuntimeError, EOFError, ValueError, subprocess.SubprocessError) as exc:
         print(json.dumps({"event": "openrouter_start_failed", "kind": type(exc).__name__}), file=sys.stderr)
-        sys.exit(1)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -53,6 +53,27 @@ class OpenRouterConfigTests(unittest.TestCase):
             route.provider_config("openrouter")
         self.assertNotIn("private-key-marker", str(caught.exception))
 
+    def test_config_error_message_points_at_the_web_console(self):
+        with self.assertRaises(route.OpenRouterConfigError) as caught:
+            route.provider_config("openrouter")
+        message = str(caught.exception)
+        self.assertIn("startClaudeDashboard.ps1", message)
+        self.assertIn("127.0.0.1:8787", message)
+
+    def test_launcher_config_failure_prints_setup_guidance(self):
+        with mock.patch.object(route, "launch", side_effect=route.OpenRouterConfigError()), \
+             contextlib.redirect_stderr(io.StringIO()) as stderr:
+            code = route.main([])
+        self.assertEqual(code, 1)
+        text = stderr.getvalue()
+        self.assertIn("[setup required]", text)
+        self.assertIn("startClaudeDashboard.ps1", text)
+        payload = json.loads([line for line in text.splitlines() if line.startswith("{")][-1])
+        self.assertEqual(payload["action"], "open_dashboard")
+        self.assertEqual(payload["dashboard"], "http://127.0.0.1:8787/")
+        self.assertEqual(payload["code"], "openrouter_configuration_invalid")
+        self.assertEqual(payload["kind"], "OpenRouterConfigError")
+
     def test_example_exposes_both_required_settings(self):
         example = Path(SPEC.origin).parent / ".env.openrouter.example"
         values = route.read_env(example)
