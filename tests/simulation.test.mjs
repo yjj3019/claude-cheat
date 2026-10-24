@@ -6,13 +6,16 @@ import { test } from 'node:test';
 
 test('simulator routes a small mixed load without violations', () => {
   const result = spawnSync(process.execPath,
-    ['tests/simulate.mjs', '--requests', '120', '--concurrency', '8', '--turns', '10', '--json'],
+    ['tests/simulate.mjs', '--requests', '120', '--concurrency', '8', '--turns', '10', '--soak', '200',
+      '--json'],
     { encoding: 'utf8', timeout: 180000 });
   assert.equal(result.status, 0, (result.stderr || result.stdout).slice(0, 800));
   const summary = JSON.parse(result.stdout);
   assert.deepEqual(summary.violations, []);
   assert.ok(summary.requests >= 120);
   assert.equal(summary.session.turns, 10);
+  assert.equal(summary.soak.requests, 200);
+  assert.ok(summary.soak.peakRssMb > 0);
   assert.ok(summary.routes.replacement > 0);
   assert.ok(summary.latencyMs.p50 > 0);
   assert.equal(summary.circuit.bypass, 200);

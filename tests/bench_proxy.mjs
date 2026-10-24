@@ -88,13 +88,15 @@ function historyPayload(messages, kbEach = 2) {
   return JSON.stringify({ model: MODEL, max_tokens: 256, messages: list });
 }
 
-async function timedRun(label, body, { failFirst = false, rounds = 12 } = {}) {
+async function timedRun(label, body, { failFirst = false, alwaysFail = false, rounds = 12 } = {}) {
   const seen = new Set();
   let marker = 0;
   const server = createProxy({
     key: KEY, nonce: NONCE, openrouterModel: 'bench/model', retryDelayMs: 0, attemptTimeoutMs: 5000,
+    cooldownMs: 0,
     fetchImpl: async (url, options) => {
       const model = JSON.parse(options.body).model;
+      if (url.includes('openrouter.ai') && alwaysFail) return new Response('down', { status: 503 });
       if (failFirst) {
         const key = String(++marker);
         if (!seen.has(key)) { seen.add(key); return new Response('boom', { status: 500 }); }
@@ -125,3 +127,6 @@ async function timedRun(label, body, { failFirst = false, rounds = 12 } = {}) {
 
 await timedRun('history 120 turns', historyPayload(120));
 await timedRun('history 120 turns, 1 retry', historyPayload(120), { failFirst: true });
+await timedRun('1MB body', payload(1024));
+await timedRun('1MB body, 1 retry', payload(1024), { failFirst: true });
+await timedRun('1MB body, 4 failed attempts', payload(1024), { alwaysFail: true });

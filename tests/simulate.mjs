@@ -20,6 +20,7 @@ const option = (name, fallback) => {
 const REQUESTS = option('requests', 1200);
 const CONCURRENCY = option('concurrency', 24);
 const TURNS = option('turns', 60);
+const SOAK = option('soak', 0);
 const JSON_OUT = ARGS.includes('--json');
 
 const OAUTH = 'Bearer sk-ant-oat-simulator';
@@ -226,6 +227,57 @@ check(average(tail) < average(head) * 4 + 30,
   `session latency grew from ${average(head).toFixed(1)}ms to ${average(tail).toFixed(1)}ms`);
 const sessionGrowthMb = (rssSessionEnd - rssSessionStart) / 1048576;
 check(sessionGrowthMb < 80, `session rss grew ${sessionGrowthMb.toFixed(1)}MB`);
+
+// ---------- phase 4: soak (throughput stability and resident memory) ----------
+const soakProxy = SOAK > 0 ? await startProxy() : null;
+const soak = { requests: 0, samples: [], windows: [], rssStart: 0, rssPeakMb: 0 };
+if (soakProxy) {
+  const mix = ['simple', 'stream', 'tools', 'retry', 'large'];
+  const perWindow = 200;
+  let cursor = 0;
+  let windowStarted = performance.now();
+  let windowDone = 0;
+  soak.rssStart = process.memoryUsage().rss;
+  const workerSoak = async () => {
+    while (true) {
+      const index = cursor++;
+      if (index >= SOAK) return;
+      const scenario = mix[index % mix.length];
+      try {
+        const result = await send(soakProxy.base, scenario, index);
+        check(result.status === 200, `soak ${scenario}: status ${result.status}`);
+      } catch (error) {
+        violations.push(`soak ${scenario}: ${error.message}`);
+      }
+      soak.requests += 1;
+      windowDone += 1;
+      if (windowDone === perWindow) {
+        const elapsed = (performance.now() - windowStarted) / 1000;
+        soak.windows.push(Number((windowDone / elapsed).toFixed(1)));
+        soak.samples.push(process.memoryUsage().rss);
+        windowStarted = performance.now();
+        windowDone = 0;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: CONCURRENCY }, workerSoak));
+  soak.rssPeakMb = Number((Math.max(...soak.samples) / 1048576).toFixed(1));
+  const metrics = await (await fetch(soakProxy.base.replace('/v1/messages', '/api/metrics'),
+    { headers: { 'x-local-route-token': NONCE } })).json();
+  check(metrics.requests >= soak.requests, `soak metrics saw ${metrics.requests} of ${soak.requests}`);
+  check(metrics.latencyMs.external.count <= 512, 'latency ring exceeded its window');
+  const first = soak.samples.slice(0, Math.max(1, Math.floor(soak.samples.length / 4)));
+  const last = soak.samples.slice(-Math.max(1, Math.floor(soak.samples.length / 4)));
+  const median = values => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)];
+  soak.driftMb = Number(((median(last) - median(first)) / 1048576).toFixed(1));
+  check(soak.driftMb < 150, `soak rss drifted ${soak.driftMb}MB`);
+  const rateFirst = soak.windows.slice(0, Math.max(1, Math.floor(soak.windows.length / 2)));
+  const rateLast = soak.windows.slice(-Math.max(1, Math.floor(soak.windows.length / 2)));
+  soak.throughputDrift = Number((median(rateLast) / Math.max(1, median(rateFirst))).toFixed(2));
+  check(soak.throughputDrift > 0.6, `soak throughput fell to ${soak.throughputDrift}x`);
+  soakProxy.server.closeAllConnections();
+  soakProxy.server.close();
+}
 console.error = realError;
 
 const latencies = results.map(result => result.elapsed).sort((a, b) => a - b);
@@ -266,6 +318,13 @@ const summary = {
     bytesIn: metrics.bytesIn,
     p95Ms: metrics.latencyMs.external.p95,
   },
+  soak: soak.requests ? {
+    requests: soak.requests,
+    peakRssMb: soak.rssPeakMb,
+    driftMb: soak.driftMb,
+    throughputDrift: soak.throughputDrift,
+    windows: soak.windows.length,
+  } : null,
   session: {
     turns: turnStats.length,
     firstAvgMs: Number(average(head).toFixed(1)),
@@ -294,6 +353,10 @@ else {
     `rss ${summary.session.rssGrowthMb >= 0 ? '+' : ''}${summary.session.rssGrowthMb}MB`);
   console.log(`bypass ${summary.circuit.bypass} · fallback ${summary.circuit.fallback} · ` +
     `cooldown ${summary.circuit.cooldown}`);
+  if (summary.soak) {
+    console.log(`soak: ${summary.soak.requests} requests · peak rss ${summary.soak.peakRssMb}MB · ` +
+      `drift ${summary.soak.driftMb}MB · throughput ${summary.soak.throughputDrift}x of the first half`);
+  }
   if (violations.length) console.log('violations:\n' + violations.slice(0, 8).join('\n'));
 }
 process.exitCode = violations.length ? 1 : 0;

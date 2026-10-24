@@ -351,7 +351,16 @@ Reference numbers (this development machine, Node 24, client and proxy in one pr
 | Mixed throughput | ~700–980 req/s at 1,200 requests / concurrency 24, p50 16–25ms, p95 55–82ms |
 | Long session | 120 turns, 247KB history: 3.1ms (3.9ms before the fix) |
 | Body size | 1MB in 7.7–8.9ms (~120MB/s) |
+| Retry cost | 1MB + one retry 10.7ms vs 12.8ms before, four failures 9.8ms vs 12.1ms (~17–19% better) |
 | Circuit | 4 failures → Plan fallback, Plan during cooldown, external again after recovery |
+
+Long runs use `--soak`, which also samples resident memory and window throughput.
+
+```powershell
+node tests/simulate.mjs --soak 3000 --concurrency 16
+```
+
+Measured: 3,000 requests with a **245MB peak RSS, 5.6MB drift and 1.0x throughput** in the second half (no leak or slowdown), with the latency ring pinned at 512 samples.
 
 Dashboard refresh cost is measured the same way (a snapshot is rebuilt every two seconds):
 
