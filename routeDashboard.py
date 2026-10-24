@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import socket
 import threading
 import time
@@ -28,7 +29,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 ROUTE_LOG = ROOT / ".route.log"
 PROXY_FILE = ROOT / "claudeRouteProxy.mjs"
+PID_FILE = ROOT / ".dashboard.pid"
 PROJECTS = Path.home() / ".claude" / "projects"
+DEFAULT_PORT = 8787
 ACCOUNT_TTL = 60
 SESSION_SUFFIX = ".jsonl"
 ROUTE_WINDOW = 60
@@ -68,6 +71,7 @@ HELP_SECTION = {
         ["python routeDashboard.py --status --pretty", "읽기 좋게 들여쓰기"],
         ["python routeDashboard.py --status --usage", "토큰·비용까지 집계 (느림)"],
         ["python routeDashboard.py --status --offline", "OpenRouter 호출 생략"],
+        ["powershell -File startClaudeDashboard.ps1", "고정 포트(8787)로 이 페이지 열기"],
     ],
     "endpoints": [
         ["GET /api/status", "위와 같은 요약 JSON"],
@@ -916,15 +920,67 @@ class DashboardServer(ThreadingHTTPServer):
         super().server_bind()
 
 
-def serve(host="127.0.0.1", port=8787, refresh=3):
+def _read_pid_record(path=None):
+    """Previous instance record, so a redeploy can take the same port instead of moving."""
+    try:
+        data = json.loads(Path(path or PID_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if isinstance(data, dict) and isinstance(data.get("pid"), int) and isinstance(data.get("port"), int):
+        return data
+    return None
+
+
+def _write_pid_record(port, path=None):
+    record = {"pid": os.getpid(), "port": port,
+              "started": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    try:
+        Path(path or PID_FILE).write_text(json.dumps(record), encoding="utf-8")
+    except OSError:
+        pass
+    return record
+
+
+def _port_open(port, host="127.0.0.1"):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.25)
+        return probe.connect_ex((host, port)) == 0
+
+
+def _stop_previous(port, path=None, timeout=5.0):
+    """Terminate a dashboard this launcher started before, keeping the requested port stable."""
+    record = _read_pid_record(path)
+    if not record or record.get("pid") == os.getpid() or record.get("port") != port:
+        return False
+    if not _port_open(port):
+        return False
+    try:
+        os.kill(record["pid"], signal.SIGTERM)
+    except OSError:
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _port_open(port):
+            return True
+        time.sleep(0.15)
+    return not _port_open(port)
+
+
+def serve(host="127.0.0.1", port=DEFAULT_PORT, refresh=3, allow_fallback=False):
     threading.Thread(target=_refresh_loop, args=(max(1, refresh),), daemon=True).start()
+    # A previous dashboard keeps its port between restarts; take it over instead of moving.
+    _stop_previous(port)
     fallback = None
     try:
         server = DashboardServer((host, port), Handler)
-    except OSError:
-        # A requested port can be reserved by Windows; any free loopback port is equivalent here.
+    except OSError as error:
+        if not allow_fallback:
+            raise SystemExit(
+                f"port {port} is unavailable ({error}). Stop the other listener or start with "
+                f"--port <port>, or pass --allow-port-fallback to pick a free port.") from None
         server = DashboardServer((host, 0), Handler)
         fallback = "requested_port_unavailable"
+    _write_pid_record(server.server_address[1])
     url = f"http://{host}:{server.server_address[1]}/"
     print(json.dumps({"dashboard": url, "route_log": str(ROUTE_LOG), "read_only": True,
                       **({"port_fallback": fallback} if fallback else {})}), flush=True)
@@ -934,6 +990,12 @@ def serve(host="127.0.0.1", port=8787, refresh=3):
         pass
     finally:
         server.server_close()
+        record = _read_pid_record()
+        if record and record.get("pid") == os.getpid():
+            try:
+                PID_FILE.unlink()
+            except OSError:
+                pass
 
 
 def status_report(include_usage=False, offline=False):
@@ -1002,12 +1064,14 @@ def status_exit_code(report):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Read-only loopback dashboard for OpenRouter routing")
     parser.add_argument("--host", default="127.0.0.1", help="Loopback address to bind")
-    parser.add_argument("--port", type=int, default=8787, help="Port to listen on")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port to listen on")
     parser.add_argument("--refresh", type=int, default=3, help="Seconds between background scans")
     parser.add_argument("--status", action="store_true", help="Print one JSON status report and exit")
     parser.add_argument("--usage", action="store_true", help="Include token and cost totals (slower)")
     parser.add_argument("--offline", action="store_true", help="Skip OpenRouter account and pricing calls")
     parser.add_argument("--pretty", action="store_true", help="Indent the status report")
+    parser.add_argument("--allow-port-fallback", action="store_true",
+                        help="Pick a free port instead of failing when the requested port is busy")
     args = parser.parse_args(argv)
     if args.status:
         report = status_report(include_usage=args.usage, offline=args.offline)
@@ -1015,7 +1079,7 @@ def main(argv=None):
         return status_exit_code(report)
     if args.host not in ("127.0.0.1", "::1", "localhost"):
         raise SystemExit("Bind a loopback address only")
-    serve(args.host, args.port, args.refresh)
+    serve(args.host, args.port, args.refresh, allow_fallback=args.allow_port_fallback)
     return 0
 
 

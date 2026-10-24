@@ -6,6 +6,7 @@ __pycache__/
 *.pyc
 node_modules/
 *.log
+.dashboard.pid
 .analysis/
 *.bundle
 PROGRESS.md

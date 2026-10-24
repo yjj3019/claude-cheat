@@ -1,6 +1,7 @@
 """Dashboard aggregation runs on synthetic logs and transcripts only."""
 import contextlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -445,7 +446,7 @@ class TransitionTests(unittest.TestCase):
         for row in dash.HELP_SECTION["states"] + dash.HELP_SECTION["exit_codes"]:
             self.assertEqual(len(row), 2)
         commands = dash.HELP_SECTION["commands"]
-        self.assertEqual(len(commands), 4)
+        self.assertEqual(len(commands), 5)
         self.assertTrue(all(len(row) == 2 and all(row) for row in commands))
         joined = " ".join(row[0] for row in commands)
         for flag in ("--status", "--pretty", "--usage", "--offline"):
@@ -509,6 +510,48 @@ class ProxyStaleTests(unittest.TestCase):
             alerts = dash.build_alerts(routing, {}, {"ok": True, "limit_usd": 50, "remaining_usd": 40},
                                        {"ok": True})
         self.assertIn("실행기 재시작 필요", [alert["title"] for alert in alerts])
+
+
+class PortTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.pid_file = self.root / ".dashboard.pid"
+        self.enterContext(mock.patch.object(dash, "PID_FILE", self.pid_file))
+
+    def test_pid_record_roundtrip_and_malformed_input(self):
+        self.assertIsNone(dash._read_pid_record())
+        self.pid_file.write_text("{broken", encoding="utf-8")
+        self.assertIsNone(dash._read_pid_record())
+        self.pid_file.write_text('{"pid": "x", "port": 1}', encoding="utf-8")
+        self.assertIsNone(dash._read_pid_record())
+        record = dash._write_pid_record(8787)
+        self.assertEqual(record["port"], 8787)
+        self.assertEqual(dash._read_pid_record()["pid"], record["pid"])
+        self.assertIn("started", record)
+
+    def test_busy_port_fails_instead_of_moving(self):
+        import socket as socket_module
+
+        holder = socket_module.socket()
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        port = holder.getsockname()[1]
+        try:
+            with mock.patch.object(dash, "_refresh_loop", lambda *args: None):
+                with self.assertRaises(SystemExit):
+                    dash.serve(port=port)
+        finally:
+            holder.close()
+
+    def test_previous_instance_is_only_stopped_for_its_own_port(self):
+        self.pid_file.write_text(json.dumps({"pid": os.getpid(), "port": 1}), encoding="utf-8")
+        self.assertFalse(dash._stop_previous(8787))
+        self.assertFalse(dash._stop_previous(1))
+
+    def test_default_port_is_stable(self):
+        self.assertEqual(dash.DEFAULT_PORT, 8787)
+        parser_default = inspect.signature(dash.serve).parameters["port"].default
+        self.assertEqual(parser_default, dash.DEFAULT_PORT)
 
 
 class ServerTests(unittest.TestCase):

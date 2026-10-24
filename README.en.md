@@ -219,7 +219,7 @@ Every interactive launch now makes one minimal provider-only inference check bef
 .\startClaudeDashboard.ps1
 ```
 
-A **read-only** page bound to `127.0.0.1`, refreshed every two seconds. The default port is 8787; if it is taken or reserved the server picks a free loopback port and prints the real address.
+A **read-only** page bound to `127.0.0.1`, refreshed every two seconds. The port is **fixed at 8787**; an older dashboard instance is stopped automatically so the same port is reused. If another program holds that port the server fails with a message instead of silently moving; pass `--allow-port-fallback` to pick a free port instead.
 
 | Panel | Content |
 | --- | --- |
