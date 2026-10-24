@@ -227,6 +227,16 @@ test('citation fields echoed back in history keep the request on the replacement
   assert.deepEqual(calls[0].parsedBody.messages[1].content[0].citations, citations);
 });
 
+test('the 1M context beta keeps the request on the replacement route', async t => {
+  const { calls, request } = await fixture(t);
+  const beta = BETA + ',context-1m-2025-08-07';
+  const response = await request(requestBody(SONNET), { headers: { ...proHeaders, 'anthropic-beta': beta } });
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, 'https://openrouter.ai/api/v1/messages');
+});
+
 test('replacement route logs the model that actually served the request', async t => {
   const log = t.mock.method(console, 'error', () => {});
   const { calls, request } = await fixture(t);

@@ -136,9 +136,11 @@ function compatExclusion(body, beta) {
   }
   return externalExclusion(copy, '', true, true);
 }
-// Claude Code 2.1.310 sends these on every request, even with experimental betas disabled. They only
-// steer reasoning hints this proxy rewrites per request, so a name alone must not divert traffic to Plan.
-const BASELINE_BETAS = new Set(['interleaved-thinking-2025-05-14', 'effort-2025-11-24']);
+// Claude Code sends these on every request, even with experimental betas disabled. They only
+// steer reasoning hints or the client's context budget, so a name alone must not divert traffic to Plan.
+// context-1m only raises the client budget: it adds no request field and providers ignore the header.
+const BASELINE_BETAS = new Set(['interleaved-thinking-2025-05-14', 'effort-2025-11-24',
+  'context-1m-2025-08-07']);
 function unsupportedBetas(beta, localCompat = false) {
   return (beta || '').split(',').map(x => x.trim()).filter(x => x &&
     !BASELINE_BETAS.has(x) && !(localCompat && COMPAT_BETAS.has(x)) &&
