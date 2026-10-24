@@ -91,7 +91,8 @@ const FABLE = 'claude-fable-5-1';
 const requestBody = (model = DEEPSEEK, extra = {}) => ({
   model, max_tokens: 64, messages: [{ role: 'user', content: 'fixture' }], ...extra,
 });
-const jsonResponse = (_url, options) => new Response(JSON.stringify({ type: 'message',
+const META = { id: 'msg_fixture', role: 'assistant', usage: { input_tokens: 1, output_tokens: 1 } };
+const jsonResponse = (_url, options) => new Response(JSON.stringify({ ...META, type: 'message',
   model: options ? JSON.parse(options.body).model : DEEPSEEK, content: [{ type: 'text', text: 'fixture answer' }], stop_reason: 'end_turn' }), {
   headers: { 'content-type': 'application/json' },
 });
@@ -102,7 +103,7 @@ const sseResponse = (parts) => new Response(new ReadableStream({
   },
 }), { headers: { 'content-type': 'text/event-stream' } });
 const frame = (type, extra = {}) => `event: ${type}\ndata: ${JSON.stringify({ type,
-  ...(type === 'message_start' ? { message: { model: DEEPSEEK } } : {}),
+  ...(type === 'message_start' ? { message: { ...META, model: DEEPSEEK } } : {}),
   ...(type === 'message_delta' ? { delta: { stop_reason: 'end_turn' } } : {}), ...extra })}\n\n`;
 
 async function fixture(t, upstream = jsonResponse, config = {}) {
@@ -208,7 +209,7 @@ for (const provider of ['openrouter', 'local']) {
     const config = provider === 'local' ? { provider, localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-model' } : {};
     const { calls, request } = await fixture(t, (_url, options) => {
       const body = JSON.parse(options.body);
-      return Response.json({ type: 'message', model: body.model,
+      return Response.json({ ...META, type: 'message', model: body.model,
         content: body.messages.length === 1 ? [tool] : [{ type: 'text', text: 'history preserved' }],
         stop_reason: body.messages.length === 1 ? 'tool_use' : 'end_turn' });
     }, config);
@@ -398,7 +399,7 @@ const contentStream = (content, stopReason = 'end_turn') => frame('message_start
   content.map((block, index) => frame('content_block_start', { index, content_block: block }) +
     frame('content_block_stop', { index })).join('') +
   frame('message_delta', { delta: { stop_reason: stopReason } }) + frame('message_stop');
-const complete = model => frame('message_start', { message: { model } }) +
+const complete = model => frame('message_start', { message: { ...META, model } }) +
   frame('content_block_start', { index: 0, content_block: { type: 'text', text: '' } }) +
   frame('content_block_delta', { index: 0, delta: { type: 'text_delta', text: 'fixture answer' } }) +
   frame('content_block_stop', { index: 0 }) + frame('message_delta') + frame('message_stop');
@@ -489,7 +490,7 @@ for (const stopReason of ['refusal', 'model_context_window_exceeded']) {
   for (const format of ['json', 'sse']) {
     test(`external ${format} explicit ${stopReason} is preserved without retry or fallback`, async t => {
       const { calls, request } = await fixture(t, () => format === 'json'
-        ? new Response(JSON.stringify({ type: 'message', model: DEEPSEEK, content: [], stop_reason: stopReason }), { headers: { 'content-type': 'application/json' } })
+        ? new Response(JSON.stringify({ ...META, type: 'message', model: DEEPSEEK, content: [], stop_reason: stopReason }), { headers: { 'content-type': 'application/json' } })
         : sseResponse([contentStream([], stopReason)]));
       const response = await request(requestBody(SONNET, { stream: format === 'sse' }), { headers: proHeaders });
       assert.equal(response.status, 200);
@@ -1412,7 +1413,7 @@ test('stale in-flight failure does not reopen a recovered circuit', async t => {
 });
 
 test('ordinary mode never asks external for thinking and rejects a thinking reply for that request only', async t => {
-  const withThinking = () => Response.json({ type: 'message', model: DEEPSEEK, stop_reason: 'end_turn',
+  const withThinking = () => Response.json({ ...META, type: 'message', model: DEEPSEEK, stop_reason: 'end_turn',
     content: [{ type: 'thinking', thinking: 'x', signature: 'external' }, { type: 'text', text: 'ok' }] });
   const { calls, request } = await fixture(t, (url, options) => url === proURL ? jsonResponse(url, options) : withThinking());
   await (await request(requestBody(SONNET, { thinking: { type: 'adaptive' } }), { headers: proHeaders })).text();
@@ -1486,4 +1487,31 @@ test('Local-only HTTP 402 reports a billing-specific code without retry', async 
   assert.equal(response.status, 400);
   assert.match(await response.text(), /local_payment_required/);
   assert.equal(calls.length, 1);
+});
+
+for (const [label, patch] of [['missing id', { id: undefined }], ['wrong role', { role: 'user' }], ['missing usage', { usage: undefined }]]) {
+  test(`OpenRouter reply with ${label} is rejected and retried`, async t => {
+    const { calls, request } = await fixture(t, (url, options) => url === proURL ? jsonResponse(url, options) :
+      Response.json({ ...META, type: 'message', model: DEEPSEEK, content: [{ type: 'text', text: 'x' }], stop_reason: 'end_turn', ...patch }));
+    await (await request(requestBody(SONNET), { headers: proHeaders })).text();
+    assert.equal(calls.filter(call => call.url === externalURL).length, 4);
+    assert.equal(calls.at(-1).url, proURL);
+  });
+}
+
+test('Local replies are not held to the OpenRouter message metadata shape', async t => {
+  const { calls, request } = await fixture(t, () => Response.json({ type: 'message', model: 'fixture-local', content: [{ type: 'text', text: 'x' }], stop_reason: 'end_turn' }),
+    { provider: 'local', localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-local' });
+  const response = await request(requestBody(SONNET), { headers: proHeaders });
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 1);
+});
+
+test('SSE frame whose event name differs from its JSON type is rejected', async t => {
+  const wrong = complete(DEEPSEEK).replace('event: message_stop', 'event: error');
+  assert.notEqual(wrong, complete(DEEPSEEK));
+  const { calls, request } = await fixture(t, (url, options) => url === proURL ? jsonResponse(url, options) : sseResponse([wrong]));
+  await (await request(requestBody(SONNET, { stream: true }), { headers: proHeaders })).text();
+  assert.equal(calls.filter(call => call.url === externalURL).length, 4);
+  assert.equal(calls.at(-1).url, proURL);
 });

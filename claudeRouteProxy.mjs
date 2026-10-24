@@ -173,7 +173,12 @@ function localEndpoint(value, allowRemote, httpUrl) {
   return url.href;
 }
 
-async function bufferedResponse(upstream, model, clientModel, stream, signal, onProgress) {
+// Verified live against OpenRouter: every message carries id, role=assistant and token usage.
+const validMessageMeta = message => typeof message?.id === 'string' && message.id && message.role === 'assistant' &&
+  Number.isFinite(message.usage?.input_tokens) && message.usage.input_tokens >= 0 &&
+  Number.isFinite(message.usage?.output_tokens) && message.usage.output_tokens >= 0;
+
+async function bufferedResponse(upstream, model, clientModel, stream, signal, onProgress, strictMeta = false) {
   if (!upstream.ok) throw new Error('External request failed');
   if (!upstream.body) throw new Error('Empty message response');
   const sse = (upstream.headers.get('content-type') || '').includes('text/event-stream');
@@ -219,7 +224,8 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal, on
   if (!sse) {
     const response = JSON.parse(text);
     if (response.type !== 'message' || response.model !== model || !Array.isArray(response.content) ||
-        !response.content.every(validContentBlock) || !STOP_REASONS.has(response.stop_reason)) throw new Error('Invalid message response');
+        !response.content.every(validContentBlock) || !STOP_REASONS.has(response.stop_reason) ||
+        (strictMeta && !validMessageMeta(response))) throw new Error('Invalid message response');
     if (!response.content.some(usableContent) && !CONTROL_STOPS.has(response.stop_reason)) throw new Error('Empty message response');
     response.model = clientModel;
     return { contentType: 'application/json', text: JSON.stringify(response) };
@@ -238,10 +244,13 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal, on
     if (!data) { output.push(frame + '\n\n'); continue; }
     if (data === '[DONE]') { if (!stopped) throw new Error('Premature stream terminator'); continue; }
     const event = JSON.parse(data);
+    const named = frame.split(/\r?\n/).find(line => line.startsWith('event:'))?.slice(6).trim();
+    if (named !== undefined && named !== event.type) throw new Error('Unexpected stream event');
     if (!['message_start', 'content_block_start', 'content_block_delta', 'content_block_stop', 'message_delta', 'message_stop', 'ping'].includes(event.type)) throw new Error('Unexpected stream event');
     if (stopped) { if (event.type === 'ping') continue; throw new Error('Event after message stop'); }
     if (event.type === 'message_start') {
       if (started || event.message?.model !== model) throw new Error('Wrong response model');
+      if (strictMeta && !validMessageMeta(event.message)) throw new Error('Invalid stream metadata');
       started = true;
       event.message.model = clientModel;
     } else if (event.type !== 'ping' && !started) throw new Error('Missing start');
@@ -290,10 +299,7 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal, on
 
 function jsonMessageStream(text) {
   const message = JSON.parse(text);
-  if (typeof message.id !== 'string' || !message.id || message.role !== 'assistant' ||
-      !Number.isFinite(message.usage?.input_tokens) || message.usage.input_tokens < 0 ||
-      !Number.isFinite(message.usage?.output_tokens) || message.usage.output_tokens < 0)
-    throw new Error('Invalid stream metadata');
+  if (!validMessageMeta(message)) throw new Error('Invalid stream metadata');
   const frame = (type, fields = {}) => `event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`;
   let output = frame('message_start', { message: { ...message, content: [], stop_reason: null, stop_sequence: null,
     usage: { ...message.usage, output_tokens: 0 } } });
@@ -563,7 +569,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
                 await response.body?.cancel();
                 throw new Error('External request failed');
               }
-              const validated = await bufferedResponse(response, externalModel, model, noPlan ? false : body.stream, controller.signal, noPlan ? undefined : arm);
+              const validated = await bufferedResponse(response, externalModel, model, noPlan ? false : body.stream, controller.signal, noPlan ? undefined : arm, provider === 'openrouter');
               if (compatProfile) {
                 const content = JSON.parse(validated.text).content;
                 if (content.some(block => Object.keys(block).some(name =>
