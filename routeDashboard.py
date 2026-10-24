@@ -911,226 +911,599 @@ def _refresh_loop(interval):
 
 
 PAGE = """<!doctype html>
-<html lang="ko"><head><meta charset="utf-8"><title>OpenRouter 라우팅 대시보드</title>
+<html lang="ko"><head><meta charset="utf-8"><title>OpenRouter 라우팅 콘솔</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-:root{color-scheme:dark}
+:root{
+ color-scheme:dark;
+ --bg:#070b12; --bg-soft:#0b1119; --panel:#0f1622; --panel-2:#121a28; --panel-3:#162031;
+ --line:#1d2739; --line-2:#27344b; --line-3:#33465f;
+ --fg:#e9eff8; --fg-2:#b6c2d4; --fg-3:#8391a7; --fg-4:#5f6d83;
+ --accent:#5b9dff; --accent-soft:rgba(91,157,255,.16); --accent-line:rgba(91,157,255,.45);
+ --ok:#43d9a3; --ok-soft:rgba(67,217,163,.14); --ok-line:rgba(67,217,163,.4);
+ --warn:#f2b95e; --warn-soft:rgba(242,185,94,.14); --warn-line:rgba(242,185,94,.4);
+ --bad:#ff7089; --bad-soft:rgba(255,112,137,.14); --bad-line:rgba(255,112,137,.4);
+ --radius:16px; --radius-sm:11px; --radius-xs:8px;
+ --shadow:0 18px 40px -24px rgba(0,0,0,.9), 0 2px 8px rgba(0,0,0,.35);
+ --mono:ui-monospace,"Cascadia Mono","JetBrains Mono",Consolas,monospace;
+ --sans:"Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,"Malgun Gothic",sans-serif;
+}
 *{box-sizing:border-box}
-body{margin:0;padding:24px;background:#0b1020;color:#e6ebf5;
- font:14px/1.5 "Segoe UI",system-ui,-apple-system,sans-serif}
-h1{font-size:18px;margin:0 0 4px;font-weight:600}
-.sub{color:#8b97ad;font-size:12px;margin-bottom:20px}
-.grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
-.card{background:#141b2d;border:1px solid #24304a;border-radius:12px;padding:16px}
-.card h2{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#8b97ad;margin:0 0 10px;font-weight:600}
-.big{font-size:26px;font-weight:700;line-height:1.2}
-.badge{display:inline-block;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600}
-.ext{background:#0f3b2e;color:#5ee6a8;border:1px solid #1c6b52}
-.plan{background:#3a1f12;color:#ffb27a;border:1px solid #6d3a1d}
-.idle{background:#232b3d;color:#9aa7bf;border:1px solid #34405a}
-.unknown{background:#232b3d;color:#9aa7bf;border:1px solid #34405a}
-.kv{display:flex;justify-content:space-between;padding:3px 0;color:#b9c4d6}
-.kv b{color:#e6ebf5;font-weight:600}
-.bar{height:8px;border-radius:6px;background:#1e2740;overflow:hidden;margin:10px 0}
-.bar>i{display:block;height:100%;background:linear-gradient(90deg,#3f7dff,#5ee6a8)}
-table{width:100%;border-collapse:collapse;font-size:12px}
-th,td{text-align:left;padding:5px 4px;border-bottom:1px solid #202a41;white-space:nowrap}
-th{color:#8b97ad;font-weight:600}
-td.num{text-align:right;font-variant-numeric:tabular-nums}
-.mono{font-family:ui-monospace,Consolas,monospace;font-size:11px;color:#9aa7bf}
-.wide{grid-column:1/-1}
-.muted{color:#77839a}
-.alerts{display:flex;flex-direction:column;gap:8px;margin-bottom:14px}
-.alert{border-radius:10px;padding:10px 12px;border:1px solid;font-size:13px}
-.alert b{display:block;margin-bottom:2px}
-.alert.critical{background:#3a1220;border-color:#7d2740;color:#ffb3c4}
-.alert.warn{background:#3a2a12;border-color:#7d5527;color:#ffd39b}
-.alert.info{background:#1a2438;border-color:#2c3b58;color:#a9bad6}
-.timeline{display:flex;align-items:flex-end;gap:3px;height:120px;margin-top:6px}
-.tl-col{flex:1;display:flex;flex-direction:column;justify-content:flex-end;height:100%}
-.tl-plan{background:#c9803a}
-.tl-ext{background:#3fae7a}
-.tl-labels{display:flex;gap:3px;margin-top:4px}
-.tl-labels span{flex:1;font-size:9px;color:#77839a;text-align:center;font-family:ui-monospace,Consolas,monospace}
-.legend{display:flex;gap:14px;font-size:11px;color:#9aa7bf;margin-top:8px}
-.legend i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:4px}
-a{color:#7fb0ff}
-details{margin:8px 0}
-summary{cursor:pointer;color:#b9c4d6;font-size:12px;margin:4px 0}
-.hint{font-size:11px;color:#8b97ad;line-height:1.5;margin-top:2px}
-.hint b{color:#c8d2e4}
-.reason{margin-bottom:8px}
-.code{background:#0e1526;border:1px solid #24304a;border-radius:8px;padding:10px 12px;overflow-x:auto;
- font-family:ui-monospace,Consolas,monospace;font-size:11px;line-height:1.7;color:#c8d2e4;margin:8px 0 4px;
- white-space:pre}
-.row{display:flex;gap:8px;align-items:center;margin:6px 0;color:#b9c4d6;font-size:12px}
-.row span{min-width:132px}
-.row input[type=text],.row input[type=password]{flex:1;background:#0e1526;border:1px solid #24304a;border-radius:8px;
- padding:6px 8px;color:#e6ebf5;font:12px ui-monospace,Consolas,monospace}
-.row input[type=checkbox]{width:16px;height:16px}
-.actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
-.actions button{background:#2b4b8f;border:1px solid #3a63b8;color:#e6ebf5;border-radius:8px;
- padding:6px 12px;font-size:12px;cursor:pointer}
-.actions button.ghost{background:#1a2438;border-color:#2c3b58}
-.result{margin-top:8px;color:#8b97ad;white-space:pre-wrap;word-break:break-all}
+html,body{height:100%}
+body{margin:0;background:
+ radial-gradient(1200px 600px at 15% -10%, rgba(91,157,255,.10), transparent 60%),
+ radial-gradient(900px 500px at 100% 0%, rgba(67,217,163,.06), transparent 55%),
+ var(--bg);
+ color:var(--fg);font:14px/1.55 var(--sans);-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+h1,h2,h3,p{margin:0}
+.wrap{max-width:1460px;margin:0 auto;padding:0 28px}
+.mono{font-family:var(--mono);font-size:12px;letter-spacing:-.1px}
+.muted{color:var(--fg-3)}
+
+/* top bar */
+.topbar{position:sticky;top:0;z-index:40;background:rgba(7,11,18,.82);
+ backdrop-filter:blur(14px) saturate(140%);border-bottom:1px solid var(--line)}
+.topbar-in{display:flex;align-items:center;justify-content:space-between;gap:20px;height:66px}
+.brand{display:flex;align-items:center;gap:13px;min-width:0}
+.logo{width:34px;height:34px;border-radius:11px;flex:0 0 auto;
+ background:linear-gradient(145deg,#5b9dff,#2f6bd6);box-shadow:0 6px 18px -6px rgba(91,157,255,.8);
+ position:relative}
+.logo::after{content:"";position:absolute;inset:9px;border-radius:50%;
+ border:2px solid rgba(255,255,255,.9);border-right-color:transparent;border-bottom-color:transparent;
+ transform:rotate(35deg)}
+.brand h1{font-size:15px;font-weight:650;letter-spacing:-.2px}
+.brand p{font-size:11.5px;color:var(--fg-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.top-actions{display:flex;align-items:center;gap:10px;flex:0 0 auto}
+
+/* pills + chips */
+.pill{display:inline-flex;align-items:center;gap:8px;height:30px;padding:0 12px;border-radius:999px;
+ font-size:12px;font-weight:600;border:1px solid var(--line-2);background:var(--panel-2);color:var(--fg-2);
+ white-space:nowrap}
+.pill .dot{width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 0 3px rgba(255,255,255,.04)}
+.pill-ok{color:var(--ok);border-color:var(--ok-line);background:var(--ok-soft)}
+.pill-warn{color:var(--warn);border-color:var(--warn-line);background:var(--warn-soft)}
+.pill-bad{color:var(--bad);border-color:var(--bad-line);background:var(--bad-soft)}
+.pill-mute{color:var(--fg-3)}
+.chip{display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 9px;border-radius:7px;
+ font-size:11px;font-family:var(--mono);color:var(--fg-2);background:var(--panel-3);border:1px solid var(--line)}
+
+/* layout */
+main{padding:26px 0 80px}
+.grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:18px}
+.col-3{grid-column:span 3}.col-4{grid-column:span 4}.col-5{grid-column:span 5}
+.col-6{grid-column:span 6}.col-7{grid-column:span 7}.col-8{grid-column:span 8}
+.col-12{grid-column:span 12}
+@media(max-width:1180px){.col-3{grid-column:span 6}.col-4,.col-5,.col-7,.col-8{grid-column:span 12}
+ .col-6{grid-column:span 12}}
+@media(max-width:720px){.col-3{grid-column:span 12}.wrap{padding:0 16px}}
+
+/* cards */
+.card{background:linear-gradient(180deg,var(--panel),var(--panel-2));border:1px solid var(--line);
+ border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden;display:flex;flex-direction:column}
+.card-h{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;
+ padding:16px 18px 13px;border-bottom:1px solid var(--line)}
+.card-h h2{font-size:13px;font-weight:650;letter-spacing:-.1px}
+.card-h .sub{font-size:11.5px;color:var(--fg-4);font-family:var(--mono);margin-top:2px}
+.card-b{padding:16px 18px 18px;flex:1;display:flex;flex-direction:column}
+.card-b.tight{padding:12px 18px 16px}
+
+/* buttons */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;height:34px;padding:0 14px;
+ border-radius:var(--radius-xs);border:1px solid var(--line-2);background:var(--panel-3);color:var(--fg);
+ font:600 12.5px/1 var(--sans);cursor:pointer;transition:.16s ease;white-space:nowrap}
+.btn:hover:not(:disabled){border-color:var(--line-3);background:#1a2436;transform:translateY(-1px)}
+.btn:active:not(:disabled){transform:none}
+.btn:focus-visible{outline:2px solid var(--accent-line);outline-offset:2px}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn-primary{background:linear-gradient(180deg,#5b9dff,#3b78e8);border-color:#6ba8ff;color:#fff;
+ box-shadow:0 8px 18px -10px rgba(91,157,255,.9)}
+.btn-primary:hover:not(:disabled){background:linear-gradient(180deg,#6ba8ff,#4482f0)}
+.btn-ghost{background:transparent}
+.btn-sm{height:28px;padding:0 10px;font-size:11.5px}
+.btn.loading::before{content:"";width:11px;height:11px;border-radius:50%;
+ border:2px solid rgba(255,255,255,.35);border-top-color:#fff;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* metrics */
+.metric{display:flex;flex-direction:column;gap:2px}
+.metric .k{font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--fg-4);font-weight:600}
+.metric .v{font-size:23px;font-weight:680;letter-spacing:-.6px;font-variant-numeric:tabular-nums}
+.metric .v small{font-size:12px;font-weight:600;color:var(--fg-3);letter-spacing:0}
+.metric-list{display:flex;flex-direction:column;gap:7px;margin-top:4px}
+.row-kv{display:flex;align-items:baseline;justify-content:space-between;gap:12px;font-size:12.5px}
+.row-kv .k{color:var(--fg-3)}
+.row-kv .v{color:var(--fg);font-variant-numeric:tabular-nums;text-align:right}
+.bar{height:7px;border-radius:999px;background:#0a1119;border:1px solid var(--line);overflow:hidden;margin:12px 0 10px}
+.bar>i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,#3b78e8,#43d9a3)}
+.hairline{height:1px;background:var(--line);margin:12px 0}
+
+/* tables */
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+thead th{font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--fg-4);font-weight:650;
+ text-align:left;padding:0 10px 8px 0;border-bottom:1px solid var(--line)}
+tbody td{padding:9px 10px 9px 0;border-bottom:1px solid rgba(255,255,255,.035);vertical-align:middle}
+tbody tr:last-child td{border-bottom:0}
+tbody tr:hover td{background:rgba(91,157,255,.04)}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+td.id{font-family:var(--mono);font-size:11.5px;color:var(--fg-2)}
+
+/* alerts */
+.alerts{display:flex;flex-direction:column;gap:10px;margin-bottom:18px}
+.alert{display:flex;gap:12px;align-items:flex-start;padding:12px 15px;border-radius:var(--radius-sm);
+ border:1px solid var(--line-2);background:var(--panel-2);font-size:12.5px}
+.alert .icon{width:18px;height:18px;border-radius:50%;flex:0 0 auto;margin-top:1px;
+ display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700}
+.alert b{display:block;font-size:12.5px;margin-bottom:1px}
+.alert .txt{color:var(--fg-2)}
+.alert.critical{border-color:var(--bad-line);background:var(--bad-soft)}
+.alert.critical .icon{background:var(--bad);color:#3a0a13}
+.alert.warn{border-color:var(--warn-line);background:var(--warn-soft)}
+.alert.warn .icon{background:var(--warn);color:#3a2606}
+.alert.info{border-color:var(--accent-line);background:var(--accent-soft)}
+.alert.info .icon{background:var(--accent);color:#06152e}
+
+/* settings form */
+.setting-form{display:flex;flex-direction:column}
+.field{padding:11px 0;border-bottom:1px dashed rgba(255,255,255,.05)}
+.field:last-of-type{border-bottom:0}
+.field label{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600;color:var(--fg-2);margin-bottom:6px}
+.req{font-size:10px;font-weight:700;letter-spacing:.04em;color:var(--fg-4);text-transform:uppercase}
+.input{width:100%;height:38px;padding:0 12px;border-radius:var(--radius-xs);border:1px solid var(--line-2);
+ background:#0a111c;color:var(--fg);font:12.5px var(--mono);transition:.15s ease}
+.input::placeholder{color:var(--fg-4);font-family:var(--sans)}
+.input:hover{border-color:var(--line-3)}
+.input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.input[readonly]{opacity:.85}
+.input-group{display:flex;gap:8px}
+.input-group .input{flex:1}
+.hint{font-size:11.5px;color:var(--fg-4);margin-top:6px;line-height:1.5}
+.hint b{color:var(--fg-3)}
+.field.invalid .input{border-color:var(--bad-line);box-shadow:0 0 0 3px var(--bad-soft)}
+.switch{display:inline-flex;align-items:center;gap:10px;cursor:pointer;user-select:none;font-size:12.5px;
+ color:var(--fg-2);font-weight:600}
+.switch input{position:absolute;opacity:0;width:0;height:0}
+.switch .track{width:38px;height:22px;border-radius:999px;background:#0a111c;border:1px solid var(--line-2);
+ position:relative;transition:.18s ease;flex:0 0 auto}
+.switch .track::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;
+ background:var(--fg-3);transition:.18s ease}
+.switch input:checked+.track{background:var(--accent-soft);border-color:var(--accent-line)}
+.switch input:checked+.track::after{left:18px;background:var(--accent)}
+.switch input:focus-visible+.track{box-shadow:0 0 0 3px var(--accent-soft)}
+.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}
+.save-state{font-size:11px;font-weight:600;color:var(--fg-4)}
+.save-state.dirty{color:var(--warn)}
+.result{margin-top:14px;border-top:1px solid var(--line);padding-top:12px;min-height:34px}
+.result-line{display:flex;align-items:center;gap:9px;font-size:12.5px;font-weight:600}
+.result-line .dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto}
+.result-line.ok{color:var(--ok)} .result-line.ok .dot{background:var(--ok);box-shadow:0 0 0 3px var(--ok-soft)}
+.result-line.bad{color:var(--bad)} .result-line.bad .dot{background:var(--bad);box-shadow:0 0 0 3px var(--bad-soft)}
+.result-meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.empty{color:var(--fg-4);font-size:12px}
+.stored{display:flex;flex-direction:column;gap:6px;margin-top:auto;padding-top:12px}
+.stored-title{font-size:10.5px;text-transform:uppercase;letter-spacing:.09em;color:var(--fg-4);font-weight:650;
+ margin-bottom:2px}
+.stored .row-kv{font-size:12px}
+
+/* timeline */
+.timeline{display:flex;align-items:flex-end;gap:4px;height:132px;padding-top:6px}
+.tl-col{flex:1;display:flex;flex-direction:column;justify-content:flex-end;min-width:0;position:relative;height:100%}
+.tl-ext{background:linear-gradient(180deg,#43d9a3,#2fb383);border-radius:3px 3px 0 0}
+.tl-plan{background:linear-gradient(180deg,#f2b95e,#c98f36);border-radius:3px 3px 0 0}
+.tl-col:hover .tl-ext,.tl-col:hover .tl-plan{filter:brightness(1.15)}
+.tl-labels{display:flex;gap:4px;margin-top:7px}
+.tl-labels span{flex:1;font-size:9.5px;color:var(--fg-4);text-align:center;font-family:var(--mono)}
+.legend{display:flex;gap:16px;font-size:11.5px;color:var(--fg-3);margin-top:10px}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:6px}
+
+/* help */
+details{border-top:1px solid var(--line);padding:10px 0}
+details:first-of-type{border-top:0}
+summary{cursor:pointer;font-size:12.5px;font-weight:600;color:var(--fg-2);list-style:none;
+ display:flex;align-items:center;justify-content:space-between}
+summary::-webkit-details-marker{display:none}
+summary::after{content:"+";color:var(--fg-4);font-weight:700}
+details[open] summary::after{content:"–"}
+details .card-b{padding-top:10px}
+.code{background:#080d15;border:1px solid var(--line);border-radius:var(--radius-sm);padding:12px 14px;
+ font:12px/1.85 var(--mono);color:var(--fg-2);white-space:pre;overflow-x:auto;margin:10px 0 4px}
+
+/* toasts */
+.toasts{position:fixed;right:22px;bottom:22px;z-index:80;display:flex;flex-direction:column;gap:9px}
+.toast{display:flex;align-items:center;gap:10px;min-width:230px;max-width:380px;padding:12px 14px;
+ border-radius:var(--radius-sm);border:1px solid var(--line-2);background:#0d1522;color:var(--fg);
+ font-size:12.5px;box-shadow:var(--shadow);animation:in .18s ease}
+.toast .dot{width:8px;height:8px;border-radius:50%}
+.toast.ok{border-color:var(--ok-line)} .toast.ok .dot{background:var(--ok)}
+.toast.warn{border-color:var(--warn-line)} .toast.warn .dot{background:var(--warn)}
+.toast.bad{border-color:var(--bad-line)} .toast.bad .dot{background:var(--bad)}
+.toast.out{opacity:0;transform:translateY(6px);transition:.25s ease}
+@keyframes in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+
+.section-title{display:flex;align-items:center;gap:10px;margin:30px 0 14px}
+.section-title h2{font-size:12px;text-transform:uppercase;letter-spacing:.1em;color:var(--fg-4);font-weight:650}
+.section-title .line{flex:1;height:1px;background:var(--line)}
 </style></head><body>
-<h1>OpenRouter 라우팅 대시보드</h1>
-<div class="sub" id="stamp">불러오는 중…</div>
-<div class="alerts" id="alerts"></div>
-<div class="grid" id="settings"></div>
-<div class="grid" id="grid"></div>
+<header class="topbar"><div class="wrap topbar-in">
+  <div class="brand">
+    <span class="logo"></span>
+    <div style="min-width:0">
+      <h1>OpenRouter 라우팅 콘솔</h1>
+      <p id="stamp">불러오는 중…</p>
+    </div>
+  </div>
+  <div class="top-actions">
+    <span class="pill pill-mute" id="live-pill"><span class="dot"></span><span id="live-text">확인 중</span></span>
+    <button class="btn btn-sm" onclick="tick(true)">새로고침</button>
+    <a class="btn btn-sm btn-ghost" href="#help">도움말</a>
+  </div>
+</div></header>
+
+<main class="wrap">
+  <div class="alerts" id="alerts"></div>
+
+  <div class="section-title"><h2>설정</h2><span class="line"></span></div>
+  <div class="grid" id="settings"></div>
+
+  <div class="section-title"><h2>상태</h2><span class="line"></span></div>
+  <div class="grid" id="grid"></div>
+
+  <div class="section-title"><h2>도움말</h2><span class="line"></span></div>
+  <div class="grid" id="help"></div>
+</main>
+<div class="toasts" id="toasts"></div>
+
 <script>
-const esc = value => String(value ?? '').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-const num = value => value === null || value === undefined ? '—' : Number(value).toLocaleString('ko-KR');
-const usd = value => value === null || value === undefined ? '—' : '$' + Number(value).toFixed(3);
-const usd4 = value => value === null || value === undefined ? '—' : '$' + Number(value).toFixed(4);
-const tokens = row => row ? (row[0] + row[1] + row[2] + row[3]) : 0;
-const stateText = {external:'OpenRouter 사용 중', plan:'Plan 우회 중', idle:'유휴', unknown:'기록 없음'};
-const stateClass = {external:'ext', plan:'plan', idle:'idle', unknown:'unknown'};
 const TOKEN = "__DASHBOARD_TOKEN__";
-const CONFIG_SPEC = {
-  openrouter: {title:'OpenRouter', note:'.env.openrouter', fields:[
-    ['OPENROUTER_MODEL','모델 ID','text','vendor/model'],
-    ['ANTHROPIC_AUTH_TOKEN','API 키','password','저장됨 — 변경할 때만 입력']]},
-  local: {title:'Local LLM', note:'.env.local-llm', fields:[
-    ['LOCAL_LLM_URL','Messages URL','text','http://127.0.0.1:11434/v1/messages'],
-    ['LOCAL_LLM_MODEL','모델 ID','text','설치된 모델 ID'],
-    ['LOCAL_LLM_API_KEY','서버 키 (선택)','password','저장됨 — 변경할 때만 입력'],
-    ['LOCAL_LLM_ALLOW_REMOTE','원격 HTTPS 허용','checkbox',''],
-    ['LOCAL_LLM_HTTP_URL','내부 HTTP 예외 URL','text',''],
-    ['LOCAL_LLM_MODELS_URL','모델 목록 URL','text','']]},
+const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const num = value => value === null || value === undefined || value === '' ? '—' : Number(value).toLocaleString('ko-KR');
+const usd = (value, digits = 3) => value === null || value === undefined ? '—' : '$' + Number(value).toFixed(digits);
+const tokens = row => row ? row.reduce((sum, value) => sum + value, 0) : 0;
+const stateText = {external:'OpenRouter 사용 중', plan:'Plan 우회 중', idle:'유휴', unknown:'기록 없음'};
+const statePill = {external:'pill-ok', plan:'pill-warn', idle:'pill-mute', unknown:'pill-mute'};
+const PROVIDERS = {
+  openrouter: {title:'OpenRouter', file:'.env.openrouter', fields:[
+    ['OPENROUTER_MODEL','모델 ID','text','vendor/model','OpenRouter 모델 목록의 정확한 ID','필수'],
+    ['ANTHROPIC_AUTH_TOKEN','API 키','password','sk-or-...','비워 두면 저장된 키를 유지합니다','필수']]},
+  local: {title:'Local LLM', file:'.env.local-llm', fields:[
+    ['LOCAL_LLM_URL','Messages URL','text','http://127.0.0.1:11434/v1/messages','Anthropic 호환 /v1/messages 주소','필수'],
+    ['LOCAL_LLM_MODEL','모델 ID','text','설치된 모델 ID','서버에 실제로 있는 모델 이름','필수'],
+    ['LOCAL_LLM_API_KEY','서버 키','password','선택 사항','비워 두면 저장된 키를 유지합니다','선택'],
+    ['LOCAL_LLM_ALLOW_REMOTE','원격 HTTPS 허용','switch','','루프백이 아닌 HTTPS 서버를 허용합니다','선택'],
+    ['LOCAL_LLM_HTTP_URL','내부 HTTP 예외','text','http://host/v1/messages','사내 서버용 예외 주소 (선택)','선택'],
+    ['LOCAL_LLM_MODELS_URL','모델 목록 URL','text','기본: /v1/models','모델 확인에 사용할 같은 출처 주소','선택']]},
 };
-let CONFIG = null;
+const ERROR_TEXT = {
+  unknown_provider:'알 수 없는 제공자', invalid_values:'입력 형식 오류', invalid_value:'값 형식 오류',
+  invalid_model:'모델 ID 형식이 올바르지 않습니다', invalid_key:'API 키 형식이 올바르지 않습니다 (sk-or-...)',
+  missing_anthropic_auth_token:'API 키가 필요합니다', missing_openrouter_model:'모델 ID가 필요합니다',
+  missing_local_llm_url:'Messages URL이 필요합니다', missing_local_llm_model:'모델 ID가 필요합니다',
+  invalid_local_url:'Local URL 규칙 위반 (http(s), /v1/messages, 루프백 또는 허용된 HTTPS)',
+  invalid_local_model:'모델 ID가 비어 있거나 잘못되었습니다', invalid_local_key:'서버 키에 제어 문자가 있습니다',
+  invalid_allow_remote:'원격 허용 값은 true/false여야 합니다', invalid_models_url:'모델 목록 URL이 올바르지 않습니다',
+  invalid_configuration:'설정이 올바르지 않습니다', write_failed:'파일을 쓰지 못했습니다',
+  token_required:'세션 토큰이 없습니다 (페이지 새로고침 후 다시 시도)', origin_rejected:'다른 출처의 요청입니다',
+  request_too_large:'요청이 너무 큽니다', invalid_json:'JSON 형식 오류', invalid_payload:'요청 형식 오류',
+  invalid_mode:'알 수 없는 테스트 모드', invalid_length:'요청 길이 오류',
+};
+const TEST_TEXT = {
+  ready:'연결과 추론이 정상입니다', model_found:'모델을 찾았습니다', model_not_found:'설정한 모델이 목록에 없습니다',
+  wrong_model:'다른 모델이 응답했습니다', empty_reply:'응답 본문이 비어 있습니다', http_error:'HTTP 오류',
+  connection_failed:'연결 실패', invalid_response:'응답 형식 오류', configuration_missing:'설정이 먼저 필요합니다',
+  invalid_configuration:'저장된 설정이 올바르지 않습니다',
+};
+
+let CONFIG = null, SNAP = null;
+const DIRTY = new Set(), BUSY = new Set(), RESULTS = {};
+
+function toast(kind, text) {
+  const host = document.getElementById('toasts');
+  const node = document.createElement('div');
+  node.className = 'toast ' + kind;
+  node.innerHTML = `<span class="dot"></span><span>${esc(text)}</span>`;
+  host.appendChild(node);
+  setTimeout(() => { node.classList.add('out'); setTimeout(() => node.remove(), 260); }, 3400);
+}
+
+function card(title, subtitle, body, span) {
+  return `<section class="card ${span || 'col-12'}">
+    <header class="card-h"><div><h2>${esc(title)}</h2>${subtitle ? `<p class="sub">${esc(subtitle)}</p>` : ''}</div></header>
+    <div class="card-b">${body}</div></section>`;
+}
+
+function kv(label, value, mono) {
+  return `<div class="row-kv"><span class="k">${esc(label)}</span><span class="v${mono ? ' mono' : ''}">${value}</span></div>`;
+}
+
+/* ---------- settings ---------- */
+function fieldValue(provider, name) {
+  const fields = (CONFIG && CONFIG[provider] && CONFIG[provider].fields) || {};
+  return fields[name] || {value:'', set:false, preview:'', secret:false};
+}
 
 function renderSettings(force) {
   if (!CONFIG) return;
   const host = document.getElementById('settings');
   if (!force && host.contains(document.activeElement)) return;
-  host.innerHTML = Object.entries(CONFIG_SPEC).map(([provider, spec]) => {
-    const current = (CONFIG[provider] || {}).fields || {};
-    const inputs = spec.fields.map(([name, label, type, placeholder]) => {
-      const field = current[name] || {value:'', set:false, preview:''};
+  host.innerHTML = Object.entries(PROVIDERS).map(([provider, spec]) => {
+    const rows = spec.fields.map(([name, label, type, placeholder, hint, badge]) => {
+      const field = fieldValue(provider, name);
       const id = `cfg-${provider}-${name}`;
-      if (type === 'checkbox')
-        return `<label class="row"><input type="checkbox" id="${id}" ${field.value === 'true' ? 'checked' : ''}><span>${esc(label)}</span></label>`;
-      const hint = field.secret && field.set
-        ? ` placeholder="저장됨 (${esc(field.preview)}) — 변경할 때만 입력"`
-        : ` placeholder="${esc(placeholder)}"`;
-      return `<label class="row"><span>${esc(label)}</span><input type="${type}" id="${id}" value="${field.secret ? '' : esc(field.value || '')}"${hint} autocomplete="off"></label>`;
+      const dirty = DIRTY.has(`${provider}:${name}`);
+      if (type === 'switch') {
+        return `<div class="field"><label>${esc(label)}<span class="req">${esc(badge)}</span></label>
+          <label class="switch"><input type="checkbox" id="${id}" data-provider="${provider}" data-name="${name}"
+            ${field.value === 'true' ? 'checked' : ''}><span class="track"></span>
+            <span>${field.value === 'true' ? '허용' : '허용 안 함'}</span></label>
+          <p class="hint">${esc(hint)}</p></div>`;
+      }
+      const value = field.secret ? '' : esc(field.value || '');
+      const effectivePlaceholder = field.secret && field.set
+        ? `저장됨 (${field.preview}) — 변경할 때만 입력` : placeholder;
+      const reveal = field.secret
+        ? `<button class="btn btn-sm btn-ghost" type="button" data-reveal="${id}">보기</button>` : '';
+      return `<div class="field${dirty ? ' invalid' : ''}" data-field="${provider}:${name}">
+        <label for="${id}">${esc(label)}<span class="req">${esc(badge)}</span></label>
+        <div class="input-group"><input class="input" id="${id}" type="${type}" value="${value}"
+          placeholder="${esc(effectivePlaceholder)}" data-provider="${provider}" data-name="${name}"
+          data-secret="${field.secret ? '1' : '0'}" autocomplete="off" spellcheck="false">${reveal}</div>
+        <p class="hint">${esc(hint)}</p></div>`;
     }).join('');
-    return `<div class="card">
-      <h2>${esc(spec.title)} 설정 <span class="muted" style="text-transform:none">${esc(spec.note)}</span></h2>
-      ${inputs}
-      <div class="actions">
-        <button onclick="saveConfig('${provider}')">저장</button>
-        <button class="ghost" onclick="testConfig('${provider}','metadata')">모델 확인</button>
-        <button class="ghost" onclick="testConfig('${provider}','inference')">추론 테스트</button>
-      </div>
-      <div class="mono result" id="cfg-result-${provider}">변경 사항은 새 세션부터 적용됩니다.</div>
-    </div>`;
+    const dirtyCount = spec.fields.filter(([name]) => DIRTY.has(`${provider}:${name}`)).length;
+    const stored = spec.fields.map(([name, label]) => {
+      const field = fieldValue(provider, name);
+      if (field.secret) {
+        return kv(label, field.set ? `<span class="mono">${esc(field.preview)}</span>`
+                                   : '<span class="empty">설정 안 됨</span>');
+      }
+      return kv(label, field.value ? esc(field.value) : '<span class="empty">설정 안 됨</span>');
+    }).join('');
+    return `<section class="card col-6" id="card-${provider}">
+      <header class="card-h">
+        <div><h2>${esc(spec.title)}</h2><p class="sub">${esc(spec.file)}</p></div>
+        <span class="save-state ${dirtyCount ? 'dirty' : ''}" id="state-${provider}">
+          ${dirtyCount ? `저장되지 않은 변경 ${dirtyCount}` : '저장됨'}</span>
+      </header>
+      <div class="card-b">
+        <div class="setting-form">${rows}</div>
+        <div class="actions">
+          <button class="btn btn-primary" data-busy-key="${provider}" onclick="saveSettings('${provider}')">저장</button>
+          <button class="btn" data-busy-key="${provider}:metadata" onclick="runTest('${provider}','metadata')">모델 확인</button>
+          <button class="btn" data-busy-key="${provider}:inference" onclick="runTest('${provider}','inference')">추론 테스트</button>
+        </div>
+        <div class="result" id="res-${provider}"></div>
+        <div class="hairline"></div>
+        <div class="stored"><span class="stored-title">현재 저장된 값</span>${stored}</div>
+      </div></section>`;
   }).join('');
+  wireSettings();
+  Object.keys(PROVIDERS).forEach(provider => renderResult(provider));
 }
 
-async function loadConfig() {
-  try {
-    CONFIG = await (await fetch('/api/config', {cache:'no-store'})).json();
-    renderSettings();
-  } catch (error) { /* keep the previous view */ }
+function wireSettings() {
+  document.querySelectorAll('#settings .input').forEach(input => {
+    input.addEventListener('input', () => {
+      const key = `${input.dataset.provider}:${input.dataset.name}`;
+      const original = fieldValue(input.dataset.provider, input.dataset.name);
+      const current = input.dataset.secret === '1' ? input.value : input.value;
+      const changed = input.dataset.secret === '1' ? current !== '' : current !== (original.value || '');
+      if (changed) DIRTY.add(key); else DIRTY.delete(key);
+      const field = input.closest('.field');
+      if (field) field.classList.toggle('invalid', false);
+      updateSaveState(input.dataset.provider);
+    });
+  });
+  document.querySelectorAll('#settings .switch input').forEach(input => {
+    input.addEventListener('change', () => {
+      DIRTY.add(`${input.dataset.provider}:${input.dataset.name}`);
+      const label = input.parentElement.querySelector('span:last-child');
+      if (label) label.textContent = input.checked ? '허용' : '허용 안 함';
+      updateSaveState(input.dataset.provider);
+    });
+  });
+  document.querySelectorAll('#settings [data-reveal]').forEach(button => {
+    button.addEventListener('click', () => {
+      const input = document.getElementById(button.dataset.reveal);
+      if (!input) return;
+      const reveal = input.type === 'password';
+      input.type = reveal ? 'text' : 'password';
+      button.textContent = reveal ? '숨기기' : '보기';
+    });
+  });
 }
 
-async function postConfig(path, payload) {
+function updateSaveState(provider) {
+  const spec = PROVIDERS[provider];
+  const count = spec.fields.filter(([name]) => DIRTY.has(`${provider}:${name}`)).length;
+  const node = document.getElementById(`state-${provider}`);
+  if (!node) return;
+  node.textContent = count ? `저장되지 않은 변경 ${count}` : '저장됨';
+  node.classList.toggle('dirty', count > 0);
+}
+
+function setBusy(key, flag) {
+  if (flag) BUSY.add(key); else BUSY.delete(key);
+  document.querySelectorAll(`[data-busy-key="${key}"]`).forEach(button => {
+    button.disabled = flag;
+    button.classList.toggle('loading', flag);
+  });
+}
+
+function collect(provider) {
+  const values = {};
+  for (const [name, , type] of PROVIDERS[provider].fields) {
+    const element = document.getElementById(`cfg-${provider}-${name}`);
+    if (!element) continue;
+    values[name] = type === 'switch' ? (element.checked ? 'true' : 'false') : element.value;
+  }
+  return values;
+}
+
+async function post(path, payload) {
   const response = await fetch(path, {method:'POST',
     headers:{'content-type':'application/json', 'x-dashboard-token':TOKEN},
     body: JSON.stringify(payload)});
   return response.json();
 }
 
-async function saveConfig(provider) {
-  const values = {};
-  for (const [name, , type] of CONFIG_SPEC[provider].fields) {
-    const element = document.getElementById(`cfg-${provider}-${name}`);
-    if (!element) continue;
-    values[name] = type === 'checkbox' ? (element.checked ? 'true' : 'false') : element.value;
+async function saveSettings(provider) {
+  setBusy(provider, true);
+  let result;
+  try { result = await post('/api/config', {provider, values: collect(provider)}); }
+  catch (error) { result = {saved:false, error:'connection_failed'}; }
+  setBusy(provider, false);
+  if (result.saved) {
+    PROVIDERS[provider].fields.forEach(([name]) => DIRTY.delete(`${provider}:${name}`));
+    CONFIG = result.config;
+    RESULTS[provider] = {ok:true, reason:'saved'};
+    renderSettings(true);
+    renderResult(provider, '저장했습니다. 새 세션부터 적용됩니다.');
+    toast('ok', `${PROVIDERS[provider].title} 설정을 저장했습니다`);
+  } else {
+    RESULTS[provider] = {error: result.error};
+    renderSettings(true);
+    renderResult(provider);
+    toast('bad', ERROR_TEXT[result.error] || '저장에 실패했습니다');
   }
-  const result = await postConfig('/api/config', {provider, values});
-  document.getElementById(`cfg-result-${provider}`).textContent =
-    result.saved ? '저장했습니다. 새 세션부터 적용됩니다.' : `오류: ${result.error}`;
-  await loadConfig();
-  renderSettings(true);
 }
 
-async function testConfig(provider, mode) {
-  const target = document.getElementById(`cfg-result-${provider}`);
-  target.textContent = '확인 중…';
-  target.textContent = JSON.stringify(await postConfig('/api/test', {provider, mode}));
+async function runTest(provider, mode) {
+  const key = `${provider}:${mode}`;
+  setBusy(key, true);
+  renderResult(provider, mode === 'inference' ? '추론을 확인하는 중…' : '모델 목록을 확인하는 중…');
+  let result;
+  try { result = await post('/api/test', {provider, mode}); }
+  catch (error) { result = {ok:false, reason:'connection_failed', mode}; }
+  setBusy(key, false);
+  RESULTS[provider] = {...result, mode};
+  renderResult(provider);
+  toast(result.ok ? 'ok' : 'warn',
+    `${PROVIDERS[provider].title} ${mode === 'inference' ? '추론 테스트' : '모델 확인'} ${result.ok ? '성공' : '실패'}`);
 }
-loadConfig();
 
-function card(title, body, cls) {
-  return `<div class="card ${cls || ''}"><h2>${title}</h2>${body}</div>`;
+function renderResult(provider, pending) {
+  const box = document.getElementById(`res-${provider}`);
+  if (!box) return;
+  if (pending) { box.innerHTML = `<p class="empty">${esc(pending)}</p>`; return; }
+  const result = RESULTS[provider];
+  if (!result) { box.innerHTML = '<p class="empty">아직 테스트하지 않았습니다. 변경 사항은 새 세션부터 적용됩니다.</p>'; return; }
+  if (result.reason === 'saved') {
+    box.innerHTML = '<div class="result-line ok"><span class="dot"></span>저장 완료 · 새 세션부터 적용됩니다</div>';
+    return;
+  }
+  if (result.error) {
+    box.innerHTML = `<div class="result-line bad"><span class="dot"></span>${esc(ERROR_TEXT[result.error] || result.error)}</div>`;
+    return;
+  }
+  const label = result.mode === 'inference' ? '추론 테스트' : '모델 확인';
+  const text = TEST_TEXT[result.reason] || result.reason || '알 수 없는 결과';
+  const chips = [
+    result.model ? `<span class="chip">${esc(result.model)}</span>` : '',
+    result.status ? `<span class="chip">HTTP ${esc(result.status)}</span>` : '',
+    result.model_count !== undefined ? `<span class="chip">모델 ${num(result.model_count)}개</span>` : '',
+  ].filter(Boolean).join('');
+  box.innerHTML = `<div class="result-line ${result.ok ? 'ok' : 'bad'}"><span class="dot"></span>${esc(label)} · ${esc(text)}</div>
+    ${chips ? `<div class="result-meta">${chips}</div>` : ''}`;
 }
 
-function render(data) {
-  const r = data.routing, u = data.usage, a = data.account;
-  document.getElementById('stamp').innerHTML =
-    `갱신 ${new Date(data.generated_at).toLocaleTimeString('ko-KR')} · 설정 모델 ${esc(data.model || '미설정')}`
-    + ` · 최근 응답 모델 ${esc(r.last?.model || '—')} · 읽기 전용 뷰 · 설정 저장 가능 · <a href="#help">도움말 ↓</a>`;
-  const age = r.last?.age_seconds;
-  const ageText = age === null || age === undefined ? '아직 기록 없음'
+async function loadConfig() {
+  try {
+    CONFIG = await (await fetch('/api/config', {cache:'no-store'})).json();
+    renderSettings(true);
+  } catch (error) { /* keep the previous view */ }
+}
+
+/* ---------- dashboard ---------- */
+function renderHeader(data) {
+  const routing = data.routing || {};
+  const state = routing.state || 'unknown';
+  const pill = document.getElementById('live-pill');
+  pill.className = 'pill ' + (statePill[state] || 'pill-mute');
+  document.getElementById('live-text').textContent = stateText[state] || state;
+  const age = routing.last && routing.last.age_seconds;
+  const ageText = age === null || age === undefined ? '기록 없음'
     : age < 60 ? `${Math.round(age)}초 전` : `${Math.round(age / 60)}분 전`;
-  const lastDetail = r.last ? [r.last.reason, r.last.detail].filter(Boolean).join(' / ') : '—';
-  const status = card('지금 상태',
-    `<div><span class="badge ${stateClass[r.state] || 'unknown'}">${stateText[r.state] || r.state}</span></div>
-     <div class="kv"><span>마지막 결정</span><b>${esc(ageText)}</b></div>
-     <div class="kv"><span>사유</span><b>${esc(lastDetail)}</b></div>
-     <div class="kv"><span>실제 사용 모델</span><b class="mono">${esc(r.last?.model || '—')}</b></div>
-     <div class="kv"><span>프록시 시작</span><b>${esc(r.proxy_started_at ? new Date(r.proxy_started_at).toLocaleString('ko-KR') : '—')}</b></div>
-     ${data.proxy_stale ? '<div class="kv"><span>프록시 상태</span><b style="color:#ffb27a">코드보다 오래됨 · 재시작 필요</b></div>' : ''}`);
+  document.getElementById('stamp').textContent =
+    `${data.model || '모델 미설정'} · 마지막 결정 ${ageText} · 갱신 ${new Date(data.generated_at).toLocaleTimeString('ko-KR')}`;
+}
 
-  const total = r.counts.external + r.counts.plan;
-  const pct = total ? Math.round(r.counts.external / total * 100) : 0;
-  const modelRows = (r.models || []).slice(0, 3)
-    .map(([label, count]) => `<div class="kv"><span class="mono">${esc(label)}</span><b>${num(count)}</b></div>`).join('');
-  const split = card(`최근 ${r.window_minutes}분 라우팅`,
-    `<div class="big">${pct}% <span class="muted" style="font-size:13px">OpenRouter</span></div>
-     <div class="bar"><i style="width:${pct}%"></i></div>
-     <div class="kv"><span>OpenRouter</span><b>${num(r.counts.external)}건</b></div>
-     <div class="kv"><span>Plan</span><b>${num(r.counts.plan)}건</b></div>
-     <div class="kv"><span>회로 차단</span><b>${num(r.circuit_opens)}회</b></div>
-     <div class="kv"><span>최근 ${r.short?.minutes}분</span><b>외부 ${num(r.short?.counts?.external)} / Plan ${num(r.short?.counts?.plan)}</b></div>
-     ${modelRows || '<div class="muted">모델 기록 없음</div>'}`);
+function renderAlerts(data) {
+  const host = document.getElementById('alerts');
+  const alerts = data.alerts || [];
+  host.innerHTML = alerts.map(alert => {
+    const icon = alert.level === 'critical' ? '!' : alert.level === 'warn' ? '!' : 'i';
+    return `<div class="alert ${esc(alert.level)}"><span class="icon">${icon}</span>
+      <div><b>${esc(alert.title)}</b><span class="txt">${esc(alert.detail)}</span></div></div>`;
+  }).join('');
+}
 
-  const reasons = r.plan_reasons.length
-    ? r.plan_reasons.map(([label, count]) => {
-        const help = (data.help?.reasons || {})[label];
-        return `<div class="reason"><div class="kv"><span class="mono">${esc(label)}</span><b>${num(count)}</b></div>
-          ${help ? `<div class="hint"><b>${esc(help[0])}</b> — ${esc(help[1])}</div>` : ''}</div>`;
+function renderGrid(data) {
+  const routing = data.routing || {}, usage = data.usage || {}, account = data.account || {};
+  const last = routing.last || {};
+  const counts = routing.counts || {external:0, plan:0};
+  const short = routing.short || {minutes:10, counts:{external:0, plan:0}};
+  const total = (counts.external || 0) + (counts.plan || 0);
+  const share = total ? Math.round((counts.external || 0) / total * 100) : 0;
+
+  const statusCard = card('지금 상태', '마지막 라우팅 결정',
+    `<div class="metric"><span class="k">경로</span>
+       <span class="v" style="font-size:19px">${esc(stateText[routing.state] || routing.state || '—')}</span></div>
+     <div class="metric-list">
+       ${kv('사유', esc([last.reason, last.detail].filter(Boolean).join(' / ') || '—'), true)}
+       ${kv('모델', `<span class="mono">${esc(last.model || '—')}</span>`)}
+       ${kv('프록시 시작', esc(routing.proxy_started_at ? new Date(routing.proxy_started_at).toLocaleString('ko-KR') : '—'))}
+       ${data.proxy_stale ? '<div class="row-kv"><span class="k">프록시</span><span class="v" style="color:var(--warn)">코드보다 오래됨 · 재시작 필요</span></div>' : ''}
+     </div>`, 'col-3');
+
+  const splitCard = card(`최근 ${routing.window_minutes || 60}분`, '외부 대 Plan 비율',
+    `<div class="metric"><span class="k">OpenRouter</span><span class="v">${share}<small>%</small></span></div>
+     <div class="bar"><i style="width:${share}%"></i></div>
+     <div class="metric-list">
+       ${kv('OpenRouter', num(counts.external) + '건')}
+       ${kv('Plan', num(counts.plan) + '건')}
+       ${kv(`최근 ${short.minutes}분`, `외부 ${num(short.counts.external)} / Plan ${num(short.counts.plan)}`)}
+       ${kv('회로 차단', num(routing.circuit_opens) + '회')}
+     </div>`, 'col-3');
+
+  const limit = account.limit_usd, spent = account.spent_usd, remaining = account.remaining_usd;
+  const used = limit && spent !== null && spent !== undefined ? Math.min(100, Math.round(spent / limit * 100)) : 0;
+  const creditCard = card('크레딧', 'OpenRouter 키 한도',
+    account.ok ? `<div class="metric"><span class="k">남은 금액</span><span class="v">${usd(remaining)}</span></div>
+      <div class="bar"><i style="width:${used}%"></i></div>
+      <div class="metric-list">
+        ${kv('이번 달 사용', usd(spent))}
+        ${kv('한도', usd(limit))}
+        ${kv('리셋', esc(account.reset || '—') + (account.resets_at ? ' · ' + new Date(account.resets_at).toLocaleDateString('ko-KR') : ''))}
+      </div>`
+    : `<div class="metric"><span class="k">상태</span><span class="v" style="font-size:18px;color:var(--fg-3)">확인 불가</span></div>
+       <div class="metric-list">${kv('사유', esc(account.error || 'unknown'), true)}</div>`, 'col-3');
+
+  const today = usage.today || {external:[0,0,0,0], plan:[0,0,0,0]};
+  const tokensCard = card('오늘 사용량', '토큰과 추정 비용',
+    `<div class="metric"><span class="k">OpenRouter 토큰</span><span class="v">${num(tokens(today.external))}</span></div>
+     <div class="metric-list">
+       ${kv('Plan 토큰', num(tokens(today.plan)))}
+       ${kv('입력 / 출력', `${num(today.external[0])} / ${num(today.external[1])}`)}
+       ${kv('캐시 읽기 / 생성', `${num(today.external[2])} / ${num(today.external[3])}`)}
+       ${kv('추정 비용', `<span style="color:var(--ok)">${usd(usage.cost_usd)}</span>`)}
+     </div>`, 'col-3');
+
+  const reasons = (routing.plan_reasons || []).length
+    ? routing.plan_reasons.map(([code, count]) => {
+        const help = ((data.help || {}).reasons || {})[code];
+        return `<div style="padding:9px 0;border-bottom:1px dashed rgba(255,255,255,.05)">
+          <div class="row-kv"><span class="mono">${esc(code)}</span><span class="v">${num(count)}</span></div>
+          ${help ? `<p class="hint" style="margin-top:4px"><b>${esc(help[0])}</b> — ${esc(help[1])}</p>` : ''}</div>`;
       }).join('')
-    : '<div class="muted">Plan 우회 없음</div>';
-  const failRows = r.failures.length
-    ? r.failures.map(([k, v]) => `<div class="kv"><span class="mono">${esc(k)}</span><b>${num(v)}</b></div>`).join('')
-    : '<div class="muted">실패 없음</div>';
-  const why = card('Plan 우회 사유 / 외부 실패', reasons + '<div style="height:8px"></div>' + failRows);
+    : '<p class="empty">Plan 우회 없음</p>';
+  const failures = (routing.failures || []).length
+    ? routing.failures.map(([code, count]) => kv(code, num(count), true)).join('')
+    : kv('외부 실패', '없음');
+  const reasonsCard = card('Plan 우회 사유', '최근 60분',
+    reasons + '<div class="hairline"></div>' + failures, 'col-4');
 
-  const limit = a.limit_usd, spent = a.spent_usd ?? null, remaining = a.remaining_usd;
-  const used = limit && spent !== null ? Math.min(100, Math.round(spent / limit * 100)) : 0;
-  const credit = card('OpenRouter 크레딧', a.ok
-    ? `<div class="big">${usd(remaining)} <span class="muted" style="font-size:13px">남음</span></div>
-       <div class="bar"><i style="width:${used}%"></i></div>
-       <div class="kv"><span>이번 달 사용</span><b>${usd(spent)}</b></div>
-       <div class="kv"><span>한도</span><b>${usd(limit)}</b></div>
-       <div class="kv"><span>리셋</span><b>${esc(a.reset || '—')}${a.resets_at ? ' · ' + new Date(a.resets_at).toLocaleDateString('ko-KR') : ''}</b></div>`
-    : `<div class="big muted">확인 불가</div><div class="mono">${esc(a.error || 'unknown')}</div>`);
-
-  const todayExt = u.today.external, todayPlan = u.today.plan;
-  const tokensCard = card('오늘 토큰 사용',
-    `<div class="kv"><span>OpenRouter</span><b>${num(tokens(todayExt))}</b></div>
-     <div class="kv"><span>Plan</span><b>${num(tokens(todayPlan))}</b></div>
-     <div class="kv"><span>입력 / 출력 (외부)</span><b>${num(todayExt[0])} / ${num(todayExt[1])}</b></div>
-     <div class="kv"><span>캐시 읽기 / 생성 (외부)</span><b>${num(todayExt[2])} / ${num(todayExt[3])}</b></div>
-     <div class="kv"><span>추정 비용 (외부, 누적)</span><b>${usd4(u.cost_usd)}</b></div>`);
-
-  const timeline = u.timeline || [];
+  const timeline = usage.timeline || [];
   const peak = Math.max(1, ...timeline.map(hour => tokens(hour.external.tokens) + tokens(hour.plan.tokens)));
   const bars = timeline.map(hour => {
     const ext = tokens(hour.external.tokens), plan = tokens(hour.plan.tokens);
@@ -1140,79 +1513,105 @@ function render(data) {
   }).join('');
   const labels = timeline.map((hour, index) =>
     `<span>${index % 3 === 0 ? hour.hour.slice(11) + '시' : ''}</span>`).join('');
-  const timelineCard = card('시간대별 토큰 (최근 24시간)',
-    timeline.length ? `<div class="timeline">${bars}</div><div class="tl-labels">${labels}</div>
-      <div class="legend"><span><i style="background:#3fae7a"></i>OpenRouter</span>
-      <span><i style="background:#c9803a"></i>Plan</span></div>`
-      : '<div class="muted">데이터 없음</div>', 'wide');
+  const timelineCard = card('시간대별 토큰', '최근 24시간',
+    `<div class="timeline">${bars || '<p class="empty">데이터 없음</p>'}</div>
+     <div class="tl-labels">${labels}</div>
+     <div class="legend"><span><i style="background:#43d9a3"></i>OpenRouter</span>
+     <span><i style="background:#f2b95e"></i>Plan</span></div>`, 'col-8');
 
-  const rows = u.sessions.map(s => `<tr>
-      <td>${esc(s.project)}</td><td class="mono">${esc(s.session)}</td>
-      <td class="num">${num(s.turns)}</td><td class="num">${num(s.external)}</td><td class="num">${num(s.plan)}</td>
-      <td class="num">${num(tokens(s.tokens.external))}</td><td class="num">${usd4(s.cost_usd)}</td>
-      <td class="mono">${esc((s.models[0] || ['—'])[0])}</td></tr>`).join('');
-  const sessions = card('세션별 사용 (최근 활동순)',
-    u.sessions.length ? `<table><tr><th>프로젝트</th><th>세션</th><th>턴</th><th>외부</th><th>Plan</th><th>외부 토큰</th><th>비용(추정)</th><th>모델</th></tr>${rows}</table>`
-      : '<div class="muted">세션 기록 없음</div>', 'wide');
-
-  const transitions = (r.transitions || []).slice().reverse().map(entry => {
-    const duration = entry.ongoing ? '<span class="badge ext">진행 중</span>'
+  const transitions = (routing.transitions || []).slice().reverse().map(entry => {
+    const duration = entry.ongoing ? '<span class="pill pill-ok" style="height:22px">진행 중</span>'
       : entry.seconds === null || entry.seconds === undefined ? '—'
       : entry.seconds < 90 ? `${Math.round(entry.seconds)}초` : `${Math.round(entry.seconds / 60)}분`;
-    return `<tr><td class="mono">${esc(new Date(entry.first_ts).toLocaleTimeString('ko-KR'))}</td>
-      <td><span class="badge ${entry.state === 'external' ? 'ext' : 'plan'}">${esc(stateText[entry.state] || entry.state)}</span></td>
-      <td class="mono">${esc([entry.reason, entry.detail].filter(Boolean).join(' / ') || '—')}</td>
-      <td class="mono">${esc(entry.model || '—')}</td>
+    return `<tr>
+      <td class="id">${new Date(entry.first_ts).toLocaleTimeString('ko-KR')}</td>
+      <td><span class="pill ${entry.state === 'external' ? 'pill-ok' : 'pill-warn'}" style="height:24px">
+        ${esc(stateText[entry.state] || entry.state)}</span></td>
+      <td class="id">${esc([entry.reason, entry.detail].filter(Boolean).join(' / ') || '—')}</td>
+      <td class="id">${esc(entry.model || '—')}</td>
       <td class="num">${num(entry.count)}</td><td class="num">${duration}</td></tr>`;
   }).join('');
-  const transitionsCard = card('라우팅 전환 기록 (최근 12회)',
-    (r.transitions || []).length ? `<table><tr><th>시작</th><th>경로</th><th>사유</th><th>모델</th><th>건수</th><th>지속</th></tr>${transitions}</table>`
-      : '<div class="muted">아직 전환 기록이 없습니다. 실행기 세션에서 메시지를 보내면 쌓입니다.</div>', 'wide');
+  const transitionsCard = card('라우팅 전환 기록', '최근 12회',
+    (routing.transitions || []).length
+      ? `<table><thead><tr><th>시작</th><th>경로</th><th>사유</th><th>모델</th><th class="num">건수</th><th class="num">지속</th></tr></thead><tbody>${transitions}</tbody></table>`
+      : '<p class="empty">아직 전환 기록이 없습니다. 실행기 세션에서 메시지를 보내면 쌓입니다.</p>');
 
-  const help = data.help || {};
-  const reasonHelp = Object.entries(help.reasons || {}).map(([code, values]) =>
-    `<tr><td class="mono">${esc(code)}</td><td>${esc(values[0])}</td><td>${esc(values[1])}</td></tr>`).join('');
-  const listRows = rows => (rows || []).map(([left, right]) =>
-    `<tr><td class="mono">${esc(left)}</td><td>${esc(right)}</td></tr>`).join('');
-  const commandBlock = (help.commands || []).map(([command, description]) =>
-    `${command}${' '.repeat(Math.max(2, 52 - command.length))}# ${description}`).join('\\n');
-  const helpCard = `<div class="card wide" id="help"><h2>도움말 — 화면 읽는 법</h2>
-     <div class="hint">터미널에서 상태 확인 (복사해서 사용)</div>
-     <pre class="code">${esc(commandBlock)}</pre>
-     <table style="margin-top:8px"><tr><th>HTTP API</th><th>내용</th></tr>${listRows(help.endpoints)}</table>
-     <details open style="margin-top:10px"><summary>라우팅 사유 코드 (${Object.keys(help.reasons || {}).length}개)</summary>
-       <table><tr><th>코드</th><th>의미</th><th>조치</th></tr>${reasonHelp}</table></details>
-     <details><summary>상태 배지 / 종료 코드 / 데이터 출처</summary>
-       <table><tr><th>상태</th><th>의미</th></tr>${listRows(help.states)}</table>
-       <table style="margin-top:10px"><tr><th>종료 코드</th><th>의미</th></tr>${listRows(help.exit_codes)}</table>
-       <table style="margin-top:10px"><tr><th>데이터</th><th>출처</th></tr>${listRows(help.sources)}</table></details>
-     </div>`;
+  const sessions = (usage.sessions || []).map(row => `<tr>
+      <td>${esc(row.project)}</td><td class="id">${esc(row.session)}</td>
+      <td class="num">${num(row.turns)}</td><td class="num">${num(row.external)}</td><td class="num">${num(row.plan)}</td>
+      <td class="num">${num(tokens(row.tokens.external))}</td><td class="num">${usd(row.cost_usd, 4)}</td>
+      <td class="id">${esc((row.models[0] || ['—'])[0])}</td></tr>`).join('');
+  const sessionsCard = card('세션별 사용', `${num(usage.session_count)}개 세션 · 최근 활동순`,
+    (usage.sessions || []).length
+      ? `<table><thead><tr><th>프로젝트</th><th>세션</th><th class="num">턴</th><th class="num">외부</th>
+         <th class="num">Plan</th><th class="num">외부 토큰</th><th class="num">비용</th><th>모델</th></tr></thead>
+         <tbody>${sessions}</tbody></table>`
+      : '<p class="empty">세션 기록 없음</p>');
 
-  const recent = r.recent.slice().reverse().map(e => `<tr>
-      <td class="mono">${esc(new Date(e.ts).toLocaleTimeString('ko-KR'))}</td>
-      <td class="mono">${esc(e.event || '—')}</td>
-      <td>${esc(e.provider || '—')}</td>
-      <td>${esc([e.reason, e.detail].filter(Boolean).join(' / ') || '—')}</td>
-      <td class="num">${esc(e.status ?? '')}</td></tr>`).join('');
-  const recentCard = card('최근 라우팅 이벤트',
-    r.recent.length ? `<table><tr><th>시각</th><th>이벤트</th><th>경로</th><th>사유</th><th>HTTP</th></tr>${recent}</table>`
-      : '<div class="muted">아직 기록이 없습니다. 실행기로 세션을 시작하고 메시지를 보내면 나타납니다.</div>', 'wide');
+  const recent = (routing.recent || []).slice().reverse().map(event => `<tr>
+      <td class="id">${new Date(event.ts).toLocaleTimeString('ko-KR')}</td>
+      <td class="id">${esc(event.event || '—')}</td>
+      <td>${esc(event.provider || '—')}</td>
+      <td class="id">${esc([event.reason, event.detail].filter(Boolean).join(' / ') || '—')}</td>
+      <td class="num">${esc(event.status ?? '')}</td></tr>`).join('');
+  const recentCard = card('최근 라우팅 이벤트', '최대 15건',
+    (routing.recent || []).length
+      ? `<table><thead><tr><th>시각</th><th>이벤트</th><th>경로</th><th>사유</th><th class="num">HTTP</th></tr></thead><tbody>${recent}</tbody></table>`
+      : '<p class="empty">아직 기록이 없습니다.</p>');
 
-  document.getElementById('alerts').innerHTML = (data.alerts || []).map(alert =>
-    `<div class="alert ${esc(alert.level)}"><b>${esc(alert.title)}</b>${esc(alert.detail)}</div>`).join('');
   document.getElementById('grid').innerHTML =
-    [status, split, credit, tokensCard, why, timelineCard, transitionsCard, sessions, recentCard, helpCard].join('');
+    [statusCard, splitCard, creditCard, tokensCard, reasonsCard, timelineCard, transitionsCard, sessionsCard, recentCard].join('');
 }
 
-async function tick() {
+function renderHelp(data) {
+  const help = data.help || {};
+  const commands = (help.commands || []).map(([command, description]) =>
+    `${command.padEnd(52)}# ${description}`).join('\\n');
+  const rows = list => (list || []).map(([left, right]) =>
+    `<div class="row-kv"><span class="k mono">${esc(left)}</span><span class="v">${esc(right)}</span></div>`).join('');
+  const reasons = Object.entries(help.reasons || {}).map(([code, values]) =>
+    `<tr><td class="id">${esc(code)}</td><td>${esc(values[0])}</td><td>${esc(values[1])}</td></tr>`).join('');
+  const body = `<details open><summary>터미널 명령</summary>
+      <pre class="code">${esc(commands)}</pre></details>
+    <details><summary>HTTP API</summary><div class="card-b">${rows(help.endpoints)}</div></details>
+    <details><summary>라우팅 사유 코드 ${Object.keys(help.reasons || {}).length}개</summary>
+      <table><thead><tr><th>코드</th><th>의미</th><th>조치</th></tr></thead><tbody>${reasons}</tbody></table></details>
+    <details><summary>상태 · 종료 코드 · 데이터 출처</summary>
+      <div class="card-b">
+        <div class="row-kv" style="color:var(--fg-4)"><span class="k">상태</span><span class="v">의미</span></div>
+        ${rows(help.states)}<div class="hairline"></div>
+        <div class="row-kv" style="color:var(--fg-4)"><span class="k">종료 코드</span><span class="v">의미</span></div>
+        ${rows(help.exit_codes)}<div class="hairline"></div>
+        <div class="row-kv" style="color:var(--fg-4)"><span class="k">데이터</span><span class="v">출처</span></div>
+        ${rows(help.sources)}
+      </div></details>`;
+  document.getElementById('help').innerHTML =
+    `<section class="card col-12" id="help-card"><header class="card-h">
+      <div><h2>도움말 — 화면 읽는 법</h2><p class="sub">상태 배지 · 사유 코드 · CLI · API</p></div></header>
+      <div class="card-b">${body}</div></section>`;
+}
+
+function render(data) {
+  SNAP = data;
+  renderHeader(data);
+  renderAlerts(data);
+  renderGrid(data);
+  renderHelp(data);
+}
+
+async function tick(force) {
   try {
-    const response = await fetch('/api/snapshot', { cache: 'no-store' });
+    const response = await fetch('/api/snapshot', {cache:'no-store'});
     render(await response.json());
+    if (force) toast('ok', '새로고침했습니다');
   } catch (error) {
-    document.getElementById('stamp').textContent = '연결 끊김 — 대시보드 서버가 실행 중인지 확인하세요';
+    document.getElementById('live-text').textContent = '연결 끊김';
+    document.getElementById('live-pill').className = 'pill pill-bad';
   }
 }
-tick(); setInterval(tick, 2000);
+loadConfig();
+tick();
+setInterval(() => tick(), 2000);
 </script></body></html>
 """
 
