@@ -385,7 +385,7 @@ Long runs use `--soak`, which also samples resident memory and window throughput
 node tests/simulate.mjs --soak 3000 --concurrency 16
 ```
 
-Measured: 3,000 requests with a **245MB peak RSS, 5.6MB drift and 1.0x throughput** in the second half (no leak or slowdown), with the latency ring pinned at 512 samples.
+Measured: 3,000 requests with a **245MB peak RSS and 5.6MB drift** (no leak), with the latency ring pinned at 512 samples. Resident-memory drift is the gate; per-window median latency is printed for reference, since the client and proxy share one process and GC noise shows up there.
 
 Dashboard refresh cost is measured the same way (a snapshot is rebuilt every two seconds):
 
