@@ -14,7 +14,9 @@ prompt text and never writes anything. Run it next to a routing session:
 
 import argparse
 import json
+import os
 import re
+import socket
 import threading
 import time
 import urllib.error
@@ -40,6 +42,34 @@ _ACCOUNT = {"at": 0.0, "data": None}
 _PRICING = {"at": 0.0, "data": None}
 _SNAPSHOT = {"at": 0.0, "data": None}
 PRICING_TTL = 3600
+
+# Why a request left the replacement route, in one line, plus what the reader can do about it.
+REASON_HELP = {
+    "native_feature:plan_model": ["Plan 전용 모델", "Opus·Haiku 등은 설계상 Plan으로 갑니다. Sonnet으로 요청하세요."],
+    "native_feature:token_count": ["토큰 수 계산", "count_tokens 요청은 항상 Plan입니다. 정상 동작입니다."],
+    "native_feature:unsupported_beta": ["모르는 beta", "CLI가 새 beta를 보냈습니다. 실행기를 최신으로 갱신하세요."],
+    "native_feature:unsupported_content_field": ["모르는 콘텐츠 필드", "이력 블록에 라우터가 모르는 필드가 있습니다. 실행기를 갱신하세요."],
+    "native_feature:unsupported_content_block": ["모르는 콘텐츠 블록", "서버 도구·inline 블록처럼 외부가 표현할 수 없는 내용입니다."],
+    "native_feature:unsupported_content": ["콘텐츠 형식", "메시지 내용 형식이 예상과 다릅니다."],
+    "native_feature:unsupported_tool_definition": ["서버 전용 도구", "외부 제공자가 실행할 수 없는 도구 정의입니다."],
+    "native_feature:unsupported_tool_choice": ["tool_choice 구성", "tool_choice에 예상 밖 필드가 있습니다."],
+    "native_feature:unsupported_output_config": ["지원하지 않는 출력 설정", "structured output 등 외부가 지원하지 않는 설정입니다."],
+    "native_feature:unsupported_thinking_config": ["thinking 구성", "thinking 설정에 예상 밖 필드가 있습니다."],
+    "native_feature:unsupported_context_management": ["서버 문맥 편집", "외부 제공자는 문맥 편집을 지원하지 않습니다."],
+    "native_feature:unsupported_message_shape": ["메시지 형식", "역할이나 필드 구성이 예상과 다릅니다."],
+    "fallback": ["외부 실패 후 Plan", "이 요청만 Plan으로 처리했습니다. 다음 요청은 다시 외부로 시도합니다."],
+    "circuit_open": ["외부 대기 중", "장애 후 30초 대기 또는 복구 확인 중입니다. 잠시 후 다시 시도하세요."],
+}
+
+HELP_SECTION = {
+    "states": [["external", "OpenRouter 사용 중"], ["plan", "Plan 우회 중"], ["idle", "유휴(5분 이상 결정 없음)"],
+               ["unknown", "기록 없음"]],
+    "exit_codes": [["0", "정상"], ["2", "현재 Plan 경로"], ["3", "심각 경고"], ["4", "라우팅 기록 없음"]],
+    "sources": [["라우팅 결정", "실행기 폴더의 .route.log (프록시가 기록)"],
+                ["토큰·모델", "Claude Code 세션 기록 (~/.claude/projects)"],
+                ["크레딧·단가", "OpenRouter /api/v1/key, /api/v1/models"],
+                ["상태 JSON", "GET /api/status 또는 python routeDashboard.py --status"]],
+}
 SCAN_DAYS = 7
 SCAN_FILES = 300
 
@@ -107,6 +137,45 @@ def _local_hour(stamp):
     if then.tzinfo is None:
         then = then.replace(tzinfo=timezone.utc)
     return then.astimezone().strftime("%Y-%m-%dT%H")
+
+
+def route_transitions(events, limit=12):
+    """Collapse consecutive identical decisions into state changes with their duration."""
+    selected = [event for event in events if event.get("event") == "route_selected"]
+    entries = []
+    for event in selected:
+        provider = "external" if event.get("provider") in ("openrouter", "local") else "plan"
+        key = (provider, event.get("reason"), event.get("detail"))
+        if entries and entries[-1]["key"] == key:
+            entries[-1]["count"] += 1
+            entries[-1]["last_ts"] = event["ts"]
+            if event.get("model"):
+                entries[-1]["model"] = event["model"]
+            continue
+        entries.append({"key": key, "state": provider, "reason": event.get("reason"),
+                        "detail": event.get("detail"), "model": event.get("model"),
+                        "first_ts": event["ts"], "last_ts": event["ts"], "count": 1})
+    for index, entry in enumerate(entries):
+        following = entries[index + 1]["first_ts"] if index + 1 < len(entries) else None
+        entry["seconds"] = _seconds_between(entry["first_ts"], following)
+        entry["ongoing"] = following is None
+        entry.pop("key", None)
+    return entries[-limit:]
+
+
+def _seconds_between(first, second):
+    try:
+        start = datetime.fromisoformat(str(first).replace("Z", "+00:00"))
+        end = datetime.fromisoformat(str(second).replace("Z", "+00:00")) if second else None
+    except ValueError:
+        return None
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end is None:
+        return None
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    return max(0.0, (end - start).total_seconds())
 
 
 def routing_state(events, now=None, idle_after=300):
@@ -180,6 +249,7 @@ def routing_state(events, now=None, idle_after=300):
                   "failures": short["failures"], "models": short["models"],
                   "circuit_opens": short["circuit_opens"]},
         "proxy_started_at": starts[-1]["ts"] if starts else None,
+        "transitions": route_transitions(events),
         "recent": [{"ts": e["ts"], "event": e.get("event"), "provider": e.get("provider"),
                     "reason": e.get("reason"), "detail": e.get("detail"),
                     "status": e.get("status"), "category": e.get("category")}
@@ -503,6 +573,7 @@ def snapshot():
         "account": account,
         "pricing": pricing,
         "alerts": build_alerts(routing, usage, account, pricing),
+        "help": {"reasons": REASON_HELP, **HELP_SECTION},
         "model": model,
     }
 
@@ -526,6 +597,7 @@ def cached_snapshot():
         "account": account,
         "pricing": None,
         "alerts": build_alerts(routing, usage, account, None),
+        "help": {"reasons": REASON_HELP, **HELP_SECTION},
         "model": config.get("OPENROUTER_MODEL") or None,
     }
 
@@ -584,6 +656,12 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
 .tl-labels span{flex:1;font-size:9px;color:#77839a;text-align:center;font-family:ui-monospace,Consolas,monospace}
 .legend{display:flex;gap:14px;font-size:11px;color:#9aa7bf;margin-top:8px}
 .legend i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:4px}
+a{color:#7fb0ff}
+details{margin:8px 0}
+summary{cursor:pointer;color:#b9c4d6;font-size:12px;margin:4px 0}
+.hint{font-size:11px;color:#8b97ad;line-height:1.5;margin-top:2px}
+.hint b{color:#c8d2e4}
+.reason{margin-bottom:8px}
 </style></head><body>
 <h1>OpenRouter 라우팅 대시보드</h1>
 <div class="sub" id="stamp">불러오는 중…</div>
@@ -628,10 +706,15 @@ function render(data) {
      <div class="kv"><span>OpenRouter</span><b>${num(r.counts.external)}건</b></div>
      <div class="kv"><span>Plan</span><b>${num(r.counts.plan)}건</b></div>
      <div class="kv"><span>회로 차단</span><b>${num(r.circuit_opens)}회</b></div>
+     <div class="kv"><span>최근 ${r.short?.minutes}분</span><b>외부 ${num(r.short?.counts?.external)} / Plan ${num(r.short?.counts?.plan)}</b></div>
      ${modelRows || '<div class="muted">모델 기록 없음</div>'}`);
 
   const reasons = r.plan_reasons.length
-    ? r.plan_reasons.map(([k, v]) => `<div class="kv"><span class="mono">${esc(k)}</span><b>${num(v)}</b></div>`).join('')
+    ? r.plan_reasons.map(([label, count]) => {
+        const help = (data.help?.reasons || {})[label];
+        return `<div class="reason"><div class="kv"><span class="mono">${esc(label)}</span><b>${num(count)}</b></div>
+          ${help ? `<div class="hint"><b>${esc(help[0])}</b> — ${esc(help[1])}</div>` : ''}</div>`;
+      }).join('')
     : '<div class="muted">Plan 우회 없음</div>';
   const failRows = r.failures.length
     ? r.failures.map(([k, v]) => `<div class="kv"><span class="mono">${esc(k)}</span><b>${num(v)}</b></div>`).join('')
@@ -681,6 +764,36 @@ function render(data) {
     u.sessions.length ? `<table><tr><th>프로젝트</th><th>세션</th><th>턴</th><th>외부</th><th>Plan</th><th>외부 토큰</th><th>비용(추정)</th><th>모델</th></tr>${rows}</table>`
       : '<div class="muted">세션 기록 없음</div>', 'wide');
 
+  const transitions = (r.transitions || []).slice().reverse().map(entry => {
+    const duration = entry.ongoing ? '<span class="badge ext">진행 중</span>'
+      : entry.seconds === null || entry.seconds === undefined ? '—'
+      : entry.seconds < 90 ? `${Math.round(entry.seconds)}초` : `${Math.round(entry.seconds / 60)}분`;
+    return `<tr><td class="mono">${esc(new Date(entry.first_ts).toLocaleTimeString('ko-KR'))}</td>
+      <td><span class="badge ${entry.state === 'external' ? 'ext' : 'plan'}">${esc(stateText[entry.state] || entry.state)}</span></td>
+      <td class="mono">${esc([entry.reason, entry.detail].filter(Boolean).join(' / ') || '—')}</td>
+      <td class="mono">${esc(entry.model || '—')}</td>
+      <td class="num">${num(entry.count)}</td><td class="num">${duration}</td></tr>`;
+  }).join('');
+  const transitionsCard = card('라우팅 전환 기록 (최근 12회)',
+    (r.transitions || []).length ? `<table><tr><th>시작</th><th>경로</th><th>사유</th><th>모델</th><th>건수</th><th>지속</th></tr>${transitions}</table>`
+      : '<div class="muted">아직 전환 기록이 없습니다. 실행기 세션에서 메시지를 보내면 쌓입니다.</div>', 'wide');
+
+  const help = data.help || {};
+  const reasonHelp = Object.entries(help.reasons || {}).map(([code, values]) =>
+    `<tr><td class="mono">${esc(code)}</td><td>${esc(values[0])}</td><td>${esc(values[1])}</td></tr>`).join('');
+  const listRows = rows => (rows || []).map(([left, right]) =>
+    `<tr><td class="mono">${esc(left)}</td><td>${esc(right)}</td></tr>`).join('');
+  const helpCard = card('도움말 — 화면 읽는 법',
+    `<details open><summary>라우팅 사유 코드 (${Object.keys(help.reasons || {}).length}개)</summary>
+       <table><tr><th>코드</th><th>의미</th><th>조치</th></tr>${reasonHelp}</table></details>
+     <details><summary>상태 배지 / 종료 코드 / 데이터 출처</summary>
+       <table><tr><th>상태</th><th>의미</th></tr>${listRows(help.states)}</table>
+       <table style="margin-top:10px"><tr><th>종료 코드</th><th>의미</th></tr>${listRows(help.exit_codes)}</table>
+       <table style="margin-top:10px"><tr><th>데이터</th><th>출처</th></tr>${listRows(help.sources)}</table></details>
+     <div class="hint" style="margin-top:8px">기계판독용: <a href="/api/status">/api/status</a> ·
+       <a href="/api/snapshot">/api/snapshot</a> · CLI <span class="mono">python routeDashboard.py --status</span></div>`,
+    'wide');
+
   const recent = r.recent.slice().reverse().map(e => `<tr>
       <td class="mono">${esc(new Date(e.ts).toLocaleTimeString('ko-KR'))}</td>
       <td class="mono">${esc(e.event || '—')}</td>
@@ -694,7 +807,7 @@ function render(data) {
   document.getElementById('alerts').innerHTML = (data.alerts || []).map(alert =>
     `<div class="alert ${esc(alert.level)}"><b>${esc(alert.title)}</b>${esc(alert.detail)}</div>`).join('');
   document.getElementById('grid').innerHTML =
-    [status, split, credit, tokensCard, why, timelineCard, sessions, recentCard].join('');
+    [status, split, credit, tokensCard, why, timelineCard, transitionsCard, sessions, recentCard, helpCard].join('');
 }
 
 async function tick() {
@@ -742,14 +855,25 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+class DashboardServer(ThreadingHTTPServer):
+    """Exclusive loopback listener: a stale instance must never share the port on Windows."""
+
+    allow_reuse_address = False
+
+    def server_bind(self):
+        if os.name == "nt":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 def serve(host="127.0.0.1", port=8787, refresh=3):
     threading.Thread(target=_refresh_loop, args=(max(1, refresh),), daemon=True).start()
     fallback = None
     try:
-        server = ThreadingHTTPServer((host, port), Handler)
+        server = DashboardServer((host, port), Handler)
     except OSError:
         # A requested port can be reserved by Windows; any free loopback port is equivalent here.
-        server = ThreadingHTTPServer((host, 0), Handler)
+        server = DashboardServer((host, 0), Handler)
         fallback = "requested_port_unavailable"
     url = f"http://{host}:{server.server_address[1]}/"
     print(json.dumps({"dashboard": url, "route_log": str(ROUTE_LOG), "read_only": True,

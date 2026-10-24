@@ -380,6 +380,79 @@ class StatusReportTests(unittest.TestCase):
         builder.assert_called_once_with(include_usage=True, offline=False)
 
 
+class TransitionTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.log = self.root / ".route.log"
+        self.enterContext(mock.patch.object(dash, "ROUTE_LOG", self.log))
+
+    def test_consecutive_decisions_collapse_with_durations(self):
+        start = datetime(2026, 10, 25, 3, 0, 0, tzinfo=timezone.utc)
+
+        def stamp(minutes):
+            return (start + timedelta(minutes=minutes)).isoformat().replace("+00:00", "Z")
+
+        self.log.write_text(
+            route_line(stamp(0), {"event": "route_selected", "provider": "openrouter",
+                                  "reason": "replacement", "model": "vendor/a"})
+            + route_line(stamp(1), {"event": "route_selected", "provider": "openrouter",
+                                    "reason": "replacement", "model": "vendor/a"})
+            + route_line(stamp(4), {"event": "route_selected", "provider": "plan",
+                                    "reason": "native_feature", "detail": "plan_model"})
+            + route_line(stamp(5), {"event": "route_selected", "provider": "plan",
+                                    "reason": "native_feature", "detail": "plan_model"}),
+            encoding="utf-8")
+        entries = dash.route_transitions(dash.parse_route_log())
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0]["state"], "external")
+        self.assertEqual(entries[0]["count"], 2)
+        self.assertEqual(entries[0]["model"], "vendor/a")
+        self.assertEqual(entries[0]["seconds"], 240.0)
+        self.assertFalse(entries[0]["ongoing"])
+        self.assertEqual(entries[1]["state"], "plan")
+        self.assertEqual(entries[1]["count"], 2)
+        self.assertTrue(entries[1]["ongoing"])
+        self.assertIsNone(entries[1]["seconds"])
+        self.assertEqual(entries[1]["detail"], "plan_model")
+
+    def test_transition_limit_keeps_the_newest_entries(self):
+        start = datetime(2026, 10, 25, 3, 0, 0, tzinfo=timezone.utc)
+        lines = []
+        for index in range(30):
+            provider = "openrouter" if index % 2 else "plan"
+            lines.append(route_line((start + timedelta(minutes=index)).isoformat().replace("+00:00", "Z"),
+                                    {"event": "route_selected", "provider": provider, "reason": "replacement"}))
+        self.log.write_text("".join(lines), encoding="utf-8")
+        entries = dash.route_transitions(dash.parse_route_log(), limit=5)
+        self.assertEqual(len(entries), 5)
+        self.assertEqual(entries[-1]["first_ts"],
+                         (start + timedelta(minutes=29)).isoformat().replace("+00:00", "Z"))
+
+    def test_help_covers_every_reason_the_proxy_emits(self):
+        expected = {"native_feature:plan_model", "native_feature:token_count",
+                    "native_feature:unsupported_beta", "native_feature:unsupported_content_field",
+                    "native_feature:unsupported_content_block", "fallback", "circuit_open"}
+        self.assertLessEqual(expected, set(dash.REASON_HELP))
+        for code, values in dash.REASON_HELP.items():
+            self.assertEqual(len(values), 2, code)
+            self.assertTrue(all(isinstance(value, str) and value for value in values), code)
+        for row in dash.HELP_SECTION["states"] + dash.HELP_SECTION["exit_codes"]:
+            self.assertEqual(len(row), 2)
+
+
+class ServerTests(unittest.TestCase):
+    def test_dashboard_server_binds_exclusively(self):
+        self.assertFalse(dash.DashboardServer.allow_reuse_address)
+        first = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        try:
+            port = first.server_address[1]
+            with self.assertRaises(OSError):
+                # A stale instance must not share the port and answer with older code.
+                dash.DashboardServer(("127.0.0.1", port), dash.Handler)
+        finally:
+            first.server_close()
+
+
 class SnapshotTests(unittest.TestCase):
     def test_snapshot_shape_and_loopback_only_binding(self):
         with mock.patch.object(dash, "scan_sessions", return_value=dash._empty_usage()), \
@@ -388,7 +461,7 @@ class SnapshotTests(unittest.TestCase):
              mock.patch.object(dash, "model_pricing", return_value={"ok": False, "error": "configuration_missing"}), \
              mock.patch.object(dash, "read_env", return_value={"OPENROUTER_MODEL": "vendor/model"}):
             data = dash.snapshot()
-        self.assertEqual(sorted(data), ["account", "alerts", "generated_at", "model", "pricing", "routing", "usage"])
+        self.assertEqual(sorted(data), ["account", "alerts", "generated_at", "help", "model", "pricing", "routing", "usage"])
         self.assertEqual(data["model"], "vendor/model")
         self.assertEqual(data["routing"]["state"], "unknown")
         self.assertEqual(data["alerts"], [])

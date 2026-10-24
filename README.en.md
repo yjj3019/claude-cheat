@@ -226,11 +226,13 @@ A **read-only** page bound to `127.0.0.1`, refreshed every two seconds. The defa
 | Now | **OpenRouter serving / Plan bypass / idle**, the **model that actually answered**, age, reason |
 | Alerts | Shown when Plan bypass reaches 50% within ten minutes, a circuit opens, a 400/413/422 rejection repeats, or the balance drops below 10% |
 | Last 60 minutes | Replacement versus Plan counts, circuit opens |
-| Bypass reasons | Counts per `native_feature` `detail`, external failure statuses and validation classes |
+| Bypass reasons | Counts per `native_feature` `detail` with **meaning and action**, external failure statuses and validation classes |
 | Credits | Key limit, spend this period, remaining, reset date (OpenRouter `/api/v1/key`) |
 | Today | Replacement and Plan tokens, input/output, cache, **estimated cost** |
 | Hourly tokens | The last 24 hours as replacement versus Plan bars |
+| Route transitions | When the route changed, its reason, model, count and duration (last 12) |
 | Per session | Turns, replacement/Plan turns, replacement tokens, **estimated cost**, model |
+| Help | Reason code table (meaning/action), state badges, exit codes, data sources |
 
 Estimated cost uses the model rates from OpenRouter `/api/v1/models`; confirm actual charges against the provider's own records. The **model that actually answered** is recorded by the proxy just before a response is delivered; the name the CLI shows is the request alias (`claude-sonnet-5-5` and so on), so this value is the real provider model.
 
