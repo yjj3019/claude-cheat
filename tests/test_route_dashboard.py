@@ -3,6 +3,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -66,11 +67,16 @@ class RouteLogTests(unittest.TestCase):
         self.log.write_text(
             "not-a-timestamp {\"event\": \"route_selected\", \"provider\": \"plan\"}\n"
             "2026-10-25T02:00:00Z {broken json\n"
-            "2026-10-25T02:00:00Z --- proxy start ---\n",
+            "2026-10-25T02:00:00Z --- proxy start ---\n"
+            "2026-10-25T03:00:00Z --- proxy start code=2026-10-25T02:30:00.000Z ---\n",
             encoding="utf-8")
         events = dash.parse_route_log()
         self.assertEqual([event["event"] for event in events],
-                         ["route_selected", "proxy_start"])
+                         ["route_selected", "proxy_start", "proxy_start"])
+        self.assertNotIn("code", events[1])
+        self.assertEqual(events[2]["code"], "2026-10-25T02:30:00.000Z")
+        state = dash.routing_state(events)
+        self.assertEqual(state["proxy_code"], "2026-10-25T02:30:00.000Z")
 
     def test_missing_log_reports_unknown_state(self):
         self.assertEqual(dash.parse_route_log(), [])
@@ -467,6 +473,44 @@ class PageTests(unittest.TestCase):
         self.assertIn("help.reasons", script)
 
 
+class ProxyStaleTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.code = self.root / "claudeRouteProxy.mjs"
+        self.code.write_text("// fixture", encoding="utf-8")
+        modified = datetime(2026, 10, 25, 3, 0, tzinfo=timezone.utc).timestamp()
+        os.utime(self.code, (modified, modified))
+
+    def routing(self, started):
+        return {"proxy_started_at": started, "state": "plan", "last": None}
+
+    def test_proxy_started_before_the_code_is_stale(self):
+        stale = dash.proxy_stale(self.routing("2026-10-25T02:40:00Z"), path=self.code)
+        self.assertTrue(stale)
+
+    def test_proxy_started_after_the_code_is_current(self):
+        self.assertFalse(dash.proxy_stale(self.routing("2026-10-25T03:10:00Z"), path=self.code))
+
+    def test_missing_start_or_missing_file_is_unknown(self):
+        self.assertIsNone(dash.proxy_stale(self.routing(None), path=self.code))
+        self.assertIsNone(dash.proxy_stale(self.routing("2026-10-25T03:10:00Z"), path=self.root / "absent.mjs"))
+
+    def test_recorded_code_stamp_is_authoritative(self):
+        older = {"proxy_started_at": "2026-10-25T03:20:00Z", "proxy_code": "2026-10-25T02:30:00.000Z"}
+        current = {"proxy_started_at": "2026-10-25T02:00:00Z", "proxy_code": "2026-10-25T03:00:00.000Z"}
+        self.assertTrue(dash.proxy_stale(older, path=self.code))
+        self.assertFalse(dash.proxy_stale(current, path=self.code))
+
+    def test_stale_proxy_raises_a_restart_alert(self):
+        routing = self.routing("2026-10-25T02:40:00Z")
+        routing["short"] = {"minutes": 10, "counts": {"external": 1, "plan": 0}, "plan_reasons": [],
+                            "failures": [], "circuit_opens": 0}
+        with mock.patch.object(dash, "PROXY_FILE", self.code):
+            alerts = dash.build_alerts(routing, {}, {"ok": True, "limit_usd": 50, "remaining_usd": 40},
+                                       {"ok": True})
+        self.assertIn("실행기 재시작 필요", [alert["title"] for alert in alerts])
+
+
 class ServerTests(unittest.TestCase):
     def test_dashboard_server_binds_exclusively(self):
         self.assertFalse(dash.DashboardServer.allow_reuse_address)
@@ -488,7 +532,9 @@ class SnapshotTests(unittest.TestCase):
              mock.patch.object(dash, "model_pricing", return_value={"ok": False, "error": "configuration_missing"}), \
              mock.patch.object(dash, "read_env", return_value={"OPENROUTER_MODEL": "vendor/model"}):
             data = dash.snapshot()
-        self.assertEqual(sorted(data), ["account", "alerts", "generated_at", "help", "model", "pricing", "routing", "usage"])
+        self.assertEqual(sorted(data),
+                         ["account", "alerts", "generated_at", "help", "model", "pricing", "proxy_stale",
+                          "routing", "usage"])
         self.assertEqual(data["model"], "vendor/model")
         self.assertEqual(data["routing"]["state"], "unknown")
         self.assertEqual(data["alerts"], [])

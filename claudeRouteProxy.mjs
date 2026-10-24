@@ -1,8 +1,8 @@
 import http from 'node:http';
 import { once } from 'node:events';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { appendFileSync } from 'node:fs';
-import { pathToFileURL } from 'node:url';
+import { appendFileSync, statSync } from 'node:fs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 // Diagnostic mirror: routing events also land in a file so a session can be explained afterwards.
 // The launcher sets ROUTE_LOG_PATH for OpenRouter sessions; without it nothing is written.
@@ -14,7 +14,11 @@ if (routeLogPath) {
     emit(...args);
     try { appendFileSync(routeLogPath, `${new Date().toISOString()} ${args.join(' ')}\n`); } catch {}
   };
-  try { appendFileSync(routeLogPath, `${new Date().toISOString()} --- proxy start ---\n`); } catch {}
+  // Record which source revision this process loaded so a stale run is visible afterwards.
+  const codeStamp = (() => {
+    try { return statSync(fileURLToPath(import.meta.url)).mtime.toISOString(); } catch { return null; }
+  })();
+  try { appendFileSync(routeLogPath, `${new Date().toISOString()} --- proxy start${codeStamp ? ` code=${codeStamp}` : ''} ---\n`); } catch {}
 }
 
 // Historical client alias only; the upstream model must be configured explicitly.
@@ -139,8 +143,9 @@ function compatExclusion(body, beta) {
 // Claude Code sends these on every request, even with experimental betas disabled. They only
 // steer reasoning hints or the client's context budget, so a name alone must not divert traffic to Plan.
 // context-1m only raises the client budget: it adds no request field and providers ignore the header.
+// fallback-credit is client bookkeeping for the Plan fallback model; it changes no request field either.
 const BASELINE_BETAS = new Set(['interleaved-thinking-2025-05-14', 'effort-2025-11-24',
-  'context-1m-2025-08-07']);
+  'context-1m-2025-08-07', 'fallback-credit-2026-06-01']);
 function unsupportedBetas(beta, localCompat = false) {
   return (beta || '').split(',').map(x => x.trim()).filter(x => x &&
     !BASELINE_BETAS.has(x) && !(localCompat && COMPAT_BETAS.has(x)) &&

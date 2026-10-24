@@ -393,6 +393,7 @@ python routeDashboard.py --status --offline  # OpenRouter 호출 생략
 | Local 설정을 바꿔도 이전 서버 사용 | 프로세스 환경변수 우선순위와 전역 실행기 대상 확인 후 세션 재시작 |
 | Local 모델 목록 성공인데 추론 실패 | Messages API·모델 ID·도구/응답 형식 호환성을 별도 확인 |
 | Sonnet 선택 후 계속 Plan 사용 | `-Debug`로 `route_selected` 확인; `native_feature`는 Plan 전용 모델·토큰 계산·네이티브 이력 때문에 정상일 수 있음. `unsupported_beta`가 반복되면 CLI가 라우터가 모르는 beta를 추가한 것이므로 실행기를 갱신 |
+| 대시보드에 `실행기 재시작 필요` | 실행 중인 프록시가 현재 코드보다 먼저 시작됨. 수정된 필터가 적용되지 않으므로 세션을 재시작 |
 | `503 ... restart required`가 반복됨 | 과거 실행기/프록시 잔존 여부·첫 upstream 오류를 확인하고 최신 실행기로 새 세션 시작; 후속 503만으로 원인 단정 금지 |
 | HUD·MCP 일부가 동작하지 않음 | 일반 Claude에서도 같은지 비교; 설정 로드와 서버 연결·권한 정상 여부는 별도 |
 | 응답 전 대기가 길어짐 | 외부 4회 시도와 버퍼링 여부 확인; 사용자가 취소하면 후속 시도도 중단 |

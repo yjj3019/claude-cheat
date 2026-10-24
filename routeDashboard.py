@@ -27,6 +27,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 ROUTE_LOG = ROOT / ".route.log"
+PROXY_FILE = ROOT / "claudeRouteProxy.mjs"
 PROJECTS = Path.home() / ".claude" / "projects"
 ACCOUNT_TTL = 60
 SESSION_SUFFIX = ".jsonl"
@@ -113,8 +114,10 @@ def parse_route_log(path=None, limit=5000):
             continue
         stamp, _, rest = line.partition(" ")
         rest = rest.strip()
-        if rest == "--- proxy start ---":
-            events.append({"ts": stamp, "event": "proxy_start"})
+        start = re.fullmatch(r"--- proxy start(?: code=(\S+))? ---", rest)
+        if start:
+            events.append({"ts": stamp, "event": "proxy_start",
+                           **({"code": start.group(1)} if start.group(1) else {})})
             continue
         if not rest.startswith("{"):
             continue
@@ -259,6 +262,7 @@ def routing_state(events, now=None, idle_after=300):
                   "failures": short["failures"], "models": short["models"],
                   "circuit_opens": short["circuit_opens"]},
         "proxy_started_at": starts[-1]["ts"] if starts else None,
+        "proxy_code": starts[-1].get("code") if starts else None,
         "transitions": route_transitions(events),
         "recent": [{"ts": e["ts"], "event": e.get("event"), "provider": e.get("provider"),
                     "reason": e.get("reason"), "detail": e.get("detail"),
@@ -522,6 +526,30 @@ def model_pricing(key, model, cache=None, now=None):
     return result
 
 
+def code_modified_at(path=None):
+    """When the proxy source last changed; a running proxy older than this uses stale filters."""
+    try:
+        return datetime.fromtimestamp(Path(path or PROXY_FILE).stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        return None
+
+
+def proxy_stale(routing, path=None):
+    """True when the running proxy loaded an older revision than the current source."""
+    modified = code_modified_at(path)
+    if modified is None:
+        return None
+    started_code = routing.get("proxy_code")
+    if started_code:
+        age = _seconds_between(started_code, modified.isoformat())
+        return age is not None and abs(age) > 1
+    started = routing.get("proxy_started_at")
+    if not started:
+        return None
+    age = _seconds_between(started, modified.isoformat())
+    return age is not None and age > 0
+
+
 def build_alerts(routing, usage, account, pricing):
     """Actionable warnings; the page shows them in severity order."""
     alerts = []
@@ -550,6 +578,9 @@ def build_alerts(routing, usage, account, pricing):
         if last.get("detail"):
             reason = f"{reason} / {last['detail']}"
         alerts.append({"level": "info", "title": "현재 Plan 경로", "detail": f"마지막 결정 사유: {reason}"})
+    if proxy_stale(routing):
+        alerts.append({"level": "warn", "title": "실행기 재시작 필요",
+                       "detail": "실행 중인 프록시가 현재 코드보다 먼저 시작되었습니다. 수정된 라우팅 필터가 적용되지 않아 Plan으로 우회할 수 있으니 세션을 재시작하세요."})
     if account.get("ok"):
         limit, remaining = account.get("limit_usd"), account.get("remaining_usd")
         if all(isinstance(value, (int, float)) for value in (limit, remaining)) and limit > 0:
@@ -583,6 +614,7 @@ def snapshot():
         "account": account,
         "pricing": pricing,
         "alerts": build_alerts(routing, usage, account, pricing),
+        "proxy_stale": proxy_stale(routing),
         "help": {"reasons": REASON_HELP, **HELP_SECTION},
         "model": model,
     }
@@ -607,6 +639,7 @@ def cached_snapshot():
         "account": account,
         "pricing": None,
         "alerts": build_alerts(routing, usage, account, None),
+        "proxy_stale": proxy_stale(routing),
         "help": {"reasons": REASON_HELP, **HELP_SECTION},
         "model": config.get("OPENROUTER_MODEL") or None,
     }
@@ -707,7 +740,8 @@ function render(data) {
      <div class="kv"><span>마지막 결정</span><b>${esc(ageText)}</b></div>
      <div class="kv"><span>사유</span><b>${esc(lastDetail)}</b></div>
      <div class="kv"><span>실제 사용 모델</span><b class="mono">${esc(r.last?.model || '—')}</b></div>
-     <div class="kv"><span>프록시 시작</span><b>${esc(r.proxy_started_at ? new Date(r.proxy_started_at).toLocaleString('ko-KR') : '—')}</b></div>`);
+     <div class="kv"><span>프록시 시작</span><b>${esc(r.proxy_started_at ? new Date(r.proxy_started_at).toLocaleString('ko-KR') : '—')}</b></div>
+     ${data.proxy_stale ? '<div class="kv"><span>프록시 상태</span><b style="color:#ffb27a">코드보다 오래됨 · 재시작 필요</b></div>' : ''}`);
 
   const total = r.counts.external + r.counts.plan;
   const pct = total ? Math.round(r.counts.external / total * 100) : 0;
@@ -922,9 +956,11 @@ def status_report(include_usage=False, offline=False):
     alerts = build_alerts(routing, usage, account, pricing)
     last = routing.get("last") or {}
     critical = any(alert["level"] == "critical" for alert in alerts)
+    stale = proxy_stale(routing)
     report = {
-        "ok": not critical and routing["state"] in ("external", "idle"),
+        "ok": not critical and not stale and routing["state"] in ("external", "idle"),
         "state": routing["state"],
+        "proxy_stale": stale,
         "provider": last.get("provider"),
         "reason": last.get("reason"),
         "detail": last.get("detail"),
@@ -940,7 +976,10 @@ def status_report(include_usage=False, offline=False):
         "account": {name: account.get(name) for name in
                     ("ok", "error", "limit_usd", "spent_usd", "remaining_usd", "resets_at")},
         "config": {"model": model, "route_log_exists": ROUTE_LOG.is_file(),
-                   "route_log": str(ROUTE_LOG)},
+                   "route_log": str(ROUTE_LOG), "proxy_stale": proxy_stale(routing),
+                   "proxy_code": routing.get("proxy_code"),
+                   "code_modified_at": (code_modified_at().isoformat(timespec="seconds")
+                                        if code_modified_at() else None)},
         "generated_at": now.isoformat(timespec="seconds"),
     }
     if include_usage:

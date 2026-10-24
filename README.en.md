@@ -283,6 +283,7 @@ A failed check exits with code 1 and never invokes Plan fallback. A successful m
 | OpenRouter 401 / missing authentication header | Router key file and key validity; successful HUD installation does not prove inference auth |
 | Old Local address remains active | Process environment overrides, global shim target, then restart |
 | Sonnet continues using Plan | Check `route_selected` with `-Debug`; `native_feature` can be legitimate (Plan-only model, token counting, native history). Repeated `unsupported_beta` means the CLI added a beta the router does not know yet, so update the launcher |
+| Dashboard shows `실행기 재시작 필요` | The running proxy started before the current source, so fixes are not loaded; restart the session |
 | Repeated historical `503 ... restart required` | Stale session/proxy and first upstream error; restart with current launcher |
 | HUD or MCP failure | Compare ordinary Claude; loading settings does not prove server connectivity |
 
