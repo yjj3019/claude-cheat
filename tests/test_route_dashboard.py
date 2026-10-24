@@ -833,6 +833,55 @@ class RouteTailTests(unittest.TestCase):
         self.assertEqual(events[-1]["ts"], "2026-01-01T00:00:29+00:00")
 
 
+class SnapshotReuseTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch.object(dash, "_USAGE_SNAP",
+                                            {"signature": None, "at": 0.0, "data": None}))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        usage = dash._empty_usage()
+        usage["totals"]["external"] = [10, 2, 0, 0]
+        self.usage = usage
+
+    def test_unchanged_signature_skips_the_transcript_walk(self):
+        with mock.patch.object(dash, "scan_sessions", return_value=self.usage) as scan:
+            first = dash.usage_snapshot(signature=("2026-10-25T01:00:00Z", 3, 200))
+            second = dash.usage_snapshot(signature=("2026-10-25T01:00:00Z", 3, 200))
+        scan.assert_called_once()
+        self.assertIs(first, second)
+
+    def test_new_routing_event_forces_a_rescan(self):
+        with mock.patch.object(dash, "scan_sessions", return_value=self.usage) as scan:
+            dash.usage_snapshot(signature=("2026-10-25T01:00:00Z", 3, 200))
+            dash.usage_snapshot(signature=("2026-10-25T01:05:00Z", 4, 200))
+        self.assertEqual(scan.call_count, 2)
+
+    def test_missing_signature_always_scans(self):
+        with mock.patch.object(dash, "scan_sessions", return_value=self.usage) as scan:
+            dash.usage_snapshot(signature=None)
+            dash.usage_snapshot(signature=None)
+        self.assertEqual(scan.call_count, 2)
+
+    def test_expired_cache_rescans(self):
+        with mock.patch.object(dash, "scan_sessions", return_value=self.usage) as scan:
+            dash.usage_snapshot(signature=("t", 1, 200), ttl=0)
+            dash.usage_snapshot(signature=("t", 1, 200), ttl=0)
+        self.assertEqual(scan.call_count, 2)
+
+    def test_routing_signature_tracks_the_last_event(self):
+        routing = {"last": {"ts": "2026-10-25T02:00:00Z", "status": 200}, "recent": [{"ts": "x"}] * 4}
+        self.assertEqual(dash.routing_signature(routing)[:2], ("2026-10-25T02:00:00Z", 4))
+        self.assertIsNone(dash.routing_signature({})[0])
+
+    def test_transcript_walk_finds_nested_files(self):
+        projects = self.root / "projects"
+        (projects / "a" / "b").mkdir(parents=True)
+        (projects / "top.jsonl").write_text("{}\n", encoding="utf-8")
+        (projects / "a" / "b" / "deep.jsonl").write_text("{}\n", encoding="utf-8")
+        (projects / "a" / "notes.txt").write_text("x", encoding="utf-8")
+        found = {path.name for path, _mtime, _size in dash._transcript_files(projects)}
+        self.assertEqual(found, {"top.jsonl", "deep.jsonl"})
+
+
 class ProxyMetricsTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))

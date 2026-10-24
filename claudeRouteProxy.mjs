@@ -262,7 +262,7 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal, on
     await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
-  const text = Buffer.concat(chunks).toString('utf8');
+  const text = (chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)).toString('utf8');
   if (!text.trim()) throw new Error('Empty message response');
   if (!sse) {
     const response = JSON.parse(text);
@@ -515,7 +515,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         if (size > MAX_RESPONSE) return reject(413, 'Request too large');
         chunks.push(chunk);
       }
-      const raw = Buffer.concat(chunks);
+      const raw = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
       let body;
       try { body = JSON.parse(raw.toString('utf8')); } catch { return reject(400, 'Invalid JSON'); }
       if (!body || typeof body !== 'object' || Array.isArray(body)) return reject(403, 'Unsupported request fields');

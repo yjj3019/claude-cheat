@@ -12,6 +12,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 SPEC = importlib.util.spec_from_file_location(
     "route_dashboard", Path(__file__).resolve().parents[1] / "routeDashboard.py")
@@ -100,6 +101,25 @@ def main():
             handle.write(json.dumps({"type": "assistant", "timestamp": datetime.now(timezone.utc).isoformat(),
                                      "message": {"model": "vendor/model", "usage": {"input_tokens": 10}}}) + "\n")
         timed("scan_sessions (one file appended)", lambda: dash.scan_sessions(projects=projects, pricing=None))
+
+        # End-to-end refresh cost, with the network stubbed out.
+        original_projects, original_log = dash.PROJECTS, dash.ROUTE_LOG
+        dash.PROJECTS, dash.ROUTE_LOG = projects, log
+        dash._USAGE_SNAP.update({"signature": None, "at": 0.0, "data": None})
+        dash._ROUTE_TAIL.update({"path": None, "events": [], "offset": 0, "digest": None})
+        try:
+            with mock.patch.object(dash, "read_env", return_value={"OPENROUTER_MODEL": "vendor/model"}), \
+                 mock.patch.object(dash, "account_state", return_value={"ok": False, "error": "offline"}), \
+                 mock.patch.object(dash, "model_pricing", return_value={"ok": False}):
+                timed("snapshot (first, cold caches)", lambda: dash.snapshot(), rounds=2)
+                timed("snapshot (unchanged inputs)", lambda: dash.snapshot())
+                with log.open("a", encoding="utf-8") as handle:
+                    handle.write(datetime.now(timezone.utc).isoformat() + " " +
+                                 json.dumps({"event": "route_selected", "provider": "openrouter",
+                                             "reason": "replacement"}) + "\n")
+                timed("snapshot (first refresh after new data)", lambda: dash.snapshot(), rounds=1)
+        finally:
+            dash.PROJECTS, dash.ROUTE_LOG = original_projects, original_log
 
 
 if __name__ == "__main__":

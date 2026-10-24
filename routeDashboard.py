@@ -39,6 +39,7 @@ DEFAULT_PORT = 8787
 ACCOUNT_TTL = 60
 SESSION_SUFFIX = ".jsonl"
 ROUTE_WINDOW = 60
+ROUTING_EVENTS_CAP = 2000
 SHORT_WINDOW = 10
 TIMELINE_HOURS = 24
 BYTES_CAP = 65536
@@ -258,6 +259,10 @@ def _seconds_between(first, second):
 
 def routing_state(events, now=None, idle_after=300):
     """Summarise the newest decisions: what is serving traffic right now."""
+    # Bound the per-refresh work: one CLI session keeps far fewer events in a 60 minute
+    # window, while a pathological log still renders in a few milliseconds.
+    if len(events) > ROUTING_EVENTS_CAP:
+        events = events[-ROUTING_EVENTS_CAP:]
     now = now or datetime.now(timezone.utc)
     selected = [e for e in events if e.get("event") == "route_selected"]
     last = selected[-1] if selected else None
@@ -388,6 +393,30 @@ def _session_cost(tokens, pricing):
             tokens[2] * pricing["cache_read"] + tokens[3] * pricing["cache_write"])
 
 
+def _transcript_files(root):
+    """Yield (path, mtime, size) for transcript files.
+
+    Walks with ``os.scandir`` so Windows reuses the metadata already returned by the
+    directory read: a ``Path.rglob`` plus ``stat`` pays for a second syscall per file.
+    """
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        yield from _transcript_files(entry.path)
+                    elif entry.name.endswith(SESSION_SUFFIX):
+                        info = entry.stat()
+                        yield Path(entry.path), info.st_mtime, info.st_size
+                except OSError:
+                    continue
+    except OSError:
+        return
+
+
+_USAGE_CACHE = {"key": None, "data": None}
+
+
 def scan_sessions(projects=None, max_files=SCAN_FILES, now=None, pricing=None):
     """Incrementally total token usage per provider from Claude Code transcripts."""
     projects = Path(projects or PROJECTS)
@@ -396,16 +425,19 @@ def scan_sessions(projects=None, max_files=SCAN_FILES, now=None, pricing=None):
         return _empty_usage(now)
     cutoff = (now - timedelta(days=SCAN_DAYS)).timestamp()
     candidates = []
-    try:
-        for entry in projects.rglob("*" + SESSION_SUFFIX):
-            try:
-                modified = entry.stat().st_mtime
-            except OSError:
-                continue
-            if modified >= cutoff:
-                candidates.append((modified, entry))
-    except OSError:
-        return _empty_usage(now)
+    total_size, newest = 0, 0.0
+    for path, modified, size in _transcript_files(projects):
+        total_size += size
+        newest = max(newest, modified)
+        if modified >= cutoff:
+            candidates.append((modified, path))
+    # Nothing was appended, removed or touched since the previous scan: reuse the result.
+    price_key = None if not pricing else (pricing.get("prompt"), pricing.get("completion"),
+                                          pricing.get("cache_read"), pricing.get("cache_write"))
+    cache_key = (str(projects), len(candidates), newest, total_size, now.strftime("%Y%m%d%H"),
+                 price_key, max_files)
+    if _USAGE_CACHE["key"] == cache_key and _USAGE_CACHE["data"] is not None:
+        return _USAGE_CACHE["data"]
     candidates.sort(reverse=True)
     if max_files:
         candidates = candidates[:max_files]
@@ -501,9 +533,41 @@ def scan_sessions(projects=None, max_files=SCAN_FILES, now=None, pricing=None):
                              "plan": {"turns": bucket["plan"]["turns"],
                                       "tokens": bucket["plan"]["tokens"]}})
         sessions.sort(key=lambda item: item["last"] or "", reverse=True)
-        return {"totals": totals, "today": hour_totals, "current_hour": current_hour,
-                "timeline": timeline, "cost_usd": round(total_cost, 6) if pricing and pricing.get("ok") else None,
-                "sessions": sessions[:8], "session_count": len(sessions)}
+        usage = {"totals": totals, "today": hour_totals, "current_hour": current_hour,
+                 "timeline": timeline,
+                 "cost_usd": round(total_cost, 6) if pricing and pricing.get("ok") else None,
+                 "sessions": sessions[:8], "session_count": len(sessions)}
+        _USAGE_CACHE["key"] = cache_key
+        _USAGE_CACHE["data"] = usage
+        return usage
+
+
+_USAGE_SNAP = {"signature": None, "at": 0.0, "data": None}
+
+
+def routing_signature(routing):
+    """Cheap change signal: a new routing decision means new assistant tokens exist."""
+    last = routing.get("last") or {}
+    recent = routing.get("recent") or []
+    return (last.get("ts"), len(recent), last.get("status"))
+
+
+def usage_snapshot(pricing=None, signature=None, ttl=60):
+    """Skip the transcript walk while nothing new was routed.
+
+    A new assistant turn always produces a ``route_selected`` event, so an unchanged
+    signature cannot hide new tokens; a periodic rescan still refreshes clock-derived
+    fields such as the 24-hour timeline.
+    """
+    now = time.monotonic()
+    cached = _USAGE_SNAP["data"]
+    if (cached is not None and signature is not None
+            and _USAGE_SNAP["signature"] == signature
+            and now - _USAGE_SNAP["at"] < ttl):
+        return cached
+    data = scan_sessions(pricing=pricing)
+    _USAGE_SNAP.update({"signature": signature, "at": now, "data": data})
+    return data
 
 
 def account_state(key, cache=None, now=None):
@@ -1231,7 +1295,7 @@ def snapshot():
     routing = routing_state(parse_route_log(), now=now)
     pricing = model_pricing(key, model)
     account = account_state(key)
-    usage = scan_sessions(pricing=pricing)
+    usage = usage_snapshot(pricing=pricing, signature=routing_signature(routing))
     metrics = proxy_metrics()
     insights = build_insights(routing, usage, account, pricing, metrics=metrics)
     return {
@@ -1263,7 +1327,7 @@ def cached_snapshot():
     key = config.get("ANTHROPIC_AUTH_TOKEN")
     routing = routing_state(parse_route_log(), now=now)
     account = account_state(key)
-    usage = _empty_usage()
+    usage = _USAGE_SNAP["data"] or _empty_usage()
     return {
         "generated_at": now.isoformat(timespec="seconds"),
         "building": True,

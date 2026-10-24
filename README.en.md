@@ -395,10 +395,11 @@ python tests/bench_dashboard.py            # 10MB log, 2,000 transcript files
 
 | Metric | Value |
 | --- | --- |
-| `.route.log` parsing | 38–278ms for a full 10MB read → **2.9ms incremental tail** (3.2ms with 200 new lines) |
-| Transcript scan | 4.8s for the first 2,000-file scan (background), 40ms incremental afterwards |
+| `.route.log` parsing | 38–278ms for a full 10MB read → **1–3ms incremental tail** (1ms with 200 new lines) |
+| Transcript scan | 5s for the first 2,000-file scan (background), 40ms → **23ms** incremental (`os.scandir` metadata) |
+| Snapshot refresh | 2,000 files and a 10MB log: **8ms with unchanged inputs**, 43ms for the first refresh after new data |
 
-What the measurements changed: the request body was serialized **four times inside the retry loop** and is now serialized once, a history without signed reasoning no longer rebuilds its message array on every turn (~19% better on long sessions), and the routing log is **read incrementally from a parked offset** instead of re-parsed every refresh (rotation and truncation are detected from a leading-byte fingerprint). The same commands re-measure it at any time.
+What the measurements changed: the request body was serialized **four times inside the retry loop** and is now serialized once, a history without signed reasoning no longer rebuilds its message array on every turn (~19% better on long sessions), the routing log is **read incrementally from a parked offset** (rotation and truncation are detected from a leading-byte fingerprint), the transcript walk is **skipped entirely when no new routing decision exists** (signature cache with a 60 second forced rescan), a single-chunk body is **forwarded without a copy**, and a window is capped at the newest 2,000 events so a pathological log cannot slow a refresh. The same commands re-measure it at any time.
 
 - A real Local service still requires separate authentication, inference, and tool-call validation.
 - Unsupported native features or signed history stay on the Plan route. External usage can be zero, and native history may prevent a safe return to the external provider in the same conversation.
