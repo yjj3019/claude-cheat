@@ -1,18 +1,21 @@
 param([switch]$Remove)
 # Installs bare commands that forward to this checkout:
-#   startOpenClaude.ps1     -> startOpenClaude.ps1 (routing session)
-#   startDashboard.ps1      -> startDashboard.ps1 (dashboard)
-#   startClaudeOpenRouter.ps1 / startClaudeDashboard.ps1 -> compatibility forwarders
+#   OpenClaude.ps1            -> routing session
+#   OpenClaudeDashboard.ps1   -> dashboard
+#   startOpenClaude.ps1, startDashboard.ps1,
+#   startClaudeOpenRouter.ps1, startClaudeDashboard.ps1  -> forwarders for previous names
 #   .\installLauncher.ps1          # install or refresh
 #   .\installLauncher.ps1 -Remove  # delete every installed forwarder
 $ErrorActionPreference = 'Stop'
 $target = Join-Path $HOME '.local\bin'
 
 $commands = [ordered]@{
-    'startOpenClaude.ps1'        = @('startOpenClaude.ps1', 'routing session')
-    'startDashboard.ps1'         = @('startDashboard.ps1', 'dashboard')
-    'startClaudeOpenRouter.ps1'  = @('startOpenClaude.ps1', 'previous name')
-    'startClaudeDashboard.ps1'   = @('startDashboard.ps1', 'previous name')
+    'OpenClaude.ps1'            = @('OpenClaude.ps1', 'routing session')
+    'OpenClaudeDashboard.ps1'   = @('OpenClaudeDashboard.ps1', 'dashboard')
+    'startOpenClaude.ps1'       = @('OpenClaude.ps1', 'previous name')
+    'startDashboard.ps1'        = @('OpenClaudeDashboard.ps1', 'previous name')
+    'startClaudeOpenRouter.ps1' = @('OpenClaude.ps1', 'previous name')
+    'startClaudeDashboard.ps1'  = @('OpenClaudeDashboard.ps1', 'previous name')
 }
 
 if ($Remove) {
@@ -48,7 +51,7 @@ foreach ($name in $commands.Keys) {
 
 $onPath = ($env:PATH -split ';' | Where-Object { $_ }) -contains $target
 if ($onPath) {
-    Write-Host 'run from any folder:  startOpenClaude.ps1   |   startDashboard.ps1'
+    Write-Host 'run from any folder:  OpenClaude   |   OpenClaudeDashboard'
 } else {
     Write-Warning "$target is not on PATH; add it with:  [Environment]::SetEnvironmentVariable('PATH', `$env:PATH + ';$target', 'User')"
 }

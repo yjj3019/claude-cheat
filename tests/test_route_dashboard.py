@@ -558,7 +558,7 @@ class ProxyStaleTests(unittest.TestCase):
             alerts = dash.build_alerts(routing, dash._empty_usage(), {"ok": False}, {"ok": False})
         stale = [alert for alert in alerts if alert["title"] == "실행기 재시작 필요"]
         self.assertEqual(len(stale), 1)
-        self.assertEqual(stale[0]["command"], ".\\startOpenClaude.ps1")
+        self.assertEqual(stale[0]["command"], ".\\OpenClaude.ps1")
 
     def test_stale_proxy_raises_a_restart_alert(self):
         routing = self.routing("2026-10-25T02:40:00Z")

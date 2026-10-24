@@ -52,7 +52,7 @@ class OpenRouterConfigError(ValueError):
         super().__init__(
             "Set a valid ANTHROPIC_AUTH_TOKEN and OPENROUTER_MODEL in .env.openrouter beside openrouterAdvisor.py. "
             "No default model is selected. Values hidden. "
-            "Or run startDashboard.ps1, open http://127.0.0.1:8787/ and fill the OpenRouter settings there.")
+            "Or run OpenClaudeDashboard.ps1, open http://127.0.0.1:8787/ and fill the OpenRouter settings there.")
 
 
 def read_env(path: Path) -> dict:
@@ -640,10 +640,10 @@ def main(argv=None) -> int:
                    "message": str(exc)}
         if isinstance(exc, OpenRouterConfigError):
             payload.update({"action": "open_dashboard", "dashboard": "http://127.0.0.1:8787/",
-                            "command": "powershell -File startDashboard.ps1"})
+                            "command": "powershell -File OpenClaudeDashboard.ps1"})
             print("[setup required] .env.openrouter is missing or invalid", file=sys.stderr)
-            print("  powershell -File startDashboard.ps1   ->  http://127.0.0.1:8787/", file=sys.stderr)
-            print("  fill the OpenRouter settings there, save, then run startOpenClaude.ps1 again",
+            print("  powershell -File OpenClaudeDashboard.ps1   ->  http://127.0.0.1:8787/", file=sys.stderr)
+            print("  fill the OpenRouter settings there, save, then run OpenClaude.ps1 again",
                   file=sys.stderr)
         print(json.dumps(payload), file=sys.stderr)
         return 1

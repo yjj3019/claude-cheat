@@ -64,21 +64,21 @@ claude auth status
 
 | 실행 방식 | 읽는 설정 위치 |
 | --- | --- |
-| 내려받은 저장소에서 `.\startOpenClaude.ps1` 실행 | 해당 저장소의 `.env.openrouter` / `.env.local-llm` |
-| 기존 PC의 전역 `startOpenClaude.ps1` 실행 | 전역 실행기가 가리키는 원본 실행기 폴더 |
+| 내려받은 저장소에서 `.\OpenClaude.ps1` 실행 | 해당 저장소의 `.env.openrouter` / `.env.local-llm` |
+| 기존 PC의 전역 `OpenClaude.ps1` 실행 | 전역 실행기가 가리키는 원본 실행기 폴더 |
 
 전역 실행기를 따로 설치했다면 그 대상 폴더에서 설정을 읽습니다. 저장소를 clone해도 전역 명령이 자동 설치되거나 기존 실행기의 대상이 바뀌지 않습니다. 새 checkout은 해당 폴더의 실행기를 명시적으로 실행하세요.
 
-> 이전 이름 `startClaudeOpenRouter.ps1`은 **호환 shim**으로 남아 있어 기존 바로가기·별칭이 그대로 동작합니다(새 이름으로 인자를 넘기고 안내만 출력).
+> 실행 스크립트는 **제품명 형태**입니다: `OpenClaude.ps1`(라우팅 세션), `OpenClaudeDashboard.ps1`(대시보드). 이전 이름 `startClaudeOpenRouter.ps1`·`startOpenClaude.ps1`·`startClaudeDashboard.ps1`·`startDashboard.ps1`은 **호환 shim**으로 남아 있어 기존 바로가기·별칭이 그대로 동작합니다(새 이름으로 인자를 넘기고 안내만 출력).
 
 **어느 폴더에서나 이름만으로 실행하려면** 한 번 설치합니다.
 
 ```powershell
-.\installLauncher.ps1          # %USERPROFILE%\.local\bin\startOpenClaude.ps1 생성 (+ 이전 이름용 포워더)
-.\installLauncher.ps1 -Remove   # 두 포워더 삭제
+.\installLauncher.ps1          # %USERPROFILE%\.local\bin 에 OpenClaude·OpenClaudeDashboard + 이전 이름 포워더 생성
+.\installLauncher.ps1 -Remove   # 설치한 포워더 전부 삭제
 ```
 
-설치 후에는 `D:\AI-Codding\Claude\ShowBox>` 같은 다른 폴더에서 `startOpenClaude.ps1`만 입력하면 됩니다. 포워더는 이 체크아웃의 경로를 담으므로, 저장소를 옮기면 다시 설치하세요. `.local\bin`이 PATH에 없으면 설치 스크립트가 추가 명령을 안내합니다.
+설치 후에는 `D:\AI-Codding\Claude\ShowBox>` 같은 다른 폴더에서 `OpenClaude`(또는 `OpenClaudeDashboard`)만 입력하면 됩니다. 포워더는 이 체크아웃의 경로를 담으므로, 저장소를 옮기면 다시 설치하세요. `.local\bin`이 PATH에 없으면 설치 스크립트가 추가 명령을 안내합니다.
 
 `.env`는 한 줄에 `KEY=VALUE` 하나를 사용합니다. 빈 줄·`#`으로 시작하는 주석·값 전체를 감싼 따옴표는 허용하며, 여러 줄 값·셸 변수 확장은 지원하지 않습니다. 키 뒤에 같은 줄 주석을 붙이지 마세요. 실제 `.env*`는 Git에서 제외합니다. 예제에는 실제 인증값을 넣지 마세요.
 
@@ -87,7 +87,7 @@ claude auth status
 **처음 한 번은 웹 콘솔에서 설정하는 것을 권합니다.** 콘솔은 라우팅 세션이 없어도 실행되고, 설정이 비어 있으면 화면에 시작 안내가 표시됩니다.
 
 ```powershell
-.\startDashboard.ps1        # http://127.0.0.1:8787/ (포트 고정, 이전 인스턴스는 자동 종료)
+.\OpenClaudeDashboard.ps1        # http://127.0.0.1:8787/ (포트 고정, 이전 인스턴스는 자동 종료)
 ```
 
 OpenRouter 카드에 **모델 ID**와 **API 키**를 입력하고 **모델 확인** → **저장**을 누른 뒤 세션을 시작하세요. 모델 확인은 저장 전 값으로도 실행되며, `.env.openrouter`가 없으면 저장 시 예제 파일의 주석을 그대로 가져와 값만 채웁니다. 설정이 없거나 잘못된 상태로 실행기를 시작하면 세션을 열지 않고 콘솔 주소를 안내합니다.
@@ -119,7 +119,7 @@ OPENROUTER_MODEL=REPLACE_WITH_OPENROUTER_MODEL_ID
 
 ```powershell
 # 실행기 폴더에서 실행: 기본 제공자는 OpenRouter
-.\startOpenClaude.ps1
+.\OpenClaude.ps1
 ```
 
 Claude Code에서 `/model`로 **Sonnet**을 선택합니다. 호환되는 요청은 OpenRouter의 `https://openrouter.ai/api/v1/messages`로 보내며, 대체 모델은 `.env.openrouter`의 `OPENROUTER_MODEL`로 지정합니다. 특정 모델을 기본값으로 선택하지 않습니다.
@@ -127,7 +127,7 @@ Claude Code에서 `/model`로 **Sonnet**을 선택합니다. 호환되는 요청
 기존 전역 실행기가 설치된 PC에서는 다른 작업 폴더에서도 다음처럼 실행할 수 있습니다.
 
 ```powershell
-startOpenClaude.ps1
+OpenClaude.ps1
 ```
 
 실행기는 해당 Claude 프로세스의 연결 주소만 로컬 라우터로 설정하고 기존 Plan 인증을 검사합니다. 저장된 로그인·사용자 설정을 API용 설정으로 덮어쓰지 않습니다. `/status`의 Plan 로그인 표시는 인증 상태이며 **현재 응답을 OpenRouter 모델이 만들었다는 증거는 아닙니다.**
@@ -137,7 +137,7 @@ startOpenClaude.ps1
 ### OpenRouter 호환 모드: Plan 전환 차단
 
 ```powershell
-.\startOpenClaude.ps1 -Provider OpenRouter -OpenRouterCompat
+.\OpenClaude.ps1 -Provider OpenRouter -OpenRouterCompat
 ```
 
 Claude Code 2.1.304 이상에서 `.env.openrouter`의 같은 키와 `OPENROUTER_MODEL`을 사용합니다. 주 모델·빠른 모델·하위 에이전트의 Claude 모델 선택을 모두 지정한 같은 OpenRouter 모델로 전달하며, Plan 로그인과 Plan fallback은 사용하지 않습니다. 기존 일반 실행과 Local 모드는 유지합니다.
@@ -207,7 +207,7 @@ URL 내 사용자명·비밀번호·쿼리·fragment, redirect, 잘못된 인증
 ### ② 모델 목록만 사전 점검
 
 ```powershell
-.\startOpenClaude.ps1 -CheckLocal
+.\OpenClaude.ps1 -CheckLocal
 ```
 
 이 명령은 Local 모델 목록에 **GET만** 보냅니다. Claude 실행·Plan 인증·추론·도구 실행·fallback을 하지 않습니다. 환경 프록시와 redirect를 사용하지 않으며 응답 크기는 1MiB, 소켓 타임아웃은 5초입니다. 전체 실행 시간이 반드시 5초 이하라는 뜻은 아닙니다.
@@ -232,9 +232,9 @@ URL 내 사용자명·비밀번호·쿼리·fragment, redirect, 잘못된 인증
 ### ③ Local 모드로 실행
 
 ```powershell
-.\startOpenClaude.ps1 -Provider Local
+.\OpenClaude.ps1 -Provider Local
 # 기존 전역 실행기가 설치된 PC에서는 다음 명령도 가능
-# startOpenClaude.ps1 -Provider Local
+# OpenClaude.ps1 -Provider Local
 ```
 
 다시 OpenRouter를 쓰려면 세션을 종료하고 기본 명령으로 재실행합니다. 실행 중인 세션에서 `/model`은 Claude 모델을 선택하며 OpenRouter/Local 제공자를 바꾸는 메뉴가 아닙니다.
@@ -242,7 +242,7 @@ URL 내 사용자명·비밀번호·쿼리·fragment, redirect, 잘못된 인증
 ### Claude CLI Local 호환 모드
 
 ```powershell
-.\startOpenClaude.ps1 -Provider Local -LocalCompat
+.\OpenClaude.ps1 -Provider Local -LocalCompat
 ```
 
 Claude Code 2.1.304 이상에서 플러그인·스킬·MCP·hooks·하위 에이전트와 추론 설정을 사용하는 별도 선택 모드입니다. 일반 설정과 프로젝트 지침을 로드하며 기본 승인·거절 규칙을 유지합니다. API 키 helper는 비활성화하고, 실행 시 설정으로 프록시 주소와 임시 인증을 고정합니다. 기존 실행과 아래 `-LocalMode`의 제한은 바뀌지 않습니다. `-LocalCompat`은 `-LocalMode`·진단 옵션과 함께 사용할 수 없습니다.
@@ -254,7 +254,7 @@ Claude Code 2.1.304 이상에서 플러그인·스킬·MCP·hooks·하위 에이
 ### Claude CLI Local 전용 모드
 
 ```powershell
-.\startOpenClaude.ps1 -Provider Local -LocalMode
+.\OpenClaude.ps1 -Provider Local -LocalMode
 ```
 
 일반 Claude CLI를 Local 서버로 실행하는 별도 모드입니다. Claude Code **2.1.304 이상**이 필요하며, 2.1.304로 검증했습니다. 이전 버전은 프록시와 세션을 시작하기 전에 차단합니다. `--safe-mode`에서 Bash/Read/Edit/Write/Glob/Grep를 제공하며, 기본 권한 확인(`default`)과 기존 사용자·프로젝트의 deny/ask 규칙을 유지합니다. 권한 우회나 Auto 모드를 켜지 않습니다. 기존 실행 명령은 그대로 유지합니다.
@@ -305,7 +305,7 @@ Local 응답은 JSON으로 받아 설정한 모델을 검증한 뒤 CLI용 SSE�
 ### Local 실제 추론 진단
 
 ```powershell
-.\startOpenClaude.ps1 -Provider Local -DiagnoseLocal
+.\OpenClaude.ps1 -Provider Local -DiagnoseLocal
 ```
 
 기존 실행과 분리된 진단 모드입니다. Claude CLI를 실행하지 않고 beta·도구·대화 이력 없이 고정 합성 질문을 Local Messages API에 한 번 보냅니다. 출력은 최대 512토큰, 전체 요청은 60초로 제한하며 재시도·Plan fallback·리다이렉트를 하지 않습니다. 기존 주소 검증과 HTTP 허용 설정을 그대로 적용합니다. 실제 추론이므로 서버 자원을 사용합니다.
@@ -363,7 +363,7 @@ Sonnet 선택과 HUD의 모델·비용 표시는 실제 외부 라우팅이나 �
 ### 실시간 대시보드
 
 ```powershell
-.\startDashboard.ps1
+.\OpenClaudeDashboard.ps1
 ```
 
 `127.0.0.1`에만 열리는 **읽기 전용** 페이지로, 2초마다 자동 갱신됩니다. 포트는 **8787로 고정**되며, 이전에 띄운 대시보드가 남아 있으면 자동으로 종료하고 같은 포트를 다시 사용합니다. 다른 프로그램이 그 포트를 쓰고 있으면 임의 포트로 옮기지 않고 오류로 알립니다. 빈 포트로 대체하려면 `--allow-port-fallback`을 지정하세요.
@@ -430,7 +430,7 @@ python routeDashboard.py --status --offline  # OpenRouter 호출 생략
 | Local 설정을 바꿔도 이전 서버 사용 | 프로세스 환경변수 우선순위와 전역 실행기 대상 확인 후 세션 재시작 |
 | Local 모델 목록 성공인데 추론 실패 | Messages API·모델 ID·도구/응답 형식 호환성을 별도 확인 |
 | Sonnet 선택 후 계속 Plan 사용 | `-Debug`로 `route_selected` 확인; `native_feature`는 Plan 전용 모델·토큰 계산·네이티브 이력 때문에 정상일 수 있음. `unsupported_beta`가 반복되면 CLI가 라우터가 모르는 beta를 추가한 것이므로 실행기를 갱신 |
-| 대시보드에 `실행기 재시작 필요` | 실행 중인 프록시가 현재 코드보다 먼저 시작됨. 경고의 **명령 복사** 버튼으로 `.\startOpenClaude.ps1`을 복사해 세션을 재시작. `지금 상태` 카드의 **프록시 코드**·**소스 수정** 시각으로 차이를 확인 |
+| 대시보드에 `실행기 재시작 필요` | 실행 중인 프록시가 현재 코드보다 먼저 시작됨. 경고의 **명령 복사** 버튼으로 `.\OpenClaude.ps1`을 복사해 세션을 재시작. `지금 상태` 카드의 **프록시 코드**·**소스 수정** 시각으로 차이를 확인 |
 | 세션이 갑자기 끊김 | `.route.log`에서 `parent_disconnected`(실행기 종료) 여부 확인. 다른 스크립트·작업이 `python` 프로세스를 **일괄 종료**하지 않았는지 확인. 대시보드는 `python routeDashboard.py --stop`으로만 종료 |
 | `503 ... restart required`가 반복됨 | 과거 실행기/프록시 잔존 여부·첫 upstream 오류를 확인하고 최신 실행기로 새 세션 시작; 후속 503만으로 원인 단정 금지 |
 | HUD·MCP 일부가 동작하지 않음 | 일반 Claude에서도 같은지 비교; 설정 로드와 서버 연결·권한 정상 여부는 별도 |
@@ -520,7 +520,7 @@ python tests/bench_dashboard.py            # 10MB 로그 · 2,000개 세션 파�
 
 | 파일 | 역할 |
 | --- | --- |
-| [startOpenClaude.ps1](startOpenClaude.ps1) | 제공자 선택과 Python 실행기 호출 |
+| [OpenClaude.ps1](OpenClaude.ps1) | 제공자 선택과 Python 실행기 호출 |
 | [openrouterAdvisor.py](openrouterAdvisor.py) | Plan 인증 검사·환경 격리·프록시 수명 관리·Local 목록 점검 |
 | [localProcessTree.py](localProcessTree.py) | Windows Local 전용 진입점의 Job 소유권·프로세스 트리 종료 감시 |
 | [claudeRouteProxy.mjs](claudeRouteProxy.mjs) | 모델별 라우팅·응답 검증·재시도·fallback·복구 |

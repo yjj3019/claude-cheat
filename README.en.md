@@ -32,19 +32,28 @@ From the checkout root:
 
 ```powershell
 # Default provider: OpenRouter; model comes from .env.openrouter
-.\startOpenClaude.ps1
+.\OpenClaude.ps1
 # Local Messages API, after configuring a real local service
-.\startOpenClaude.ps1 -Provider Local
+.\OpenClaude.ps1 -Provider Local
 ```
 
 If you install a global launcher separately, configuration is read beside its target script. Cloning this repository neither installs a global command nor changes an existing launcher target. Run the script in the intended checkout explicitly.
 
-> The previous name `startClaudeOpenRouter.ps1` remains as a **compatibility shim**: existing shortcuts and aliases keep working (it forwards every argument and prints a one-line notice).
+> Scripts use the **product-name form**: `OpenClaude.ps1` (routing session) and `OpenClaudeDashboard.ps1` (dashboard). The previous names `startClaudeOpenRouter.ps1`, `startOpenClaude.ps1`, `startClaudeDashboard.ps1` and `startDashboard.ps1` remain as **compatibility shims**, so existing shortcuts and aliases keep working (they forward every argument and print a one-line notice).
+>
+> To run them as bare commands from any folder, install the forwarders once:
+>
+> ```powershell
+> .\installLauncher.ps1          # writes OpenClaude, OpenClaudeDashboard (and the old names) into %USERPROFILE%\.local\bin
+> .\installLauncher.ps1 -Remove  # removes every installed forwarder
+> ```
+>
+> They embed this checkout's path, so re-run the installer if the repository moves.
 
 Configure OpenRouter once in the web console — it runs without a routing session and shows setup guidance while the settings are empty:
 
 ```powershell
-.\startDashboard.ps1        # http://127.0.0.1:8787/ (fixed port)
+.\OpenClaudeDashboard.ps1        # http://127.0.0.1:8787/ (fixed port)
 ```
 
 Fill the OpenRouter card with a **model ID** and **API key**, press **Model check**, then **Save**, and start the session. The check also runs on unsaved values, and saving without an existing `.env.openrouter` seeds the file from the shipped example so its comments stay. Starting the launcher with missing or invalid settings exits with the console address instead of opening a session. Editing the files by hand still works exactly as before.
@@ -82,7 +91,7 @@ The CLI or HUD can still display Sonnet/Plan for a replacement response. That la
 ## Local compatibility mode
 
 ```powershell
-.\startOpenClaude.ps1 -Provider Local -LocalCompat
+.\OpenClaude.ps1 -Provider Local -LocalCompat
 ```
 
 This separate opt-in mode restores normal plugin, skill, MCP, hook, subagent, project-instruction and thinking/effort settings on Claude Code 2.1.304 or later. Default permissions and deny/ask rules remain active. The API-key helper stays disabled; per-launch settings pin the loopback route and temporary authentication above saved environment settings. Existing commands and `-LocalMode` retain their behavior. Do not combine `-LocalCompat` with `-LocalMode` or diagnostics.
@@ -94,7 +103,7 @@ The current server returns an SSE model identifier that does not match the confi
 ## Local-only Claude CLI mode
 
 ```powershell
-.\startOpenClaude.ps1 -Provider Local -LocalMode
+.\OpenClaude.ps1 -Provider Local -LocalMode
 ```
 
 This opt-in mode launches the real Claude CLI with `--safe-mode`, Sonnet as the routing alias, and Bash/Read/Edit/Write/Glob/Grep. Claude Code **2.1.304 or later** is required; verification uses 2.1.304. Older versions are rejected before the proxy or session starts. Standard permission prompts (`default`) and existing user/project deny/ask rules stay enabled; this mode does not enable bypassPermissions or auto mode. Existing launch commands without `-LocalMode` are unchanged.
@@ -145,7 +154,7 @@ Use a new Local session rather than resuming a native Plan conversation. This mo
 ## Local inference diagnostic mode
 
 ```powershell
-.\startOpenClaude.ps1 -Provider Local -DiagnoseLocal
+.\OpenClaude.ps1 -Provider Local -DiagnoseLocal
 ```
 
 This separate mode sends one fixed synthetic Messages request directly to the configured Local server. It does not launch Claude Code, load CLI hooks/MCP/history, send beta headers or tools, retry, or call Plan. The request has a 512-token output limit and a 60-second deadline; redirects remain blocked. The existing endpoint restrictions and explicit HTTP pin still apply. An actual inference may consume server resources.
@@ -165,9 +174,9 @@ if (-not (Test-Path -LiteralPath '.env.local-llm')) {
 }
 notepad .env.local-llm
 # Model metadata only; no inference or Plan login is used.
-.\startOpenClaude.ps1 -CheckLocal
+.\OpenClaude.ps1 -CheckLocal
 # Normal launch still checks the saved Plan authentication.
-.\startOpenClaude.ps1 -Provider Local
+.\OpenClaude.ps1 -Provider Local
 ```
 
 ```dotenv
@@ -212,7 +221,7 @@ Independent validation after these Local additions passed Node tests, Python tes
 ## OpenRouter compatibility mode and startup checks
 
 ```powershell
-.\startOpenClaude.ps1 -Provider OpenRouter -OpenRouterCompat
+.\OpenClaude.ps1 -Provider OpenRouter -OpenRouterCompat
 ```
 
 Requires Claude Code 2.1.304 or newer and the same two `.env.openrouter` settings. All Claude model roles use the selected `OPENROUTER_MODEL`, without Plan login or fallback. The LocalCompat profile retains client plugins, skills, MCP, hooks, subagents, thinking and effort settings, ordinary configuration sources and default permissions. API-key helpers are disabled; the proxy route and temporary authentication are pinned in launch settings. Provider credentials stay in the proxy. Unknown native fields/betas and token counting are rejected. Ordinary routing and both Local modes remain available.
@@ -226,7 +235,7 @@ Every interactive launch now makes one minimal provider-only inference check bef
 ## Live dashboard
 
 ```powershell
-.\startDashboard.ps1
+.\OpenClaudeDashboard.ps1
 ```
 
 A **read-only** page bound to `127.0.0.1`, refreshed every two seconds. The port is **fixed at 8787**; an older dashboard instance is stopped automatically so the same port is reused. If another program holds that port the server fails with a message instead of silently moving; pass `--allow-port-fallback` to pick a free port instead.
@@ -309,7 +318,7 @@ A failed check exits with code 1 and never invokes Plan fallback. A successful m
 | OpenRouter 401 / missing authentication header | Router key file and key validity; successful HUD installation does not prove inference auth |
 | Old Local address remains active | Process environment overrides, global shim target, then restart |
 | Sonnet continues using Plan | Check `route_selected` with `-Debug`; `native_feature` can be legitimate (Plan-only model, token counting, native history). Repeated `unsupported_beta` means the CLI added a beta the router does not know yet, so update the launcher |
-| Dashboard shows `실행기 재시작 필요` | The running proxy started before the current source. Use the alert's **명령 복사** button to copy `.\startOpenClaude.ps1`, restart the session, and compare **프록시 코드** with **소스 수정** in the status card |
+| Dashboard shows `실행기 재시작 필요` | The running proxy started before the current source. Use the alert's **명령 복사** button to copy `.\OpenClaude.ps1`, restart the session, and compare **프록시 코드** with **소스 수정** in the status card |
 | Session drops abruptly | Check `.route.log` for `parent_disconnected` (launcher exited). Make sure no other script kills `python` processes wholesale; stop the dashboard with `python routeDashboard.py --stop` |
 | Repeated historical `503 ... restart required` | Stale session/proxy and first upstream error; restart with current launcher |
 | HUD or MCP failure | Compare ordinary Claude; loading settings does not prove server connectivity |
@@ -391,7 +400,7 @@ See the [connection and recovery checklist](docs/LIVE-VALIDATION.ko.md) for a ge
 
 | File | Purpose |
 | --- | --- |
-| `startOpenClaude.ps1` | PowerShell provider selector and launcher |
+| `OpenClaude.ps1` | PowerShell provider selector and launcher |
 | `openrouterAdvisor.py` | Plan authentication checks, environment isolation, proxy lifecycle, self-tests |
 | `localProcessTree.py` | Windows Local CLI Job ownership and process-tree guardian |
 | `claudeRouteProxy.mjs` | Routing, response validation, retries, fallback, recovery |
