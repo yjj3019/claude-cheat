@@ -326,6 +326,30 @@ node --check claudeRouteProxy.mjs
 
 The tests cover payload preservation, authentication isolation, tool-result round trips, the initial request plus three retries, Plan fallback, recovery, cancellation, timeouts, and empty responses. Synthetic success does not establish live-provider or full native-feature parity.
 
+### Simulation and performance
+
+A mock upstream generates traffic so throughput, latency, memory and routing decisions can be measured without calling a provider.
+
+```powershell
+node tests/simulate.mjs                                   # mixed load, long session, circuit breaker
+node tests/simulate.mjs --requests 4000 --concurrency 48 --json
+node tests/bench_proxy.mjs                                # proxy overhead by body size
+node --test tests/simulation.test.mjs                     # simulator smoke test
+```
+
+Scenarios cover a plain reply, SSE streaming, tool calls, a 429 retry, a 1MB body, an unsupported beta bypass, and the circuit breaker with cooldown; each response carries a marker so the simulator can assert which path served it. Any mismatch exits 1.
+
+Reference numbers (this development machine, Node 24, client and proxy in one process):
+
+| Metric | Value |
+| --- | --- |
+| Mixed throughput | ~700–980 req/s at 1,200 requests / concurrency 24, p50 16–25ms, p95 55–82ms |
+| Long session | 120 turns, 247KB history: 3.1ms (3.9ms before the fix) |
+| Body size | 1MB in 7.7–8.9ms (~120MB/s) |
+| Circuit | 4 failures → Plan fallback, Plan during cooldown, external again after recovery |
+
+What the measurements changed: the request body was serialized **four times inside the retry loop** and is now serialized once, and a history without signed reasoning no longer rebuilds its message array on every turn (~19% better on long sessions). The same commands re-measure it at any time.
+
 - A real Local service still requires separate authentication, inference, and tool-call validation.
 - Unsupported native features or signed history stay on the Plan route. External usage can be zero, and native history may prevent a safe return to the external provider in the same conversation.
 - Running only a native advisor on the subscription path during external inference is not implemented. Full native-feature equivalence, including remote managed settings and organization policy with a custom `ANTHROPIC_BASE_URL`, is not guaranteed.

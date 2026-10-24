@@ -92,6 +92,10 @@ const withoutNativeThinking = messages => messages.map(message => {
   // A turn that held only reasoning keeps its place so the conversation keeps valid turn order.
   return { ...message, content: content.length ? content : [{ type: 'text', text: OMITTED_REASONING }] };
 });
+// Scanning first avoids rebuilding (and re-allocating) a long history on every turn; most
+// sessions never carry signed reasoning because ordinary mode disables it upstream.
+const hasNativeThinking = messages => messages.some(message =>
+  Array.isArray(message.content) && message.content.some(isNativeThinking));
 const COMPAT_BETAS = new Set(['interleaved-thinking-2025-05-14', 'redact-thinking-2026-02-12',
   'context-management-2025-06-27', 'prompt-caching-scope-2026-01-05', 'per-turn-control-2026-07-01',
   'mid-conversation-tool-changes-2026-07-01', 'inline-tools-2026-09-15', 'advisor-tool-2026-03-01',
@@ -574,7 +578,9 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       try {
         const externalModel = provider === 'local' ? localModel : openrouterModel;
         const externalBody = { ...body, model: externalModel };
-        if (Array.isArray(externalBody.messages)) externalBody.messages = withoutNativeThinking(externalBody.messages);
+        if (Array.isArray(externalBody.messages) && hasNativeThinking(externalBody.messages)) {
+          externalBody.messages = withoutNativeThinking(externalBody.messages);
+        }
         delete externalBody.metadata; // client account/session identifiers stay off third-party providers
         if (noPlan) {
           externalBody.stream = false;
@@ -583,6 +589,9 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         if (!compatProfile) externalBody.thinking = { type: 'disabled' };
         if (body.tools) externalBody.tools = body.tools.map(tool => ({ ...tool, input_schema: compatibleSchema(tool.input_schema) }));
         if (provider === 'openrouter') externalBody.provider = { allow_fallbacks: false };
+        // Serialize once: the retry loop reuses the same payload, and a large history would
+        // otherwise be stringified up to four times.
+        const externalPayload = JSON.stringify(externalBody);
         const headers = { 'content-type': 'application/json', 'anthropic-version': req.headers['anthropic-version'] || '2023-06-01' };
         if (compatProfile && req.headers['anthropic-beta']) headers['anthropic-beta'] = req.headers['anthropic-beta'];
         const credential = provider === 'local' ? localKey : key;
@@ -605,7 +614,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           try {
             const operation = (async () => {
               const response = await fetchImpl(externalUrl, { method: 'POST', headers,
-                body: JSON.stringify(externalBody), redirect: 'error', signal: controller.signal });
+                body: externalPayload, redirect: 'error', signal: controller.signal });
               status = response.status;
               if (status === 429) { const seconds = Number(response.headers.get('retry-after')); if (seconds > 0) retryAfterMs = seconds * 1000; }
               if (!response.ok) {
