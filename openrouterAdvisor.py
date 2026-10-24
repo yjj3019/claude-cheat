@@ -214,7 +214,7 @@ def run_owned(args: list, env: dict, cwd: str, prompt: str = "", timeout: int = 
 
 
 @contextlib.contextmanager
-def routed_session(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False, openrouter_compat: bool = False):
+def routed_session(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False, openrouter_compat: bool = False, debug: bool = False):
     """Own one loopback proxy; ordinary sessions alone use the subscription login."""
     if (local_only and provider != "local") or (local_compat and not local_only):
         raise ValueError("Local CLI mode requires the local provider")
@@ -297,7 +297,8 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
     proxy_command = [node, str(ROOT / "claudeRouteProxy.mjs"), "--parent-pipe"]
     try:
         proxy = subprocess.Popen(proxy_command, env=proxy_env,
-                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8")
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8",
+                                 stderr=None if debug else subprocess.DEVNULL)
     except OSError:
         if isolated:
             raise startup_error("local_proxy_start_failed") from None
@@ -420,7 +421,7 @@ def local_cli_command(claude: str, compat: bool = False) -> list:
             "--no-chrome", "--settings", json.dumps(settings), "--append-system-prompt", workspace_context]
 
 
-def launch(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False, openrouter_compat: bool = False) -> int:
+def launch(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False, openrouter_compat: bool = False, debug: bool = False) -> int:
     if (local_only and provider != "local") or (local_compat and not local_only):
         raise ValueError("Local CLI mode requires the local provider")
     if openrouter_compat and (provider != "openrouter" or local_only or local_compat):
@@ -450,8 +451,8 @@ def launch(provider: str = "openrouter", local_only: bool = False, local_compat:
         if openrouter_compat:
             prompt_index = command.index("--append-system-prompt") + 1
             command[prompt_index] = command[prompt_index].replace("Local session", "OpenRouter session")
-        session = routed_session(provider, openrouter_compat=True) if openrouter_compat else (
-            routed_session(provider, local_only=True, local_compat=True) if local_compat else routed_session(provider, local_only=True))
+        session = routed_session(provider, openrouter_compat=True, debug=debug) if openrouter_compat else (
+            routed_session(provider, local_only=True, local_compat=True, debug=debug) if local_compat else routed_session(provider, local_only=True, debug=debug))
         with session as env:
             # CLI settings.env outranks process env: pin the same isolated route at that boundary.
             settings_index = command.index("--settings") + 1
@@ -480,7 +481,7 @@ def launch(provider: str = "openrouter", local_only: bool = False, local_compat:
     print(f"Sonnet replacement: {provider}. Opus/Haiku/Fable keep Claude Plan OAuth.")
     print("Initial request + 3 retries, then Plan fallback (subscription Sonnet); recovery checked on a later request.")
     print("Native-only features stay on Plan. Replacement replies are buffered until validated.")
-    with routed_session(provider) as env:
+    with routed_session(provider, debug=debug) as env:
         return subprocess.call([claude, "--model", "sonnet"], env=env)
 
 
@@ -529,8 +530,12 @@ def self_test() -> None:
             assert start.call_args.kwargs["env"]["OPENROUTER_MODEL"] == "fixture/model"
             assert "OPENROUTER_MODEL" not in env
             assert "sk-or-test-placeholder" not in repr(start.call_args.args)
+            assert start.call_args.kwargs["stderr"] == subprocess.DEVNULL
         proxy.terminate.assert_called_once()
     assert dict(os.environ) == original_env
+    with patch(__name__ + ".run_owned", return_value=auth), patch("shutil.which", return_value="executable"), patch(__name__ + ".read_env", return_value={"ANTHROPIC_AUTH_TOKEN": "sk-or-test-placeholder", "OPENROUTER_MODEL": "fixture/model"}), patch(__name__ + ".check_connection", return_value=0), patch("subprocess.Popen", return_value=proxy) as start:
+        with routed_session(debug=True):
+            assert start.call_args.kwargs["stderr"] is None
     proxy = Mock()
     proxy.stdout.readline.return_value = '{"port": 12345}\n'
     with patch.dict(os.environ, {"LOCAL_LLM_URL": "http://127.0.0.1:11434/v1/messages", "LOCAL_LLM_MODELS_URL": "http://127.0.0.1:11434/v1/models", "LOCAL_LLM_MODEL": "fixture-local", "LOCAL_LLM_API_KEY": "test-local-key"}), patch(__name__ + ".run_owned", return_value=auth), patch("shutil.which", return_value="executable"), patch(__name__ + ".read_key", side_effect=AssertionError("Local must not read OpenRouter key")), patch(__name__ + ".check_connection", return_value=0), patch("subprocess.Popen", return_value=proxy) as start:
@@ -579,6 +584,7 @@ if __name__ == "__main__":
             parser.add_argument("--local-mode", action="store_true", help="Interactive Local-only CLI with native integrations disabled and no Plan fallback")
             parser.add_argument("--local-compat", action="store_true", help="Opt-in Local-only CLI compatibility mode with client integrations and no Plan fallback")
             parser.add_argument("--openrouter-compat", action="store_true", help="Opt-in OpenRouter-only CLI compatibility mode with client integrations and no Plan fallback")
+            parser.add_argument("--debug", action="store_true", help="Show proxy routing logs (route_selected, circuit_open, ...) on stderr")
             options = parser.parse_args()
             if options.openrouter_compat and (options.provider != "openrouter" or options.local_mode or options.local_compat or options.check_local or options.diagnose_local):
                 parser.error("--openrouter-compat requires --provider openrouter and cannot be combined with Local modes or diagnostic checks")
@@ -600,7 +606,7 @@ if __name__ == "__main__":
                 except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
                     error = OpenRouterStartupError if options.openrouter_compat else LocalStartupError
                     raise error("local_process_cleanup_failed") from None
-            sys.exit(launch(options.provider, local_only=options.local_mode or options.local_compat, local_compat=options.local_compat, openrouter_compat=options.openrouter_compat))
+            sys.exit(launch(options.provider, local_only=options.local_mode or options.local_compat, local_compat=options.local_compat, openrouter_compat=options.openrouter_compat, debug=options.debug))
     except (LocalStartupError, OpenRouterConfigError) as exc:
         print(json.dumps({"event": "openrouter_start_failed", "kind": type(exc).__name__,
                           "code": exc.code if isinstance(exc, LocalStartupError) else "openrouter_configuration_invalid", "message": str(exc)}), file=sys.stderr)

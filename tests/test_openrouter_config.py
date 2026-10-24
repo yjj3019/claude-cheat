@@ -208,7 +208,7 @@ class OpenRouterConfigTests(unittest.TestCase):
              mock.patch.object(route, "routed_session", return_value=contextlib.nullcontext(pinned)) as session, \
              mock.patch.object(route.subprocess, "call", return_value=0) as child, contextlib.redirect_stdout(output):
             self.assertEqual(route.launch("openrouter", openrouter_compat=True), 0)
-        session.assert_called_once_with("openrouter", openrouter_compat=True)
+        session.assert_called_once_with("openrouter", openrouter_compat=True, debug=False)
         command = child.call_args.args[0]
         self.assertNotIn("--safe-mode", command)
         self.assertNotIn("--disallowedTools", command)

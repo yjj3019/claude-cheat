@@ -221,7 +221,7 @@ class LocalCliModeTests(LocalTestCase):
                   "ANTHROPIC_SMALL_FAST_MODEL": "claude-haiku-5-5", "CLAUDE_CODE_SUBAGENT_MODEL": "claude-sonnet-5-5"}
         with contextlib.redirect_stdout(output), mock.patch.object(route.shutil, "which", return_value="synthetic-cli"), mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.304")), mock.patch.object(route, "routed_session", return_value=contextlib.nullcontext(pinned)) as session, mock.patch.object(route.subprocess, "call", return_value=0) as child:
             self.assertEqual(route.launch("local", local_only=True, local_compat=True), 0)
-        session.assert_called_once_with("local", local_only=True, local_compat=True)
+        session.assert_called_once_with("local", local_only=True, local_compat=True, debug=False)
         self.assertIn("compatibility mode", output.getvalue())
         self.assertIn("No Plan fallback", output.getvalue())
         command = child.call_args.args[0]
@@ -495,7 +495,7 @@ class LocalCliModeTests(LocalTestCase):
         env = {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "2048"}
         with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(route.shutil, "which", return_value="synthetic-cli"), mock.patch.object(route, "routed_session", return_value=contextlib.nullcontext(env)) as session, mock.patch.object(route.subprocess, "call", return_value=0) as child:
             self.assertEqual(route.launch("local"), 0)
-        session.assert_called_once_with("local")
+        session.assert_called_once_with("local", debug=False)
         self.assertEqual(child.call_args.args[0], ["synthetic-cli", "--model", "sonnet"])
         self.assertEqual(child.call_args.kwargs["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"], "2048")
 

@@ -63,6 +63,8 @@ Routing metadata uses `route_selected` with provider `openrouter`, `local` or `p
 
 For `native_feature`, `detail` reports the first exclusion: `token_count`, `plan_model`, `unsupported_beta`, `unsupported_request_field`, `unsupported_message_shape`, `unsupported_thinking_config`, `unsupported_output_config`, `unsupported_tool_choice`, `native_thinking_history`, `unsupported_content`, `unsupported_content_block`, `unsupported_content_field`, `unsupported_tool_caller`, or `unsupported_tool_definition`. Exclusion labels are fixed; user text, tool names, signatures and credentials are never logged. For `unsupported_beta`, `beta_features` lists up to 16 date-suffixed feature identifiers and `unsupported_beta_count` gives the total. Nonstandard or credential-like entries are redacted; raw header strings are not logged. Restart the launcher to enable new diagnostics; old logs cannot reveal these details.
 
+Router logs (`route_selected` and the other events) are hidden by default and printed to stderr only with `-Debug` (or `python openrouterAdvisor.py --debug`). Startup errors and `provider_connection_unavailable` still print without it. Use `-Debug` to verify routing.
+
 The CLI or HUD can still display Sonnet/Plan for a replacement response. That label and its cost estimate do not prove the inference provider or actual OpenRouter billing. Check the safe `route_selected` metadata: `replacement`, `native_feature`, `fallback`, or `circuit_open`.
 
 ## Local compatibility mode

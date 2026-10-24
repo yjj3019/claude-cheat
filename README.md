@@ -322,6 +322,8 @@ Sonnet 선택과 HUD의 모델·비용 표시는 실제 외부 라우팅이나 �
 {"event":"route_selected","provider":"plan","reason":"native_feature","detail":"unsupported_beta"}
 ```
 
+라우터 로그(`route_selected` 등)는 기본적으로 숨겨지며 `-Debug`(또는 `python openrouterAdvisor.py --debug`)를 지정할 때만 터미널 stderr에 표시됩니다. 프록시 시작 오류와 `provider_connection_unavailable`은 `-Debug` 없이도 출력됩니다. 라우팅을 확인하려면 `-Debug`로 실행하세요.
+
 | 로그 항목 | 의미 |
 | --- | --- |
 | `route_selected` + `openrouter` 또는 `local` + `replacement` | 외부 응답 검증을 통과한 대체 경로 |
