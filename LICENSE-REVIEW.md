@@ -12,7 +12,7 @@
 | --- | --- |
 | `claudeRouteProxy.mjs` | Node.js 내장 `node:http`, `node:events`, `node:url` 및 내장 fetch·stream API |
 | `openrouterAdvisor.py` | Python 표준 라이브러리; 별도 설치된 `node`·`claude` 실행; 자체 검사 |
-| `startClaudeOpenRouter.ps1` | PowerShell 기본 기능으로 Python 실행 |
+| `startOpenClaude.ps1` | PowerShell 기본 기능으로 Python 실행 |
 | `tests/claudeRouteProxy.test.mjs` | Node.js 내장 assert·events·test, 프로젝트 프록시; 합성 인증값과 모의 응답 |
 | 후속 Local 연동 파일 | `tests/localLlmIntegration.test.mjs`의 Node 내장 HTTP 서버, `tests/test_local_config.py`의 Python 표준 unittest·HTTP 서버·mock; 실행기의 urllib 메타데이터 조회도 표준 라이브러리 사용 |
 | `README.md`, `.gitignore` | 문서·패턴; 기존 별도 라이선스 고지 없음 |

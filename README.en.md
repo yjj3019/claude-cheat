@@ -32,12 +32,14 @@ From the checkout root:
 
 ```powershell
 # Default provider: OpenRouter; model comes from .env.openrouter
-.\startClaudeOpenRouter.ps1
+.\startOpenClaude.ps1
 # Local Messages API, after configuring a real local service
-.\startClaudeOpenRouter.ps1 -Provider Local
+.\startOpenClaude.ps1 -Provider Local
 ```
 
 If you install a global launcher separately, configuration is read beside its target script. Cloning this repository neither installs a global command nor changes an existing launcher target. Run the script in the intended checkout explicitly.
+
+> The previous name `startClaudeOpenRouter.ps1` remains as a **compatibility shim**: existing shortcuts and aliases keep working (it forwards every argument and prints a one-line notice).
 
 Configure OpenRouter once in the web console — it runs without a routing session and shows setup guidance while the settings are empty:
 
@@ -80,7 +82,7 @@ The CLI or HUD can still display Sonnet/Plan for a replacement response. That la
 ## Local compatibility mode
 
 ```powershell
-.\startClaudeOpenRouter.ps1 -Provider Local -LocalCompat
+.\startOpenClaude.ps1 -Provider Local -LocalCompat
 ```
 
 This separate opt-in mode restores normal plugin, skill, MCP, hook, subagent, project-instruction and thinking/effort settings on Claude Code 2.1.304 or later. Default permissions and deny/ask rules remain active. The API-key helper stays disabled; per-launch settings pin the loopback route and temporary authentication above saved environment settings. Existing commands and `-LocalMode` retain their behavior. Do not combine `-LocalCompat` with `-LocalMode` or diagnostics.
@@ -92,7 +94,7 @@ The current server returns an SSE model identifier that does not match the confi
 ## Local-only Claude CLI mode
 
 ```powershell
-.\startClaudeOpenRouter.ps1 -Provider Local -LocalMode
+.\startOpenClaude.ps1 -Provider Local -LocalMode
 ```
 
 This opt-in mode launches the real Claude CLI with `--safe-mode`, Sonnet as the routing alias, and Bash/Read/Edit/Write/Glob/Grep. Claude Code **2.1.304 or later** is required; verification uses 2.1.304. Older versions are rejected before the proxy or session starts. Standard permission prompts (`default`) and existing user/project deny/ask rules stay enabled; this mode does not enable bypassPermissions or auto mode. Existing launch commands without `-LocalMode` are unchanged.
@@ -143,7 +145,7 @@ Use a new Local session rather than resuming a native Plan conversation. This mo
 ## Local inference diagnostic mode
 
 ```powershell
-.\startClaudeOpenRouter.ps1 -Provider Local -DiagnoseLocal
+.\startOpenClaude.ps1 -Provider Local -DiagnoseLocal
 ```
 
 This separate mode sends one fixed synthetic Messages request directly to the configured Local server. It does not launch Claude Code, load CLI hooks/MCP/history, send beta headers or tools, retry, or call Plan. The request has a 512-token output limit and a 60-second deadline; redirects remain blocked. The existing endpoint restrictions and explicit HTTP pin still apply. An actual inference may consume server resources.
@@ -163,9 +165,9 @@ if (-not (Test-Path -LiteralPath '.env.local-llm')) {
 }
 notepad .env.local-llm
 # Model metadata only; no inference or Plan login is used.
-.\startClaudeOpenRouter.ps1 -CheckLocal
+.\startOpenClaude.ps1 -CheckLocal
 # Normal launch still checks the saved Plan authentication.
-.\startClaudeOpenRouter.ps1 -Provider Local
+.\startOpenClaude.ps1 -Provider Local
 ```
 
 ```dotenv
@@ -210,7 +212,7 @@ Independent validation after these Local additions passed Node tests, Python tes
 ## OpenRouter compatibility mode and startup checks
 
 ```powershell
-.\startClaudeOpenRouter.ps1 -Provider OpenRouter -OpenRouterCompat
+.\startOpenClaude.ps1 -Provider OpenRouter -OpenRouterCompat
 ```
 
 Requires Claude Code 2.1.304 or newer and the same two `.env.openrouter` settings. All Claude model roles use the selected `OPENROUTER_MODEL`, without Plan login or fallback. The LocalCompat profile retains client plugins, skills, MCP, hooks, subagents, thinking and effort settings, ordinary configuration sources and default permissions. API-key helpers are disabled; the proxy route and temporary authentication are pinned in launch settings. Provider credentials stay in the proxy. Unknown native fields/betas and token counting are rejected. Ordinary routing and both Local modes remain available.
@@ -380,7 +382,7 @@ See the [connection and recovery checklist](docs/LIVE-VALIDATION.ko.md) for a ge
 
 | File | Purpose |
 | --- | --- |
-| `startClaudeOpenRouter.ps1` | PowerShell provider selector and launcher |
+| `startOpenClaude.ps1` | PowerShell provider selector and launcher |
 | `openrouterAdvisor.py` | Plan authentication checks, environment isolation, proxy lifecycle, self-tests |
 | `localProcessTree.py` | Windows Local CLI Job ownership and process-tree guardian |
 | `claudeRouteProxy.mjs` | Routing, response validation, retries, fallback, recovery |

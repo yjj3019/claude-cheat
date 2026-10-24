@@ -643,7 +643,7 @@ def main(argv=None) -> int:
                             "command": "powershell -File startClaudeDashboard.ps1"})
             print("[setup required] .env.openrouter is missing or invalid", file=sys.stderr)
             print("  powershell -File startClaudeDashboard.ps1   ->  http://127.0.0.1:8787/", file=sys.stderr)
-            print("  fill the OpenRouter settings there, save, then run startClaudeOpenRouter.ps1 again",
+            print("  fill the OpenRouter settings there, save, then run startOpenClaude.ps1 again",
                   file=sys.stderr)
         print(json.dumps(payload), file=sys.stderr)
         return 1
