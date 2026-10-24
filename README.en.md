@@ -279,6 +279,8 @@ python routeDashboard.py --status --offline  # skip OpenRouter calls
 
 The report includes `state`, `provider`, `reason`, `detail`, **`model`**, `last_event_age_seconds`, `window_counts`, `plan_reasons`, `failures`, `alerts` and `account`. A running dashboard serves the same document at `GET /api/status`. Neither path includes the key, prompts or request bodies.
 
+A running proxy exposes its own counters at `GET /api/metrics` (same session token required, loopback only): request count, external/Plan split, p50/p95 latency, retries, streams, circuit opens and bytes in/out. The same snapshot is written to `.proxy-metrics.json` beside the launcher once a second and shown as the dashboard's **proxy throughput** card.
+
 ## Understanding connection checks and troubleshooting
 
 `-CheckLocal` accepts model lists shaped as `data[].id` or `models[].name` / `models[].model`. It prints safe metadata, not model names or response bodies. Example output, not a real-server result:

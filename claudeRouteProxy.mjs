@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { once } from 'node:events';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { appendFileSync, statSync } from 'node:fs';
+import { appendFileSync, statSync, writeFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 // Diagnostic mirror: routing events also land in a file so a session can be explained afterwards.
@@ -429,7 +429,8 @@ export async function checkConnection({ provider, key, openrouterModel, fetchImp
 
 export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrouter', openrouterModel, localUrl,
   localModel, localKey, localAllowRemote = false, localHttpUrl, localOnly = false, localCompat = false, openrouterCompat = false, fallbackModel = 'claude-sonnet-5-5', retryDelayMs = 1000,
-  cooldownMs = 30000, attemptTimeoutMs = localOnly || openrouterCompat ? 120000 : 30000, planHeaderMs = 120000, planIdleMs = 300000, attemptCeilingMs = 300000, now = Date.now }) {
+  cooldownMs = 30000, attemptTimeoutMs = localOnly || openrouterCompat ? 120000 : 30000, planHeaderMs = 120000, planIdleMs = 300000, attemptCeilingMs = 300000, now = Date.now,
+  metricsPath = process.env.ROUTE_METRICS_PATH }) {
   if (typeof localOnly !== 'boolean' || (localOnly && provider !== 'local')) throw new Error('Local-only mode requires local provider');
   if (typeof localCompat !== 'boolean' || (localCompat && (!localOnly || provider !== 'local')))
     throw new Error('Local compatibility requires Local-only mode');
@@ -451,6 +452,43 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   for (const value of [retryDelayMs, cooldownMs, attemptTimeoutMs, planHeaderMs, planIdleMs, attemptCeilingMs])
     if (!Number.isFinite(value) || value < 0) throw new Error('Invalid routing timeout');
   let openUntil = 0, probing = false, generation = 0, lastLocalFailure = 'upstream_error';
+  // Counters stay in memory and are written to a small file at most once a second, so the
+  // dashboard can read routing load without talking to this process.
+  const metrics = { startedAt: Date.now(), requests: 0, ok: 0, failed: 0, streams: 0, attempts: 0,
+    retries: 0, bytesIn: 0, bytesOut: 0, circuitOpens: 0, routes: { external: 0, plan: 0 },
+    reasons: {}, latency: { external: [], plan: [] }, last: null };
+  const LATENCY_WINDOW = 512;
+  const latencySummary = values => {
+    if (!values.length) return { count: 0, p50: null, p95: null, max: null };
+    const sorted = [...values].sort((a, b) => a - b);
+    const at = fraction => Number(sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * fraction))].toFixed(2));
+    return { count: sorted.length, p50: at(0.5), p95: at(0.95), max: at(1) };
+  };
+  const metricsSnapshot = () => ({
+    startedAt: new Date(metrics.startedAt).toISOString(),
+    uptimeMs: Date.now() - metrics.startedAt,
+    requests: metrics.requests, ok: metrics.ok, failed: metrics.failed,
+    streams: metrics.streams, attempts: metrics.attempts, retries: metrics.retries,
+    routes: { ...metrics.routes }, reasons: { ...metrics.reasons },
+    bytesIn: metrics.bytesIn, bytesOut: metrics.bytesOut, circuitOpens: metrics.circuitOpens,
+    latencyMs: { external: latencySummary(metrics.latency.external), plan: latencySummary(metrics.latency.plan) },
+    last: metrics.last,
+  });
+  let flushTimer = null, lastFlushAt = 0, metricsDirty = false;
+  const flushMetrics = () => {
+    flushTimer = null;
+    lastFlushAt = Date.now();
+    if (!metricsDirty || !metricsPath) return;
+    metricsDirty = false;
+    try { writeFileSync(metricsPath, JSON.stringify(metricsSnapshot())); } catch {}
+  };
+  const scheduleMetricsFlush = () => {
+    metricsDirty = true;
+    if (!metricsPath || flushTimer) return;
+    flushTimer = setTimeout(flushMetrics, Math.max(0, 1000 - (Date.now() - lastFlushAt)));
+    flushTimer.unref?.();
+  };
+  if (metricsPath) process.once('exit', flushMetrics);
   const server = http.createServer(async (req, res) => {
     const reject = (status, message) => {
       if (res.destroyed) return;
@@ -460,6 +498,11 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     };
     if (!tokenMatches(req.headers['x-local-route-token'])) return reject(403, 'Local authorization required');
     if (req.method === 'HEAD' && req.url === '/api/hello') { res.writeHead(200); res.end(); return; }
+    if (req.method === 'GET' && /^\/api\/metrics(?:\?.*)?$/.test(req.url)) {
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+      res.end(JSON.stringify(metricsSnapshot()));
+      return;
+    }
     if (req.method !== 'POST' || !/^\/v1\/messages(?:\/count_tokens)?(?:\?beta=true)?$/.test(req.url)) return reject(403, 'Endpoint blocked');
     const client = new AbortController();
     res.on('close', () => { if (!res.writableFinished) client.abort('client_close'); });
@@ -477,6 +520,40 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       try { body = JSON.parse(raw.toString('utf8')); } catch { return reject(400, 'Invalid JSON'); }
       if (!body || typeof body !== 'object' || Array.isArray(body)) return reject(403, 'Unsupported request fields');
       const model = body.model;
+      // Everything from here to the response is a routed request; count it once.
+      const startedAt = performance.now();
+      metrics.requests += 1;
+      metrics.bytesIn += raw.length;
+      if (body.stream === true) metrics.streams += 1;
+      const originalWrite = res.write.bind(res), originalEnd = res.end.bind(res);
+      res.write = chunk => {
+        if (chunk) metrics.bytesOut += Buffer.byteLength(chunk);
+        return originalWrite(chunk);
+      };
+      res.end = (chunk, encoding, callback) => {
+        if (chunk) metrics.bytesOut += Buffer.byteLength(chunk);
+        return originalEnd(chunk, encoding, callback);
+      };
+      let routeKind = null, routeReason = null;
+      const noteRoute = (kind, reason) => {
+        if (routeKind) return;
+        routeKind = kind;
+        routeReason = reason;
+        metrics.routes[kind] += 1;
+        metrics.reasons[reason] = (metrics.reasons[reason] || 0) + 1;
+      };
+      res.on('finish', () => {
+        const elapsed = Number((performance.now() - startedAt).toFixed(2));
+        if (res.statusCode < 400) metrics.ok += 1; else metrics.failed += 1;
+        if (routeKind) {
+          const bucket = metrics.latency[routeKind];
+          bucket.push(elapsed);
+          if (bucket.length > LATENCY_WINDOW) bucket.shift();
+        }
+        metrics.last = { ts: new Date().toISOString(), route: routeKind || 'none', reason: routeReason,
+          status: res.statusCode, ms: elapsed };
+        scheduleMetricsFlush();
+      });
       const compatAlias = compatProfile && ['sonnet', 'opus', 'haiku', 'fable'].includes(model);
       const configuredAlias = provider === 'openrouter' && model === openrouterModel;
       if (!compatAlias && !configuredAlias && !isPro(model) && !isSonnet(model) && model !== DEEPSEEK) return reject(403, 'Model blocked');
@@ -521,6 +598,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         client.signal.throwIfAborted();
         // The model that actually serves a Plan request may differ from the client alias.
         const planModel = model === DEEPSEEK || (configuredAlias && !isPro(model) && !isSonnet(model)) ? fallbackModel : model;
+        noteRoute('plan', reason);
         console.error(JSON.stringify({ event: 'route_selected', provider: 'plan', reason, ...(detail ? { detail } : {}),
           model: planModel,
           ...(betas.length ? { beta_features: betaFeatures, unsupported_beta_count: betas.length } : {}) }));
@@ -537,6 +615,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         const arm = ms => { clearTimeout(stall); stall = setTimeout(() => plan.abort('plan_timeout'), ms); };
         if (body.stream === true) arm(planHeaderMs);
         try {
+        metrics.attempts += 1;
         const upstream = await abortable(fetchImpl('https://api.anthropic.com' + req.url,
           { method: 'POST', headers, body: proBody, redirect: 'error', signal: plan.signal }), plan.signal);
         const responseHeaders = {};
@@ -600,6 +679,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         // Permanent 4xx will not change on retry; request-level ones must not open the provider-wide circuit.
         let requestRejected = false;
         for (let attempt = 0; attempt < attempts; attempt++) {
+          metrics.attempts += 1;
+          if (attempt > 0) metrics.retries += 1;
           client.signal.throwIfAborted();
           const controller = new AbortController();
           const cancel = () => controller.abort('client_close');
@@ -664,6 +745,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               openUntil = 0;
             }
             console.error(JSON.stringify({ event: 'route_selected', provider, reason: 'replacement', model: externalModel }));
+            noteRoute('external', 'replacement');
             res.writeHead(200, { 'content-type': response.contentType, 'cache-control': 'no-store' });
             res.end(response.text);
             return;
@@ -697,6 +779,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           generation++;
           if (noPlan) lastLocalFailure = localFailure;
           openUntil = now() + cooldownMs;
+          metrics.circuitOpens += 1;
           console.error(JSON.stringify({ event: 'circuit_open', provider }));
         }
       } finally {
@@ -717,9 +800,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const config = { key: process.env.OPENROUTER_API_KEY, openrouterModel: process.env.OPENROUTER_MODEL, nonce: process.env.LOCAL_ROUTE_TOKEN,
     provider: process.env.SONNET_PROVIDER || 'openrouter', localUrl: process.env.LOCAL_LLM_URL,
     localModel: process.env.LOCAL_LLM_MODEL, localKey: process.env.LOCAL_LLM_API_KEY,
-    localOnly: process.env.LOCAL_ROUTE_ONLY === '1', localCompat: process.env.LOCAL_ROUTE_COMPAT === '1', openrouterCompat: process.env.OPENROUTER_ROUTE_COMPAT === '1', localHttpUrl: process.env.LOCAL_LLM_HTTP_URL, localAllowRemote: process.env.LOCAL_LLM_ALLOW_REMOTE === 'true' };
+    localOnly: process.env.LOCAL_ROUTE_ONLY === '1', localCompat: process.env.LOCAL_ROUTE_COMPAT === '1', openrouterCompat: process.env.OPENROUTER_ROUTE_COMPAT === '1', localHttpUrl: process.env.LOCAL_LLM_HTTP_URL, localAllowRemote: process.env.LOCAL_LLM_ALLOW_REMOTE === 'true',
+    metricsPath: process.env.ROUTE_METRICS_PATH };
   for (const name of ['OPENROUTER_API_KEY', 'OPENROUTER_MODEL', 'LOCAL_ROUTE_TOKEN', 'LOCAL_ROUTE_ONLY', 'LOCAL_ROUTE_COMPAT', 'OPENROUTER_ROUTE_COMPAT', 'SONNET_PROVIDER', 'LOCAL_LLM_URL',
-    'LOCAL_LLM_MODEL', 'LOCAL_LLM_API_KEY', 'LOCAL_LLM_ALLOW_REMOTE', 'LOCAL_LLM_HTTP_URL', 'LOCAL_LLM_MODELS_URL']) delete process.env[name];
+    'LOCAL_LLM_MODEL', 'LOCAL_LLM_API_KEY', 'LOCAL_LLM_ALLOW_REMOTE', 'LOCAL_LLM_HTTP_URL', 'LOCAL_LLM_MODELS_URL', 'ROUTE_METRICS_PATH']) delete process.env[name];
   if (process.argv.slice(2).includes('--check-connection')) {
     try {
       const result = await checkConnection(config);

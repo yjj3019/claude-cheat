@@ -407,6 +407,8 @@ python routeDashboard.py --status --offline  # OpenRouter 호출 생략
 
 출력에는 `state`, `provider`, `reason`, `detail`, **`model`**, `last_event_age_seconds`, `window_counts`, `plan_reasons`, `failures`, `alerts`, `account`가 포함됩니다. 대시보드를 띄워 둔 경우 `GET /api/status`로 같은 내용을 받습니다. 두 경로 모두 키·프롬프트·요청 본문을 포함하지 않습니다.
 
+실행 중인 프록시는 자체 카운터를 `GET /api/metrics`로 제공합니다(같은 세션 토큰 필요, 127.0.0.1 전용). 요청 수, 외부·Plan 경로 분포, p50/p95 지연, 재시도·스트림·회로 횟수, 송수신 바이트를 담고 있으며, 같은 값이 실행기 폴더의 `.proxy-metrics.json`에 1초 간격으로 기록되어 대시보드의 **프록시 처리량** 카드에 표시됩니다.
+
 ## 7. 문제 해결과 일반 Claude로 돌아가기
 
 | 증상 | 먼저 확인할 내용 |

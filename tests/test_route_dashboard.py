@@ -6,6 +6,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -451,7 +452,10 @@ class TransitionTests(unittest.TestCase):
         joined = " ".join(row[0] for row in commands)
         for flag in ("--status", "--pretty", "--usage", "--offline"):
             self.assertIn(flag, joined)
-        self.assertEqual(len(dash.HELP_SECTION["endpoints"]), 2)
+        self.assertEqual(len(dash.HELP_SECTION["endpoints"]), 4)
+        names = " ".join(endpoint for endpoint, _ in dash.HELP_SECTION["endpoints"])
+        self.assertIn("/api/config", names)
+        self.assertIn("/api/metrics", names)
 
 
 class PageTests(unittest.TestCase):
@@ -759,6 +763,47 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(dash.run_connection_test("openrouter")["reason"], "connection_failed")
 
 
+class ProxyMetricsTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.path = self.root / ".proxy-metrics.json"
+        self.enterContext(mock.patch.object(dash, "METRICS_FILE", self.path))
+
+    def test_missing_file_reports_none(self):
+        self.assertIsNone(dash.proxy_metrics())
+
+    def test_counters_are_exposed_with_age(self):
+        self.path.write_text(json.dumps({"requests": 4, "routes": {"external": 3, "plan": 1}}),
+                             encoding="utf-8")
+        data = dash.proxy_metrics()
+        self.assertEqual(data["requests"], 4)
+        self.assertEqual(data["routes"]["external"], 3)
+        self.assertFalse(data["stale"])
+        self.assertGreaterEqual(data["age_seconds"], 0)
+
+    def test_old_file_is_marked_stale(self):
+        self.path.write_text('{"requests": 1}', encoding="utf-8")
+        old = time.time() - 120
+        os.utime(self.path, (old, old))
+        data = dash.proxy_metrics()
+        self.assertTrue(data["stale"])
+        self.assertGreater(data["age_seconds"], 60)
+
+    def test_broken_json_is_ignored(self):
+        self.path.write_text("{not json", encoding="utf-8")
+        self.assertIsNone(dash.proxy_metrics())
+
+    def test_snapshot_carries_the_metrics(self):
+        self.path.write_text(json.dumps({"requests": 7, "latencyMs": {"external": {"p50": 3.5}}}),
+                             encoding="utf-8")
+        with mock.patch.object(dash, "model_pricing", return_value={"ok": False}), \
+             mock.patch.object(dash, "account_state", return_value={"ok": False}), \
+             mock.patch.object(dash, "scan_sessions", return_value=dash._empty_usage()):
+            data = dash.snapshot()
+        self.assertEqual(data["proxy_metrics"]["requests"], 7)
+        self.assertEqual(data["proxy_metrics"]["latencyMs"]["external"]["p50"], 3.5)
+
+
 class SnapshotTests(unittest.TestCase):
     def test_snapshot_shape_and_loopback_only_binding(self):
         with mock.patch.object(dash, "scan_sessions", return_value=dash._empty_usage()), \
@@ -768,8 +813,8 @@ class SnapshotTests(unittest.TestCase):
              mock.patch.object(dash, "read_env", return_value={"OPENROUTER_MODEL": "vendor/model"}):
             data = dash.snapshot()
         self.assertEqual(sorted(data),
-                         ["account", "alerts", "generated_at", "help", "model", "pricing", "proxy_stale",
-                          "routing", "usage"])
+                         ["account", "alerts", "generated_at", "help", "model", "pricing", "proxy_metrics",
+                          "proxy_stale", "routing", "usage"])
         self.assertEqual(data["model"], "vendor/model")
         self.assertEqual(data["routing"]["state"], "unknown")
         self.assertEqual(data["alerts"], [])

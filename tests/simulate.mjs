@@ -164,6 +164,16 @@ await Promise.all(Array.from({ length: CONCURRENCY }, worker));
 const wall = (performance.now() - startedAt) / 1000;
 const rssAfter = process.memoryUsage().rss;
 
+// The proxy reports its own counters; they must agree with the traffic just generated.
+const metricsUrl = phase1.base.replace('/v1/messages', '/api/metrics');
+const metrics = await (await fetch(metricsUrl, { headers: { 'x-local-route-token': NONCE } })).json();
+check(metrics.requests >= results.length, `metrics saw ${metrics.requests} of ${results.length} requests`);
+check(metrics.routes.external >= results.length, `metrics external ${metrics.routes.external}`);
+check(metrics.ok >= results.length, `metrics ok ${metrics.ok}`);
+check(metrics.streams >= perScenario, `metrics streams ${metrics.streams}`);
+check(metrics.bytesIn > 0 && metrics.bytesOut > 0, 'metrics bytes not counted');
+check((metrics.latencyMs.external.count || 0) > 0, 'metrics latency not recorded');
+
 for (const result of results) {
   check(result.status === 200, `${result.scenario}: status ${result.status}`);
   if (result.scenario === 'stream' || result.scenario === 'tools') {
@@ -247,6 +257,15 @@ const summary = {
   rssMb: { before: Number((rssBefore / 1048576).toFixed(1)), after: Number((rssAfter / 1048576).toFixed(1)),
     growth: Number(((rssAfter - rssBefore) / 1048576).toFixed(1)) },
   byScenario,
+  metrics: {
+    requests: metrics.requests,
+    routes: metrics.routes,
+    streams: metrics.streams,
+    attempts: metrics.attempts,
+    retries: metrics.retries,
+    bytesIn: metrics.bytesIn,
+    p95Ms: metrics.latencyMs.external.p95,
+  },
   session: {
     turns: turnStats.length,
     firstAvgMs: Number(average(head).toFixed(1)),

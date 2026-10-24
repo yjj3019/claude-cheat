@@ -309,6 +309,7 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
     if provider == "openrouter":
         # Keep routing decisions for later diagnosis; -Debug only shows them live in the terminal.
         proxy_env["ROUTE_LOG_PATH"] = str(ROOT / ".route.log")
+        proxy_env["ROUTE_METRICS_PATH"] = str(ROOT / ".proxy-metrics.json")
     proxy_env.pop("LOCAL_ROUTE_COMPAT", None)
     proxy_env.pop("OPENROUTER_ROUTE_COMPAT", None)
     if local_compat:
