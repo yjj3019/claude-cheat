@@ -488,6 +488,7 @@ class PageTests(unittest.TestCase):
         dashboard, settings = self.scripts()["dashboard"], self.scripts()["settings"]
         self.assertIn("help.commands", dashboard)
         self.assertIn("renderGrid", dashboard)
+        self.assertIn("data-copy", dashboard)
         self.assertNotIn("saveSettings", dashboard)
         self.assertIn("saveSettings", settings)
         self.assertNotIn("renderGrid", settings)
@@ -549,6 +550,15 @@ class ProxyStaleTests(unittest.TestCase):
         current = {"proxy_started_at": "2026-10-25T02:00:00Z", "proxy_code": "2026-10-25T03:00:00.000Z"}
         self.assertTrue(dash.proxy_stale(older, path=self.code))
         self.assertFalse(dash.proxy_stale(current, path=self.code))
+
+    def test_stale_alert_carries_a_copyable_restart_command(self):
+        routing = {"proxy_started_at": "2026-10-25T02:40:00Z", "proxy_code": None, "state": "plan",
+                   "last": None, "short": {}, "counts": {}}
+        with mock.patch.object(dash, "PROXY_FILE", self.code):
+            alerts = dash.build_alerts(routing, dash._empty_usage(), {"ok": False}, {"ok": False})
+        stale = [alert for alert in alerts if alert["title"] == "실행기 재시작 필요"]
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(stale[0]["command"], ".\\startOpenClaude.ps1")
 
     def test_stale_proxy_raises_a_restart_alert(self):
         routing = self.routing("2026-10-25T02:40:00Z")
@@ -973,7 +983,7 @@ class SnapshotTests(unittest.TestCase):
             data = dash.snapshot()
         self.assertEqual(sorted(data),
                          ["account", "alerts", "generated_at", "help", "model", "pricing", "proxy_metrics",
-                          "proxy_stale", "routing", "usage"])
+                          "proxy_modified_at", "proxy_stale", "routing", "usage"])
         self.assertEqual(data["model"], "vendor/model")
         self.assertEqual(data["routing"]["state"], "unknown")
         self.assertEqual(data["alerts"], [])
