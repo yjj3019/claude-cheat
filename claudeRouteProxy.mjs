@@ -447,6 +447,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             const descriptions = {
               timeout: [`${errorPrefix}_timeout`, `${label} request timed out.`],
               authentication_failed: [`${errorPrefix}_authentication_failed`, `${label} server authentication failed. Check the ${label} API key and access permissions; restart the ${label} session after changing credentials.`],
+              payment_required: [`${errorPrefix}_payment_required`, `${label} server rejected the request for billing or credit reasons. Check the ${label} account balance and limits; restart the ${label} session after changing them.`],
               empty_response: [`${errorPrefix}_empty_response`, `${label} server returned an empty response.`],
               upstream_error: [`${errorPrefix}_upstream_error`, `${label} server request failed. Check the ${errorPrefix} routing log.`],
             };
@@ -551,12 +552,13 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           const arm = () => { clearTimeout(timer); timer = setTimeout(() => controller.abort('attempt_timeout'), attemptTimeoutMs); };
           arm();
           const ceiling = noPlan ? undefined : setTimeout(() => controller.abort('attempt_timeout'), attemptCeilingMs);
-          let status;
+          let status, retryAfterMs = 0;
           try {
             const operation = (async () => {
               const response = await fetchImpl(externalUrl, { method: 'POST', headers,
                 body: JSON.stringify(externalBody), redirect: 'error', signal: controller.signal });
               status = response.status;
+              if (status === 429) { const seconds = Number(response.headers.get('retry-after')); if (seconds > 0) retryAfterMs = seconds * 1000; }
               if (!response.ok) {
                 await response.body?.cancel();
                 throw new Error('External request failed');
@@ -616,7 +618,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               'Invalid stream metadata': 'invalid_stream_metadata', 'Expected JSON Local response': 'expected_json', 'Unsupported Local response content': 'unsupported_local_content',
               'Local thinking response disabled': 'thinking_response', 'Thinking response in ordinary mode': 'thinking_response', 'Unsupported Local response fields': 'unsupported_content_fields' }[error?.message];
             if (noPlan) localFailure = controller.signal.reason === 'attempt_timeout' ? 'timeout' :
-              status === 401 || status === 403 ? 'authentication_failed' : validation === 'empty_response' ? 'empty_response' : 'upstream_error';
+              status === 401 || status === 403 ? 'authentication_failed' : status === 402 ? 'payment_required' : validation === 'empty_response' ? 'empty_response' : 'upstream_error';
             console.error(JSON.stringify({ event: 'external_attempt_failed', provider, attempt: attempt + 1,
               ...(Number.isInteger(status) ? { status } : {}), ...(validation ? { validation } : {}),
               category: controller.signal.reason === 'attempt_timeout' ? 'timeout' : 'upstream' }));
@@ -629,7 +631,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             client.signal.removeEventListener('abort', cancel);
           }
           if (attempt + 1 < attempts && retryDelayMs) await abortable(new Promise(resolve => {
-            const timeout = setTimeout(resolve, retryDelayMs);
+            const timeout = setTimeout(resolve, Math.min(Math.max(retryDelayMs, retryAfterMs), 10000));
             client.signal.addEventListener('abort', () => { clearTimeout(timeout); resolve(); }, { once: true });
           }), client.signal);
         }

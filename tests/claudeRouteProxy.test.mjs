@@ -1466,3 +1466,24 @@ test('ordinary mode: the total ceiling still ends an endless trickle and falls b
   assert.equal(calls.at(-1).url, proURL);
   assert.equal(calls.filter(call => call.url === externalURL).length, 4);
 });
+
+test('HTTP 429 Retry-After lengthens the retry delay (bounded)', async t => {
+  const stamps = [];
+  const { request } = await fixture(t, (url, options) => {
+    if (url === proURL) return jsonResponse(url, options);
+    stamps.push(Date.now());
+    return new Response('slow down', { status: 429, headers: { 'retry-after': '0.15' } });
+  }, { retryDelayMs: 10 });
+  await (await request(requestBody(SONNET), { headers: proHeaders })).text();
+  assert.equal(stamps.length, 4);
+  assert.ok(stamps[1] - stamps[0] >= 130, `gap ${stamps[1] - stamps[0]}ms should honor Retry-After`);
+});
+
+test('Local-only HTTP 402 reports a billing-specific code without retry', async t => {
+  const { calls, request } = await fixture(t, () => new Response('pay', { status: 402 }), { provider: 'local', localOnly: true,
+    localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-local' });
+  const response = await request(requestBody(SONNET), { headers: proHeaders });
+  assert.equal(response.status, 400);
+  assert.match(await response.text(), /local_payment_required/);
+  assert.equal(calls.length, 1);
+});
