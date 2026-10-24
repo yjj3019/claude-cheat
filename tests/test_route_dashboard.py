@@ -1,4 +1,5 @@
 """Dashboard aggregation runs on synthetic logs and transcripts only."""
+import contextlib
 import importlib.util
 import io
 import json
@@ -286,6 +287,97 @@ class AlertTests(unittest.TestCase):
         titles = [alert["title"] for alert in alerts]
         self.assertEqual(titles[0], "OpenRouter 잔액 부족")
         self.assertIn("단가 조회 실패", titles)
+
+
+class StatusReportTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch.object(dash, "read_env", return_value={
+            "ANTHROPIC_AUTH_TOKEN": "sk-or-synthetic", "OPENROUTER_MODEL": "vendor/model"}))
+
+    def event(self, provider="openrouter", reason="replacement", model="vendor/model", minutes=0):
+        stamp = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat().replace("+00:00", "Z")
+        return {"ts": stamp, "event": "route_selected", "provider": provider, "reason": reason,
+                "model": model}
+
+    def test_external_state_is_healthy_and_does_not_scan_transcripts(self):
+        with mock.patch.object(dash, "parse_route_log", return_value=[self.event()]), \
+             mock.patch.object(dash, "account_state",
+                               return_value={"ok": True, "limit_usd": 50, "remaining_usd": 40}) as account, \
+             mock.patch.object(dash, "scan_sessions",
+                               side_effect=AssertionError("status must stay cheap")) as scan:
+            report = dash.status_report()
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["state"], "external")
+        self.assertEqual(report["provider"], "openrouter")
+        self.assertEqual(report["model"], "vendor/model")
+        self.assertEqual(report["alerts"], [])
+        self.assertNotIn("usage", report)
+        self.assertEqual(report["config"]["model"], "vendor/model")
+        account.assert_called_once()
+        scan.assert_not_called()
+        self.assertEqual(dash.status_exit_code(report), 0)
+        self.assertNotIn("sk-or-synthetic", json.dumps(report))
+
+    def test_plan_state_reports_exit_code_two(self):
+        with mock.patch.object(dash, "parse_route_log",
+                               return_value=[self.event(provider="plan", reason="native_feature")]), \
+             mock.patch.object(dash, "account_state", return_value={"ok": True, "limit_usd": 50,
+                                                                   "remaining_usd": 40}):
+            report = dash.status_report()
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["state"], "plan")
+        self.assertIn("현재 Plan 경로", [alert["title"] for alert in report["alerts"]])
+        self.assertEqual(dash.status_exit_code(report), 2)
+
+    def test_critical_alert_wins_over_plan(self):
+        with mock.patch.object(dash, "parse_route_log", return_value=[
+                self.event(provider="plan", reason="fallback", minutes=1),
+                {"ts": (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+                 "event": "circuit_open", "provider": "openrouter"}]), \
+             mock.patch.object(dash, "account_state", return_value={"ok": True, "limit_usd": 50,
+                                                                   "remaining_usd": 40}):
+            report = dash.status_report()
+        self.assertEqual(report["alerts"][0]["title"], "외부 회로 차단")
+        self.assertEqual(dash.status_exit_code(report), 3)
+
+    def test_offline_skips_account_and_usage_opt_in_is_explicit(self):
+        usage = dash._empty_usage()
+        usage["cost_usd"] = 0.5
+        with mock.patch.object(dash, "parse_route_log", return_value=[self.event()]), \
+             mock.patch.object(dash, "account_state",
+                               side_effect=AssertionError("offline must not call the API")), \
+             mock.patch.object(dash, "model_pricing", side_effect=AssertionError("offline pricing")), \
+             mock.patch.object(dash, "scan_sessions", return_value=usage) as scan:
+            report = dash.status_report(include_usage=True, offline=True)
+        self.assertEqual(report["account"]["error"], "offline")
+        self.assertEqual(report["usage"]["cost_usd"], 0.5)
+        scan.assert_called_once()
+
+    def test_no_route_record_returns_exit_code_four(self):
+        with mock.patch.object(dash, "parse_route_log", return_value=[]), \
+             mock.patch.object(dash, "account_state", return_value={"ok": False, "error": "configuration_missing"}):
+            report = dash.status_report()
+        self.assertEqual(report["state"], "unknown")
+        self.assertFalse(report["ok"])
+        self.assertEqual(dash.status_exit_code(report), 4)
+
+    def test_cli_prints_json_and_returns_the_exit_code(self):
+        payload = {"ok": True, "state": "external", "alerts": [], "model": "vendor/model"}
+        with mock.patch.object(dash, "status_report", return_value=payload) as builder, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            code = dash.main(["--status", "--offline"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output.getvalue()), payload)
+        builder.assert_called_once_with(include_usage=False, offline=True)
+
+    def test_cli_pretty_and_usage_flags(self):
+        payload = {"ok": False, "state": "plan", "alerts": [{"level": "warn", "title": "t", "detail": "d"}]}
+        with mock.patch.object(dash, "status_report", return_value=payload) as builder, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            code = dash.main(["--status", "--usage", "--pretty"])
+        self.assertEqual(code, 2)
+        self.assertIn("\n", output.getvalue())
+        builder.assert_called_once_with(include_usage=True, offline=False)
 
 
 class SnapshotTests(unittest.TestCase):

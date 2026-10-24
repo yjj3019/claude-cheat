@@ -729,6 +729,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 self._send(500, "application/json; charset=utf-8",
                            json.dumps({"error": "snapshot_failed"}))
+        elif self.path.split("?")[0] == "/api/status":
+            try:
+                self._send(200, "application/json; charset=utf-8",
+                           json.dumps(status_report(), ensure_ascii=False))
+            except Exception:
+                self._send(500, "application/json; charset=utf-8", json.dumps({"error": "status_failed"}))
         else:
             self._send(404, "application/json; charset=utf-8", json.dumps({"error": "not_found"}))
 
@@ -756,12 +762,78 @@ def serve(host="127.0.0.1", port=8787, refresh=3):
         server.server_close()
 
 
+def status_report(include_usage=False, offline=False):
+    """Compact machine-readable status for scripts and agents.
+
+    Deliberately cheap: routing state comes from ``.route.log`` and only the key
+    limit needs the network, so a check stays well under a second. Token totals
+    are opt-in because they scan transcripts.
+    """
+    now = datetime.now(timezone.utc)
+    config = read_env(ROOT / ".env.openrouter")
+    key = config.get("ANTHROPIC_AUTH_TOKEN")
+    model = config.get("OPENROUTER_MODEL") or None
+    routing = routing_state(parse_route_log(), now=now)
+    account = {"ok": False, "error": "offline"} if offline else account_state(key)
+    pricing, usage = None, _empty_usage()
+    if include_usage:
+        pricing = None if offline else model_pricing(key, model)
+        usage = scan_sessions(pricing=pricing)
+    alerts = build_alerts(routing, usage, account, pricing)
+    last = routing.get("last") or {}
+    critical = any(alert["level"] == "critical" for alert in alerts)
+    report = {
+        "ok": not critical and routing["state"] in ("external", "idle"),
+        "state": routing["state"],
+        "provider": last.get("provider"),
+        "reason": last.get("reason"),
+        "detail": last.get("detail"),
+        "model": last.get("model"),
+        "last_event_age_seconds": last.get("age_seconds"),
+        "proxy_started_at": routing.get("proxy_started_at"),
+        "window_minutes": routing.get("window_minutes"),
+        "window_counts": routing.get("counts"),
+        "plan_reasons": routing.get("plan_reasons"),
+        "failures": routing.get("failures"),
+        "models": routing.get("models"),
+        "alerts": alerts,
+        "account": {name: account.get(name) for name in
+                    ("ok", "error", "limit_usd", "spent_usd", "remaining_usd", "resets_at")},
+        "config": {"model": model, "route_log_exists": ROUTE_LOG.is_file(),
+                   "route_log": str(ROUTE_LOG)},
+        "generated_at": now.isoformat(timespec="seconds"),
+    }
+    if include_usage:
+        report["usage"] = {"today": usage["today"], "cost_usd": usage["cost_usd"],
+                           "session_count": usage["session_count"]}
+    return report
+
+
+def status_exit_code(report):
+    """0 healthy, 2 currently on Plan, 3 critical alert, 4 no routing record yet."""
+    if any(alert["level"] == "critical" for alert in report.get("alerts") or []):
+        return 3
+    if report.get("state") == "plan":
+        return 2
+    if report.get("state") == "unknown":
+        return 4
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Read-only loopback dashboard for OpenRouter routing")
     parser.add_argument("--host", default="127.0.0.1", help="Loopback address to bind")
     parser.add_argument("--port", type=int, default=8787, help="Port to listen on")
     parser.add_argument("--refresh", type=int, default=3, help="Seconds between background scans")
+    parser.add_argument("--status", action="store_true", help="Print one JSON status report and exit")
+    parser.add_argument("--usage", action="store_true", help="Include token and cost totals (slower)")
+    parser.add_argument("--offline", action="store_true", help="Skip OpenRouter account and pricing calls")
+    parser.add_argument("--pretty", action="store_true", help="Indent the status report")
     args = parser.parse_args(argv)
+    if args.status:
+        report = status_report(include_usage=args.usage, offline=args.offline)
+        print(json.dumps(report, ensure_ascii=False, indent=2 if args.pretty else None))
+        return status_exit_code(report)
     if args.host not in ("127.0.0.1", "::1", "localhost"):
         raise SystemExit("Bind a loopback address only")
     serve(args.host, args.port, args.refresh)

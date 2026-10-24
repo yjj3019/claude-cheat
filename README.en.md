@@ -236,6 +236,26 @@ Estimated cost uses the model rates from OpenRouter `/api/v1/models`; confirm ac
 
 The page shows no key, prompt or request body, and the server writes nothing. It is a separate process, so it can run beside the routing session.
 
+### Status API for scripts and agents
+
+Check the current state without opening the page:
+
+```powershell
+python routeDashboard.py --status           # one JSON line plus an exit code
+python routeDashboard.py --status --pretty  # indented
+python routeDashboard.py --status --usage    # add token and cost totals (slower)
+python routeDashboard.py --status --offline  # skip OpenRouter calls
+```
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | Healthy (replacement route serving, or idle) |
+| 2 | Currently on the Plan route |
+| 3 | Critical alert (circuit open, low balance, ...) |
+| 4 | No routing record yet (no launcher session) |
+
+The report includes `state`, `provider`, `reason`, `detail`, **`model`**, `last_event_age_seconds`, `window_counts`, `plan_reasons`, `failures`, `alerts` and `account`. A running dashboard serves the same document at `GET /api/status`. Neither path includes the key, prompts or request bodies.
+
 ## Understanding connection checks and troubleshooting
 
 `-CheckLocal` accepts model lists shaped as `data[].id` or `models[].name` / `models[].model`. It prints safe metadata, not model names or response bodies. Example output, not a real-server result:

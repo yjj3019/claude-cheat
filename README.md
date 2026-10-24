@@ -362,6 +362,26 @@ Sonnet 선택과 HUD의 모델·비용 표시는 실제 외부 라우팅이나 �
 
 키·프롬프트·요청 본문은 표시하지 않고 서버는 아무것도 기록하지 않습니다. 대시보드는 세션과 별개 프로세스이므로 라우팅 세션과 함께 띄워 두면 됩니다.
 
+### 스크립트·에이전트용 상태 API
+
+페이지를 열지 않고도 한 번에 상태를 확인할 수 있습니다.
+
+```powershell
+python routeDashboard.py --status           # 한 줄 JSON + 종료 코드
+python routeDashboard.py --status --pretty  # 읽기 좋게
+python routeDashboard.py --status --usage    # 토큰·비용까지 집계(느림)
+python routeDashboard.py --status --offline  # OpenRouter 호출 생략
+```
+
+| 종료 코드 | 의미 |
+| --- | --- |
+| 0 | 정상 (외부 경로 사용 중이거나 유휴) |
+| 2 | 현재 Plan 경로 |
+| 3 | 심각 경고 (회로 차단·잔액 부족 등) |
+| 4 | 라우팅 기록 없음 (아직 실행기 세션 없음) |
+
+출력에는 `state`, `provider`, `reason`, `detail`, **`model`**, `last_event_age_seconds`, `window_counts`, `plan_reasons`, `failures`, `alerts`, `account`가 포함됩니다. 대시보드를 띄워 둔 경우 `GET /api/status`로 같은 내용을 받습니다. 두 경로 모두 키·프롬프트·요청 본문을 포함하지 않습니다.
+
 ## 7. 문제 해결과 일반 Claude로 돌아가기
 
 | 증상 | 먼저 확인할 내용 |
