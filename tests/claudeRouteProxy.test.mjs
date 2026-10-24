@@ -1436,3 +1436,33 @@ test('request body up to 32 MiB reaches routing instead of being rejected at 16 
   assert.equal((await request(big, { headers: proHeaders })).status, 200);
   assert.ok(calls.length >= 1);
 });
+
+const trickleSse = (gapMs, count) => {
+  const data = complete(DEEPSEEK);
+  const size = Math.ceil(data.length / count);
+  let index = 0;
+  return new Response(new ReadableStream({
+    async pull(controller) {
+      if (index >= data.length) return controller.close();
+      await new Promise(resolve => setTimeout(resolve, gapMs));
+      controller.enqueue(new TextEncoder().encode(data.slice(index, index += size)));
+    },
+  }), { headers: { 'content-type': 'text/event-stream' } });
+};
+
+test('ordinary mode: a slow but live stream outlasts the silence limit', async t => {
+  const { calls, request } = await fixture(t, (url, options) => url === proURL ? jsonResponse(url, options) : trickleSse(40, 8),
+    { attemptTimeoutMs: 150, attemptCeilingMs: 5000 });
+  const response = await request(requestBody(SONNET, { stream: true }), { headers: proHeaders });
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.deepEqual(calls.map(call => call.url), [externalURL]);
+});
+
+test('ordinary mode: the total ceiling still ends an endless trickle and falls back to Plan', async t => {
+  const { calls, request } = await fixture(t, (url, options) => url === proURL ? jsonResponse(url, options) : trickleSse(40, 400),
+    { attemptTimeoutMs: 150, attemptCeilingMs: 200, retryDelayMs: 0 });
+  await (await request(requestBody(SONNET, { stream: true }), { headers: proHeaders })).text();
+  assert.equal(calls.at(-1).url, proURL);
+  assert.equal(calls.filter(call => call.url === externalURL).length, 4);
+});

@@ -173,7 +173,7 @@ function localEndpoint(value, allowRemote, httpUrl) {
   return url.href;
 }
 
-async function bufferedResponse(upstream, model, clientModel, stream, signal) {
+async function bufferedResponse(upstream, model, clientModel, stream, signal, onProgress) {
   if (!upstream.ok) throw new Error('External request failed');
   if (!upstream.body) throw new Error('Empty message response');
   const sse = (upstream.headers.get('content-type') || '').includes('text/event-stream');
@@ -191,6 +191,7 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal) {
       const { done, value } = await reader.read();
       signal.throwIfAborted();
       if (done) break;
+      onProgress?.();
       size += value.byteLength;
       if (size > MAX_RESPONSE) throw new Error('Response too large');
       chunks.push(Buffer.from(value));
@@ -379,7 +380,7 @@ export async function checkConnection({ provider, key, openrouterModel, fetchImp
 
 export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrouter', openrouterModel, localUrl,
   localModel, localKey, localAllowRemote = false, localHttpUrl, localOnly = false, localCompat = false, openrouterCompat = false, fallbackModel = 'claude-sonnet-5-5', retryDelayMs = 1000,
-  cooldownMs = 30000, attemptTimeoutMs = localOnly || openrouterCompat ? 120000 : 30000, planHeaderMs = 120000, planIdleMs = 300000, now = Date.now }) {
+  cooldownMs = 30000, attemptTimeoutMs = localOnly || openrouterCompat ? 120000 : 30000, planHeaderMs = 120000, planIdleMs = 300000, attemptCeilingMs = 300000, now = Date.now }) {
   if (typeof localOnly !== 'boolean' || (localOnly && provider !== 'local')) throw new Error('Local-only mode requires local provider');
   if (typeof localCompat !== 'boolean' || (localCompat && (!localOnly || provider !== 'local')))
     throw new Error('Local compatibility requires Local-only mode');
@@ -398,7 +399,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   const externalUrl = provider === 'local' ? localEndpoint(localUrl, localAllowRemote, localHttpUrl) : 'https://openrouter.ai/api/v1/messages';
   if (provider === 'local' && (typeof localModel !== 'string' || !localModel.trim())) throw new Error('Local model required');
   if (!isSonnet(fallbackModel)) throw new Error('Fallback must be a native Sonnet model');
-  for (const value of [retryDelayMs, cooldownMs, attemptTimeoutMs, planHeaderMs, planIdleMs])
+  for (const value of [retryDelayMs, cooldownMs, attemptTimeoutMs, planHeaderMs, planIdleMs, attemptCeilingMs])
     if (!Number.isFinite(value) || value < 0) throw new Error('Invalid routing timeout');
   let openUntil = 0, probing = false, generation = 0, lastLocalFailure = 'upstream_error';
   const server = http.createServer(async (req, res) => {
@@ -544,7 +545,12 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           const controller = new AbortController();
           const cancel = () => controller.abort('client_close');
           client.signal.addEventListener('abort', cancel, { once: true });
-          const timer = setTimeout(() => controller.abort('attempt_timeout'), attemptTimeoutMs);
+          // Ordinary mode: attemptTimeoutMs bounds silence (headers and gaps between chunks), so long but live
+          // generations survive; attemptCeilingMs bounds the total. Local/compat modes keep the fixed total limit.
+          let timer;
+          const arm = () => { clearTimeout(timer); timer = setTimeout(() => controller.abort('attempt_timeout'), attemptTimeoutMs); };
+          arm();
+          const ceiling = noPlan ? undefined : setTimeout(() => controller.abort('attempt_timeout'), attemptCeilingMs);
           let status;
           try {
             const operation = (async () => {
@@ -555,7 +561,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
                 await response.body?.cancel();
                 throw new Error('External request failed');
               }
-              const validated = await bufferedResponse(response, externalModel, model, noPlan ? false : body.stream, controller.signal);
+              const validated = await bufferedResponse(response, externalModel, model, noPlan ? false : body.stream, controller.signal, noPlan ? undefined : arm);
               if (compatProfile) {
                 const content = JSON.parse(validated.text).content;
                 if (content.some(block => Object.keys(block).some(name =>
@@ -619,6 +625,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             if (requestRejected || [401, 402, 403, 404].includes(status)) break;
           } finally {
             clearTimeout(timer);
+            clearTimeout(ceiling);
             client.signal.removeEventListener('abort', cancel);
           }
           if (attempt + 1 < attempts && retryDelayMs) await abortable(new Promise(resolve => {
