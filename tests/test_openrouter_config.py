@@ -57,7 +57,7 @@ class OpenRouterConfigTests(unittest.TestCase):
         with self.assertRaises(route.OpenRouterConfigError) as caught:
             route.provider_config("openrouter")
         message = str(caught.exception)
-        self.assertIn("startClaudeDashboard.ps1", message)
+        self.assertIn("startDashboard.ps1", message)
         self.assertIn("127.0.0.1:8787", message)
 
     def test_launcher_config_failure_prints_setup_guidance(self):
@@ -67,7 +67,7 @@ class OpenRouterConfigTests(unittest.TestCase):
         self.assertEqual(code, 1)
         text = stderr.getvalue()
         self.assertIn("[setup required]", text)
-        self.assertIn("startClaudeDashboard.ps1", text)
+        self.assertIn("startDashboard.ps1", text)
         payload = json.loads([line for line in text.splitlines() if line.startswith("{")][-1])
         self.assertEqual(payload["action"], "open_dashboard")
         self.assertEqual(payload["dashboard"], "http://127.0.0.1:8787/")

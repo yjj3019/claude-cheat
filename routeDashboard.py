@@ -88,7 +88,7 @@ HELP_SECTION = {
         ["python routeDashboard.py --status --pretty", "읽기 좋게 들여쓰기"],
         ["python routeDashboard.py --status --usage", "토큰·비용까지 집계 (느림)"],
         ["python routeDashboard.py --status --offline", "OpenRouter 호출 생략"],
-        ["powershell -File startClaudeDashboard.ps1", "고정 포트(8787)로 이 페이지 열기"],
+        ["powershell -File startDashboard.ps1", "고정 포트(8787)로 이 페이지 열기"],
         ["python routeDashboard.py --stop", "대시보드만 종료 (실행기 세션은 유지)"],
     ],
     "endpoints": [

@@ -44,7 +44,7 @@ If you install a global launcher separately, configuration is read beside its ta
 Configure OpenRouter once in the web console — it runs without a routing session and shows setup guidance while the settings are empty:
 
 ```powershell
-.\startClaudeDashboard.ps1        # http://127.0.0.1:8787/ (fixed port)
+.\startDashboard.ps1        # http://127.0.0.1:8787/ (fixed port)
 ```
 
 Fill the OpenRouter card with a **model ID** and **API key**, press **Model check**, then **Save**, and start the session. The check also runs on unsaved values, and saving without an existing `.env.openrouter` seeds the file from the shipped example so its comments stay. Starting the launcher with missing or invalid settings exits with the console address instead of opening a session. Editing the files by hand still works exactly as before.
@@ -226,7 +226,7 @@ Every interactive launch now makes one minimal provider-only inference check bef
 ## Live dashboard
 
 ```powershell
-.\startClaudeDashboard.ps1
+.\startDashboard.ps1
 ```
 
 A **read-only** page bound to `127.0.0.1`, refreshed every two seconds. The port is **fixed at 8787**; an older dashboard instance is stopped automatically so the same port is reused. If another program holds that port the server fails with a message instead of silently moving; pass `--allow-port-fallback` to pick a free port instead.
