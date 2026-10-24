@@ -76,6 +76,12 @@ class OpenRouterConfigTests(unittest.TestCase):
                 self.assertEqual(spawn.call_args.kwargs["env"]["OPENROUTER_API_KEY"], "sk-or-synthetic-key")
         proxy.terminate.assert_called_once()
 
+    def test_launcher_lifecycle_marker_is_written_beside_the_route_log(self):
+        (self.root / ".route.log").write_text("", encoding="utf-8")
+        route.log_route_marker("launcher start pid=1")
+        text = (self.root / ".route.log").read_text(encoding="utf-8")
+        self.assertRegex(text.strip(), r"^\S+Z --- launcher start pid=1 ---$")
+
     def test_routed_openrouter_sessions_disable_experimental_protocol(self):
         self.write()
         proxy = mock.Mock()

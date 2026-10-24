@@ -72,6 +72,7 @@ HELP_SECTION = {
         ["python routeDashboard.py --status --usage", "토큰·비용까지 집계 (느림)"],
         ["python routeDashboard.py --status --offline", "OpenRouter 호출 생략"],
         ["powershell -File startClaudeDashboard.ps1", "고정 포트(8787)로 이 페이지 열기"],
+        ["python routeDashboard.py --stop", "대시보드만 종료 (실행기 세션은 유지)"],
     ],
     "endpoints": [
         ["GET /api/status", "위와 같은 요약 JSON"],
@@ -1072,7 +1073,21 @@ def main(argv=None):
     parser.add_argument("--pretty", action="store_true", help="Indent the status report")
     parser.add_argument("--allow-port-fallback", action="store_true",
                         help="Pick a free port instead of failing when the requested port is busy")
+    parser.add_argument("--stop", action="store_true",
+                        help="Stop only the dashboard recorded in .dashboard.pid")
     args = parser.parse_args(argv)
+    if args.stop:
+        record = _read_pid_record()
+        if not record:
+            print(json.dumps({"stopped": False, "reason": "no_record"}))
+            return 1
+        try:
+            os.kill(record["pid"], signal.SIGTERM)
+        except OSError as error:
+            print(json.dumps({"stopped": False, "pid": record["pid"], "reason": str(error)}))
+            return 1
+        print(json.dumps({"stopped": True, "pid": record["pid"], "port": record["port"]}))
+        return 0
     if args.status:
         report = status_report(include_usage=args.usage, offline=args.offline)
         print(json.dumps(report, ensure_ascii=False, indent=2 if args.pretty else None))

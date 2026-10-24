@@ -446,7 +446,7 @@ class TransitionTests(unittest.TestCase):
         for row in dash.HELP_SECTION["states"] + dash.HELP_SECTION["exit_codes"]:
             self.assertEqual(len(row), 2)
         commands = dash.HELP_SECTION["commands"]
-        self.assertEqual(len(commands), 5)
+        self.assertEqual(len(commands), 6)
         self.assertTrue(all(len(row) == 2 and all(row) for row in commands))
         joined = " ".join(row[0] for row in commands)
         for flag in ("--status", "--pretty", "--usage", "--offline"):
@@ -547,6 +547,17 @@ class PortTests(unittest.TestCase):
         self.pid_file.write_text(json.dumps({"pid": os.getpid(), "port": 1}), encoding="utf-8")
         self.assertFalse(dash._stop_previous(8787))
         self.assertFalse(dash._stop_previous(1))
+
+    def test_stop_only_targets_the_recorded_dashboard(self):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(dash.main(["--stop"]), 1)
+        self.assertIn("no_record", output.getvalue())
+        self.pid_file.write_text(json.dumps({"pid": 4321, "port": 8787}), encoding="utf-8")
+        with mock.patch.object(dash.os, "kill") as killer, contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(dash.main(["--stop"]), 0)
+        killer.assert_called_once()
+        self.assertEqual(killer.call_args.args[0], 4321)
+        self.assertIn('"stopped": true', output.getvalue())
 
     def test_default_port_is_stable(self):
         self.assertEqual(dash.DEFAULT_PORT, 8787)

@@ -2,6 +2,7 @@
 
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 import re
 import shutil
@@ -183,6 +184,16 @@ def check_local() -> dict:
         return {**base, "reason": "invalid_configuration_or_response"}
 
 
+def log_route_marker(text: str) -> None:
+    """Append a launcher lifecycle marker beside the proxy events, so a dropped session is explainable."""
+    stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    try:
+        with (ROOT / ".route.log").open("a", encoding="utf-8") as handle:
+            handle.write(f"{stamp} --- {text} ---\n")
+    except OSError:
+        pass
+
+
 def clean_env() -> dict:
     # Keep OS execution variables; never inherit another provider's auth or model routing.
     return {k: v for k, v in os.environ.items()
@@ -340,8 +351,10 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
                        CLAUDE_CODE_DISABLE_ADVISOR_TOOL="1", MAX_THINKING_TOKENS="0",
                        CLAUDE_CODE_AUTO_CONNECT_IDE="false", CLAUDE_CODE_DISABLE_BACKGROUND_TASKS="1",
                        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
+        log_route_marker(f"launcher start pid={os.getpid()} proxy={proxy.pid} port={port}")
         yield env
     finally:
+        log_route_marker(f"launcher exit pid={os.getpid()}")
         proxy.terminate()
         try:
             proxy.wait(timeout=5)
