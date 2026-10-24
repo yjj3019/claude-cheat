@@ -38,12 +38,15 @@ for (const model of ['sonnet', 'opus', 'haiku', 'fable', 'claude-opus-5-5', 'cla
     assert.deepEqual(body.output_config, { effort: 'high' });
   });
 }
-test('compat preserves signed thinking history and opaque tool metadata', async t => {
+test('compat drops signed thinking history and keeps opaque tool metadata', async t => {
   const s = await session(t, () => reply());
   const content = [{ type: 'thinking', thinking: 'fixture', signature: 'opaque-signature', provider_specific_fields: { opaque: 'keep-thinking' } },
     { type: 'tool_use', id: 'tool-fixture', name: 'mcp__fixture__echo', input: {}, provider_specific_fields: { opaque: 'keep' } }];
   assert.equal((await s.send({ messages: [{ role: 'assistant', content }] })).status, 200);
-  assert.deepEqual(JSON.parse(s.calls[0].body).messages[0].content, content);
+  const forwarded = JSON.parse(s.calls[0].body).messages[0].content;
+  assert.deepEqual(forwarded, [content[1]]);
+  assert.equal(JSON.stringify(forwarded).includes('opaque-signature'), false);
+  assert.equal(JSON.stringify(forwarded).includes('opaque'), true);
 });
 test('compat synthesizes thinking/signature deltas only when upstream returns JSON', async t => {
   const s = await session(t, () => reply([{ type: 'thinking', thinking: 'fixture', signature: 'opaque-signature' },

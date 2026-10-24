@@ -156,7 +156,6 @@ const exclusionCases = [
   ['unsupported_thinking_config', { thinking: { type: 'private-value-marker' } }],
   ['unsupported_output_config', { output_config: { format: 'private-value-marker' } }],
   ['unsupported_tool_choice', { tool_choice: { private_field_marker: true } }],
-  ['native_thinking_history', { messages: [{ role: 'assistant', content: [{ type: 'thinking', thinking: 'private-value-marker', signature: 'private-signature-marker' }] }] }],
   ['unsupported_content_block', { messages: [{ role: 'user', content: [{ type: 'private-block-marker' }] }] }],
   ['unsupported_content_field', { messages: [{ role: 'user', content: [{ type: 'text', text: 'private-value-marker', private_field_marker: true }] }] }],
   ['unsupported_tool_caller', { messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: {}, caller: { type: 'private-caller-marker' } }] }] }],
@@ -182,6 +181,34 @@ for (const [detail, extra, headers = proHeaders, path = '/v1/messages'] of exclu
     assert.equal(JSON.stringify(entries).includes(OAUTH), false);
   });
 }
+
+test('signed reasoning history is dropped from the external copy instead of pinning the session to Plan', async t => {
+  const { calls, request } = await fixture(t);
+  const thinking = { type: 'thinking', thinking: 'private-value-marker', signature: 'private-signature-marker' };
+  const body = requestBody(SONNET, { messages: [
+    { role: 'user', content: 'fixture' },
+    { role: 'assistant', content: [thinking, { type: 'text', text: 'fixture answer' }] },
+    { role: 'user', content: 'fixture follow-up' }] });
+  const response = await request(body, { headers: proHeaders });
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, 'https://openrouter.ai/api/v1/messages');
+  assert.deepEqual(calls[0].parsedBody.messages[1].content, [{ type: 'text', text: 'fixture answer' }]);
+  assert.equal(JSON.stringify(calls[0].parsedBody).includes('private-value-marker'), false);
+  assert.equal(body.messages[1].content.length, 2);
+});
+
+test('a reasoning-only turn keeps its position with a neutral placeholder', async t => {
+  const { calls, request } = await fixture(t);
+  const body = requestBody(SONNET, { messages: [
+    { role: 'user', content: 'fixture' },
+    { role: 'assistant', content: [{ type: 'thinking', thinking: 'private-value-marker', signature: 'private-signature-marker' }] },
+    { role: 'user', content: 'fixture follow-up' }] });
+  assert.equal((await request(body, { headers: proHeaders })).status, 200);
+  assert.equal(calls[0].url, 'https://openrouter.ai/api/v1/messages');
+  assert.deepEqual(calls[0].parsedBody.messages[1].content, [{ type: 'text', text: '(reasoning omitted)' }]);
+});
 
 test('beta diagnostics show bounded feature identifiers and redact nonstandard or credential-like values', async t => {
   const log = t.mock.method(console, 'error', () => {});
@@ -241,14 +268,13 @@ for (const caller of [null, {}, [], 1, 'direct', { type: 'future' }, { type: 'co
   });
 }
 
-for (const nativeFeature of ['beta', 'native thinking history', 'nested caller']) {
+for (const nativeFeature of ['beta', 'unsupported output configuration', 'nested caller']) {
   test(`direct caller does not bypass ${nativeFeature} preservation`, async t => {
     const tool = { type: 'tool_use', id: 't1', name: 'ReadHistory', input: {}, caller: { type: 'direct' } };
     const body = requestBody(SONNET, { messages: [{ role: 'assistant', content: [tool] }] });
     const headers = { ...proHeaders };
     if (nativeFeature === 'beta') headers['anthropic-beta'] += ',future-native-2026-10-20';
-    if (nativeFeature === 'native thinking history')
-      body.messages[0].content.unshift({ type: 'thinking', thinking: 'synthetic', signature: 'synthetic-signature' });
+    if (nativeFeature === 'unsupported output configuration') body.output_config = { format: { type: 'json_schema' } };
     if (nativeFeature === 'nested caller') body.messages.push({ role: 'user', content: [
       { type: 'tool_result', tool_use_id: 't1', content: [{ ...tool, caller: { type: 'future' } }] },
     ] });
@@ -621,7 +647,6 @@ const nativeFeatures = [
   ['unknown top field', { future_native: true }],
   ['provider override', { provider: { allow_fallbacks: true } }],
   ['endpoint override', { base_url: 'https://example.invalid' }],
-  ['signed thinking history', { messages: [{ role: 'assistant', content: [{ type: 'thinking', thinking: 'native', signature: 'fixture' }] }] }],
   ['server tool history', { messages: [{ role: 'assistant', content: [{ type: 'server_tool_use', id: 'tool', name: 'web_search', input: {} }] }] }],
   ['nested server result', { messages: [{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tool', content: [{ type: 'web_search_tool_result', content: [] }] }] }] }],
   ['inline tool addition', { messages: [{ role: 'user', content: [{ type: 'tool_addition', tools: [] }] }] }],
@@ -647,7 +672,7 @@ for (const [label, body, path = '/v1/messages', headers = proHeaders] of [
   ['token count', requestBody(SONNET), '/v1/messages/count_tokens'],
   ['native beta', requestBody(SONNET), '/v1/messages', { ...proHeaders, 'anthropic-beta': BETA + ',future-native-2026-10-20' }],
   ['native tool', requestBody(SONNET, { tools: [{ type: 'advisor_20260301', name: 'advisor' }] })],
-  ['native history', requestBody(SONNET, { messages: [{ role: 'assistant', content: [{ type: 'thinking', thinking: 'fixture' }] }] })],
+  ['native server tool history', requestBody(SONNET, { messages: [{ role: 'assistant', content: [{ type: 'server_tool_use', id: 'tool', name: 'web_search', input: {} }] }] })],
 ]) {
   test(`Local-only mode rejects ${label} even with valid OAuth and never calls Plan`, async t => {
     const { calls, request } = await fixture(t, jsonResponse, { provider: 'local', localOnly: true,

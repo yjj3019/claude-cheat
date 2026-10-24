@@ -58,6 +58,21 @@ const CONTENT_FIELDS = {
 // Read-only fields a provider may add to a response block; request blocks never carry them.
 const RESPONSE_FIELDS = { text: new Set(['citations']) };
 const responseBlockField = (type, name) => Boolean(CONTENT_FIELDS[type]?.has(name) || RESPONSE_FIELDS[type]?.has(name));
+// Native reasoning stays on the subscription route: another provider cannot verify the Anthropic
+// signature, and forwarding it would ship the Plan model's internal reasoning to a third party.
+// Dropping it from the external copy also keeps a session routable after one Plan fallback.
+const NATIVE_THINKING = new Set(['thinking', 'redacted_thinking']);
+const OMITTED_REASONING = '(reasoning omitted)';
+const isNativeThinking = block => NATIVE_THINKING.has(block?.type);
+const nativeThinkingOK = block => block.type === 'thinking' ? typeof block.thinking === 'string' :
+  typeof block.data === 'string';
+const withoutNativeThinking = messages => messages.map(message => {
+  if (!Array.isArray(message.content)) return message;
+  const content = message.content.filter(block => !isNativeThinking(block));
+  if (content.length === message.content.length) return message;
+  // A turn that held only reasoning keeps its place so the conversation keeps valid turn order.
+  return { ...message, content: content.length ? content : [{ type: 'text', text: OMITTED_REASONING }] };
+});
 const COMPAT_BETAS = new Set(['interleaved-thinking-2025-05-14', 'redact-thinking-2026-02-12',
   'context-management-2025-06-27', 'prompt-caching-scope-2026-01-05', 'per-turn-control-2026-07-01',
   'mid-conversation-tool-changes-2026-07-01', 'inline-tools-2026-09-15', 'advisor-tool-2026-03-01',
@@ -104,13 +119,6 @@ function compatExclusion(body, beta) {
     if (!['updates', 'omitted', 'summarized'].includes(body.thinking.display)) return 'unsupported_thinking_config';
     copy.thinking = { ...body.thinking }; delete copy.thinking.display;
   }
-  for (const message of body.messages || []) for (const block of Array.isArray(message.content) ? message.content : []) {
-    if (['thinking', 'redacted_thinking'].includes(block?.type) && (!validContentBlock(block) ||
-        Object.keys(block).some(name => !['type', 'thinking', 'signature', 'data', 'cache_control', 'provider_specific_fields'].includes(name)) ||
-        (block.provider_specific_fields !== undefined && block.provider_specific_fields !== null &&
-          (typeof block.provider_specific_fields !== 'object' || Array.isArray(block.provider_specific_fields))) ||
-        (block.signature !== undefined && typeof block.signature !== 'string'))) return 'unsupported_thinking_history';
-  }
   return externalExclusion(copy, '', true, true);
 }
 // Claude Code 2.1.310 sends these on every request, even with experimental betas disabled. They only
@@ -122,7 +130,8 @@ function unsupportedBetas(beta, localCompat = false) {
     !/^oauth-\d{4}-\d{2}-\d{2}$/.test(x) && !['claude-code-20250219', 'prompt-caching-2024-07-31'].includes(x));
 }
 function externalExclusion(body, beta, localOnly = false, localCompat = false) {
-  // Unknown betas/fields and native history belong to the subscription API. Never strip them.
+  // Unknown betas/fields belong to the subscription API and are never stripped; native reasoning is
+  // the one exception, dropped from the external copy because no other provider can verify it.
   if (unsupportedBetas(beta).length) return 'unsupported_beta';
   if (Object.keys(body).some(name => !BASIC_FIELDS.has(name))) return 'unsupported_request_field';
   // Claude Code sends a context turn with role "system" in messages; it carries text only.
@@ -138,8 +147,9 @@ function externalExclusion(body, beta, localOnly = false, localCompat = false) {
   let contentDetail = 'unsupported_content';
   const contentOK = (content, toolResult = false) => typeof content === 'string' || (Array.isArray(content) && content.every(block => {
     const fields = localCompat && toolResult && block?.type === 'tool_reference' ? new Set(['type', 'tool_name', 'cache_control']) : CONTENT_FIELDS[block?.type];
+    if (isNativeThinking(block)) return nativeThinkingOK(block);
     if (!block || !fields) {
-      contentDetail = block?.type === 'thinking' || block?.type === 'redacted_thinking' ? 'native_thinking_history' : 'unsupported_content_block';
+      contentDetail = 'unsupported_content_block';
       return false;
     }
     if ((block.type === 'tool_reference' && (typeof block.tool_name !== 'string' ||
@@ -539,6 +549,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       try {
         const externalModel = provider === 'local' ? localModel : openrouterModel;
         const externalBody = { ...body, model: externalModel };
+        if (Array.isArray(externalBody.messages)) externalBody.messages = withoutNativeThinking(externalBody.messages);
         delete externalBody.metadata; // client account/session identifiers stay off third-party providers
         if (noPlan) {
           externalBody.stream = false;

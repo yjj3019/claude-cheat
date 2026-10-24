@@ -35,7 +35,7 @@ for (const model of ['sonnet', 'opus', 'haiku', 'fable', 'claude-sonnet-5-5', 'c
     assert.deepEqual(c.parsed.thinking, { type: 'adaptive' }); assert.deepEqual(c.parsed.output_config, { effort: 'high' });
   });
 }
-test('OpenRouter compatibility preserves native history, tool references and opaque metadata', async t => {
+test('OpenRouter compatibility keeps extensions and opaque metadata while dropping signed reasoning', async t => {
   const s = await session(t);
   const fields = { context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }] },
     thinking: { type: 'adaptive', display: 'updates' }, output_config: { effort: 'low' },
@@ -45,7 +45,14 @@ test('OpenRouter compatibility preserves native history, tool references and opa
     { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'fixture-tool', content: [{ type: 'tool_reference', tool_name: 'mcp__fixture__echo' }] }] },
     { role: 'system', content: [{ type: 'text', text: 'fixture' }], output_config: { effort: 'low' } }] };
   assert.equal((await s.send(fields)).status, 200);
-  for (const field of Object.keys(fields)) assert.deepEqual(s.calls[0].parsed[field], fields[field]);
+  for (const field of ['context_management', 'thinking', 'output_config', 'tools'])
+    assert.deepEqual(s.calls[0].parsed[field], fields[field]);
+  const messages = s.calls[0].parsed.messages;
+  assert.deepEqual(messages[0].content, [fields.messages[0].content[1]]);
+  assert.deepEqual(messages[1], fields.messages[1]);
+  assert.equal(messages[2].role, 'system');
+  assert.deepEqual(messages[2].output_config, { effort: 'low' });
+  assert.equal(JSON.stringify(s.calls[0].parsed).includes('opaque-signature'), false);
 });
 test('OpenRouter compatibility accepts provider citation fields on text blocks', async t => {
   const s = await session(t, () => reply({ content: [{ type: 'text', text: 'OK', citations: [{ cited_text: 'fixture' }] }] }));
