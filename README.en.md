@@ -259,6 +259,7 @@ The tests cover payload preservation, authentication isolation, tool-result roun
 - Allowed paths are POST `/v1/messages` and `/v1/messages/count_tokens` (optionally `?beta=true`), plus local readiness HEAD `/api/hello`. Other paths are rejected, not forwarded to the subscription route.
 - A custom `CLAUDE_CONFIG_DIR` is preserved unless absent or set to the historical `~/.claude-openrouter`, in which case the child uses `~/.claude`. Old MCP/plugin registrations are not automatically migrated; directories are not copied or deleted.
 - The per-session random token (nonce) of Local/compat isolated sessions appears in the Claude Code process's `--settings` argument and environment. Any same-user process (including EDR or audit tools that log command lines) can read it, and a leaked token allows consuming OpenRouter/Local usage through the local proxy for that session. It is regenerated per session and bound to `127.0.0.1` only; it grants no Plan access.
+- If `claude` resolves to an npm `.cmd`/`.bat` shim, isolated modes (Local, OpenRouter compatibility) print a warning. cmd.exe may mis-parse quotes, `&` or `%` in arguments passed through a shim; this was not reproduced. Prefer the native `claude.exe` install.
 - Diagnose HTTP 429 using the affected account's Usage screen and response. Account-specific limits and reset schedules are not published here.
 
 See the [connection and recovery checklist](docs/LIVE-VALIDATION.ko.md) for a general procedure.

@@ -433,6 +433,10 @@ def launch(provider: str = "openrouter", local_only: bool = False, local_compat:
         if isolated:
             raise startup_error("local_cli_not_found")
         raise FileNotFoundError("Claude Code executable not found")
+    if isolated and Path(claude).suffix.lower() in (".cmd", ".bat"):
+        # shortcut: warn only; cmd.exe can mis-parse quotes/&/% in the workspace path or settings JSON passed through a shim.
+        # Upgrade to a hard error if an injection is ever reproduced.
+        print("Warning: 'claude' resolves to a .cmd/.bat shim; prefer the native claude.exe for isolated modes.", file=sys.stderr)
     if isolated:
         print("OpenRouter compatibility mode: client integrations enabled. No Plan fallback." if openrouter_compat else
               "Local compatibility mode: client integrations enabled. No Plan fallback." if local_compat else

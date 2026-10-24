@@ -255,6 +255,15 @@ class LocalCliModeTests(LocalTestCase):
             self.assertEqual(effective[name], "")
         self.assertNotIn("ANTHROPIC_DEFAULT_SONNET_MODEL", settings["env"])
 
+    def test_cmd_shim_triggers_warning_but_does_not_block(self):
+        pinned = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:12345", "ANTHROPIC_AUTH_TOKEN": "synthetic-nonce",
+                  "ANTHROPIC_CUSTOM_HEADERS": "X-Local-Route-Token: synthetic-nonce"}
+        for executable, warned in (("C:/tools/claude.cmd", True), ("C:/tools/claude.exe", False)):
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err), mock.patch.object(route.shutil, "which", return_value=executable), mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.304")), mock.patch.object(route, "routed_session", return_value=contextlib.nullcontext(pinned)), mock.patch.object(route.subprocess, "call", return_value=0):
+                self.assertEqual(route.launch("local", local_only=True), 0)
+            self.assertEqual(".cmd/.bat shim" in err.getvalue(), warned)
+
     def test_compat_retains_version_budget_and_cleanup_startup_guards(self):
         with mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.303")):
             with self.assertRaises(route.LocalStartupError) as result:
