@@ -255,9 +255,10 @@ The tests cover payload preservation, authentication isolation, tool-result roun
 - A real Local service still requires separate authentication, inference, and tool-call validation.
 - Unsupported native features or signed history stay on the Plan route. External usage can be zero, and native history may prevent a safe return to the external provider in the same conversation.
 - Running only a native advisor on the subscription path during external inference is not implemented. Full native-feature equivalence, including remote managed settings and organization policy with a custom `ANTHROPIC_BASE_URL`, is not guaranteed.
-- Request bodies above 16 MiB receive HTTP 413 before fallback. Only versioned `claude-sonnet-*`, `claude-opus-*`, `claude-haiku-*`, `claude-fable-*` names whose version starts with a digit, the configured OpenRouter model ID, and the historical client alias are accepted. Unknown models receive HTTP 403.
+- Request bodies above 32 MiB receive HTTP 413 before fallback. Only versioned `claude-sonnet-*`, `claude-opus-*`, `claude-haiku-*`, `claude-fable-*` names whose version starts with a digit, the configured OpenRouter model ID, and the historical client alias are accepted. Unknown models receive HTTP 403.
 - Allowed paths are POST `/v1/messages` and `/v1/messages/count_tokens` (optionally `?beta=true`), plus local readiness HEAD `/api/hello`. Other paths are rejected, not forwarded to the subscription route.
 - A custom `CLAUDE_CONFIG_DIR` is preserved unless absent or set to the historical `~/.claude-openrouter`, in which case the child uses `~/.claude`. Old MCP/plugin registrations are not automatically migrated; directories are not copied or deleted.
+- The per-session random token (nonce) of Local/compat isolated sessions appears in the Claude Code process's `--settings` argument and environment. Any same-user process (including EDR or audit tools that log command lines) can read it, and a leaked token allows consuming OpenRouter/Local usage through the local proxy for that session. It is regenerated per session and bound to `127.0.0.1` only; it grants no Plan access.
 - Diagnose HTTP 429 using the affected account's Usage screen and response. Account-specific limits and reset schedules are not published here.
 
 See the [connection and recovery checklist](docs/LIVE-VALIDATION.ko.md) for a general procedure.

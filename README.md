@@ -372,9 +372,10 @@ node --check claudeRouteProxy.mjs
 - 실제 Local 서버의 인증·추론·도구 호출은 별도 검증이 필요합니다.
 - 미지원 네이티브 기능이나 서명된 이력이 있으면 Plan 경로를 사용합니다. 따라서 외부 모델 사용률이 0%일 수 있고, 같은 대화에서 외부 경로로 돌아오지 못할 수도 있습니다.
 - 외부 추론의 네이티브 advisor만 별도로 구독 경로에서 실행하는 기능은 구현하지 않았습니다. custom `ANTHROPIC_BASE_URL`에서 원격 managed settings·organization policy를 포함한 모든 네이티브 기능의 동등성을 보장하지 않습니다.
-- 요청 본문은 16MiB로 제한하며 초과 시 fallback 전에 HTTP 413을 반환합니다. 버전이 숫자로 시작하는 `claude-sonnet-*`, `claude-opus-*`, `claude-haiku-*`, `claude-fable-*`, 설정한 OpenRouter 모델 ID와 과거 클라이언트 모델 별칭을 허용하며, 미등록 모델은 HTTP 403으로 거부합니다.
+- 요청 본문은 32MiB로 제한하며 초과 시 fallback 전에 HTTP 413을 반환합니다. 버전이 숫자로 시작하는 `claude-sonnet-*`, `claude-opus-*`, `claude-haiku-*`, `claude-fable-*`, 설정한 OpenRouter 모델 ID와 과거 클라이언트 모델 별칭을 허용하며, 미등록 모델은 HTTP 403으로 거부합니다.
 - 경로는 POST `/v1/messages`, `/v1/messages/count_tokens`(선택적 `?beta=true`)와 로컬 확인 HEAD `/api/hello`만 허용합니다. 다른 경로는 구독으로 우회하지 않고 거부합니다.
 - 사용자 지정 `CLAUDE_CONFIG_DIR`는 유지하되, 미설정 또는 과거 전용 `~/.claude-openrouter`이면 자식에서 `~/.claude`를 사용합니다. 과거 폴더의 MCP·플러그인을 자동 이전하거나 폴더를 복사·삭제하지 않습니다.
+- Local·compat 격리 세션의 임의 토큰(nonce)은 Claude Code 프로세스의 `--settings` 인자와 환경변수에 들어갑니다. 같은 사용자 권한의 프로세스(명령줄을 수집하는 EDR·감사 도구 포함)가 읽을 수 있고, 유출되면 해당 세션 동안 로컬 프록시를 통해 OpenRouter/Local 사용량을 소비할 수 있습니다. 세션마다 새로 생성하며 `127.0.0.1`에만 바인드합니다. Plan 접근 권한은 주지 않습니다.
 - HTTP 429가 발생하면 해당 계정의 Usage 화면과 응답을 직접 확인해야 합니다. 특정 계정의 한도·초기화 일정은 저장소에서 관리하지 않습니다.
 
 일반적인 검증 절차는 [연결·장애 복구 점검](docs/LIVE-VALIDATION.ko.md)을 참고하세요.
