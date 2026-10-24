@@ -276,7 +276,7 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal, on
     if (event.type === 'content_block_stop') {
       const block = blocks.get(event.index);
       if (!block) throw new Error('Unknown content block');
-      if (block.hasJson) {
+      if (block.hasJson && block.json.trim()) {
         const input = JSON.parse(block.json);
         if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Invalid tool input');
       }

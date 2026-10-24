@@ -1246,6 +1246,20 @@ test('complete SSE tool input JSON across deltas succeeds and restores native cl
   assert.equal(calls.length, 1);
 });
 
+for (const [label, middle] of [
+  ['empty partial_json', toolStart() + toolDelta('') + toolStop()],
+  ['no input delta', toolStart() + toolStop()],
+]) {
+  test(`argument-less tool_use with ${label} succeeds without retry`, async t => {
+    const events = frame('message_start') + middle + frame('message_delta', { delta: { stop_reason: 'tool_use' } }) + frame('message_stop');
+    const { calls, request } = await fixture(t, () => sseResponse([events]));
+    const response = await request(requestBody(SONNET, { stream: true }), { headers: proHeaders });
+    assert.equal(response.status, 200);
+    assert.match(await response.text(), /tool_fixture/);
+    assert.equal(calls.length, 1);
+  });
+}
+
 for (const [label, responseBody] of [
   ['missing content', { type: 'message', model: DEEPSEEK, stop_reason: 'end_turn' }],
   ['missing stop reason', { type: 'message', model: DEEPSEEK, content: [] }],
