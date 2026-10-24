@@ -111,6 +111,26 @@ startClaudeOpenRouter.ps1
 
 실행기는 해당 Claude 프로세스의 연결 주소만 로컬 라우터로 설정하고 기존 Plan 인증을 검사합니다. 저장된 로그인·사용자 설정을 API용 설정으로 덮어쓰지 않습니다. `/status`의 Plan 로그인 표시는 인증 상태이며 **현재 응답을 OpenRouter 모델이 만들었다는 증거는 아닙니다.**
 
+### OpenRouter 호환 모드: Plan 전환 차단
+
+```powershell
+.\startClaudeOpenRouter.ps1 -Provider OpenRouter -OpenRouterCompat
+```
+
+Claude Code 2.1.304 이상에서 `.env.openrouter`의 같은 키와 `OPENROUTER_MODEL`을 사용합니다. 주 모델·빠른 모델·하위 에이전트의 Claude 모델 선택을 모두 지정한 같은 OpenRouter 모델로 전달하며, Plan 로그인과 Plan fallback은 사용하지 않습니다. 기존 일반 실행과 Local 모드는 유지합니다.
+
+LocalCompat과 같은 호환 처리로 플러그인·스킬·MCP·hooks·하위 에이전트 및 thinking·추론 강도 설정을 허용합니다. 사용자·프로젝트 설정과 기본 승인·거절 규칙을 유지하고, API 키 helper는 끕니다. 실행 설정으로 프록시 주소와 임시 인증을 고정하며 제공자 키는 프록시에만 전달합니다. 알려진 CLI 제어 필드만 변환하고, 지원하지 않는 beta·필드·토큰 계산 API는 명시적으로 거절합니다.
+
+응답은 JSON 전체를 검증한 뒤 CLI용 SSE로 전달합니다. 요청당 120초·외부 시도 1회·오류 후 30초 재요청 대기를 적용하며 OpenRouter의 제공자 fallback도 차단합니다. 선택 모델의 Messages API·도구·thinking 지원과 정확한 응답 모델 ID가 필요합니다. 추론 강도 전달이 Sonnet과 동일한 추론 효과를 보증하지는 않습니다.
+
+### 실행 전 연결 점검
+
+모든 대화형 실행은 선택 제공자의 설정으로 최소 추론을 1회 점검한 뒤 결과를 출력합니다. 제한은 15초·출력 512토큰이며 OpenRouter 사용료가 발생할 수 있습니다. `connection_check`, `provider`, `inference_checked`, `model_confirmed`, `reply_confirmed`, `reason`과 필요한 HTTP `status`만 기록하고 주소·키·본문은 출력하지 않습니다.
+
+점검 실패도 CLI 진입을 계속합니다. 일반 실행은 기존 Plan 라우팅과 fallback을 유지하고, `-LocalMode`·`-LocalCompat`·`-OpenRouterCompat`은 Plan 차단을 유지합니다. 실패 시 `provider_connection_unavailable`의 `action`은 `continue`, `plan_fallback`은 해당 모드 정책을 표시합니다. 이후 요청에서 제공자 연결을 다시 시도할 수 있습니다. 설정 누락·잘못된 설정·CLI 실행 불가 같은 시작 오류는 별도로 종료합니다.
+
+`ready`는 모델 ID·정확한 점검 답변·정상 종료를 확인했다는 뜻입니다. `timeout`, `authentication_failed`, `http_error`, `connection_failed`는 접속 관련 실패이며, `reply_mismatch`, `incomplete_response`, `invalid_response`는 응답 검증 실패입니다. 특히 추론 모델이 512토큰을 소진하거나 다른 문구로 답하면 연결돼 있어도 점검은 실패할 수 있습니다. 이 점검이 전체 CLI 기능 호환성을 보증하지는 않습니다. 별도 `-CheckLocal`·`-DiagnoseLocal`의 진단 후 종료 동작은 유지합니다.
+
 ## 4. Local LLM으로 전환하기
 
 ### 지원하는 서버 형식

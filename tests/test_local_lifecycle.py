@@ -55,7 +55,7 @@ def spawn(args,**kwargs):
     proxy=original(args,**kwargs)
     return proxy
 config={'SONNET_PROVIDER':'local','LOCAL_LLM_URL':url,'LOCAL_LLM_MODEL':'synthetic-model','LOCAL_LLM_API_KEY':'synthetic-local-key'}
-with patch.object(a,'provider_config',return_value=config),patch.object(a.shutil,'which',side_effect=lambda n:'synthetic-cli' if n=='claude' else node),patch.object(a.subprocess,'run',return_value=Mock(stdout='2.1.304')),patch.object(a.subprocess,'Popen',side_effect=spawn),patch.object(a,'run_owned',side_effect=AssertionError('Plan auth forbidden')):
+with patch.object(a,'check_connection',return_value=0),patch.object(a,'provider_config',return_value=config),patch.object(a.shutil,'which',side_effect=lambda n:'synthetic-cli' if n=='claude' else node),patch.object(a.subprocess,'run',return_value=Mock(stdout='2.1.304')),patch.object(a.subprocess,'Popen',side_effect=spawn),patch.object(a,'run_owned',side_effect=AssertionError('Plan auth forbidden')):
     a.localProcessTree.ensure_windows_local_tree()
     sys.exit(a.launch('local',local_only=True))
 """

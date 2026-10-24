@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 export const DEEPSEEK = 'deepseek/deepseek-v4.1-flash-1017';
 const isPro = model => typeof model === 'string' && /^claude-(opus|haiku|fable)-[0-9][a-zA-Z0-9.-]*$/.test(model);
 const isSonnet = model => typeof model === 'string' && /^claude-sonnet-[0-9][a-zA-Z0-9.-]*$/.test(model);
+const validOpenRouterModel = model => typeof model === 'string' && /^[A-Za-z0-9~@][A-Za-z0-9._:/@+~-]{0,255}$/.test(model) && !/^(REPLACE_WITH_|YOUR_)/.test(model);
 const SEGMENT = String.raw`(?:[A-Za-z0-9_\-~:@+][A-Za-z0-9_\-.~:@+]{0,199}|\.[A-Za-z0-9_\-~:@+][A-Za-z0-9_\-.~:@+]{0,198}|\.\.[A-Za-z0-9_\-.~:@+]{1,198})`;
 const PATTERNS = new Map([
   [String.raw`^(?!\.\.?(?:\/|$))[A-Za-z0-9_\-.~:@+]{1,200}$`, `^${SEGMENT}$`],
@@ -327,22 +328,27 @@ export async function diagnoseLocal({ localUrl, localModel, localKey, localHttpU
     throw new Error('Invalid Local diagnostic configuration');
   if (localKey !== undefined && (typeof localKey !== 'string' || /[\x00-\x1f\x7f]/.test(localKey)))
     throw new Error('Invalid Local credential');
+  return diagnoseEndpoint({ url, model: localModel, key: localKey, fetchImpl, timeoutMs });
+}
+
+async function diagnoseEndpoint({ url, model, key, fetchImpl, timeoutMs, openrouter = false }) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 60000) throw new Error('Invalid diagnostic timeout');
   const headers = { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' };
-  if (localKey) headers.authorization = `Bearer ${localKey}`;
+  if (key) headers.authorization = `Bearer ${key}`;
   const controller = new AbortController();
   const { signal } = controller;
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   let received = false;
   try {
     const response = await abortable(fetchImpl(url, { method: 'POST', headers, redirect: 'error', signal,
-      body: JSON.stringify({ model: localModel, max_tokens: 512, stream: false,
+      body: JSON.stringify({ model, max_tokens: 512, stream: false, ...(openrouter ? { provider: { allow_fallbacks: false } } : {}),
         messages: [{ role: 'user', content: 'Reply with exactly LOCAL_DIAGNOSTIC_OK. Do not use tools.' }] }) }), signal);
     received = true;
     if (!response.ok) {
       await response.body?.cancel();
       return { local_diagnostic: false, inference_checked: true, reason: 'http_error', status: response.status };
     }
-    const validated = await abortable(bufferedResponse(response, localModel, localModel, false, signal), signal);
+    const validated = await abortable(bufferedResponse(response, model, model, false, signal), signal);
     if (validated.contentType !== 'application/json') throw new Error('Expected JSON diagnostic response');
     const message = JSON.parse(validated.text);
     const reply = message.content.filter(block => block.type === 'text').map(block => block.text).join('').trim();
@@ -357,16 +363,31 @@ export async function diagnoseLocal({ localUrl, localModel, localKey, localHttpU
   }
 }
 
+export async function checkConnection({ provider, key, openrouterModel, fetchImpl = fetch, timeoutMs = 15000, ...config }) {
+  if (!['local', 'openrouter'].includes(provider)) throw new Error('Unsupported connection provider');
+  if (provider === 'openrouter' && (!validOpenRouterModel(openrouterModel) || typeof key !== 'string' || !/^sk-or-[A-Za-z0-9_-]+$/.test(key)))
+    throw new Error('Invalid OpenRouter connection configuration');
+  const result = await (provider === 'local' ? diagnoseLocal({ ...config, timeoutMs, fetchImpl }) :
+    diagnoseEndpoint({ url: 'https://openrouter.ai/api/v1/messages', model: openrouterModel, key, fetchImpl, timeoutMs, openrouter: true }));
+  return { connection_check: result.local_diagnostic, provider, inference_checked: result.inference_checked,
+    model_confirmed: result.model_confirmed === true, reply_confirmed: result.reply_confirmed === true,
+    reason: result.local_diagnostic ? 'ready' : [401, 403].includes(result.status) ? 'authentication_failed' : result.reason,
+    ...(Number.isInteger(result.status) ? { status: result.status } : {}) };
+}
+
 export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrouter', openrouterModel, localUrl,
-  localModel, localKey, localAllowRemote = false, localHttpUrl, localOnly = false, localCompat = false, fallbackModel = 'claude-sonnet-5-5', retryDelayMs = 1000,
-  cooldownMs = 30000, attemptTimeoutMs = localOnly ? 120000 : 30000, now = Date.now }) {
+  localModel, localKey, localAllowRemote = false, localHttpUrl, localOnly = false, localCompat = false, openrouterCompat = false, fallbackModel = 'claude-sonnet-5-5', retryDelayMs = 1000,
+  cooldownMs = 30000, attemptTimeoutMs = localOnly || openrouterCompat ? 120000 : 30000, now = Date.now }) {
   if (typeof localOnly !== 'boolean' || (localOnly && provider !== 'local')) throw new Error('Local-only mode requires local provider');
   if (typeof localCompat !== 'boolean' || (localCompat && (!localOnly || provider !== 'local')))
     throw new Error('Local compatibility requires Local-only mode');
+  if (typeof openrouterCompat !== 'boolean' || (openrouterCompat && (provider !== 'openrouter' || localOnly || localCompat)))
+    throw new Error('OpenRouter compatibility requires the OpenRouter provider');
+  const noPlan = localOnly || openrouterCompat, compatProfile = localCompat || openrouterCompat;
+  const label = openrouterCompat ? 'OpenRouter' : 'Local', errorPrefix = openrouterCompat ? 'openrouter' : 'local';
   if (!nonce || (provider === 'openrouter' && !key)) throw new Error('Proxy credentials required');
   if (!['openrouter', 'local'].includes(provider)) throw new Error('Unsupported Sonnet provider');
-  if (provider === 'openrouter' && (typeof openrouterModel !== 'string' ||
-      !/^[A-Za-z0-9~@][A-Za-z0-9._:/@+~-]{0,255}$/.test(openrouterModel) || /^(REPLACE_WITH_|YOUR_)/.test(openrouterModel)))
+  if (provider === 'openrouter' && !validOpenRouterModel(openrouterModel))
     throw new Error('OpenRouter model required; no default model is selected');
   if (typeof localAllowRemote !== 'boolean') throw new Error('Remote Local setting must be boolean');
   if (localKey !== undefined && (typeof localKey !== 'string' || /[\x00-\x1f\x7f]/.test(localKey))) throw new Error('Invalid Local credential');
@@ -402,40 +423,40 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       try { body = JSON.parse(raw.toString('utf8')); } catch { return reject(400, 'Invalid JSON'); }
       if (!body || typeof body !== 'object' || Array.isArray(body)) return reject(403, 'Unsupported request fields');
       const model = body.model;
-      const compatAlias = localCompat && ['sonnet', 'opus', 'haiku', 'fable'].includes(model);
+      const compatAlias = compatProfile && ['sonnet', 'opus', 'haiku', 'fable'].includes(model);
       const configuredAlias = provider === 'openrouter' && model === openrouterModel;
       if (!compatAlias && !configuredAlias && !isPro(model) && !isSonnet(model) && model !== DEEPSEEK) return reject(403, 'Model blocked');
       const oauthOK = /^Bearer\s+sk-ant-oat/.test(req.headers.authorization || '') && !req.headers['x-api-key'] &&
         (req.headers['anthropic-beta'] || '').includes('oauth-');
       const sendPro = async (reason = 'native_feature', detail) => {
-        const betas = detail === 'unsupported_beta' ? unsupportedBetas(req.headers['anthropic-beta'], localOnly, localCompat) : [];
+        const betas = detail === 'unsupported_beta' ? unsupportedBetas(req.headers['anthropic-beta'], localOnly, compatProfile) : [];
         const betaFeatures = betas.slice(0, 16).map(value =>
           /^[a-z][a-z0-9-]{0,63}-20\d{2}-[01]\d-[0-3]\d$/.test(value) &&
           !/(?:^|-)(?:sk|key|token|secret|password|bearer)(?:-|$)/.test(value) ? value : '[redacted]');
-        if (localOnly) {
-          let message = 'Local-only mode cannot route this request; Plan fallback disabled';
+        if (noPlan) {
+          let message = `${label}-only mode cannot route this request; Plan fallback disabled`;
           let code, retryAfterSeconds, previousErrorCode;
           if (reason === 'fallback' || reason === 'circuit_open') {
             const remaining = Math.max(0, Math.ceil((openUntil - now()) / 1000));
             const recoveryInProgress = reason === 'circuit_open' && probing && remaining === 0;
             const descriptions = {
-              timeout: ['local_timeout', 'Local request timed out.'],
-              authentication_failed: ['local_authentication_failed', 'Local server authentication failed. Check the Local API key and access permissions; restart the Local session after changing credentials.'],
-              empty_response: ['local_empty_response', 'Local server returned an empty response.'],
-              upstream_error: ['local_upstream_error', 'Local server request failed. Check the local routing log.'],
+              timeout: [`${errorPrefix}_timeout`, `${label} request timed out.`],
+              authentication_failed: [`${errorPrefix}_authentication_failed`, `${label} server authentication failed. Check the ${label} API key and access permissions; restart the ${label} session after changing credentials.`],
+              empty_response: [`${errorPrefix}_empty_response`, `${label} server returned an empty response.`],
+              upstream_error: [`${errorPrefix}_upstream_error`, `${label} server request failed. Check the ${errorPrefix} routing log.`],
             };
             let description;
             [code, description] = reason === 'fallback' ? descriptions[detail] || descriptions.upstream_error :
-              recoveryInProgress ? ['local_recovery_in_progress', 'Local recovery check is in progress. Wait for it to finish before sending a new request.'] :
-                ['local_cooldown', `Local retry cooldown is active. Previous failure: ${(descriptions[lastLocalFailure] || descriptions.upstream_error)[1]}`];
+              recoveryInProgress ? [`${errorPrefix}_recovery_in_progress`, `${label} recovery check is in progress. Wait for it to finish before sending a new request.`] :
+                [`${errorPrefix}_cooldown`, `${label} retry cooldown is active. Previous failure: ${(descriptions[lastLocalFailure] || descriptions.upstream_error)[1]}`];
             if (reason === 'circuit_open') previousErrorCode = (descriptions[lastLocalFailure] || descriptions.upstream_error)[0];
             if (!recoveryInProgress) retryAfterSeconds = remaining;
             const retryHint = recoveryInProgress ? '' : remaining > 0 ?
               ` Wait ${remaining} second${remaining === 1 ? '' : 's'} before a new request.` :
-              ' Send a new request to check Local recovery.';
+              ` Send a new request to check ${label} recovery.`;
             message = `[${code}] ${description}${retryHint} Plan fallback disabled.`;
           }
-          console.error(JSON.stringify({ event: 'local_mode_rejected', provider: 'local', reason, ...(detail ? { detail } : {}),
+          console.error(JSON.stringify({ event: `${errorPrefix}_mode_rejected`, provider, reason, ...(detail ? { detail } : {}),
             ...(code ? { code } : {}), ...(retryAfterSeconds !== undefined ? { retry_after_seconds: retryAfterSeconds } : {}),
             ...(previousErrorCode ? { previous_error_code: previousErrorCode } : {}),
             ...(betas.length ? { beta_features: betaFeatures, unsupported_beta_count: betas.length } : {}) }));
@@ -475,7 +496,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         }
         res.end();
       };
-      const nativeDetail = req.url.startsWith('/v1/messages/count_tokens') ? 'token_count' : localCompat ?
+      const nativeDetail = req.url.startsWith('/v1/messages/count_tokens') ? 'token_count' : compatProfile ?
         compatExclusion(body, req.headers['anthropic-beta']) : isPro(model) ? 'plan_model' : externalExclusion(body, req.headers['anthropic-beta'], localOnly);
       if (nativeDetail) return await sendPro('native_feature', nativeDetail);
       if (openUntil && (now() < openUntil || probing)) return await sendPro('circuit_open');
@@ -486,17 +507,17 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       try {
         const externalModel = provider === 'local' ? localModel : openrouterModel;
         const externalBody = { ...body, model: externalModel };
-        if (localOnly) {
+        if (noPlan) {
           externalBody.stream = false;
-          if (!localCompat) externalBody.thinking = { type: 'disabled' };
+          if (!compatProfile) externalBody.thinking = { type: 'disabled' };
         }
         if (body.tools) externalBody.tools = body.tools.map(tool => ({ ...tool, input_schema: compatibleSchema(tool.input_schema) }));
         if (provider === 'openrouter') externalBody.provider = { allow_fallbacks: false };
         const headers = { 'content-type': 'application/json', 'anthropic-version': req.headers['anthropic-version'] || '2023-06-01' };
-        if (localCompat && req.headers['anthropic-beta']) headers['anthropic-beta'] = req.headers['anthropic-beta'];
+        if (compatProfile && req.headers['anthropic-beta']) headers['anthropic-beta'] = req.headers['anthropic-beta'];
         const credential = provider === 'local' ? localKey : key;
         if (credential) headers.authorization = `Bearer ${credential}`;
-        const attempts = localOnly ? 1 : 4;
+        const attempts = noPlan ? 1 : 4;
         for (let attempt = 0; attempt < attempts; attempt++) {
           client.signal.throwIfAborted();
           const controller = new AbortController();
@@ -513,8 +534,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
                 await response.body?.cancel();
                 throw new Error('External request failed');
               }
-              const validated = await bufferedResponse(response, externalModel, model, localOnly ? false : body.stream, controller.signal);
-              if (localCompat) {
+              const validated = await bufferedResponse(response, externalModel, model, noPlan ? false : body.stream, controller.signal);
+              if (compatProfile) {
                 const content = JSON.parse(validated.text).content;
                 if (content.some(block => Object.keys(block).some(name =>
                     !(CONTENT_FIELDS[block.type]?.has(name) ||
@@ -543,7 +564,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
                   throw new Error('Unsupported Local response fields');
                 }
               }
-              return localOnly && body.stream === true ? jsonMessageStream(validated.text) : validated;
+              return noPlan && body.stream === true ? jsonMessageStream(validated.text) : validated;
             })();
             const response = await abortable(operation, controller.signal);
             client.signal.throwIfAborted();
@@ -564,7 +585,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               'Empty message response': 'empty_response', 'Invalid message response': 'invalid_message',
               'Invalid stream metadata': 'invalid_stream_metadata', 'Expected JSON Local response': 'expected_json', 'Unsupported Local response content': 'unsupported_local_content',
               'Local thinking response disabled': 'thinking_response', 'Unsupported Local response fields': 'unsupported_content_fields' }[error?.message];
-            if (localOnly) localFailure = controller.signal.reason === 'attempt_timeout' ? 'timeout' :
+            if (noPlan) localFailure = controller.signal.reason === 'attempt_timeout' ? 'timeout' :
               status === 401 || status === 403 ? 'authentication_failed' : validation === 'empty_response' ? 'empty_response' : 'upstream_error';
             console.error(JSON.stringify({ event: 'external_attempt_failed', provider, attempt: attempt + 1,
               ...(Number.isInteger(status) ? { status } : {}), ...(validation ? { validation } : {}),
@@ -580,13 +601,13 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           }), client.signal);
         }
         generation++;
-        if (localOnly) lastLocalFailure = localFailure;
+        if (noPlan) lastLocalFailure = localFailure;
         openUntil = now() + cooldownMs;
         console.error(JSON.stringify({ event: 'circuit_open', provider }));
       } finally {
         if (probe) probing = false;
       }
-      if (!succeeded) await sendPro('fallback', localOnly ? localFailure : undefined);
+      if (!succeeded) await sendPro('fallback', noPlan ? localFailure : undefined);
     } catch {
       if (!client.signal.aborted) {
         console.error(JSON.stringify({ event: 'route_failed', category: 'upstream' }));
@@ -601,10 +622,20 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const config = { key: process.env.OPENROUTER_API_KEY, openrouterModel: process.env.OPENROUTER_MODEL, nonce: process.env.LOCAL_ROUTE_TOKEN,
     provider: process.env.SONNET_PROVIDER || 'openrouter', localUrl: process.env.LOCAL_LLM_URL,
     localModel: process.env.LOCAL_LLM_MODEL, localKey: process.env.LOCAL_LLM_API_KEY,
-    localOnly: process.env.LOCAL_ROUTE_ONLY === '1', localCompat: process.env.LOCAL_ROUTE_COMPAT === '1', localHttpUrl: process.env.LOCAL_LLM_HTTP_URL, localAllowRemote: process.env.LOCAL_LLM_ALLOW_REMOTE === 'true' };
-  for (const name of ['OPENROUTER_API_KEY', 'OPENROUTER_MODEL', 'LOCAL_ROUTE_TOKEN', 'LOCAL_ROUTE_ONLY', 'LOCAL_ROUTE_COMPAT', 'SONNET_PROVIDER', 'LOCAL_LLM_URL',
+    localOnly: process.env.LOCAL_ROUTE_ONLY === '1', localCompat: process.env.LOCAL_ROUTE_COMPAT === '1', openrouterCompat: process.env.OPENROUTER_ROUTE_COMPAT === '1', localHttpUrl: process.env.LOCAL_LLM_HTTP_URL, localAllowRemote: process.env.LOCAL_LLM_ALLOW_REMOTE === 'true' };
+  for (const name of ['OPENROUTER_API_KEY', 'OPENROUTER_MODEL', 'LOCAL_ROUTE_TOKEN', 'LOCAL_ROUTE_ONLY', 'LOCAL_ROUTE_COMPAT', 'OPENROUTER_ROUTE_COMPAT', 'SONNET_PROVIDER', 'LOCAL_LLM_URL',
     'LOCAL_LLM_MODEL', 'LOCAL_LLM_API_KEY', 'LOCAL_LLM_ALLOW_REMOTE', 'LOCAL_LLM_HTTP_URL', 'LOCAL_LLM_MODELS_URL']) delete process.env[name];
-  if (process.argv.slice(2).includes('--diagnose-local')) {
+  if (process.argv.slice(2).includes('--check-connection')) {
+    try {
+      const result = await checkConnection(config);
+      process.stdout.write(JSON.stringify(result) + '\n');
+      process.exitCode = result.connection_check ? 0 : 1;
+    } catch {
+      process.stdout.write(JSON.stringify({ connection_check: false, provider: ['local', 'openrouter'].includes(config.provider) ? config.provider : 'unknown',
+        inference_checked: false, model_confirmed: false, reply_confirmed: false, reason: 'invalid_configuration' }) + '\n');
+      process.exitCode = 1;
+    }
+  } else if (process.argv.slice(2).includes('--diagnose-local')) {
     try {
       const result = await diagnoseLocal(config);
       process.stdout.write(JSON.stringify(result) + '\n');
@@ -615,9 +646,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     }
   } else {
     const server = createProxy(config);
-    if (config.localOnly && process.argv.slice(2).includes('--parent-pipe')) {
+    if ((config.localOnly || config.openrouterCompat) && process.argv.slice(2).includes('--parent-pipe')) {
       const parentClosed = () => {
-        console.error(JSON.stringify({ event: 'local_parent_disconnected', provider: 'local' }));
+        console.error(JSON.stringify({ event: config.openrouterCompat ? 'openrouter_parent_disconnected' : 'local_parent_disconnected', provider: config.provider }));
         process.exit(0);
       };
       process.stdin.once('end', parentClosed);

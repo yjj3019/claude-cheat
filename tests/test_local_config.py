@@ -26,6 +26,7 @@ class LocalTestCase(unittest.TestCase):
         self.temp = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(self.temp)
         self.enterContext(mock.patch.object(route, "ROOT", self.root))
+        self.enterContext(mock.patch.object(route, "check_connection", return_value=0))
         self.enterContext(mock.patch.dict(os.environ, {}, clear=True))
         self.enterContext(mock.patch.object(route, "read_key", side_effect=AssertionError("OpenRouter key access")))
         self.enterContext(mock.patch.object(route, "run_owned", side_effect=AssertionError("Claude invocation")))
@@ -235,6 +236,7 @@ class LocalCliModeTests(LocalTestCase):
                      "CLAUDE_CODE_USE_FOUNDRY", "LOCAL_LLM_API_KEY", "LOCAL_LLM_URL"):
             self.assertEqual(effective[name], "")
         self.assertEqual(settings["apiKeyHelper"], "")
+        self.assertEqual(effective[route.PRO_SESSION_GATE], "")
         self.assertEqual(effective["CLAUDE_CODE_MAX_OUTPUT_TOKENS"], "8192")
         self.assertNotIn("private-saved-override", json.dumps(settings))
 
@@ -408,7 +410,7 @@ class LocalCliModeTests(LocalTestCase):
                      mock.patch("shutil.which", side_effect=which), \
                      mock.patch("subprocess.run", return_value=mock.Mock(stdout=version)), \
                      mock.patch("subprocess.Popen", side_effect=spawn_error, return_value=proxy), \
-                     mock.patch("subprocess.call", side_effect=OSError("private-exception-marker")), \
+                     mock.patch("subprocess.call", side_effect=lambda args, **kwargs: 0 if args[-1] == "--check-connection" else (_ for _ in ()).throw(OSError("private-exception-marker"))), \
                      mock.patch.object(Path, "home", return_value=self.root), \
                      mock.patch.object(Path, "is_file", lambda p: False if p.name == ".env.local-llm" else is_file(p)), \
                      mock.patch.dict(os.environ, config), \

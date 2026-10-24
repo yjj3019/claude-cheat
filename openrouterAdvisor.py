@@ -43,6 +43,12 @@ class LocalStartupError(RuntimeError):
         super().__init__(LOCAL_STARTUP_MESSAGES[code])
 
 
+class OpenRouterStartupError(LocalStartupError):
+    def __init__(self, code):
+        self.code = code.replace("local_", "openrouter_", 1)
+        RuntimeError.__init__(self, LOCAL_STARTUP_MESSAGES[code].replace("Local", "OpenRouter").replace("local routing", "OpenRouter routing"))
+
+
 class OpenRouterConfigError(ValueError):
     def __init__(self):
         super().__init__("Set a valid ANTHROPIC_AUTH_TOKEN and OPENROUTER_MODEL in .env.openrouter beside openrouterAdvisor.py. No default model is selected. Values hidden.")
@@ -339,17 +345,22 @@ def file_mcp_sources() -> list[str]:
 
 
 @contextlib.contextmanager
-def routed_session(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False):
+def routed_session(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False, openrouter_compat: bool = False):
     """Own one loopback proxy; ordinary sessions alone use the subscription login."""
     if (local_only and provider != "local") or (local_compat and not local_only):
         raise ValueError("Local CLI mode requires the local provider")
+    if openrouter_compat and (provider != "openrouter" or local_only or local_compat):
+        raise ValueError("OpenRouter compatibility mode requires the OpenRouter provider only")
+    isolated = local_only or openrouter_compat
+    compat = local_compat or openrouter_compat
+    startup_error = OpenRouterStartupError if openrouter_compat else LocalStartupError
     claude = shutil.which("claude")
     if not claude:
-        if local_only:
-            raise LocalStartupError("local_cli_not_found")
+        if isolated:
+            raise startup_error("local_cli_not_found")
         raise FileNotFoundError("Claude Code executable not found")
-    env = clean_env() if local_only else os.environ.copy()
-    if local_compat:
+    env = clean_env() if isolated else os.environ.copy()
+    if compat:
         # Preserve client preferences, never inherited provider routing or credentials.
         for name in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_EFFORT_LEVEL", "MAX_THINKING_TOKENS",
                      "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
@@ -360,6 +371,7 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
                    ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-haiku-5-5", ANTHROPIC_DEFAULT_FABLE_MODEL="claude-fable-5-1",
                    ANTHROPIC_SMALL_FAST_MODEL="claude-haiku-5-5", CLAUDE_CODE_SUBAGENT_MODEL="claude-sonnet-5-5")
     env.pop("LOCAL_ROUTE_COMPAT", None)
+    env.pop("OPENROUTER_ROUTE_COMPAT", None)
     for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER"):
         env.pop(name, None)
     # Remove only provider credentials/routing left by the former OpenRouter setup.
@@ -374,15 +386,15 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
     if not config_dir or Path(config_dir).resolve() == (Path.home() / ".claude-openrouter").resolve():
         env["CLAUDE_CONFIG_DIR"] = str(Path.home() / ".claude")
     command = [claude]
-    if not local_only:
+    if not isolated:
         auth = run_owned(command + ["auth", "status", "--json"], env, str(Path.home()), timeout=60)
         if not (auth.get("loggedIn") is True and auth.get("authMethod") == "claude.ai"
                 and auth.get("apiProvider") == "firstParty" and auth.get("subscriptionType") == "pro"):
             raise RuntimeError("Existing first-party Plan login required; no API fallback")
     node = shutil.which("node")
     if not node:
-        if local_only:
-            raise LocalStartupError("local_node_not_found")
+        if isolated:
+            raise startup_error("local_node_not_found")
         raise FileNotFoundError("Node.js required for local routing")
     nonce = secrets.token_urlsafe(32)
     proxy_env = clean_env()
@@ -394,25 +406,31 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
         if local_only:
             raise LocalStartupError("local_configuration_invalid") from None
         raise
-    if provider == "openrouter":
+    if provider == "openrouter" and not openrouter_compat:
         for name in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
                      "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"):
             if env.get(name) == config["OPENROUTER_MODEL"]:
                 env.pop(name)
+    if check_connection(provider, config=config) != 0:
+        print(json.dumps({"event": "provider_connection_unavailable", "provider": provider,
+                          "action": "continue", "plan_fallback": not isolated}), flush=True)
     proxy_env.update(config, LOCAL_ROUTE_TOKEN=nonce, LOCAL_ROUTE_ONLY="1" if local_only else "0")
     proxy_env.pop("LOCAL_ROUTE_COMPAT", None)
+    proxy_env.pop("OPENROUTER_ROUTE_COMPAT", None)
     if local_compat:
         proxy_env["LOCAL_ROUTE_COMPAT"] = "1"
+    if openrouter_compat:
+        proxy_env["OPENROUTER_ROUTE_COMPAT"] = "1"
     proxy_command = [node, str(ROOT / "claudeRouteProxy.mjs")]
-    if local_only:
+    if isolated:
         proxy_command.append("--parent-pipe")
     try:
         proxy = subprocess.Popen(proxy_command, env=proxy_env,
-                                 **({"stdin": subprocess.PIPE} if local_only else {}),
+                                 **({"stdin": subprocess.PIPE} if isolated else {}),
                                  stdout=subprocess.PIPE, text=True, encoding="utf-8")
     except OSError:
-        if local_only:
-            raise LocalStartupError("local_proxy_start_failed") from None
+        if isolated:
+            raise startup_error("local_proxy_start_failed") from None
         raise
     ready = queue.Queue()
     def read_ready():
@@ -425,17 +443,17 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
         try:
             port = json.loads(ready.get(timeout=15))["port"]
         except (queue.Empty, ValueError, KeyError, TypeError):
-            if local_only:
-                raise LocalStartupError("local_proxy_start_failed") from None
+            if isolated:
+                raise startup_error("local_proxy_start_failed") from None
             raise RuntimeError("Local routing proxy did not start") from None
         if not isinstance(port, int) or not 1 <= port <= 65535:
-            if local_only:
-                raise LocalStartupError("local_proxy_start_failed")
+            if isolated:
+                raise startup_error("local_proxy_start_failed")
             raise RuntimeError("Invalid local routing port")
         headers = env.get("ANTHROPIC_CUSTOM_HEADERS", "").strip()
         env.update({"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
                     "ANTHROPIC_CUSTOM_HEADERS": (headers + "\n" if headers else "") + f"X-Local-Route-Token: {nonce}"})
-        if local_only:
+        if isolated:
             # A proxy Bearer token takes precedence over saved OAuth and API-key helpers.
             env.update(ANTHROPIC_AUTH_TOKEN=nonce, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
         if local_only and not local_compat:
@@ -452,7 +470,7 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
             proxy.kill()
             proxy.wait(timeout=5)
         proxy.stdout.close()
-        if local_only:
+        if isolated:
             proxy.stdin.close()
 
 
@@ -496,6 +514,35 @@ def diagnose_local() -> int:
     return subprocess.call([node, str(ROOT / "claudeRouteProxy.mjs"), "--diagnose-local"], env=env)
 
 
+def check_connection(provider: str, config: dict | None = None) -> int:
+    """One provider-only inference before interactive startup; no Plan route."""
+    failed = {"connection_check": False, "provider": provider, "inference_checked": False,
+              "model_confirmed": False, "reply_confirmed": False}
+    try:
+        if config is None:
+            config = provider_config(provider)
+    except (OSError, ValueError):
+        print(json.dumps({**failed, "reason": "invalid_configuration"}), flush=True)
+        if provider == "local":
+            raise LocalStartupError("local_configuration_invalid") from None
+        raise
+    node = shutil.which("node")
+    if not node:
+        print(json.dumps({**failed, "reason": "node_unavailable"}), flush=True)
+        error = LocalStartupError if provider == "local" else OpenRouterStartupError
+        raise error("local_node_not_found")
+    env = clean_env()
+    for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE",
+                 "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "LOCAL_ROUTE_COMPAT", "LOCAL_ROUTE_ONLY", "SONNET_PROVIDER"):
+        env.pop(name, None)
+    env.update(config)
+    try:
+        return subprocess.call([node, str(ROOT / "claudeRouteProxy.mjs"), "--check-connection"], env=env)
+    except OSError:
+        print(json.dumps({**failed, "reason": "connection_check_failed"}), flush=True)
+        return 1
+
+
 def local_cli_command(claude: str, compat: bool = False) -> list:
     try:
         version = subprocess.run([claude, "--version"], capture_output=True, text=True, timeout=10, check=True)
@@ -533,21 +580,36 @@ def local_cli_command(claude: str, compat: bool = False) -> list:
             "--no-chrome", "--settings", json.dumps(settings), "--append-system-prompt", workspace_context]
 
 
-def launch(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False) -> int:
+def launch(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False, openrouter_compat: bool = False) -> int:
     if (local_only and provider != "local") or (local_compat and not local_only):
         raise ValueError("Local CLI mode requires the local provider")
+    if openrouter_compat and (provider != "openrouter" or local_only or local_compat):
+        raise ValueError("OpenRouter compatibility mode requires the OpenRouter provider only")
+    isolated = local_only or openrouter_compat
+    compat = local_compat or openrouter_compat
+    startup_error = OpenRouterStartupError if openrouter_compat else LocalStartupError
     claude = shutil.which("claude")
     if not claude:
-        if local_only:
-            raise LocalStartupError("local_cli_not_found")
+        if isolated:
+            raise startup_error("local_cli_not_found")
         raise FileNotFoundError("Claude Code executable not found")
-    if local_only:
-        print("Local compatibility mode: client integrations enabled. No Plan fallback." if local_compat else
+    if isolated:
+        print("OpenRouter compatibility mode: client integrations enabled. No Plan fallback." if openrouter_compat else
+              "Local compatibility mode: client integrations enabled. No Plan fallback." if local_compat else
               "Local CLI mode: built-in file/shell tools; native integrations disabled. No Plan fallback.")
-        command = local_cli_command(claude, compat=True) if local_compat else local_cli_command(claude)
-        session = routed_session(provider, local_only=True, local_compat=True) if local_compat else routed_session(provider, local_only=True)
+        try:
+            command = local_cli_command(claude, compat=True) if compat else local_cli_command(claude)
+        except LocalStartupError as exc:
+            if openrouter_compat:
+                raise OpenRouterStartupError(exc.code) from None
+            raise
+        if openrouter_compat:
+            prompt_index = command.index("--append-system-prompt") + 1
+            command[prompt_index] = command[prompt_index].replace("Local session", "OpenRouter session")
+        session = routed_session(provider, openrouter_compat=True) if openrouter_compat else (
+            routed_session(provider, local_only=True, local_compat=True) if local_compat else routed_session(provider, local_only=True))
         with session as env:
-            if local_compat:
+            if compat:
                 # CLI settings.env outranks process env: pin the same isolated route at that boundary.
                 settings_index = command.index("--settings") + 1
                 settings = json.loads(command[settings_index])
@@ -556,16 +618,16 @@ def launch(provider: str = "openrouter", local_only: bool = False, local_compat:
                              "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL",
                              "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"):
                     settings["env"][name] = env[name]
-                for name in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENROUTER_API_KEY", "OPENROUTER_MODEL",
+                for name in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "OPENROUTER_ROUTE_COMPAT",
                              "ANTHROPIC_MODEL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
                              "CLAUDE_CODE_USE_FOUNDRY", "LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY",
-                             "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER"):
+                             "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER", PRO_SESSION_GATE):
                     settings["env"][name] = ""
                 command[settings_index] = json.dumps(settings)
             try:
                 return subprocess.call(command, env=env)
             except OSError:
-                raise LocalStartupError("local_cli_start_failed") from None
+                raise startup_error("local_cli_start_failed") from None
     print(f"Sonnet replacement: {provider}. Opus/Haiku/Fable keep Claude Plan OAuth.")
     print("Initial request + 3 retries, then Plan fallback (subscription Sonnet); recovery checked on a later request.")
     print("Native-only features stay on Plan. Replacement replies are buffered until validated.")
@@ -710,7 +772,7 @@ def self_test() -> None:
     assert dict(os.environ) == original_env
     proxy = Mock()
     proxy.stdout.readline.return_value = '{"port": 12345}\n'
-    with patch(__name__ + ".run_owned", return_value=auth), patch("shutil.which", return_value="executable"), patch(__name__ + ".read_env", return_value={"ANTHROPIC_AUTH_TOKEN": "sk-or-test-placeholder", "OPENROUTER_MODEL": "fixture/model"}), patch("subprocess.Popen", return_value=proxy) as start:
+    with patch(__name__ + ".run_owned", return_value=auth), patch("shutil.which", return_value="executable"), patch(__name__ + ".read_env", return_value={"ANTHROPIC_AUTH_TOKEN": "sk-or-test-placeholder", "OPENROUTER_MODEL": "fixture/model"}), patch(__name__ + ".check_connection", return_value=0), patch("subprocess.Popen", return_value=proxy) as start:
         with routed_session() as env:
             assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
             assert env.get("CLAUDE_CODE_DISABLE_ADVISOR_TOOL") == os.environ.get("CLAUDE_CODE_DISABLE_ADVISOR_TOOL")
@@ -726,7 +788,7 @@ def self_test() -> None:
     assert dict(os.environ) == original_env
     proxy = Mock()
     proxy.stdout.readline.return_value = '{"port": 12345}\n'
-    with patch.dict(os.environ, {"LOCAL_LLM_URL": "http://127.0.0.1:11434/v1/messages", "LOCAL_LLM_MODELS_URL": "http://127.0.0.1:11434/v1/models", "LOCAL_LLM_MODEL": "fixture-local", "LOCAL_LLM_API_KEY": "test-local-key"}), patch(__name__ + ".run_owned", return_value=auth), patch("shutil.which", return_value="executable"), patch(__name__ + ".read_key", side_effect=AssertionError("Local must not read OpenRouter key")), patch("subprocess.Popen", return_value=proxy) as start:
+    with patch.dict(os.environ, {"LOCAL_LLM_URL": "http://127.0.0.1:11434/v1/messages", "LOCAL_LLM_MODELS_URL": "http://127.0.0.1:11434/v1/models", "LOCAL_LLM_MODEL": "fixture-local", "LOCAL_LLM_API_KEY": "test-local-key"}), patch(__name__ + ".run_owned", return_value=auth), patch("shutil.which", return_value="executable"), patch(__name__ + ".read_key", side_effect=AssertionError("Local must not read OpenRouter key")), patch(__name__ + ".check_connection", return_value=0), patch("subprocess.Popen", return_value=proxy) as start:
         with routed_session("local") as env:
             assert "LOCAL_LLM_API_KEY" not in env and "LOCAL_LLM_URL" not in env and "LOCAL_LLM_HTTP_URL" not in env
             assert start.call_args.kwargs["env"]["SONNET_PROVIDER"] == "local"
@@ -773,7 +835,10 @@ if __name__ == "__main__":
             parser.add_argument("--diagnose-local", action="store_true", help="One synthetic Local inference without CLI, native features or Plan fallback")
             parser.add_argument("--local-mode", action="store_true", help="Interactive Local-only CLI with native integrations disabled and no Plan fallback")
             parser.add_argument("--local-compat", action="store_true", help="Opt-in Local-only CLI compatibility mode with client integrations and no Plan fallback")
+            parser.add_argument("--openrouter-compat", action="store_true", help="Opt-in OpenRouter-only CLI compatibility mode with client integrations and no Plan fallback")
             options = parser.parse_args()
+            if options.openrouter_compat and (options.provider != "openrouter" or options.local_mode or options.local_compat or options.check_local or options.diagnose_local):
+                parser.error("--openrouter-compat requires --provider openrouter and cannot be combined with Local modes or diagnostic checks")
             if options.local_compat and (options.provider != "local" or options.local_mode or options.check_local or options.diagnose_local):
                 parser.error("--local-compat requires --provider local and cannot be combined with --local-mode or diagnostic checks")
             if options.local_mode and (options.provider != "local" or options.check_local or options.diagnose_local):
@@ -786,12 +851,13 @@ if __name__ == "__main__":
                 result = check_local()
                 print(json.dumps(result))
                 sys.exit(0 if result["local_check"] else 1)
-            if options.local_mode or options.local_compat:
+            if options.local_mode or options.local_compat or options.openrouter_compat:
                 try:
                     localProcessTree.ensure_windows_local_tree()
                 except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
-                    raise LocalStartupError("local_process_cleanup_failed") from None
-            sys.exit(launch(options.provider, local_only=options.local_mode or options.local_compat, local_compat=options.local_compat))
+                    error = OpenRouterStartupError if options.openrouter_compat else LocalStartupError
+                    raise error("local_process_cleanup_failed") from None
+            sys.exit(launch(options.provider, local_only=options.local_mode or options.local_compat, local_compat=options.local_compat, openrouter_compat=options.openrouter_compat))
     except (LocalStartupError, OpenRouterConfigError) as exc:
         print(json.dumps({"event": "openrouter_start_failed", "kind": type(exc).__name__,
                           "code": exc.code if isinstance(exc, LocalStartupError) else "openrouter_configuration_invalid", "message": str(exc)}), file=sys.stderr)
