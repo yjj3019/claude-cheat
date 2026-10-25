@@ -542,7 +542,9 @@ def scan_sessions(projects=None, max_files=SCAN_FILES, now=None, pricing=None):
         candidates = candidates[:max_files]
 
     with _LOCK:
-        cached_states = _load_usage_states() if len(_SESSIONS) <= len(candidates) else {}
+        # Only a cold start needs the file: afterwards _SESSIONS is the source of truth
+        # and re-parsing 80KB on every refresh would be waste.
+        cached_states = _load_usage_states() if not _SESSIONS else {}
         cached_hit = False
         changed = False
         seen = set()
