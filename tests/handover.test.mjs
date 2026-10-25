@@ -131,6 +131,58 @@ test('concurrent handover requests share one drain run and one report', async t 
   assert.equal(one.drained, true);
   assert.equal(handedOver, 1, 'the exit hook must run exactly once');
 });
+
+test('concurrent handovers during a stalled turn share one revert and keep serving', async t => {
+  const disposables = [];
+  t.after(() => { for (const dispose of disposables) dispose(); });
+  const encoder = new TextEncoder();
+  let timer = null;
+  let handedOver = 0;
+  const stalled = new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(frame('message_start', { message: META })));
+      controller.enqueue(encoder.encode(frame('content_block_start', { index: 0,
+        content_block: { type: 'text', text: '' } })));
+      timer = setInterval(() => {
+        try {
+          controller.enqueue(encoder.encode(frame('content_block_delta', { index: 0,
+            delta: { type: 'text_delta', text: 'tick' } })));
+        } catch { clearInterval(timer); }
+      }, 50);
+    },
+    cancel() { clearInterval(timer); },
+  }), { headers: { 'content-type': 'text/event-stream' } });
+  const server = createProxy({ key: 'sk-or-handover', nonce: NONCE, openrouterModel: MODEL,
+    streamPassthrough: true, handoverTimeoutMs: 250, fetchImpl: async () => stalled,
+    onHandover: () => { handedOver += 1; } });
+  await listenSafe(server);
+  disposables.push(() => clearInterval(timer), () => server.closeAllConnections(),
+                    () => { if (server.listening) server.close(); });
+  const port = server.address().port;
+  const headers = { 'content-type': 'application/json', 'x-local-route-token': NONCE,
+    authorization: 'Bearer sk-ant-oat-handover', 'anthropic-beta': 'interleaved-thinking-2025-05-14' };
+  const body = JSON.stringify({ model: 'claude-sonnet-5-5', max_tokens: 1024, stream: true,
+    messages: [{ role: 'user', content: 'stall through a double handover' }] });
+  const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers, body });
+  assert.equal(response.status, 200);
+  const reader = response.body.getReader();
+  await reader.read();
+  const [first, second] = await Promise.all([
+    fetch(`http://127.0.0.1:${port}/api/handover`, { method: 'POST', headers: { 'x-local-route-token': NONCE } }),
+    fetch(`http://127.0.0.1:${port}/api/handover`, { method: 'POST', headers: { 'x-local-route-token': NONCE } }),
+  ]);
+  assert.equal(first.status, 409);
+  assert.equal(second.status, 409);
+  const one = await first.json();
+  const two = await second.json();
+  assert.deepEqual(two, one, 'both callers must see the same revert report');
+  assert.equal(one.reverted, true);
+  assert.equal(handedOver, 0, 'a revert must not run the exit hook');
+  // The proxy is serving again, not stuck draining or closed.
+  const metrics = await fetch(`http://127.0.0.1:${port}/api/metrics`, { headers: { 'x-local-route-token': NONCE } });
+  assert.equal(metrics.status, 200);
+  await reader.cancel().catch(() => {});
+});
 test('a handover retried after a revert drains normally once the turn is gone', async t => {
   const disposables = [];
   t.after(() => { for (const dispose of disposables) dispose(); });
