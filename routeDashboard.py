@@ -132,9 +132,11 @@ _ROUTE_TAIL = {"path": None, "events": [], "offset": 0, "digest": None}
 def _parse_route_line(line):
     stamp, _, rest = line.partition(" ")
     rest = rest.strip()
-    start = re.fullmatch(r"--- proxy start(?: code=(\S+))? ---", rest)
+    start = re.fullmatch(r"--- proxy start(?: code=(\S+))?(?: hash=([0-9a-f]+))? ---", rest)
     if start:
-        return {"ts": stamp, "event": "proxy_start", **({"code": start.group(1)} if start.group(1) else {})}
+        return {"ts": stamp, "event": "proxy_start",
+                **({"code": start.group(1)} if start.group(1) else {}),
+                **({"hash": start.group(2)} if start.group(2) else {})}
     if not rest.startswith("{"):
         return None
     try:
@@ -342,6 +344,7 @@ def routing_state(events, now=None, idle_after=300):
                   "circuit_opens": short["circuit_opens"]},
         "proxy_started_at": starts[-1]["ts"] if starts else None,
         "proxy_code": starts[-1].get("code") if starts else None,
+        "proxy_hash": starts[-1].get("hash") if starts else None,
         "transitions": route_transitions(events),
         "recent": [{"ts": e["ts"], "event": e.get("event"), "provider": e.get("provider"),
                     "reason": e.get("reason"), "detail": e.get("detail"),
@@ -687,8 +690,21 @@ def code_modified_at(path=None):
         return None
 
 
+def code_digest(path=None):
+    """First 12 hex characters of the proxy source, so mtime-only changes are not "stale"."""
+    try:
+        return hashlib.sha256(Path(path or PROXY_FILE).read_bytes()).hexdigest()[:12]
+    except OSError:
+        return None
+
+
 def proxy_stale(routing, path=None):
     """True when the running proxy loaded an older revision than the current source."""
+    recorded = routing.get("proxy_hash")
+    if recorded:
+        # Content comparison: a checkout that only touched the file must not warn.
+        current = code_digest(path)
+        return None if current is None else current != recorded
     modified = code_modified_at(path)
     if modified is None:
         return None

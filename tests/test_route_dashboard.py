@@ -553,6 +553,27 @@ class ProxyStaleTests(unittest.TestCase):
         self.assertTrue(dash.proxy_stale(older, path=self.code))
         self.assertFalse(dash.proxy_stale(current, path=self.code))
 
+    def test_staleness_compares_content_not_timestamp(self):
+        # A checkout that only touched the file (same bytes) is not stale.
+        self.code.write_text("// fixture", encoding="utf-8")
+        digest = dash.code_digest(self.code)
+        older_mtime = datetime(2026, 10, 25, 2, 0, tzinfo=timezone.utc).timestamp()
+        os.utime(self.code, (older_mtime, older_mtime))
+        self.assertFalse(dash.proxy_stale({"proxy_hash": digest}, path=self.code))
+        self.assertTrue(dash.proxy_stale({"proxy_hash": "000000000000"}, path=self.code))
+        self.assertIsNone(dash.proxy_stale({"proxy_hash": digest}, path=self.root / "absent.mjs"))
+
+    def test_start_marker_hash_is_parsed(self):
+        line = ("2026-10-25T01:00:00Z --- proxy start code=2026-10-24T23:00:00.000Z hash=abcdef123456 ---\n")
+        events = dash.parse_route_log(self.write_log(line), incremental=False)
+        self.assertEqual(events[0]["event"], "proxy_start")
+        self.assertEqual(events[0]["hash"], "abcdef123456")
+
+    def write_log(self, line):
+        path = self.root / ".route.log"
+        path.write_text(line, encoding="utf-8")
+        return path
+
     def test_stale_alert_carries_a_copyable_restart_command(self):
         routing = {"proxy_started_at": "2026-10-25T02:40:00Z", "proxy_code": None, "state": "plan",
                    "last": None, "short": {}, "counts": {}}

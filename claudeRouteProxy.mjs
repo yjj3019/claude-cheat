@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { once } from 'node:events';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { appendFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 // Diagnostic mirror: routing events also land in a file so a session can be explained afterwards.
@@ -33,7 +33,16 @@ if (routeLogPath) {
   const codeStamp = (() => {
     try { return statSync(fileURLToPath(import.meta.url)).mtime.toISOString(); } catch { return null; }
   })();
-  try { appendFileSync(routeLogPath, `${new Date().toISOString()} --- proxy start${codeStamp ? ` code=${codeStamp}` : ''} ---\n`); } catch {}
+  // A content digest tells the dashboard whether the code really differs, not just the mtime.
+  const codeHash = (() => {
+    try {
+      return createHash('sha256').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex').slice(0, 12);
+    } catch { return null; }
+  })();
+  try {
+    appendFileSync(routeLogPath, `${new Date().toISOString()} --- proxy start` +
+      `${codeStamp ? ` code=${codeStamp}` : ''}${codeHash ? ` hash=${codeHash}` : ''} ---\n`);
+  } catch {}
 }
 
 // Historical client alias only; the upstream model must be configured explicitly.
