@@ -3,6 +3,7 @@ import contextlib
 import importlib.util
 import inspect
 import io
+import http.client
 import json
 import os
 import tempfile
@@ -1019,6 +1020,27 @@ class ModelCatalogTests(unittest.TestCase):
             catalog = dash.model_catalog("openrouter")
         self.assertFalse(catalog["ok"])
         self.assertEqual(catalog["error"], "empty_catalog")
+
+    def test_unsupported_methods_answer_json_instead_of_an_html_page(self):
+        import threading
+
+        server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            for method in ("PUT", "PATCH", "DELETE", "OPTIONS"):
+                connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                try:
+                    connection.request(method, "/api/status")
+                    response = connection.getresponse()
+                    body = response.read()
+                finally:
+                    connection.close()
+                self.assertEqual(response.status, 405, method)
+                self.assertEqual(json.loads(body), {"error": "method_not_allowed"})
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_a_foreign_host_header_is_rejected(self):
         import socket as socket_module

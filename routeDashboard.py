@@ -1529,6 +1529,16 @@ class Handler(BaseHTTPRequestHandler):
         token = self.headers.get("x-dashboard-token") or ""
         return bool(token) and secrets.compare_digest(token, TOKEN)
 
+    def _method_not_allowed(self):
+        # The stdlib would answer 501 with an HTML page; keep every API reply JSON.
+        self._send(405, "application/json; charset=utf-8",
+                   json.dumps({"error": "method_not_allowed"}))
+
+    do_PUT = _method_not_allowed
+    do_PATCH = _method_not_allowed
+    do_DELETE = _method_not_allowed
+    do_OPTIONS = _method_not_allowed
+
     def do_POST(self):
         if not _host_allowed(self.headers.get("host")):
             return self._send(403, "application/json; charset=utf-8", json.dumps({"error": "host_rejected"}))

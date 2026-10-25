@@ -1,10 +1,12 @@
-param([ValidateSet('OpenRouter', 'Local')][string]$Provider = 'OpenRouter', [switch]$CheckLocal, [switch]$DiagnoseLocal, [switch]$LocalMode, [switch]$LocalCompat, [switch]$OpenRouterCompat, [switch]$Debug, [switch]$Stream)
+param([ValidateSet('OpenRouter', 'Local')][string]$Provider = 'OpenRouter', [switch]$CheckLocal, [switch]$DiagnoseLocal, [switch]$LocalMode, [switch]$LocalCompat, [switch]$OpenRouterCompat, [switch]$Debug, [switch]$Stream, [switch]$Takeover, [string]$Print)
 # -Stream forwards provider frames as they validate (lower first-token latency) but a late
 # protocol error can no longer fall back to Plan; the default buffers and keeps fallback.
 $previousStream = $env:ROUTE_STREAM_PASSTHROUGH
 if ($Stream) { $env:ROUTE_STREAM_PASSTHROUGH = '1' }
 $ErrorActionPreference = 'Stop'
 $routeArgs = @('--provider', $Provider.ToLowerInvariant())
+if ($Takeover) { $routeArgs += '--takeover' }
+if ($Print) { $routeArgs += @('--print', $Print) }
 if ($CheckLocal) { $routeArgs += '--check-local' }
 if ($DiagnoseLocal) { $routeArgs += '--diagnose-local' }
 if ($LocalMode) { $routeArgs += '--local-mode' }

@@ -13,7 +13,9 @@ import tempfile
 import contextlib
 import queue
 import secrets
+import socket
 import threading
+import time
 import argparse
 import localProcessTree
 from urllib.parse import urlsplit, urlunsplit
@@ -200,6 +202,67 @@ def log_route_marker(text: str) -> None:
         pass
 
 
+# Overridable so tests never touch a real session's handoff file.
+HANDOFF_FILE = Path(os.environ.get("ROUTE_HANDOFF_PATH") or (ROOT / ".session-handoff.json"))
+
+
+def write_handoff(*, port, nonce, proxy_pid, provider, cli_pid):
+    """Record the live route so another terminal can take it over without changing the port."""
+    if not isinstance(port, int) or not isinstance(proxy_pid, int):
+        return  # nothing usable to record (also keeps mocked sessions out of the file)
+    payload = {"port": port, "nonce": nonce, "proxy_pid": proxy_pid, "launcher_pid": cli_pid,
+               "provider": provider, "started": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    try:
+        temporary = HANDOFF_FILE.with_suffix(HANDOFF_FILE.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(temporary, HANDOFF_FILE)
+    except (OSError, TypeError):
+        pass
+
+
+def read_handoff():
+    try:
+        data = json.loads(HANDOFF_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("port"), int):
+        return None
+    return data
+
+
+def clear_handoff(*, proxy_pid):
+    try:
+        current = json.loads(HANDOFF_FILE.read_text(encoding="utf-8"))
+        if current.get("proxy_pid") == proxy_pid:
+            HANDOFF_FILE.unlink()
+    except (OSError, ValueError):
+        pass
+
+
+def port_open(port, timeout=0.5):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(timeout)
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
+def request_handover(port, nonce, timeout=25):
+    """Ask the running proxy to drain and exit so this launcher can rebind its port."""
+    request = urllib.request.Request(f"http://127.0.0.1:{port}/api/handover", data=b"",
+                                     method="POST", headers={"x-local-route-token": nonce})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=timeout) as response:
+        return json.loads(response.read() or b"{}")
+
+
+def wait_for_port_release(port, timeout=25):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not port_open(port):
+            return True
+        time.sleep(0.1)
+    return False
+
+
 def clean_env() -> dict:
     # Keep OS execution variables; never inherit another provider's auth or model routing.
     return {k: v for k, v in os.environ.items()
@@ -233,7 +296,9 @@ def run_owned(args: list, env: dict, cwd: str, prompt: str = "", timeout: int = 
 
 
 @contextlib.contextmanager
-def routed_session(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False, openrouter_compat: bool = False, debug: bool = False):
+def routed_session(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False,
+                  openrouter_compat: bool = False, debug: bool = False,
+                  port: int | None = None, nonce: str | None = None):
     """Own one loopback proxy; ordinary sessions alone use the subscription login."""
     if (local_only and provider != "local") or (local_compat and not local_only):
         raise ValueError("Local CLI mode requires the local provider")
@@ -299,7 +364,7 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
         if isolated:
             raise startup_error("local_node_not_found")
         raise FileNotFoundError("Node.js required for local routing")
-    nonce = secrets.token_urlsafe(32)
+    nonce = nonce or secrets.token_urlsafe(32)
     proxy_env = clean_env()
     for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER"):
         proxy_env.pop(name, None)
@@ -336,7 +401,7 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
     # requests while the live set stayed collectable at 256MB). Cap it so a routing
     # proxy cannot drift into gigabytes of resident memory.
     proxy_command = [node, "--max-old-space-size=512", str(ROOT / "claudeRouteProxy.mjs"),
-                     "--parent-pipe"]
+                     "--parent-pipe"] + (["--port", str(port)] if port else [])
     try:
         proxy = subprocess.Popen(proxy_command, env=proxy_env,
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8",
@@ -375,9 +440,13 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
                        CLAUDE_CODE_AUTO_CONNECT_IDE="false", CLAUDE_CODE_DISABLE_BACKGROUND_TASKS="1",
                        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
         log_route_marker(f"launcher start pid={os.getpid()} proxy={proxy.pid} port={port}")
+        # Remember the live route so a second terminal can take it over without the CLI noticing.
+        write_handoff(port=port, nonce=nonce, proxy_pid=proxy.pid, provider=provider,
+                      cli_pid=os.getpid())
         yield env
     finally:
         log_route_marker(f"launcher exit pid={os.getpid()}")
+        clear_handoff(proxy_pid=proxy.pid)
         proxy.terminate()
         try:
             proxy.wait(timeout=5)
@@ -463,6 +532,32 @@ def local_cli_command(claude: str, compat: bool = False) -> list:
             "--tools", "Bash,Read,Edit,Write,Glob,Grep", "--disallowedTools", "mcp__*",
             "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
             "--no-chrome", "--settings", json.dumps(settings), "--append-system-prompt", workspace_context]
+
+
+def takeover(provider: str = "openrouter", debug: bool = False) -> int:
+    """Hand the live port to a fresh proxy so the running CLI keeps working across a restart."""
+    record = read_handoff()
+    if not record:
+        raise RuntimeError("No running session to take over (missing .session-handoff.json)")
+    port, nonce = record["port"], record.get("nonce")
+    if not isinstance(nonce, str) or not nonce:
+        raise RuntimeError("The recorded session has no token; restart the session normally")
+    if not port_open(port):
+        raise RuntimeError(f"Nothing is listening on the recorded port {port}; start a normal session")
+    try:
+        request_handover(port, nonce)
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"The running proxy refused the handover: {error}") from None
+    if not wait_for_port_release(port):
+        raise RuntimeError("The previous proxy did not release its port")
+    log_route_marker(f"takeover port={port} provider={provider}")
+    with routed_session(provider, port=port, nonce=nonce, debug=debug):
+        print(json.dumps({"takeover": True, "port": port, "provider": provider}), flush=True)
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            return 0
 
 
 def launch(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False, openrouter_compat: bool = False, debug: bool = False,
@@ -637,6 +732,8 @@ def main(argv=None) -> int:
         parser.add_argument("--local-compat", action="store_true", help="Opt-in Local-only CLI compatibility mode with client integrations and no Plan fallback")
         parser.add_argument("--openrouter-compat", action="store_true", help="Opt-in OpenRouter-only CLI compatibility mode with client integrations and no Plan fallback")
         parser.add_argument("--debug", action="store_true", help="Show proxy routing logs (route_selected, circuit_open, ...) on stderr")
+        parser.add_argument("--takeover", action="store_true",
+                            help="Restart the routing proxy on the running session's port (no new CLI)")
         parser.add_argument("--print", dest="print_prompt", metavar="PROMPT",
                             help="Run one non-interactive turn through the proxy and exit (automation/CI)")
         parser.add_argument("--print-text", action="store_true",
@@ -662,6 +759,8 @@ def main(argv=None) -> int:
             except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
                 error = OpenRouterStartupError if options.openrouter_compat else LocalStartupError
                 raise error("local_process_cleanup_failed") from None
+        if options.takeover:
+            return takeover(options.provider, debug=options.debug)
         return launch(options.provider, local_only=options.local_mode or options.local_compat,
                       local_compat=options.local_compat, openrouter_compat=options.openrouter_compat,
                       debug=options.debug, print_prompt=options.print_prompt,

@@ -360,6 +360,14 @@ Exit and relaunch to change providers. `/model` selects Claude models, not OpenR
 
 The security model, trust boundaries, CSRF/DNS-rebinding handling and residual risks are documented in [`docs/SECURITY.ko.md`](docs/SECURITY.ko.md) (Korean).
 
+## Restarting the proxy without losing the session
+
+```powershell
+OpenClaude -Takeover        # run in a second terminal
+```
+
+The new launcher reads the live port and token from `.session-handoff.json`, asks the running proxy to drain (`POST /api/handover`, session token required), waits up to 15 s for in-flight turns, and only then rebinds the same port with the same token. The CLI keeps its base URL and simply reconnects; new requests during the drain get 503.
+
 ## Validation and limitations
 
 Personal machine configurations, account usage, billing records, and live session logs are not stored in this repository. Run synthetic tests without external model inference:
@@ -371,6 +379,8 @@ python openrouterAdvisor.py --self-test
 node --check claudeRouteProxy.mjs
 node tests/simulate.mjs --soak 3000        # synthetic traffic, long session, memory
 python openrouterAdvisor.py --print "Reply with exactly OK"   # one real CLI turn (automation)
+node tests/fuzz.mjs --iterations 2000      # proxy fuzzing (deterministic seed)
+python -m unittest tests.test_fuzz_dashboard   # dashboard fuzzing
 python tests/live_smoke.py --dry-run       # report which settings exist, no billing
 ```
 

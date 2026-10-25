@@ -480,7 +480,24 @@ claude
 
 보안 모델·신뢰 경계·CSRF/DNS 리바인딩 처리와 **잔여 위험**은 [`docs/SECURITY.ko.md`](docs/SECURITY.ko.md)에 정리되어 있습니다.
 
-## 8. 검증 방법과 남은 한계
+## 8. 무중단 재시작 (프록시 교체)
+
+프록시 코드를 바꾼 뒤에도 **실행 중인 세션의 포트를 그대로** 이어받을 수 있습니다.
+
+```powershell
+OpenClaude -Takeover        # 다른 터미널에서 실행
+```
+
+동작 순서:
+
+1. `.session-handoff.json`에서 실행 중인 포트·토큰을 읽습니다.
+2. 기존 프록시에 `POST /api/handover`(세션 토큰 필요)를 보냅니다.
+3. 기존 프록시는 **새 연결을 받지 않고**, 진행 중인 턴이 끝날 때까지(최대 15초) 기다린 뒤 종료합니다.
+4. 새 프록시가 **같은 포트·같은 토큰**으로 즉시 바인딩합니다.
+
+CLI는 포트를 바꾸지 않으므로 재연결만 하면 계속 동작합니다. 드레인 대기 중 새 요청은 503으로 거절되며, 클라이언트는 재시도합니다. 강제 킬 없이 코드가 교체되는 경로는 이 방법뿐입니다.
+
+## 9. 검증 방법과 남은 한계
 
 공개 저장소에는 개인 PC 구성, 계정 사용량, 청구 내역, 실제 세션 로그를 보관하지 않습니다. 아래 명령은 합성 데이터와 로컬 모의 서버로 검사하며 외부 모델을 호출하지 않습니다.
 
@@ -491,6 +508,8 @@ python openrouterAdvisor.py --self-test
 node --check claudeRouteProxy.mjs
 node tests/simulate.mjs --soak 3000        # 합성 트래픽·장기 세션·메모리
 python openrouterAdvisor.py --print "Reply with exactly OK"   # 실제 CLI 1턴(자동화용)
+node tests/fuzz.mjs --iterations 2000      # 프록시 퍼징(결정적 시드)
+python -m unittest tests.test_fuzz_dashboard   # 대시보드 퍼징
 python tests/live_smoke.py --dry-run       # 설정 존재 여부만 확인(무과금)
 ```
 

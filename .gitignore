@@ -15,3 +15,5 @@ SESSION_LOG.md
 .claude/.verification/
 .proxy-metrics.json
 *.log.*
+.session-handoff.json
+.session-handoff.json.tmp

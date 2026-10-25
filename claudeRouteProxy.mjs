@@ -528,7 +528,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   localModel, localKey, localAllowRemote = false, localHttpUrl, localOnly = false, localCompat = false, openrouterCompat = false, fallbackModel = 'claude-sonnet-5-5', retryDelayMs = 1000,
   cooldownMs = 30000, attemptTimeoutMs = localOnly || openrouterCompat ? 120000 : 30000, planHeaderMs = 120000, planIdleMs = 300000, attemptCeilingMs = 300000, now = Date.now,
   metricsPath = process.env.ROUTE_METRICS_PATH,
-  streamPassthrough = process.env.ROUTE_STREAM_PASSTHROUGH === '1' }) {
+  streamPassthrough = process.env.ROUTE_STREAM_PASSTHROUGH === '1',
+  onHandover = null }) {
   if (typeof localOnly !== 'boolean' || (localOnly && provider !== 'local')) throw new Error('Local-only mode requires local provider');
   if (typeof localCompat !== 'boolean' || (localCompat && (!localOnly || provider !== 'local')))
     throw new Error('Local compatibility requires Local-only mode');
@@ -595,6 +596,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     flushTimer.unref?.();
   };
   if (metricsPath) process.once('exit', flushMetrics);
+  let inflight = 0;
+  let handover = false;
   const server = http.createServer(async (req, res) => {
     const reject = (status, message) => {
       if (res.destroyed) return;
@@ -603,7 +606,24 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message } }));
     };
     if (!tokenMatches(req.headers['x-local-route-token'])) return reject(403, 'Local authorization required');
+    if (handover) return reject(503, 'Proxy is handing over');
     if (req.method === 'HEAD' && req.url === '/api/hello') { res.writeHead(200); res.end(); return; }
+    if (req.method === 'POST' && req.url === '/api/handover') {
+      // Stop accepting, let in-flight turns finish, then exit so a fresh proxy can bind the
+      // same port. The client keeps its port and only sees a brief reconnect.
+      handover = true;
+      // Drain before closing: server.close() on Windows tears down sockets that are still
+      // streaming, which would truncate a reply the client is reading right now.
+      const deadline = Date.now() + 15000;
+      while (inflight > 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
+      server.close();
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+      res.end(JSON.stringify({ drained: true, inflight }));
+      // Tests inject a callback: exiting would kill the runner.
+      if (typeof onHandover === 'function') onHandover();
+      else setTimeout(() => process.exit(0), 100);
+      return;
+    }
     if (req.method === 'GET' && /^\/api\/metrics(?:\?.*)?$/.test(req.url)) {
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
       res.end(JSON.stringify(metricsSnapshot()));
@@ -619,6 +639,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       }
     });
     req.on('aborted', () => client.abort('client_close'));
+    inflight += 1;
     try {
       const chunks = [];
       let size = 0;
@@ -659,6 +680,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       recordRequest = aborted => {
         if (recorded) return;
         recorded = true;
+        if (inflight > 0) inflight -= 1;
         const elapsed = Number((performance.now() - startedAt).toFixed(2));
         if (aborted) { metrics.aborted += 1; metrics.failed += 1; }
         else if (res.statusCode < 400) metrics.ok += 1;
@@ -1010,6 +1032,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       process.stdin.once('close', parentClosed);
       process.stdin.resume();
     }
-    server.listen(0, '127.0.0.1', () => process.stdout.write(JSON.stringify({ port: server.address().port }) + '\n'));
+    const portArg = process.argv.indexOf('--port');
+    const requestedPort = portArg > 0 ? Number(process.argv[portArg + 1]) : 0;
+    server.listen(Number.isInteger(requestedPort) ? requestedPort : 0, '127.0.0.1',
+      () => process.stdout.write(JSON.stringify({ port: server.address().port }) + '\n'));
   }
 }
