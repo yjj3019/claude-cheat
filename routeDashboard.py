@@ -1457,10 +1457,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("content-type", content_type)
         self.send_header("content-length", str(len(body)))
         self.send_header("cache-control", "no-store")
+        self.send_header("x-content-type-options", "nosniff")
+        self.send_header("referrer-policy", "no-referrer")
+        self.send_header("x-frame-options", "DENY")
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
+        if not _host_allowed(self.headers.get("host")):
+            return self._send(403, "application/json; charset=utf-8", json.dumps({"error": "host_rejected"}))
         path = self.path.split("?")[0]
         if path in ("/", "/index.html", "/dashboard"):
             self._send(200, "text/html; charset=utf-8", PAGE.replace("__DASHBOARD_TOKEN__", TOKEN))
@@ -1509,6 +1514,8 @@ class Handler(BaseHTTPRequestHandler):
         return bool(token) and secrets.compare_digest(token, TOKEN)
 
     def do_POST(self):
+        if not _host_allowed(self.headers.get("host")):
+            return self._send(403, "application/json; charset=utf-8", json.dumps({"error": "host_rejected"}))
         path = self.path.split("?")[0]
         if path not in ("/api/config", "/api/test"):
             return self._send(404, "application/json; charset=utf-8", json.dumps({"error": "not_found"}))
@@ -1575,6 +1582,22 @@ class DashboardServer(ThreadingHTTPServer):
         if os.name == "nt":
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         super().server_bind()
+
+
+ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _host_allowed(header):
+    """Reject a Host that does not name this loopback server (DNS rebinding)."""
+    if not header:
+        return True  # HTTP/1.0 clients may omit it; they are not browsers
+    host = header.strip().lower()
+    if host.startswith("["):
+        host = host.split("]")[0] + "]"
+        host = host.strip("[]")
+    else:
+        host = host.split(":")[0]
+    return host in ALLOWED_HOSTS
 
 
 def _display_host(host):

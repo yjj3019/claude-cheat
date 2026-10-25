@@ -999,6 +999,48 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertFalse(catalog["ok"])
         self.assertEqual(catalog["error"], "empty_catalog")
 
+    def test_a_foreign_host_header_is_rejected(self):
+        import socket as socket_module
+        import threading
+
+        server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with socket_module.create_connection(("127.0.0.1", port), timeout=10) as connection:
+                connection.sendall(b"GET /api/status HTTP/1.1\r\nHost: evil.example:8787\r\n"
+                                   b"Connection: close\r\n\r\n")
+                chunks = []
+                while True:
+                    piece = connection.recv(4096)
+                    if not piece:
+                        break
+                    chunks.append(piece)
+            reply = b"".join(chunks).decode("utf-8", "replace")
+            self.assertIn("403", reply.splitlines()[0])
+            self.assertIn("host_rejected", reply)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_security_headers_are_present(self):
+        import threading
+        import urllib.request
+
+        server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(f"http://127.0.0.1:{port}/api/status", timeout=15) as response:
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers.get("x-content-type-options"), "nosniff")
+                self.assertEqual(response.headers.get("referrer-policy"), "no-referrer")
+                self.assertEqual(response.headers.get("x-frame-options"), "DENY")
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_negative_content_length_is_rejected(self):
         import socket as socket_module
         import threading

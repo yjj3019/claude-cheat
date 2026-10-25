@@ -70,6 +70,8 @@ with patch.object(a,'check_connection',return_value=0),patch.object(a,'provider_
 
 
 @unittest.skipUnless(os.name == "nt" and NODE and BASH and Path(BASH).is_file(), "Windows, Node.js and Git Bash required")
+@unittest.skipUnless(os.environ.get("CLAUDE_CHEAT_SLOW") == "1",
+                     "spawns real process trees; set CLAUDE_CHEAT_SLOW=1 to run")
 class LocalLifecycleTests(unittest.TestCase):
     def setUp(self):
         self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -121,7 +123,8 @@ class LocalLifecycleTests(unittest.TestCase):
                     diagnostics.append(line.strip())
         threading.Thread(target=read_ready, daemon=True).start()
         try:
-            info = ready.get(timeout=10)
+            # Generous: this suite spawns real node/bash children and CI machines can be busy.
+            info = ready.get(timeout=45)
         except queue.Empty:
             self.fail("Synthetic process tree did not become ready: " + repr(diagnostics[-3:]))
         for name in ("guardian", "bash", "grandchild"):

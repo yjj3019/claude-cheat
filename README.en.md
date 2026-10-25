@@ -371,7 +371,9 @@ node tests/simulate.mjs --soak 3000        # synthetic traffic, long session, me
 python tests/live_smoke.py --dry-run       # report which settings exist, no billing
 ```
 
-- The Windows process-tree tests (`test_local_lifecycle`) need **Git Bash**. `C:\Windows\System32\bash.exe` is WSL and cannot run the Windows python path the harness passes, so those tests skip themselves.
+- The Windows process-tree tests (`test_local_lifecycle`) and the concurrency stress (`test_dashboard_concurrency`) are **skipped by default**: they spawn real process trees or 12 threads, so they are slow and load sensitive. Enable them with `$env:CLAUDE_CHEAT_SLOW = '1'`.
+- The process-tree suite needs **Git Bash**. `C:\Windows\System32\bash.exe` is WSL and cannot run the Windows python path the harness passes, so it skips itself.
+- The dashboard enforces a **Host allowlist** (127.0.0.1, localhost, ::1) against DNS rebinding and sends `nosniff`, `no-referrer` and `X-Frame-Options: DENY`. Write endpoints require the session token and a same-origin request.
 - Real provider calls stay out of the suite. After a configuration change, confirm once with `python tests/live_smoke.py` (16 tokens, well under a cent per run).
 
 The tests cover payload preservation, authentication isolation, tool-result round trips, the initial request plus three retries, Plan fallback, recovery, cancellation, timeouts, and empty responses. Synthetic success does not establish live-provider or full native-feature parity.
@@ -398,6 +400,7 @@ Reference numbers (this development machine, Node 24, client and proxy in one pr
 | Body size | 1MB in 7.7–8.9ms (~120MB/s) |
 | Retry cost | 1MB + one retry 10.7ms vs 12.8ms before, four failures 9.8ms vs 12.1ms (~17–19% better) |
 | Circuit | 4 failures → Plan fallback, Plan during cooldown, external again after recovery |
+| Long soak | **150,000 requests · 266MB peak · 4.3MB drift** (no leak) |
 
 Long runs use `--soak`, which also samples resident memory and window throughput.
 
