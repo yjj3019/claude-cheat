@@ -661,14 +661,26 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     if (req.method !== 'POST' || !/^\/v1\/messages(?:\/count_tokens)?(?:\?beta=true)?$/.test(req.url)) return reject(403, 'Endpoint blocked');
     const client = new AbortController();
     let recordRequest = () => {};
+    // A request owns one inflight slot until it is released. An early rejection (bad JSON,
+    // oversized body) never reaches recordRequest, and a client that vanishes mid-body never
+    // finishes its response, so release on 'close' too: a leaked slot makes every later
+    // handover wait out its cap and revert instead of draining.
+    let ownsTurn = false, released = false;
+    const releaseTurn = () => {
+      if (!ownsTurn || released) return;
+      released = true;
+      if (inflight > 0) inflight -= 1;
+    };
     res.on('close', () => {
       if (!res.writableFinished) {
         recordRequest(true);
         client.abort('client_close');
       }
+      releaseTurn();
     });
     req.on('aborted', () => client.abort('client_close'));
     inflight += 1;
+    ownsTurn = true;
     try {
       const chunks = [];
       let size = 0;
@@ -709,7 +721,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       recordRequest = aborted => {
         if (recorded) return;
         recorded = true;
-        if (inflight > 0) inflight -= 1;
+        releaseTurn();
         const elapsed = Number((performance.now() - startedAt).toFixed(2));
         if (aborted) { metrics.aborted += 1; metrics.failed += 1; }
         else if (res.statusCode < 400) metrics.ok += 1;
