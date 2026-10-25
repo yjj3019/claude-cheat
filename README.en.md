@@ -71,14 +71,26 @@ A routed session starts Claude Code with experimental beta features disabled (`C
 
 - OpenRouter uses the required `OPENROUTER_MODEL` setting, with no default model.
 - OpenRouter and Local are selected at launch; the router does not switch between them automatically. Select Sonnet in `/model` for eligible replacement requests.
-- The external provider receives the initial attempt plus three retries. Each attempt has a 30-second limit, with a one-second delay between attempts.
+- The external provider receives the initial attempt plus three retries. Each attempt has a 30-second limit, with a one-second delay between attempts. A provider `Retry-After` is parsed from seconds or any RFC 7231 HTTP-date and honored internally only up to 10 seconds (`ROUTE_RETRY_MAX_WAIT_MS`); a longer wait is returned to the client as a `Retry-After` header on the 429/529 failure instead of freezing the turn. A bare 429 invents no delay.
 - Four full timeouts plus retry delays can take approximately 123 seconds before the Plan request begins. Plan response time and the CLI's own retries may add further time. Cancelling stops router retries and fallback.
+- The circuit breaker distinguishes causes: transport failures, timeouts, 5xx, 408 and unusable 2xx answers open it as provider faults; 401/402/403 keep their provider-wide cooldown; a 429 uses the parsed `Retry-After` (bounded at ten minutes) as its cooldown, and a request-level 4xx never opens it. Exactly one half-open probe is admitted, and late completions from older generations cannot overwrite the newer circuit state.
+- A client that stalls mid-body is dropped after an idle timeout (30 seconds by default, `ROUTE_REQUEST_IDLE_TIMEOUT_MS`, `0` disables it), releasing its turn; slow but live uploads are not cut. A disconnected client's upstream read, timers and retry are released instead of retried.
 - After all four fail, the router forwards the original request to Plan Sonnet once. A Plan failure does not loop back to another provider or switch to an Anthropic API key.
 - During a 30-second cooldown, requests use Plan. Afterward, one compatible real request checks recovery; concurrent requests use Plan. A validated external response restores the external route. There are no separate paid background probes.
 - External responses are buffered, up to 32 MiB, until model identity, message completion, block indices, and tool-input JSON are validated. Failed attempts do not expose partial text or tool calls to the CLI. This delays visible responses, and retries may incur duplicate inference costs.
 - Plan requests, responses, streams, and errors pass through unchanged. A routed session disables Claude Code's experimental betas, so the CLI does not build advisor or inline tool requests. `system`-role context turns, including text blocks, and the `interleaved-thinking-2025-05-14`, `effort-2025-11-24` and `context-1m-2025-08-07` betas the CLI always sends are accepted in every mode. Provider `citations` are returned in responses and echoed back in later history, so they are accepted on input too. Signed reasoning blocks are dropped from the external copy only, so a conversation returns to the replacement provider on its next request instead of staying on Plan. Unsupported server tools still bypass. Such a bypass is not counted as an external recovery check.
 - The router does not block account-level usage credits, so Plan routing is not a guarantee of zero additional account charges.
 - Model access and usage credits remain subject to the Claude app and account plan. There is no separate Fable ban or credits-OFF requirement. External providers do not receive the Plan OAuth credential.
+
+Proxy behavior can be tuned with these environment variables (the defaults are enough; set them before starting a session).
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `ROUTE_REQUEST_IDLE_TIMEOUT_MS` | `30000` | Idle timeout for the request body and headers. `0` disables it. Slow but live uploads are unaffected |
+| `ROUTE_RETRY_MAX_WAIT_MS` | `10000` | Cap on one in-proxy retry wait; a longer `Retry-After` goes to the client as a header |
+| `ROUTE_HANDOVER_TIMEOUT_MS` | `120000` | How long a handover waits for in-flight turns before reverting to serving (409) |
+| `ROUTE_STREAM_PASSTHROUGH` | off | `1` forwards validated frames immediately to cut the first-token delay |
+| `ROUTE_STABILIZE_PROMPT_CACHE` | off | `1` peels the trailing `<total_tokens>…` footer from system text before the external request to keep the prefix cache (opt-in) |
 
 Routing metadata uses `route_selected` with provider `openrouter`, `local` or `plan`. Reason `replacement` identifies a validated external response; `native_feature` identifies a native-feature bypass; `fallback` follows failed external attempts; `circuit_open` uses Plan during cooldown or another recovery probe. `external_attempt_failed` records a failed attempt, and `circuit_open` / `circuit_recovered` report circuit transitions. These logs omit keys and request bodies; requests sent to external services may still contain conversation, code, tool definitions and results.
 
