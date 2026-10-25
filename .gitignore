@@ -19,3 +19,4 @@ SESSION_LOG.md
 .session-handoff.json.tmp
 .usage-cache.json
 .usage-cache.json.tmp
+.bench/
