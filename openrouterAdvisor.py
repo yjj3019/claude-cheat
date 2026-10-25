@@ -332,7 +332,11 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
     if openrouter_compat:
         proxy_env["OPENROUTER_ROUTE_COMPAT"] = "1"
     # Every mode ties the proxy (and its API key) to this launcher: it exits when the pipe closes.
-    proxy_command = [node, str(ROOT / "claudeRouteProxy.mjs"), "--parent-pipe"]
+    # A long session keeps V8 lazily expanding its heap (measured 1.1GB after 1.2M
+    # requests while the live set stayed collectable at 256MB). Cap it so a routing
+    # proxy cannot drift into gigabytes of resident memory.
+    proxy_command = [node, "--max-old-space-size=512", str(ROOT / "claudeRouteProxy.mjs"),
+                     "--parent-pipe"]
     try:
         proxy = subprocess.Popen(proxy_command, env=proxy_env,
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8",

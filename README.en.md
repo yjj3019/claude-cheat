@@ -402,7 +402,8 @@ Reference numbers (this development machine, Node 24, client and proxy in one pr
 | Body size | 1MB in 7.7–8.9ms (~120MB/s) |
 | Retry cost | 1MB + one retry 10.7ms vs 12.8ms before, four failures 9.8ms vs 12.1ms (~17–19% better) |
 | Circuit | 4 failures → Plan fallback, Plan during cooldown, external again after recovery |
-| Long soak | **150,000 requests · 266MB peak · 4.3MB drift** (no leak) |
+| Long soak | 150,000 requests at 266MB; **1.2M requests reached 1.09GB RSS** (V8 heap expansion — a 256MB cap run passes, so it is collectable) |
+| Heap cap | The launcher starts the proxy with `--max-old-space-size=512`; 300,000-request re-measure: **290MB peak, 66MB drift** |
 
 Long runs use `--soak`, which also samples resident memory and window throughput.
 
