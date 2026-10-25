@@ -12,6 +12,19 @@ import threading
 
 
 _guardian = None
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_TH32CS_SNAPPROCESS = 0x2
+_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+# A stuck taskkill must never block launcher shutdown.
+TASKKILL_TIMEOUT_SECONDS = 5.0
+
+
+class _ProcessEntry32(ctypes.Structure):
+    _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260)]
 
 
 def _kernel():
@@ -22,11 +35,111 @@ def _kernel():
         ("SetInformationJobObject", [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD], wintypes.BOOL),
         ("AssignProcessToJobObject", [wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
         ("WaitForSingleObject", [wintypes.HANDLE, wintypes.DWORD], wintypes.DWORD),
+        ("GetProcessTimes", [wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME),
+                             ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME)], wintypes.BOOL),
+        ("CreateToolhelp32Snapshot", [wintypes.DWORD, wintypes.DWORD], wintypes.HANDLE),
+        ("Process32FirstW", [wintypes.HANDLE, ctypes.c_void_p], wintypes.BOOL),
+        ("Process32NextW", [wintypes.HANDLE, ctypes.c_void_p], wintypes.BOOL),
         ("CloseHandle", [wintypes.HANDLE], wintypes.BOOL),
     ]:
         function = getattr(kernel, name)
         function.argtypes, function.restype = args, result
     return kernel
+
+
+def process_identity(pid):
+    """Return (pid, creation time) for a readable process, else None.
+
+    The pair separates a recorded pid from a reused one. None means "could not verify"
+    (gone or access denied), never a match: callers must stay conservative on it.
+    """
+    if os.name != "nt" or not isinstance(pid, int):
+        return None
+    kernel = _kernel()
+    handle = kernel.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        created, exited = wintypes.FILETIME(), wintypes.FILETIME()
+        kernel_time, user_time = wintypes.FILETIME(), wintypes.FILETIME()
+        if not kernel.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                      ctypes.byref(kernel_time), ctypes.byref(user_time)):
+            return None
+        return (pid, (created.dwHighDateTime << 32) | created.dwLowDateTime)
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def _process_parents():
+    """Map every visible process id to its parent id from one Toolhelp snapshot."""
+    if os.name != "nt":
+        return {}
+    try:
+        kernel = _kernel()
+        snapshot = kernel.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+    except OSError:
+        return {}
+    if not snapshot or snapshot == _INVALID_HANDLE_VALUE:
+        return {}
+    parents = {}
+    entry = _ProcessEntry32()
+    entry.dwSize = ctypes.sizeof(_ProcessEntry32)
+    try:
+        found = kernel.Process32FirstW(snapshot, ctypes.byref(entry))
+        while found:
+            parents[entry.th32ProcessID] = entry.th32ParentProcessID
+            found = kernel.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel.CloseHandle(snapshot)
+    return parents
+
+
+def own_tree_pids():
+    """The launcher and its ancestors: terminating one of these would end the launcher."""
+    pids, pid = set(), os.getpid()
+    parents = _process_parents()
+    while pid and pid not in pids:
+        pids.add(pid)
+        pid = parents.get(pid, 0)
+    return pids
+
+
+def _taskkill_tree(pid, timeout=TASKKILL_TIMEOUT_SECONDS):
+    """Kill a pid and its descendants; bounded so a stuck taskkill cannot block shutdown."""
+    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, check=False, timeout=timeout)
+
+
+def kill_owned_tree(process, identity, *, timeout=TASKKILL_TIMEOUT_SECONDS):
+    """Terminate the tree of a spawned process only while the pid still names that process.
+
+    identity is the (pid, creation time) pair captured while the child was known alive.
+    A verified mismatch, or a pid inside our own tree, refuses every kill ("refused").
+    An unverifiable identity, a failed or timed-out taskkill, and a taskkill refusal
+    all fall back to terminating the owned root handle only ("root"); a verified tree
+    kill reports "tree". The root kill always runs after a kill decision.
+    """
+    pid = getattr(process, "pid", None)
+    if not isinstance(pid, int) or pid in own_tree_pids():
+        return "refused"
+    current = process_identity(pid)
+    verified = identity is not None and current is not None and tuple(identity) == tuple(current)
+    if identity is not None and current is not None and not verified:
+        return "refused"
+    outcome = "root"
+    try:
+        if verified and os.name == "nt":
+            try:
+                _taskkill_tree(pid, timeout)
+                outcome = "tree"
+            except (OSError, subprocess.SubprocessError):
+                outcome = "root"
+    finally:
+        try:
+            process.kill()
+        except OSError:
+            pass
+    return outcome
 
 
 def ensure_windows_local_tree():

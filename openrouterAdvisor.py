@@ -12,6 +12,7 @@ import sys
 import tempfile
 import contextlib
 import queue
+import random
 import secrets
 import socket
 import threading
@@ -205,6 +206,55 @@ def log_route_marker(text: str) -> None:
 # Overridable so tests never touch a real session's handoff file.
 HANDOFF_FILE = Path(os.environ.get("ROUTE_HANDOFF_PATH") or (ROOT / ".session-handoff.json"))
 
+# Renaming over a file some Windows reader or scanner holds open fails with these.
+_WRITE_RETRY_WINERRORS = {5, 32, 33}  # ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+_WRITE_RETRY_ATTEMPTS = 4
+
+
+def _rename_with_retry(source: Path, target: Path) -> bool:
+    """os.replace with bounded jittered retries for Windows sharing/locking contention."""
+    for attempt in range(_WRITE_RETRY_ATTEMPTS):
+        try:
+            os.replace(source, target)
+            return True
+        except OSError as error:
+            if getattr(error, "winerror", None) not in _WRITE_RETRY_WINERRORS:
+                return False
+            if attempt == _WRITE_RETRY_ATTEMPTS - 1:
+                return False
+            time.sleep(0.05 * (2 ** attempt) + random.uniform(0, 0.01))
+    return False
+
+
+def write_json_state(path: Path, payload: dict) -> bool:
+    """Write JSON state so no reader can observe a partially written file.
+
+    The rename retries Windows contention, then falls back to a documented non-atomic
+    in-place rewrite: a reader holding the target open can block every rename, and a
+    stale handoff is worse than a briefly torn one. One diagnostic reports that fallback.
+    Returns False when the state could not be written at all; temp files never survive.
+    """
+    text = json.dumps(payload)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if _rename_with_retry(temporary, path):
+            return True
+        path.write_text(text, encoding="utf-8")
+        print(json.dumps({"event": "state_write_fallback", "file": path.name}),
+              file=sys.stderr, flush=True)
+        return True
+    except (OSError, TypeError):
+        return False
+    finally:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+
 
 def write_handoff(*, port, nonce, proxy_pid, provider, cli_pid):
     """Record the live route so another terminal can take it over without changing the port."""
@@ -212,12 +262,7 @@ def write_handoff(*, port, nonce, proxy_pid, provider, cli_pid):
         return  # nothing usable to record (also keeps mocked sessions out of the file)
     payload = {"port": port, "nonce": nonce, "proxy_pid": proxy_pid, "launcher_pid": cli_pid,
                "provider": provider, "started": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-    try:
-        temporary = HANDOFF_FILE.with_suffix(HANDOFF_FILE.suffix + ".tmp")
-        temporary.write_text(json.dumps(payload), encoding="utf-8")
-        os.replace(temporary, HANDOFF_FILE)
-    except (OSError, TypeError):
-        pass
+    write_json_state(HANDOFF_FILE, payload)
 
 
 def read_handoff():
@@ -303,16 +348,17 @@ def run_owned(args: list, env: dict, cwd: str, prompt: str = "", timeout: int = 
     process = subprocess.Popen(args, env=env, cwd=cwd, stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                text=True, encoding="utf-8")
+    # Captured while the child is alive; the Popen handle keeps this pid ours until reaped.
+    identity = localProcessTree.process_identity(process.pid)
     try:
         output, error_text = process.communicate(prompt, timeout=timeout)
     except (subprocess.TimeoutExpired, KeyboardInterrupt):
+        # A tree kill by bare pid is only safe while the pid still names this child.
+        localProcessTree.kill_owned_tree(process, identity)
         try:
-            if os.name == "nt":
-                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False, timeout=10)
-        finally:
-            process.kill()
             process.communicate(timeout=5)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            pass
         raise
     if process.returncode:
         detail = " ".join((error_text or "").split())[:300]
@@ -679,7 +725,7 @@ def self_test() -> None:
             assert read_key() == "sk-or-test-placeholder"
     process = Mock(pid=123, returncode=0)
     process.communicate.side_effect = [subprocess.TimeoutExpired("claude", 1), ("", "")]
-    with patch("subprocess.Popen", return_value=process), patch("subprocess.run") as terminate:
+    with patch("subprocess.Popen", return_value=process), patch.object(localProcessTree, "process_identity", return_value=(123, 1)), patch.object(localProcessTree, "own_tree_pids", return_value=set()), patch("subprocess.run") as terminate:
         try:
             run_owned(["claude"], {}, ".", timeout=1)
             raise AssertionError("timeout accepted")
