@@ -58,6 +58,84 @@ async function readBoundedBody(body, limit) {
   return { text: Buffer.concat(chunks).subarray(0, limit).toString('utf8'), truncated };
 }
 
+// Anthropic accepts only ^[a-zA-Z0-9_-]{1,64}$ tool ids. Third-party providers mint ids like
+// `Bash:0#abc`; when such history meets the native Plan route it is rejected, so only the
+// non-conforming ids are remapped (conforming ids stay byte-identical for prompt caching).
+const PLAN_TOOL_ID = /^[a-zA-Z0-9_-]{1,64}$/;
+function normalizeToolCallIds(body) {
+  if (!Array.isArray(body?.messages)) return { body, changed: false, count: 0, empty: false };
+  const reserved = new Set();
+  const nonConforming = new Set();
+  for (const message of body.messages) {
+    if (!Array.isArray(message?.content)) continue;
+    for (const block of message.content) {
+      const id = block?.type === 'tool_use' ? block.id : block?.type === 'tool_result' ? block.tool_use_id : undefined;
+      if (id === undefined) continue;
+      // An empty id has no representable form on the native contract: reject the request.
+      if (typeof id !== 'string' || id.length === 0) return { body, changed: false, count: 0, empty: true };
+      if (PLAN_TOOL_ID.test(id)) reserved.add(id);
+      else nonConforming.add(id);
+    }
+  }
+  if (!nonConforming.size) return { body, changed: false, count: 0, empty: false };
+  // Deterministic per-request allocator: encounter order and a counter skipping every id the
+  // history already reserves, so generated ids are collision-free and stable across retries.
+  const replacements = new Map();
+  let counter = 0;
+  for (const id of nonConforming) {
+    let candidate;
+    do { counter += 1; candidate = `toolu_${counter.toString(36)}`; } while (reserved.has(candidate));
+    reserved.add(candidate);
+    replacements.set(id, candidate);
+  }
+  const messages = body.messages.map(message => {
+    if (!Array.isArray(message?.content)) return message;
+    let touched = false;
+    const content = message.content.map(block => {
+      if (block?.type === 'tool_use' && replacements.has(block.id)) {
+        touched = true;
+        return { ...block, id: replacements.get(block.id) };
+      }
+      if (block?.type === 'tool_result' && replacements.has(block.tool_use_id)) {
+        touched = true;
+        return { ...block, tool_use_id: replacements.get(block.tool_use_id) };
+      }
+      return block;
+    });
+    return touched ? { ...message, content } : message;
+  });
+  return { body: { ...body, messages }, changed: true, count: replacements.size, empty: false };
+}
+
+// Opt-in external-path stabilization: the CLI appends a volatile token-count footer to the
+// last system text block, which invalidates the provider's prefix cache. ROUTE_STABILIZE_PROMPT_CACHE=1
+// peels only that unfenced, very-last fragment; every other byte stays identical. Off by default.
+const PROMPT_CACHE_FOOTER = /<total_tokens>\d+ tokens left<\/total_tokens>$/;
+function peelPromptCacheFooter(text) {
+  const match = PROMPT_CACHE_FOOTER.exec(text);
+  if (!match || match.index + match[0].length !== text.length) return text;
+  // An odd number of fences before the footer means it is code, not a client tracker line.
+  if ((text.slice(0, match.index).split('```').length - 1) % 2 === 1) return text;
+  return text.slice(0, match.index);
+}
+function stabilizeSystem(system) {
+  if (typeof system === 'string') return peelPromptCacheFooter(system);
+  if (!Array.isArray(system)) return system;
+  // Only the last text block may change; earlier blocks (and their cache_control markers)
+  // stay identical, and user/assistant content is never touched.
+  let index = -1;
+  for (let position = system.length - 1; position >= 0; position -= 1) {
+    if (system[position]?.type === 'text' && typeof system[position].text === 'string') { index = position; break; }
+  }
+  if (index < 0) return system;
+  const text = system[index].text;
+  const stripped = peelPromptCacheFooter(text);
+  if (stripped === text) return system;
+  const blocks = system.slice();
+  blocks[index] = { ...system[index], text: stripped };
+  return blocks;
+}
+
 // Diagnostic mirror: routing events also land in a file so a session can be explained afterwards.
 // The launcher sets ROUTE_LOG_PATH for OpenRouter sessions; without it nothing is written.
 const routeLogPath = process.env.ROUTE_LOG_PATH;
@@ -620,6 +698,9 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   // wait at most this long and the full hint reaches the client as Retry-After instead.
   retryMaxWaitMs = Number.isFinite(Number(process.env.ROUTE_RETRY_MAX_WAIT_MS))
     ? Number(process.env.ROUTE_RETRY_MAX_WAIT_MS) : 10000,
+  // Opt-in: peel the CLI's trailing token-count footer from system text before the external
+  // request so the provider's prefix cache survives between turns. Documented in the README.
+  stabilizePromptCache = process.env.ROUTE_STABILIZE_PROMPT_CACHE === '1',
   onHandover = null }) {
   if (typeof localOnly !== 'boolean' || (localOnly && provider !== 'local')) throw new Error('Local-only mode requires local provider');
   if (typeof localCompat !== 'boolean' || (localCompat && (!localOnly || provider !== 'local')))
@@ -969,6 +1050,12 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         }
         if (!oauthOK) return reject(403, 'Saved subscription OAuth required');
         client.signal.throwIfAborted();
+        // Native Plan has a stricter tool-id contract than third-party providers. Normalize
+        // only unrepresentable ids here; the external route is never rewritten (it translates
+        // its own ids), and conforming ids stay byte-identical for the prompt cache.
+        const normalizedIds = normalizeToolCallIds(body);
+        if (normalizedIds.empty) return reject(400, 'Invalid tool call id');
+        if (normalizedIds.changed) logEvent({ event: 'tool_ids_normalized', provider: 'plan', count: normalizedIds.count });
         // The model that actually serves a Plan request may differ from the client alias.
         const planModel = model === DEEPSEEK || (configuredAlias && !isPro(model) && !isSonnet(model)) ? fallbackModel : model;
         noteRoute('plan', reason);
@@ -979,7 +1066,9 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         for (const [name, value] of Object.entries(req.headers))
           if (typeof value === 'string' && !['host', 'content-length', 'accept-encoding', 'connection',
             'transfer-encoding', 'x-local-route-token', 'x-api-key'].includes(name)) headers[name] = value;
-        const proBody = planModel === model ? raw : JSON.stringify({ ...body, model: planModel });
+        const planBody = normalizedIds.changed ? normalizedIds.body : body;
+        const proBody = planModel === model && !normalizedIds.changed ? raw
+          : JSON.stringify({ ...planBody, model: planModel });
         // Bound a stalled Plan upstream; user cancellation still flows through client.signal.
         const plan = new AbortController();
         const cancelPlan = () => plan.abort('client_close');
@@ -1064,6 +1153,11 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         if (!compatProfile) externalBody.thinking = { type: 'disabled' };
         if (body.tools) externalBody.tools = body.tools.map(tool => ({ ...tool, input_schema: compatibleSchema(tool.input_schema) }));
         if (provider === 'openrouter') externalBody.provider = { allow_fallbacks: false };
+        // Opt-in prefix-cache stabilization: only the very last system text block may lose a
+        // trailing, unfenced token-count footer. User/assistant content is never touched.
+        if (stabilizePromptCache && externalBody.system !== undefined) {
+          externalBody.system = stabilizeSystem(externalBody.system);
+        }
         // Serialize once: the retry loop reuses the same payload, and a large history would
         // otherwise be stringified up to four times.
         const externalPayload = JSON.stringify(externalBody);
