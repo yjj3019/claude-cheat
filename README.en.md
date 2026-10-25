@@ -399,19 +399,21 @@ A mock upstream generates traffic so throughput, latency, memory and routing dec
 ```powershell
 node tests/simulate.mjs                                   # mixed load, long session, circuit breaker
 node tests/simulate.mjs --requests 4000 --concurrency 48 --json
-node tests/bench_proxy.mjs                                # proxy overhead by body size
+node tests/bench_proxy.mjs --quick                        # fresh-process runs + correctness gates
+node tests/bench_proxy.mjs --soak-seconds 10              # time-based soak (child RSS, post-GC heap)
+node --test tests/bench_harness.test.mjs                  # regression tests for the harness itself
 node --test tests/simulation.test.mjs                     # simulator smoke test
 ```
 
 Scenarios cover a plain reply, SSE streaming, tool calls, a 429 retry, a 1MB body, an unsupported beta bypass, and the circuit breaker with cooldown; each response carries a marker so the simulator can assert which path served it. Any mismatch exits 1.
 
-Reference numbers (this development machine, Node 24, client and proxy in one process):
+Reference numbers (this development machine, Node 24). Simulator and soak figures share one process; the separated harness figures come from bench_proxy.mjs.
 
 | Metric | Value |
 | --- | --- |
 | Mixed throughput | ~700–980 req/s at 1,200 requests / concurrency 24, p50 16–25ms, p95 55–82ms |
 | Long session | 120 turns, 247KB history: 3.1ms (3.9ms before the fix) |
-| Body size | 1MB in 7.7–8.9ms (~120MB/s) |
+| Body size | 1MB in 7.7–8.9ms (~120MB/s); fresh-process harness 1MB in 8.4–9.8ms |
 | Retry cost | 1MB + one retry 10.7ms vs 12.8ms before, four failures 9.8ms vs 12.1ms (~17–19% better) |
 | Circuit | 4 failures → Plan fallback, Plan during cooldown, external again after recovery |
 | Long soak | 150,000 requests at 266MB; **1.2M requests reached 1.09GB RSS** (V8 heap expansion — a 256MB cap run passes, so it is collectable) |
@@ -478,3 +480,4 @@ The code and documentation in this repository are available under the [MIT Licen
 The reviewed source uses Node.js and Python standard libraries and invokes a separately installed Claude CLI. No bundled third-party packages or separate source-license notices were found in the review. MIT was selected as a simple permissive license for reusing this small standalone router. See the [scope, rationale, and Apache-2.0 comparison](LICENSE-REVIEW.md).
 
 Claude Code, Node.js, Python, hosted services, and models are not distributed by this repository. Their own licenses and service terms continue to apply; this project's license does not grant service access or change usage limits and billing.
+
