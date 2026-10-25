@@ -93,6 +93,37 @@ class AuditRegressionTests(unittest.TestCase):
         path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
         return self.root / "projects"
 
+    def assistant(self, tokens, stamp=None):
+        return {"type": "assistant", "timestamp": stamp or datetime.now(timezone.utc).isoformat(),
+                "message": {"model": "vendor/model",
+                            "usage": {"input_tokens": tokens, "output_tokens": 1}}}
+
+    def write_transcript(self, path, records, mtime_ns, partial=""):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(record) + "\n" for record in records) + partial,
+                        encoding="utf-8")
+        os.utime(path, ns=(mtime_ns, mtime_ns))
+        return path
+
+    def recent_mtime_ns(self, seconds_ago):
+        # Inside the 7-day scan window, while still distinct between rewrites.
+        return int((time.time() - seconds_ago) * 1_000_000_000)
+
+    def scan_usage(self, cache, restart=False, save=False):
+        """Scan the fixture projects with the repo's cache file patched out."""
+        if restart:
+            dash._SESSIONS.clear()
+            dash._USAGE_CACHE["data"] = None
+        dash._USAGE_CACHE["key"] = None
+        projects = self.root / "projects"
+        with mock.patch.object(dash, "USAGE_CACHE_FILE", cache):
+            if not save:
+                return dash.scan_sessions(projects=projects, now=datetime.now())
+            # Force the throttled save so the restore path can be exercised.
+            with mock.patch.object(dash, "_USAGE_CACHE_META", {"saved_at": 0.0}), \
+                 mock.patch.object(dash.time, "monotonic", return_value=1_000_000.0):
+                return dash.scan_sessions(projects=projects, now=datetime.now())
+
     def test_usage_cache_avoids_rereading_unchanged_transcripts(self):
         def record(tokens):
             return {"type": "assistant", "timestamp": "2026-10-25T01:00:00+00:00",
@@ -149,6 +180,216 @@ class AuditRegressionTests(unittest.TestCase):
                 dash._USAGE_CACHE["key"] = None
                 usage = dash.scan_sessions(projects=projects, now=datetime.now())
                 self.assertEqual(usage["totals"]["external"][0], 4, content[:20])
+
+    # --- usage cache: source identity and recovery ---------------------------
+    def test_an_in_place_rewrite_of_the_same_size_replaces_the_totals(self):
+        # Pins: a same-byte-count rewrite used to look like "no new data" because only
+        # the offset was persisted, so the old counts survived until the process died.
+        path = self.root / "projects" / "p" / "s.jsonl"
+        cache = self.root / ".usage-cache.json"
+        self.write_transcript(path, [self.assistant(111)], self.recent_mtime_ns(300))
+        first = self.scan_usage(cache, restart=True)
+        self.assertEqual(first["totals"]["external"], [111, 1, 0, 0])
+        size = path.stat().st_size
+        self.write_transcript(path, [self.assistant(222)], self.recent_mtime_ns(200))
+        self.assertEqual(path.stat().st_size, size, "the rewrite must keep the byte count")
+        second = self.scan_usage(cache)
+        self.assertEqual(second["totals"]["external"], [222, 1, 0, 0])
+
+    def test_a_same_size_rewrite_is_detected_after_a_restart(self):
+        # Pins: the persisted state carried no size/mtime/fingerprint, so a cold start
+        # trusted a stale offset at the same byte count and kept the old totals.
+        path = self.root / "projects" / "p" / "s.jsonl"
+        cache = self.root / ".usage-cache.json"
+        self.write_transcript(path, [self.assistant(111)], self.recent_mtime_ns(300))
+        first = self.scan_usage(cache, restart=True, save=True)
+        self.assertEqual(first["totals"]["external"], [111, 1, 0, 0])
+        cached = json.loads(cache.read_text(encoding="utf-8"))
+        self.assertEqual(cached["version"], dash.USAGE_CACHE_VERSION)
+        entry = cached["files"][str(path)]
+        self.assertEqual(entry["offset"], path.stat().st_size)
+        self.assertEqual(entry["size"], path.stat().st_size)
+        self.assertEqual(entry["mtime_ns"], path.stat().st_mtime_ns)
+        self.assertRegex(entry["head_sha"], r"^[0-9a-f]{64}$")
+        self.assertRegex(entry["tail_sha"], r"^[0-9a-f]{64}$")
+        # An untouched transcript costs no fingerprint reads on restore.
+        with mock.patch.object(dash, "_source_identity", wraps=dash._source_identity) as identity:
+            restored = self.scan_usage(cache, restart=True)
+        identity.assert_not_called()
+        self.assertEqual(restored["totals"]["external"], [111, 1, 0, 0])
+        size = path.stat().st_size
+        self.write_transcript(path, [self.assistant(222)], self.recent_mtime_ns(200))
+        self.assertEqual(path.stat().st_size, size)
+        after = self.scan_usage(cache, restart=True)
+        self.assertEqual(after["totals"]["external"], [222, 1, 0, 0])
+
+    def test_a_transcript_rewritten_larger_is_rescanned_not_appended(self):
+        # Pins: growing the file made the old offset an "append" point, so the new
+        # content was half-parsed while the old counts were still added on top.
+        path = self.root / "projects" / "p" / "s.jsonl"
+        cache = self.root / ".usage-cache.json"
+        self.write_transcript(path, [self.assistant(100)], self.recent_mtime_ns(300))
+        first = self.scan_usage(cache, restart=True)
+        self.assertEqual(first["totals"]["external"], [100, 1, 0, 0])
+        old_size = path.stat().st_size
+        self.write_transcript(path, [self.assistant(1000), self.assistant(500)],
+                              self.recent_mtime_ns(200))
+        self.assertGreater(path.stat().st_size, old_size)
+        second = self.scan_usage(cache)
+        self.assertEqual(second["totals"]["external"], [1500, 2, 0, 0])
+
+    def test_a_truncated_transcript_drops_the_counts_that_are_gone(self):
+        path = self.root / "projects" / "p" / "s.jsonl"
+        cache = self.root / ".usage-cache.json"
+        self.write_transcript(path, [self.assistant(111), self.assistant(222)],
+                              self.recent_mtime_ns(300))
+        first = self.scan_usage(cache, restart=True)
+        self.assertEqual(first["totals"]["external"], [333, 2, 0, 0])
+        self.write_transcript(path, [self.assistant(50)], self.recent_mtime_ns(200))
+        second = self.scan_usage(cache)
+        self.assertEqual(second["totals"]["external"], [50, 1, 0, 0])
+
+    def test_a_truncated_then_regrown_transcript_is_rescanned_from_the_start(self):
+        # Pins: truncating and regrowing past the old offset made the fresh bytes look
+        # like an append to the old offset, mixing the two generations together.
+        path = self.root / "projects" / "p" / "s.jsonl"
+        cache = self.root / ".usage-cache.json"
+        self.write_transcript(path, [self.assistant(300), self.assistant(300)],
+                              self.recent_mtime_ns(300))
+        first = self.scan_usage(cache, restart=True)
+        self.assertEqual(first["totals"]["external"], [600, 2, 0, 0])
+        old_size = path.stat().st_size
+        self.write_transcript(path, [self.assistant(7)] * 40, self.recent_mtime_ns(200))
+        self.assertGreaterEqual(path.stat().st_size, old_size + 1)
+        second = self.scan_usage(cache)
+        self.assertEqual(second["totals"]["external"], [280, 40, 0, 0])
+
+    def test_a_partial_trailing_line_is_counted_once_after_it_completes(self):
+        path = self.root / "projects" / "p" / "s.jsonl"
+        cache = self.root / ".usage-cache.json"
+        complete = [self.assistant(5), self.assistant(7)]
+        record = json.dumps(self.assistant(11))
+        self.write_transcript(path, complete, self.recent_mtime_ns(300), partial=record[:40])
+        first = self.scan_usage(cache, restart=True, save=True)
+        self.assertEqual(first["totals"]["external"], [12, 2, 0, 0])
+        restored = self.scan_usage(cache, restart=True)
+        self.assertEqual(restored["totals"]["external"], [12, 2, 0, 0],
+                         "the partial line must not be counted twice")
+        self.write_transcript(path, complete, self.recent_mtime_ns(200), partial=record + "\n")
+        final = self.scan_usage(cache, restart=True)
+        self.assertEqual(final["totals"]["external"], [23, 3, 0, 0])
+
+    def test_old_or_corrupt_usage_caches_are_never_trusted(self):
+        path = self.root / "projects" / "p" / "s.jsonl"
+        cache = self.root / ".usage-cache.json"
+        self.write_transcript(path, [self.assistant(4)], self.recent_mtime_ns(300))
+        stale = {"offset": path.stat().st_size, "turns": 9, "external": 9, "plan": 0,
+                 "tokens": {"external": [9, 9, 0, 0], "plan": [0, 0, 0, 0]},
+                 "last_ts": None, "models": {}, "hours": {}}
+        payloads = ["{not json", "[]",
+                    json.dumps({"version": 2, "files": {str(path): stale}}),
+                    json.dumps({"version": dash.USAGE_CACHE_VERSION, "files": [str(path)]})]
+        for payload in payloads:
+            cache.write_text(payload, encoding="utf-8")
+            usage = self.scan_usage(cache, restart=True)
+            self.assertEqual(usage["totals"]["external"], [4, 1, 0, 0], payload[:40])
+
+    def test_a_cache_without_a_usable_identity_is_rescanned(self):
+        path = self.root / "projects" / "p" / "s.jsonl"
+        cache = self.root / ".usage-cache.json"
+        self.write_transcript(path, [self.assistant(4)], self.recent_mtime_ns(300))
+        size = path.stat().st_size
+        base = {"offset": size, "size": size, "mtime_ns": path.stat().st_mtime_ns,
+                "head_sha": "0" * 64, "tail_sha": "0" * 64,
+                "turns": 9, "external": 9, "plan": 0,
+                "tokens": {"external": [9, 9, 0, 0], "plan": [0, 0, 0, 0]},
+                "last_ts": None, "models": {}, "hours": {}}
+        broken = [{"size": None}, {"size": "4000"}, {"size": size - 1},
+                  {"mtime_ns": None}, {"mtime_ns": "now"},
+                  {"head_sha": None}, {"head_sha": "abc"}, {"tail_sha": 12345}]
+        entries = []
+        for override in broken:
+            entry = dict(base)
+            entry.update(override)
+            entries.append(entry)
+        # A field that is absent is as unusable as a malformed one.
+        for missing in ("size", "mtime_ns", "head_sha", "tail_sha"):
+            entry = dict(base)
+            del entry[missing]
+            entries.append(entry)
+        for entry in entries:
+            cache.write_text(json.dumps({"version": dash.USAGE_CACHE_VERSION,
+                                         "files": {str(path): entry}}), encoding="utf-8")
+            usage = self.scan_usage(cache, restart=True)
+            self.assertEqual(usage["totals"]["external"], [4, 1, 0, 0], str(entry)[:60])
+
+    def test_a_restored_then_appended_transcript_counts_each_record_once(self):
+        path = self.root / "projects" / "p" / "s.jsonl"
+        cache = self.root / ".usage-cache.json"
+        self.write_transcript(path, [self.assistant(4)], self.recent_mtime_ns(300))
+        first = self.scan_usage(cache, restart=True, save=True)
+        self.assertEqual(first["totals"]["external"], [4, 1, 0, 0])
+        self.assertTrue(cache.is_file())
+        self.write_transcript(path, [self.assistant(4), self.assistant(6)],
+                              self.recent_mtime_ns(200))
+        second = self.scan_usage(cache, restart=True)
+        self.assertEqual(second["totals"]["external"], [10, 2, 0, 0])
+        third = self.scan_usage(cache, restart=True)
+        self.assertEqual(third["totals"]["external"], [10, 2, 0, 0])
+
+    def test_a_cache_with_malformed_nested_totals_is_rescanned_instead_of_crashing(self):
+        # Pins: a corrupt hour bucket or model count reached the merge/sort loop and
+        # raised TypeError, killing the whole dashboard refresh instead of rescanning.
+        path = self.root / "projects" / "p" / "s.jsonl"
+        cache = self.root / ".usage-cache.json"
+        self.write_transcript(path, [self.assistant(4)], self.recent_mtime_ns(300))
+        first = self.scan_usage(cache, restart=True, save=True)
+        self.assertEqual(first["totals"]["external"], [4, 1, 0, 0])
+        payload = json.loads(cache.read_text(encoding="utf-8"))
+        entry = payload["files"][str(path)]
+        bad_hours = {datetime.now().strftime("%Y-%m-%dT%H"):
+                     {"external": {"turns": "many", "tokens": [1, 2, 3, 4]},
+                      "plan": {"turns": 0, "tokens": [0, 0, 0, 0]}}}
+        bad_models = {"vendor/model": "many"}
+        for broken in ({"hours": bad_hours}, {"models": bad_models}):
+            damaged = dict(entry)
+            damaged.update(broken)
+            payload["files"][str(path)] = damaged
+            cache.write_text(json.dumps(payload), encoding="utf-8")
+            usage = self.scan_usage(cache, restart=True)
+            self.assertEqual(usage["totals"]["external"], [4, 1, 0, 0], str(broken)[:30])
+
+    def test_identity_reads_are_bounded_and_windowed(self):
+        path = self.root / "big.jsonl"
+        path.write_bytes(b"a" * 20000)
+
+        class CountingHandle:
+            def __init__(self, handle):
+                self.handle, self.total = handle, 0
+
+            def seek(self, position):
+                return self.handle.seek(position)
+
+            def read(self, count=-1):
+                data = self.handle.read(count)
+                self.total += len(data)
+                return data
+
+        with path.open("rb") as raw:
+            handle = CountingHandle(raw)
+            head_sha, tail_sha = dash._source_identity(handle, 20000)
+            self.assertLessEqual(handle.total, 2 * dash.USAGE_IDENTITY_BYTES,
+                                 "identity must not read the whole transcript")
+        # A change strictly between the two windows is out of scope (documented limitation).
+        path.write_bytes(b"a" * 5000 + b"b" * 10000 + b"a" * 5000)
+        with path.open("rb") as raw:
+            self.assertEqual(dash._source_identity(raw, 20000), (head_sha, tail_sha))
+        path.write_bytes(b"c" + b"a" * 19999)
+        with path.open("rb") as raw:
+            self.assertNotEqual(dash._source_identity(raw, 20000)[0], head_sha)
+        path.write_bytes(b"a" * 19999 + b"c")
+        with path.open("rb") as raw:
+            self.assertNotEqual(dash._source_identity(raw, 20000)[1], tail_sha)
 
     # --- route log concurrency -----------------------------------------------
     def test_concurrent_reads_do_not_double_count(self):

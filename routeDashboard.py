@@ -378,13 +378,17 @@ def _classify(message_id):
 
 
 def _new_session_state():
-    return {"offset": 0, "turns": 0, "external": 0, "plan": 0, "last_ts": None,
+    # The identity fields describe the bytes up to ``offset``; a transcript rewritten in
+    # place keeps the offset but not the fingerprints, so both must be persisted together.
+    return {"offset": 0, "size": None, "mtime_ns": None, "head_sha": None, "tail_sha": None,
+            "turns": 0, "external": 0, "plan": 0, "last_ts": None,
             "tokens": {"external": [0, 0, 0, 0], "plan": [0, 0, 0, 0]},
             "models": {}, "hours": {}}
 
 
 USAGE_CACHE_FILE = ROOT / ".usage-cache.json"
-USAGE_CACHE_VERSION = 2
+USAGE_CACHE_VERSION = 3
+USAGE_IDENTITY_BYTES = 4096
 _USAGE_CACHE_META = {"saved_at": 0.0}
 _USAGE_DIRTY = {"flag": False, "at": 0.0}
 
@@ -401,11 +405,44 @@ def _load_usage_states():
     return files if isinstance(files, dict) else {}
 
 
+def _is_sha256_hex(value):
+    return (isinstance(value, str) and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value))
+
+
+def _valid_hour_bucket(bucket):
+    """A cached hour bucket is merged into totals, so a wrong shape would crash the scan."""
+    if not isinstance(bucket, dict):
+        return False
+    for source in ("external", "plan"):
+        part = bucket.get(source)
+        if not isinstance(part, dict):
+            return False
+        if not isinstance(part.get("turns"), int) or part["turns"] < 0:
+            return False
+        values = part.get("tokens")
+        if not isinstance(values, list) or len(values) != 4 or any(
+                not isinstance(value, int) or value < 0 for value in values):
+            return False
+    return True
+
+
 def _state_from_cache(entry):
-    """Accept a cached state only when every field has the shape the scanner expects."""
+    """Accept a cached state only when every field has the shape the scanner expects.
+
+    A cached offset is only reusable together with the identity of the bytes it counted;
+    an older (v2) entry or a hand-edited one is rejected so the file is rescanned.
+    """
     if not isinstance(entry, dict):
         return None
     if not isinstance(entry.get("offset"), int) or entry["offset"] < 0:
+        return None
+    size, mtime_ns = entry.get("size"), entry.get("mtime_ns")
+    if not isinstance(size, int) or size < entry["offset"]:
+        return None
+    if not isinstance(mtime_ns, int) or mtime_ns < 0:
+        return None
+    if not _is_sha256_hex(entry.get("head_sha")) or not _is_sha256_hex(entry.get("tail_sha")):
         return None
     for name in ("turns", "external", "plan"):
         if not isinstance(entry.get(name), int) or entry[name] < 0:
@@ -418,14 +455,23 @@ def _state_from_cache(entry):
         if not isinstance(values, list) or len(values) != 4 or any(
                 not isinstance(value, int) or value < 0 for value in values):
             return None
-    if not isinstance(entry.get("models", {}), dict) or not isinstance(entry.get("hours", {}), dict):
+    models = entry.get("models", {})
+    if not isinstance(models, dict) or any(
+            not isinstance(count, int) or count < 0 for count in models.values()):
         return None
-    return {"offset": entry["offset"], "turns": entry["turns"], "external": entry["external"],
+    hours = entry.get("hours", {})
+    if not isinstance(hours, dict):
+        return None
+    for hour, bucket in hours.items():
+        if not isinstance(hour, str) or not _valid_hour_bucket(bucket):
+            return None
+    return {"offset": entry["offset"], "size": size, "mtime_ns": mtime_ns,
+            "head_sha": entry["head_sha"], "tail_sha": entry["tail_sha"],
+            "turns": entry["turns"], "external": entry["external"],
             "plan": entry["plan"], "last_ts": entry.get("last_ts"),
             "tokens": {source: list(tokens[source]) for source in ("external", "plan")},
-            "models": dict(entry.get("models") or {}),
-            "hours": {hour: bucket for hour, bucket in (entry.get("hours") or {}).items()
-                      if isinstance(hour, str) and isinstance(bucket, dict)}}
+            "models": dict(models),
+            "hours": dict(hours)}
 
 
 def _save_usage_states(states, now=None):
@@ -435,7 +481,9 @@ def _save_usage_states(states, now=None):
     files = {}
     for key, state in list(states.items()):
         hours = {hour: bucket for hour, bucket in state["hours"].items() if hour >= horizon}
-        files[key] = {"offset": state["offset"], "turns": state["turns"],
+        files[key] = {"offset": state["offset"], "size": state["size"],
+                      "mtime_ns": state["mtime_ns"], "head_sha": state["head_sha"],
+                      "tail_sha": state["tail_sha"], "turns": state["turns"],
                       "external": state["external"], "plan": state["plan"],
                       "last_ts": state["last_ts"], "tokens": state["tokens"],
                       "models": state["models"], "hours": hours}
@@ -450,25 +498,65 @@ def _save_usage_states(states, now=None):
         pass
 
 
+def _source_identity(handle, offset):
+    """Fingerprint the counted bytes with at most two bounded reads.
+
+    The first and last few KB catch an in-place rewrite, a truncation or a compaction.
+    An edit strictly between those windows of a large transcript is out of scope: the
+    checks must stay cheaper than re-reading the file.
+    """
+    offset = max(0, offset)
+    if offset <= 0:
+        empty = hashlib.sha256(b"").hexdigest()
+        return empty, empty
+    start = max(0, offset - USAGE_IDENTITY_BYTES)
+    handle.seek(start)
+    window = handle.read(offset - start)
+    tail = hashlib.sha256(window).hexdigest()
+    if start == 0:
+        return tail, tail
+    handle.seek(0)
+    return hashlib.sha256(handle.read(USAGE_IDENTITY_BYTES)).hexdigest(), tail
+
+
 def _read_appended(path, state):
-    """Return complete new JSONL lines as bytes, keeping a partial trailing line for later."""
+    """Return complete new JSONL lines, the offset to commit and the new source identity.
+
+    A transcript can be rewritten in place (compaction, retry, an editor save), which
+    keeps the byte offset but changes the bytes before it. The identity saved with the
+    offset is checked before that offset is trusted, so a rewrite is rescanned from 0
+    instead of being silently under- or over-counted.
+    """
     stat = path.stat()
-    size, offset = stat.st_size, state.get("offset", 0)
+    size, mtime_ns = stat.st_size, stat.st_mtime_ns
+    offset = state.get("offset", 0)
     if size < offset:
         state.clear()
         state.update(_new_session_state())
         offset = 0
-    if size == offset:
-        return [], offset
+    elif size == offset and state.get("mtime_ns") == mtime_ns:
+        return [], offset, None  # unchanged: not even a fingerprint read
     with path.open("rb") as handle:
+        saved = (state.get("head_sha"), state.get("tail_sha"))
+        if offset and (saved[0] is None or saved[1] is None
+                       or _source_identity(handle, offset) != saved):
+            state.clear()
+            state.update(_new_session_state())
+            offset = 0
+        if size == offset:
+            # Only the metadata changed; the bytes already counted are still there.
+            state["size"], state["mtime_ns"] = size, mtime_ns
+            return [], offset, None
         handle.seek(offset)
         chunk = handle.read(size - offset)
-    head, sep, _tail = chunk.rpartition(b"\n")
-    if not sep:
-        return [], offset
-    # The caller commits the offset only after every line was parsed, so one bad record
-    # cannot swallow the lines after it.
-    return head.split(b"\n"), offset + len(head) + 1
+        head, sep, _tail = chunk.rpartition(b"\n")
+        if not sep:
+            return [], offset, None
+        # The caller commits the offset only after every line was parsed, so one bad
+        # record cannot swallow the lines after it.
+        next_offset = offset + len(head) + 1
+        identity = (size, mtime_ns) + _source_identity(handle, next_offset)
+    return head.split(b"\n"), next_offset, identity
 
 
 def _new_hour_bucket():
@@ -557,7 +645,7 @@ def scan_sessions(projects=None, max_files=SCAN_FILES, now=None, pricing=None):
                 _SESSIONS[key] = state
                 cached_hit = True
             try:
-                lines, next_offset = _read_appended(path, state)
+                lines, next_offset, identity = _read_appended(path, state)
             except OSError:
                 continue
             if lines:
@@ -603,6 +691,8 @@ def scan_sessions(projects=None, max_files=SCAN_FILES, now=None, pricing=None):
                         for index in range(4):
                             bucket[source]["tokens"][index] += delta[index]
             state["offset"] = next_offset
+            if identity is not None:
+                state["size"], state["mtime_ns"], state["head_sha"], state["tail_sha"] = identity
         if changed or (cached_hit and time.monotonic() - _USAGE_CACHE_META["saved_at"] > 300):
             # Throttled: the scan runs every few seconds, the cache only needs to survive a restart.
             if time.monotonic() - _USAGE_CACHE_META["saved_at"] > 5:
