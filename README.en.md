@@ -309,6 +309,21 @@ The report includes `state`, `provider`, `reason`, `detail`, **`model`**, `last_
 
 A running proxy exposes its own counters at `GET /api/metrics` (same session token required, loopback only): request count, external/Plan split, p50/p95 latency, retries, streams, circuit opens and bytes in/out. The same snapshot is written to `.proxy-metrics.json` beside the launcher once a second and shown as the dashboard's **proxy throughput** card.
 
+## Lowering the first-token delay (optional)
+
+By default the proxy validates the **whole** reply before sending it, so a streamed answer appears only when generation finishes. That keeps the retry + Plan fallback guarantee but delays the first token.
+
+```powershell
+.\OpenClaude.ps1 -Stream        # forward frames as they validate (lower TTFB)
+```
+
+| Mode | First token (TTFB) | Behaviour on failure |
+| --- | --- | --- |
+| Default (buffered) | when the reply completes (measured 782ms / 782ms) | four attempts, then Plan fallback |
+| `-Stream` (opt-in) | first valid content (measured **339ms** / 772ms total) | before the first token: same fallback; **after** it: the stream ends with an error so output is never duplicated |
+
+Forwarding starts only after the first valid content, so empty replies, thinking-only replies and broken tool JSON still fall back. Environment form: `$env:ROUTE_STREAM_PASSTHROUGH = '1'; OpenClaude.ps1`.
+
 ## Understanding connection checks and troubleshooting
 
 `-CheckLocal` accepts model lists shaped as `data[].id` or `models[].name` / `models[].model`. It prints safe metadata, not model names or response bodies. Example output, not a real-server result:

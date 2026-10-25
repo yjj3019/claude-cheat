@@ -221,7 +221,95 @@ const validMessageMeta = message => typeof message?.id === 'string' && message.i
   Number.isFinite(message.usage?.input_tokens) && message.usage.input_tokens >= 0 &&
   Number.isFinite(message.usage?.output_tokens) && message.usage.output_tokens >= 0;
 
-async function bufferedResponse(upstream, model, clientModel, stream, signal, onProgress, strictMeta = false) {
+// Frames a provider may send once a message has started.
+const STREAM_EVENTS = new Set(['message_start', 'content_block_start', 'content_block_delta',
+  'content_block_stop', 'message_delta', 'message_stop', 'ping']);
+
+// Validates one SSE frame and returns the text to forward. Throws on anything the
+// client could not accept, which is what keeps a bad reply from reaching the session.
+function streamValidator(model, clientModel, strictMeta, rejectThinking = false) {
+  let started = false, delta = false, stopped = false, usable = false, stopReason;
+  // Frames may only leave the proxy once the reply provably has usable content: until
+  // then a failure must stay recoverable (retry, then Plan fallback).
+  let publishable = false, sawThinking = false;
+  const blocks = new Map();
+  const indices = new Set();
+  const thinking = block => ['thinking', 'redacted_thinking'].includes(block?.type);
+  return {
+    get started() { return started; },
+    get stopped() { return stopped; },
+    get publishable() { return publishable && started; },
+    validate(frame) {
+      const data = frame.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trim()).join('\n');
+      if (!data) return frame + '\n\n';
+      if (data === '[DONE]') { if (!stopped) throw new Error('Premature stream terminator'); return ''; }
+      const event = JSON.parse(data);
+      const named = frame.split(/\r?\n/).find(line => line.startsWith('event:'))?.slice(6).trim();
+      if (named !== undefined && named !== event.type) throw new Error('Unexpected stream event');
+      if (!STREAM_EVENTS.has(event.type)) throw new Error('Unexpected stream event');
+      if (stopped) { if (event.type === 'ping') return ''; throw new Error('Event after message stop'); }
+      if (event.type === 'message_start') {
+        if (started || event.message?.model !== model) throw new Error('Wrong response model');
+        if (strictMeta && !validMessageMeta(event.message)) throw new Error('Invalid stream metadata');
+        started = true;
+        event.message.model = clientModel;
+      } else if (event.type !== 'ping' && !started) throw new Error('Missing start');
+      if (event.type === 'content_block_start') {
+        if (!Number.isInteger(event.index) || event.index < 0 || indices.has(event.index) || delta ||
+            !validContentBlock(event.content_block)) throw new Error('Invalid content block');
+        // Ordinary mode never accepts reasoning blocks from the external provider; the
+        // buffered path caught these with a text scan, which a stream cannot rely on.
+        if (thinking(event.content_block)) sawThinking = true;
+        indices.add(event.index);
+        usable ||= usableContent(event.content_block);
+        usable ||= usableContent(event.content_block);
+        blocks.set(event.index, { type: event.content_block.type, json: '', hasJson: false });
+      }
+      if (event.type === 'content_block_delta') {
+        const block = blocks.get(event.index);
+        if (!block || !event.delta) throw new Error('Unknown content block');
+        if (['thinking_delta', 'signature_delta'].includes(event.delta.type)) sawThinking = true;
+        if (event.delta.type === 'input_json_delta' && block.type === 'tool_use' && typeof event.delta.partial_json === 'string') {
+          block.hasJson = true;
+          block.json += event.delta.partial_json;
+        } else if (!((event.delta.type === 'text_delta' && block.type === 'text' && typeof event.delta.text === 'string') ||
+            (event.delta.type === 'thinking_delta' && block.type === 'thinking' && typeof event.delta.thinking === 'string') ||
+            (event.delta.type === 'signature_delta' && block.type === 'thinking' && typeof event.delta.signature === 'string')))
+          throw new Error('Invalid content delta');
+        if (event.delta.type === 'text_delta' && event.delta.text.trim().length > 0) { usable = true; publishable = true; }
+      }
+      if (event.type === 'content_block_stop') {
+        const block = blocks.get(event.index);
+        if (!block) throw new Error('Unknown content block');
+        if (block.type === 'tool_use' && !block.hasJson) publishable = true;
+        if (block.hasJson && block.json.trim()) {
+          const input = JSON.parse(block.json);
+          if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Invalid tool input');
+          if (block.type === 'tool_use') publishable = true;
+        }
+        blocks.delete(event.index);
+      }
+      if (event.type === 'message_delta') {
+        if (blocks.size || !STOP_REASONS.has(event.delta?.stop_reason)) throw new Error('Incomplete message');
+        delta = true;
+        stopReason = event.delta.stop_reason;
+      }
+      if (event.type === 'message_stop') {
+        if (!started || !delta || blocks.size) throw new Error('Missing start or delta');
+        stopped = true;
+      }
+      return model === clientModel || event.type !== 'message_start' ? frame + '\n\n' :
+        frame.split(/\r?\n/).filter(line => !line.startsWith('data:')).concat(`data: ${JSON.stringify(event)}`).join('\n') + '\n\n';
+    },
+    finish() {
+      if (!started || !stopped) throw new Error('Truncated stream');
+      if (!usable && !CONTROL_STOPS.has(stopReason)) throw new Error('Empty message response');
+      if (rejectThinking && sawThinking) throw new Error('Thinking response in ordinary mode');
+    },
+  };
+}
+
+async function bufferedResponse(upstream, model, clientModel, stream, signal, onProgress, strictMeta = false, onFrame = null, rejectThinking = false) {
   if (!upstream.ok) throw new Error('External request failed');
   if (!upstream.body) throw new Error('Empty message response');
   const sse = (upstream.headers.get('content-type') || '').includes('text/event-stream');
@@ -229,10 +317,38 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal, on
   if (stream !== true && sse) throw new Error('Unexpected SSE response');
   const reader = upstream.body.getReader();
   const chunks = [];
-  let size = 0, eventPending = '';
+  const output = [];
+  let size = 0, eventPending = '', forwarded = false;
   const eventDecoder = new TextDecoder();
+  const validator = sse ? streamValidator(model, clientModel, strictMeta, rejectThinking) : null;
   const cancel = () => { reader.cancel().catch(() => {}); };
   signal.addEventListener('abort', cancel, { once: true });
+  // A frame is forwarded as soon as it validates, so the client sees tokens while the
+  // provider is still generating. An invalid frame after that point can no longer fall
+  // back, so it is reported with `streamed` for the caller to close the response.
+  const pending = [];
+  let committed = false;
+  const forward = text => {
+    if (!onFrame || !text) return;
+    try {
+      onFrame(text);
+      forwarded = true;
+    } catch { /* client went away; the close handler aborts */ }
+  };
+  const emit = text => {
+    if (!onFrame || !text) return;
+    if (committed) { forward(text); return; }
+    pending.push(text);
+    if (!validator.publishable) return;
+    committed = true;
+    for (const item of pending.splice(0)) forward(item);
+  };
+  const guarded = operation => {
+    try { return operation(); } catch (error) {
+      if (forwarded) Object.assign(error, { streamed: true });
+      throw error;
+    }
+  };
   try {
     while (true) {
       signal.throwIfAborted();
@@ -249,11 +365,12 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal, on
         while ((boundary = /\r?\n\r?\n/.exec(eventPending))) {
           const frame = eventPending.slice(0, boundary.index);
           eventPending = eventPending.slice(boundary.index + boundary[0].length);
-          const data = frame.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trim()).join('\n');
-          if (data && data !== '[DONE]' && JSON.parse(data).type === 'message_stop') terminal = true;
+          const text = guarded(() => validator.validate(frame));
+          if (onFrame) emit(text); else if (text) output.push(text);
+          // Keep draining buffered frames after the stop so a trailing protocol error is
+          // still caught, then stop reading; the provider may leave the stream open.
+          if (validator.stopped) terminal = true;
         }
-        // Messages completion is sufficient even if the provider leaves the HTTP stream open.
-        // Validate every frame already received before publishing any part of the response.
         if (terminal) break;
       }
     }
@@ -262,82 +379,23 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal, on
     await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
-  const text = (chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)).toString('utf8');
-  if (!text.trim()) throw new Error('Empty message response');
   if (!sse) {
+    const text = (chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)).toString('utf8');
+    if (!text.trim()) throw new Error('Empty message response');
     const response = JSON.parse(text);
     if (response.type !== 'message' || response.model !== model || !Array.isArray(response.content) ||
         !response.content.every(validContentBlock) || !STOP_REASONS.has(response.stop_reason) ||
         (strictMeta && !validMessageMeta(response))) throw new Error('Invalid message response');
     if (!response.content.some(usableContent) && !CONTROL_STOPS.has(response.stop_reason)) throw new Error('Empty message response');
     response.model = clientModel;
-    return { contentType: 'application/json', text: JSON.stringify(response) };
+    return { contentType: 'application/json', text: JSON.stringify(response), streamed: false };
   }
-  let started = false, delta = false, stopped = false;
-  let usable = false, stopReason;
-  const blocks = new Map();
-  const indices = new Set();
-  const frames = text.split(/\r?\n\r?\n/);
-  const tail = frames.pop();
+  const tail = eventPending;
   if (tail.trim() && tail.trim() !== 'data: [DONE]' && tail.trim() !== 'data:[DONE]')
-    throw new Error('Trailing incomplete event');
-  const output = [];
-  for (const frame of frames) {
-    const data = frame.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trim()).join('\n');
-    if (!data) { output.push(frame + '\n\n'); continue; }
-    if (data === '[DONE]') { if (!stopped) throw new Error('Premature stream terminator'); continue; }
-    const event = JSON.parse(data);
-    const named = frame.split(/\r?\n/).find(line => line.startsWith('event:'))?.slice(6).trim();
-    if (named !== undefined && named !== event.type) throw new Error('Unexpected stream event');
-    if (!['message_start', 'content_block_start', 'content_block_delta', 'content_block_stop', 'message_delta', 'message_stop', 'ping'].includes(event.type)) throw new Error('Unexpected stream event');
-    if (stopped) { if (event.type === 'ping') continue; throw new Error('Event after message stop'); }
-    if (event.type === 'message_start') {
-      if (started || event.message?.model !== model) throw new Error('Wrong response model');
-      if (strictMeta && !validMessageMeta(event.message)) throw new Error('Invalid stream metadata');
-      started = true;
-      event.message.model = clientModel;
-    } else if (event.type !== 'ping' && !started) throw new Error('Missing start');
-    if (event.type === 'content_block_start') {
-      if (!Number.isInteger(event.index) || event.index < 0 || indices.has(event.index) || delta ||
-          !validContentBlock(event.content_block)) throw new Error('Invalid content block');
-      indices.add(event.index);
-      usable ||= usableContent(event.content_block);
-      blocks.set(event.index, { type: event.content_block.type, json: '', hasJson: false });
-    }
-    if (event.type === 'content_block_delta') {
-      const block = blocks.get(event.index);
-      if (!block || !event.delta) throw new Error('Unknown content block');
-      if (event.delta.type === 'input_json_delta' && block.type === 'tool_use' && typeof event.delta.partial_json === 'string') {
-        block.hasJson = true;
-        block.json += event.delta.partial_json;
-      } else if (!((event.delta.type === 'text_delta' && block.type === 'text' && typeof event.delta.text === 'string') ||
-          (event.delta.type === 'thinking_delta' && block.type === 'thinking' && typeof event.delta.thinking === 'string') ||
-          (event.delta.type === 'signature_delta' && block.type === 'thinking' && typeof event.delta.signature === 'string')))
-        throw new Error('Invalid content delta');
-      if (event.delta.type === 'text_delta') usable ||= event.delta.text.trim().length > 0;
-    }
-    if (event.type === 'content_block_stop') {
-      const block = blocks.get(event.index);
-      if (!block) throw new Error('Unknown content block');
-      if (block.hasJson && block.json.trim()) {
-        const input = JSON.parse(block.json);
-        if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Invalid tool input');
-      }
-      blocks.delete(event.index);
-    }
-    if (event.type === 'message_delta') {
-      if (blocks.size || !STOP_REASONS.has(event.delta?.stop_reason)) throw new Error('Incomplete message');
-      delta = true;
-      stopReason = event.delta.stop_reason;
-    }
-    if (event.type === 'message_stop') { if (!started || !delta || blocks.size) throw new Error('Missing start or delta'); stopped = true; }
-
-    output.push(model === clientModel || event.type !== 'message_start' ? frame + '\n\n' :
-      frame.split(/\r?\n/).filter(line => !line.startsWith('data:')).concat(`data: ${JSON.stringify(event)}`).join('\n') + '\n\n');
-  }
-  if (!started || !stopped) throw new Error('Truncated stream');
-  if (!usable && !CONTROL_STOPS.has(stopReason)) throw new Error('Empty message response');
-  return { contentType: 'text/event-stream', text: output.join('') };
+    throw guarded(() => { throw new Error('Trailing incomplete event'); });
+  guarded(() => validator.finish());
+  if (onFrame) return { contentType: 'text/event-stream', text: '', streamed: forwarded };
+  return { contentType: 'text/event-stream', text: output.join(''), streamed: false };
 }
 
 function jsonMessageStream(text) {
@@ -430,7 +488,8 @@ export async function checkConnection({ provider, key, openrouterModel, fetchImp
 export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrouter', openrouterModel, localUrl,
   localModel, localKey, localAllowRemote = false, localHttpUrl, localOnly = false, localCompat = false, openrouterCompat = false, fallbackModel = 'claude-sonnet-5-5', retryDelayMs = 1000,
   cooldownMs = 30000, attemptTimeoutMs = localOnly || openrouterCompat ? 120000 : 30000, planHeaderMs = 120000, planIdleMs = 300000, attemptCeilingMs = 300000, now = Date.now,
-  metricsPath = process.env.ROUTE_METRICS_PATH }) {
+  metricsPath = process.env.ROUTE_METRICS_PATH,
+  streamPassthrough = process.env.ROUTE_STREAM_PASSTHROUGH === '1' }) {
   if (typeof localOnly !== 'boolean' || (localOnly && provider !== 'local')) throw new Error('Local-only mode requires local provider');
   if (typeof localCompat !== 'boolean' || (localCompat && (!localOnly || provider !== 'local')))
     throw new Error('Local compatibility requires Local-only mode');
@@ -671,6 +730,13 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         // Serialize once: the retry loop reuses the same payload, and a large history would
         // otherwise be stringified up to four times.
         const externalPayload = JSON.stringify(externalBody);
+        let routeLogged = false;
+        const logReplacement = () => {
+          if (routeLogged) return;
+          routeLogged = true;
+          console.error(JSON.stringify({ event: 'route_selected', provider, reason: 'replacement', model: externalModel }));
+          noteRoute('external', 'replacement');
+        };
         const headers = { 'content-type': 'application/json', 'anthropic-version': req.headers['anthropic-version'] || '2023-06-01' };
         if (compatProfile && req.headers['anthropic-beta']) headers['anthropic-beta'] = req.headers['anthropic-beta'];
         const credential = provider === 'local' ? localKey : key;
@@ -702,7 +768,21 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
                 await response.body?.cancel();
                 throw new Error('External request failed');
               }
-              const validated = await bufferedResponse(response, externalModel, model, noPlan ? false : body.stream, controller.signal, noPlan ? undefined : arm, provider === 'openrouter');
+              // Ordinary-mode streams are forwarded frame by frame; anything that needs a
+              // whole body (compat/local modes, non-stream clients) keeps the buffered path.
+              let streamStarted = false;
+              const onFrame = text => {
+                if (!streamStarted) {
+                  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store' });
+                  streamStarted = true;
+                  logReplacement();
+                }
+                res.write(text);
+              };
+              const streaming = streamPassthrough && !noPlan && body.stream === true;
+              const validated = await bufferedResponse(response, externalModel, model, noPlan ? false : body.stream,
+                controller.signal, noPlan ? undefined : arm, provider === 'openrouter',
+                streaming ? onFrame : null, !compatProfile && !localOnly);
               if (compatProfile) {
                 const content = JSON.parse(validated.text).content;
                 if (content.some(block => Object.keys(block).some(name =>
@@ -733,7 +813,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
                 }
               }
               // shortcut: textual match can false-positive on a tool_use input object containing this literal; refine if seen.
-              if (!compatProfile && !localOnly && /"type"\s*:\s*"(?:redacted_thinking|thinking|thinking_delta|signature_delta)"/.test(validated.text))
+              if (!validated.streamed && !compatProfile && !localOnly && /"type"\s*:\s*"(?:redacted_thinking|thinking|thinking_delta|signature_delta)"/.test(validated.text))
                 throw new Error('Thinking response in ordinary mode');
               return noPlan && body.stream === true ? jsonMessageStream(validated.text) : validated;
             })();
@@ -744,13 +824,24 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               if (openUntil) console.error(JSON.stringify({ event: 'circuit_recovered', provider }));
               openUntil = 0;
             }
-            console.error(JSON.stringify({ event: 'route_selected', provider, reason: 'replacement', model: externalModel }));
-            noteRoute('external', 'replacement');
+            logReplacement();
+            if (response.streamed) { res.end(); return; }
             res.writeHead(200, { 'content-type': response.contentType, 'cache-control': 'no-store' });
             res.end(response.text);
             return;
           } catch (error) {
             client.signal.throwIfAborted();
+            if (error?.streamed) {
+              // Headers are already on the wire, so retrying or falling back would corrupt
+              // the response; report the failure inside the stream and stop here.
+              console.error(JSON.stringify({ event: 'stream_broken', provider, category: 'upstream' }));
+              try {
+                res.write(`event: error\ndata: ${JSON.stringify({ type: 'error',
+                  error: { type: 'api_error', message: 'upstream stream failed' } })}\n\n`);
+              } catch {}
+              res.end();
+              return;
+            }
             const validation = { 'Wrong response model': 'wrong_model', 'Invalid content block': 'invalid_content_block',
               'Incomplete message': 'incomplete_message', 'Invalid response': 'expected_sse', 'Unexpected SSE response': 'unexpected_sse',
               'Invalid content delta': 'invalid_delta', 'Truncated stream': 'truncated_stream',

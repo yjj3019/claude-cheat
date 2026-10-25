@@ -310,6 +310,9 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
         # Keep routing decisions for later diagnosis; -Debug only shows them live in the terminal.
         proxy_env["ROUTE_LOG_PATH"] = str(ROOT / ".route.log")
         proxy_env["ROUTE_METRICS_PATH"] = str(ROOT / ".proxy-metrics.json")
+        # Opt-in frame passthrough (OpenClaude.ps1 -Stream); the proxy reads it at startup.
+        if os.environ.get("ROUTE_STREAM_PASSTHROUGH"):
+            proxy_env["ROUTE_STREAM_PASSTHROUGH"] = os.environ["ROUTE_STREAM_PASSTHROUGH"]
     proxy_env.pop("LOCAL_ROUTE_COMPAT", None)
     proxy_env.pop("OPENROUTER_ROUTE_COMPAT", None)
     if local_compat:
