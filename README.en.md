@@ -366,7 +366,7 @@ The security model, trust boundaries, CSRF/DNS-rebinding handling and residual r
 OpenClaude -Takeover        # run in a second terminal
 ```
 
-The new launcher reads the live port and token from `.session-handoff.json`, asks the running proxy to drain (`POST /api/handover`, session token required), waits up to 15 s for in-flight turns, and only then rebinds the same port with the same token. The CLI keeps its base URL and simply reconnects; new requests during the drain get 503.
+The new launcher reads the live port and token from `.session-handoff.json`, asks the running proxy to drain (`POST /api/handover`, session token required), answers new requests with 503 + `Retry-After: 1`, waits for in-flight turns (default cap **120 s**, `ROUTE_HANDOVER_TIMEOUT_MS`; the reply reports `forced: true` when the cap is hit), and only then rebinds the same port with the same token. The CLI keeps its base URL and simply reconnects; new requests during the drain get 503.
 
 ## Validation and limitations
 
@@ -415,6 +415,7 @@ Reference numbers (this development machine, Node 24, client and proxy in one pr
 | Retry cost | 1MB + one retry 10.7ms vs 12.8ms before, four failures 9.8ms vs 12.1ms (~17–19% better) |
 | Circuit | 4 failures → Plan fallback, Plan during cooldown, external again after recovery |
 | Long soak | 150,000 requests at 266MB; **1.2M requests reached 1.09GB RSS** (V8 heap expansion — a 256MB cap run passes, so it is collectable) |
+| Session-cache restart | Cold scan **1,119ms → 20ms** on real data (357 files, 464MB): per-file aggregates live in `.usage-cache.json` (80KB) and are validated by size/offset |
 | Heap cap | The launcher starts the proxy with `--max-old-space-size=512`; a 1.2M-request re-measure peaks at **510MB with a 239MB drift** (1.09GB without the cap) |
 
 Long runs use `--soak`, which also samples resident memory and window throughput.

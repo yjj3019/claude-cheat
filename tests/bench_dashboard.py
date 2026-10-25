@@ -95,6 +95,10 @@ def main():
         dash._SESSIONS.clear()
         timed("scan_sessions (first)", lambda: dash.scan_sessions(projects=projects, pricing=None),
               rounds=2)
+        # A dashboard restart now reloads the per-file aggregates instead of re-reading.
+        dash._SESSIONS.clear()
+        dash._USAGE_CACHE["key"] = None
+        timed("scan_sessions (warm cache, restart)", lambda: dash.scan_sessions(projects=projects, pricing=None))
         timed("scan_sessions (incremental)", lambda: dash.scan_sessions(projects=projects, pricing=None))
         newest = sorted(projects.rglob("*.jsonl"))[0]
         with newest.open("a", encoding="utf-8") as handle:

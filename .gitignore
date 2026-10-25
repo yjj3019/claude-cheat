@@ -17,3 +17,5 @@ SESSION_LOG.md
 *.log.*
 .session-handoff.json
 .session-handoff.json.tmp
+.usage-cache.json
+.usage-cache.json.tmp

@@ -529,6 +529,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   cooldownMs = 30000, attemptTimeoutMs = localOnly || openrouterCompat ? 120000 : 30000, planHeaderMs = 120000, planIdleMs = 300000, attemptCeilingMs = 300000, now = Date.now,
   metricsPath = process.env.ROUTE_METRICS_PATH,
   streamPassthrough = process.env.ROUTE_STREAM_PASSTHROUGH === '1',
+  handoverTimeoutMs = Number(process.env.ROUTE_HANDOVER_TIMEOUT_MS) || 120000,
   onHandover = null }) {
   if (typeof localOnly !== 'boolean' || (localOnly && provider !== 'local')) throw new Error('Local-only mode requires local provider');
   if (typeof localCompat !== 'boolean' || (localCompat && (!localOnly || provider !== 'local')))
@@ -606,19 +607,26 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message } }));
     };
     if (!tokenMatches(req.headers['x-local-route-token'])) return reject(403, 'Local authorization required');
-    if (handover) return reject(503, 'Proxy is handing over');
+    if (handover) {
+      // Tell the client to retry shortly: the replacement proxy is binding the same port.
+      res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '1', 'cache-control': 'no-store' });
+      return res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'Proxy is handing over' } }));
+    }
     if (req.method === 'HEAD' && req.url === '/api/hello') { res.writeHead(200); res.end(); return; }
     if (req.method === 'POST' && req.url === '/api/handover') {
       // Stop accepting, let in-flight turns finish, then exit so a fresh proxy can bind the
       // same port. The client keeps its port and only sees a brief reconnect.
       handover = true;
       // Drain before closing: server.close() on Windows tears down sockets that are still
-      // streaming, which would truncate a reply the client is reading right now.
-      const deadline = Date.now() + 15000;
+      // streaming, which would truncate a reply the client is reading right now. A long turn
+      // is worth waiting for (the new proxy binds right after), so the cap is generous.
+      const started = Date.now();
+      const deadline = started + handoverTimeoutMs;
       while (inflight > 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
+      const forced = inflight > 0;
       server.close();
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-      res.end(JSON.stringify({ drained: true, inflight }));
+      res.end(JSON.stringify({ drained: !forced, inflight, waitedMs: Date.now() - started, forced }));
       // Tests inject a callback: exiting would kill the runner.
       if (typeof onHandover === 'function') onHandover();
       else setTimeout(() => process.exit(0), 100);

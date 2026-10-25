@@ -226,7 +226,9 @@ def _local_hour(stamp):
         return None
     if then.tzinfo is None:
         then = then.replace(tzinfo=timezone.utc)
-    return then.astimezone().strftime("%Y-%m-%dT%H")
+    local = then.astimezone()
+    # Formatting by hand avoids strftime, which dominated the cold transcript scan.
+    return f"{local.year:04d}-{local.month:02d}-{local.day:02d}T{local.hour:02d}"
 
 
 def route_transitions(events, limit=12):
@@ -364,6 +366,73 @@ def _new_session_state():
             "models": {}, "hours": {}}
 
 
+USAGE_CACHE_FILE = ROOT / ".usage-cache.json"
+USAGE_CACHE_VERSION = 2
+_USAGE_CACHE_META = {"saved_at": 0.0}
+_USAGE_DIRTY = {"flag": False, "at": 0.0}
+
+
+def _load_usage_states():
+    """Per-file aggregates from the last run, so a restart does not re-read every transcript."""
+    try:
+        data = json.loads(USAGE_CACHE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict) or data.get("version") != USAGE_CACHE_VERSION:
+        return {}
+    files = data.get("files")
+    return files if isinstance(files, dict) else {}
+
+
+def _state_from_cache(entry):
+    """Accept a cached state only when every field has the shape the scanner expects."""
+    if not isinstance(entry, dict):
+        return None
+    if not isinstance(entry.get("offset"), int) or entry["offset"] < 0:
+        return None
+    for name in ("turns", "external", "plan"):
+        if not isinstance(entry.get(name), int) or entry[name] < 0:
+            return None
+    tokens = entry.get("tokens")
+    if not isinstance(tokens, dict):
+        return None
+    for source in ("external", "plan"):
+        values = tokens.get(source)
+        if not isinstance(values, list) or len(values) != 4 or any(
+                not isinstance(value, int) or value < 0 for value in values):
+            return None
+    if not isinstance(entry.get("models", {}), dict) or not isinstance(entry.get("hours", {}), dict):
+        return None
+    return {"offset": entry["offset"], "turns": entry["turns"], "external": entry["external"],
+            "plan": entry["plan"], "last_ts": entry.get("last_ts"),
+            "tokens": {source: list(tokens[source]) for source in ("external", "plan")},
+            "models": dict(entry.get("models") or {}),
+            "hours": {hour: bucket for hour, bucket in (entry.get("hours") or {}).items()
+                      if isinstance(hour, str) and isinstance(bucket, dict)}}
+
+
+def _save_usage_states(states, now=None):
+    """Write the aggregates atomically; a failed save only costs a rescan next time."""
+    now = now or datetime.now()
+    horizon = (now - timedelta(days=SCAN_DAYS + 2)).strftime("%Y-%m-%dT%H")
+    files = {}
+    for key, state in list(states.items()):
+        hours = {hour: bucket for hour, bucket in state["hours"].items() if hour >= horizon}
+        files[key] = {"offset": state["offset"], "turns": state["turns"],
+                      "external": state["external"], "plan": state["plan"],
+                      "last_ts": state["last_ts"], "tokens": state["tokens"],
+                      "models": state["models"], "hours": hours}
+    payload = {"version": USAGE_CACHE_VERSION,
+               "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "files": files}
+    try:
+        temporary = USAGE_CACHE_FILE.with_suffix(USAGE_CACHE_FILE.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(temporary, USAGE_CACHE_FILE)
+        _USAGE_CACHE_META["saved_at"] = time.monotonic()
+    except OSError:
+        pass
+
+
 def _read_appended(path, state):
     """Return complete new JSONL lines as bytes, keeping a partial trailing line for later."""
     stat = path.stat()
@@ -456,15 +525,24 @@ def scan_sessions(projects=None, max_files=SCAN_FILES, now=None, pricing=None):
         candidates = candidates[:max_files]
 
     with _LOCK:
+        cached_states = _load_usage_states() if len(_SESSIONS) <= len(candidates) else {}
+        cached_hit = False
+        changed = False
         seen = set()
         for _mtime, path in candidates:
             key = str(path)
             seen.add(key)
-            state = _SESSIONS.setdefault(key, _new_session_state())
+            state = _SESSIONS.get(key)
+            if state is None:
+                state = _state_from_cache(cached_states.get(key)) or _new_session_state()
+                _SESSIONS[key] = state
+                cached_hit = True
             try:
                 lines, next_offset = _read_appended(path, state)
             except OSError:
                 continue
+            if lines:
+                changed = True
             # Parse the whole chunk first: applying a line and only then failing would
             # re-read (and double count) every line applied before the failure.
             parsed = []
@@ -506,6 +584,10 @@ def scan_sessions(projects=None, max_files=SCAN_FILES, now=None, pricing=None):
                         for index in range(4):
                             bucket[source]["tokens"][index] += delta[index]
             state["offset"] = next_offset
+        if changed or (cached_hit and time.monotonic() - _USAGE_CACHE_META["saved_at"] > 300):
+            # Throttled: the scan runs every few seconds, the cache only needs to survive a restart.
+            if time.monotonic() - _USAGE_CACHE_META["saved_at"] > 5:
+                _save_usage_states(_SESSIONS, now)
         for key in list(_SESSIONS):
             if key not in seen:
                 del _SESSIONS[key]

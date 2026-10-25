@@ -25,6 +25,48 @@ function sse(frames, { delayMs = 0 } = {}) {
   }), { headers: { 'content-type': 'text/event-stream' } });
 }
 
+test('a stalled turn is cut at the configured cap and reported as forced', async () => {
+  // A valid but endless stream: frames keep flowing so the turn never finishes.
+  const encoder = new TextEncoder();
+  let timer = null;
+  const stalled = new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(frame('message_start', { message: META })));
+      controller.enqueue(encoder.encode(frame('content_block_start', { index: 0,
+        content_block: { type: 'text', text: '' } })));
+      timer = setInterval(() => {
+        try {
+          controller.enqueue(encoder.encode(frame('content_block_delta', { index: 0,
+            delta: { type: 'text_delta', text: 'tick' } })));
+        } catch { clearInterval(timer); }
+      }, 150);
+    },
+    cancel() { clearInterval(timer); },
+  }), { headers: { 'content-type': 'text/event-stream' } });
+  const server = createProxy({ key: 'sk-or-handover', nonce: NONCE, openrouterModel: MODEL,
+    streamPassthrough: true, handoverTimeoutMs: 300, fetchImpl: async () => stalled,
+    onHandover: () => {} });
+  await listenSafe(server);
+  const port = server.address().port;
+  const headers = { 'content-type': 'application/json', 'x-local-route-token': NONCE,
+    authorization: 'Bearer sk-ant-oat-handover', 'anthropic-beta': 'interleaved-thinking-2025-05-14' };
+  const body = JSON.stringify({ model: 'claude-sonnet-5-5', max_tokens: 1024, stream: true,
+    messages: [{ role: 'user', content: 'stall' }] });
+  const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers, body });
+  assert.equal(response.status, 200);
+  const reader = response.body.getReader();
+  await reader.read();
+  const started = Date.now();
+  const handover = await fetch(`http://127.0.0.1:${port}/api/handover`, { method: 'POST',
+    headers: { 'x-local-route-token': NONCE } });
+  const report = await handover.json();
+  assert.equal(report.forced, true, 'the cap must be reported');
+  assert.equal(report.drained, false);
+  assert.ok(Date.now() - started >= 250, 'it waited for the cap, not forever');
+  clearInterval(timer);
+  await reader.cancel().catch(() => {});
+  server.closeAllConnections();
+});
 test('a stream in flight finishes while the listener drains and stops accepting', async () => {
   let handedOver = false;
   const slowStream = [

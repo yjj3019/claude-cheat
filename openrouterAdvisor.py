@@ -545,14 +545,17 @@ def takeover(provider: str = "openrouter", debug: bool = False) -> int:
     if not port_open(port):
         raise RuntimeError(f"Nothing is listening on the recorded port {port}; start a normal session")
     try:
-        request_handover(port, nonce)
+        report = request_handover(port, nonce)
     except (OSError, ValueError) as error:
         raise RuntimeError(f"The running proxy refused the handover: {error}") from None
     if not wait_for_port_release(port):
         raise RuntimeError("The previous proxy did not release its port")
     log_route_marker(f"takeover port={port} provider={provider}")
     with routed_session(provider, port=port, nonce=nonce, debug=debug):
-        print(json.dumps({"takeover": True, "port": port, "provider": provider}), flush=True)
+        print(json.dumps({"takeover": True, "port": port, "provider": provider,
+                          "drained": bool(report.get("drained")),
+                          "waited_ms": report.get("waitedMs"),
+                          "forced": bool(report.get("forced"))}), flush=True)
         try:
             while True:
                 time.sleep(1)

@@ -85,6 +85,71 @@ class AuditRegressionTests(unittest.TestCase):
         self.assertEqual(first["totals"]["external"][0], 10)
         self.assertEqual(second["totals"]["external"][0], 10, "a rescan must not double count")
 
+    # --- usage cache ----------------------------------------------------------
+    def transcript(self, name, records):
+        projects = self.root / "projects" / "p"
+        projects.mkdir(parents=True, exist_ok=True)
+        path = projects / name
+        path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+        return self.root / "projects"
+
+    def test_usage_cache_avoids_rereading_unchanged_transcripts(self):
+        def record(tokens):
+            return {"type": "assistant", "timestamp": "2026-10-25T01:00:00+00:00",
+                    "message": {"model": "vendor/model", "usage": {"input_tokens": tokens, "output_tokens": 1}}}
+        projects = self.transcript("s1.jsonl", [record(5), record(7)])
+        cache = self.root / ".usage-cache.json"
+        with mock.patch.object(dash, "USAGE_CACHE_FILE", cache), \
+             mock.patch.dict(dash._USAGE_CACHE_META, {"saved_at": 0.0}, clear=True):
+            first = dash.scan_sessions(projects=projects, now=datetime.now())
+            self.assertTrue(cache.is_file(), "the scan must persist its aggregates")
+            dash._SESSIONS.clear()
+            dash._USAGE_CACHE["key"] = None
+            sizes = {}
+            real_read = dash._read_appended
+
+            def spy(path, state):
+                sizes[path.name] = (state["offset"], path.stat().st_size)
+                return real_read(path, state)
+
+            with mock.patch.object(dash, "_read_appended", side_effect=spy):
+                second = dash.scan_sessions(projects=projects, now=datetime.now())
+        self.assertEqual(first["totals"], second["totals"])
+        self.assertEqual(second["totals"]["external"][0], 12)
+        self.assertEqual(sizes["s1.jsonl"][0], sizes["s1.jsonl"][1],
+                         "the cached offset must already be at the end of the file")
+
+    def test_usage_cache_reads_only_the_new_tail(self):
+        def record(tokens):
+            return {"type": "assistant", "timestamp": "2026-10-25T01:00:00+00:00",
+                    "message": {"model": "vendor/model", "usage": {"input_tokens": tokens, "output_tokens": 1}}}
+        projects = self.transcript("s1.jsonl", [record(5)])
+        cache = self.root / ".usage-cache.json"
+        with mock.patch.object(dash, "USAGE_CACHE_FILE", cache):
+            dash.scan_sessions(projects=projects, now=datetime.now())
+            path = projects / "p" / "s1.jsonl"
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record(3)) + "\n")
+            dash._SESSIONS.clear()
+            dash._USAGE_CACHE["key"] = None
+            usage = dash.scan_sessions(projects=projects, now=datetime.now())
+        self.assertEqual(usage["totals"]["external"][0], 8, "the appended record must be counted once")
+
+    def test_a_corrupt_or_old_usage_cache_falls_back_to_a_full_scan(self):
+        def record(tokens):
+            return {"type": "assistant", "timestamp": "2026-10-25T01:00:00+00:00",
+                    "message": {"model": "vendor/model", "usage": {"input_tokens": tokens, "output_tokens": 1}}}
+        projects = self.transcript("s1.jsonl", [record(4)])
+        cache = self.root / ".usage-cache.json"
+        with mock.patch.object(dash, "USAGE_CACHE_FILE", cache):
+            for content in ("not json", json.dumps({"version": 1, "files": {}}),
+                            json.dumps({"version": dash.USAGE_CACHE_VERSION, "files": {"x": {"offset": -1}}})):
+                cache.write_text(content, encoding="utf-8")
+                dash._SESSIONS.clear()
+                dash._USAGE_CACHE["key"] = None
+                usage = dash.scan_sessions(projects=projects, now=datetime.now())
+                self.assertEqual(usage["totals"]["external"][0], 4, content[:20])
+
     # --- route log concurrency -----------------------------------------------
     def test_concurrent_reads_do_not_double_count(self):
         log = self.root / ".route.log"
