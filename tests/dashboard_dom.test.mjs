@@ -9,9 +9,11 @@ const SOURCE = readFileSync(new URL('../routeDashboard.py', import.meta.url), 'u
 
 function scriptBundle() {
   const grab = name => {
-    const match = new RegExp(`^${name} = (".*")$`, 'm').exec(SOURCE);
-    assert.ok(match, `${name} not found in routeDashboard.py`);
-    return JSON.parse(match[1]);
+    // A shared bundle may be assembled from a base assignment plus later `+=` appends
+    // (cost provenance labels are appended), so collect every assignment in order.
+    const matches = [...SOURCE.matchAll(new RegExp(`^${name}\\s*(?:\\+=|=)\\s*(".*")$`, 'gm'))];
+    assert.ok(matches.length, `${name} not found in routeDashboard.py`);
+    return matches.map(match => JSON.parse(match[1])).join('\n');
   };
   return grab('JS_SHARED') + grab('JS_DASHBOARD');
 }
