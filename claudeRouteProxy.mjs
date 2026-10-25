@@ -1,8 +1,62 @@
 import http from 'node:http';
 import { once } from 'node:events';
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { appendFileSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+
+// Diagnostics leave the process through one redaction pass: an upstream error body echoed
+// into a log line or an error response must never carry a credential. The tags stay stable
+// and greppable; model names, status codes and trace ids never match any rule.
+const REDACTED_BEARER = '[redacted:bearer-token]';
+const REDACTED_API_KEY = '[redacted:api-key]';
+const REDACTED_PROVIDER_KEY = '[redacted:provider-key]';
+// A provider error body is relayed only up to this many bytes after scrubbing.
+const MAX_ERROR_BODY = 64 * 1024;
+export function redactDiagnostic(text, secrets = []) {
+  if (typeof text !== 'string' || !text) return text;
+  let output = text;
+  // The configured credential is the most specific secret: replace it verbatim first so a
+  // provider key can never be split by the generic patterns.
+  for (const secret of secrets) {
+    if (typeof secret === 'string' && secret.length >= 4 && output.includes(secret))
+      output = output.split(secret).join(REDACTED_PROVIDER_KEY);
+  }
+  output = output.replace(/Bearer[ \t]+(?!\[redacted:)[^\s"',}\]]+/gi, `Bearer ${REDACTED_BEARER}`);
+  output = output.replace(/\bsk-(?:ant-|or-)?[A-Za-z0-9._-]{4,}/g, REDACTED_API_KEY);
+  output = output.replace(/("x-api-key"\s*:\s*")(?!\[redacted:)[^"]*(")/gi, `$1${REDACTED_API_KEY}$2`);
+  output = output.replace(/(x-api-key\s*[:=]\s*)(?!\[redacted:)[^\s"',}]+/gi, `$1${REDACTED_API_KEY}`);
+  return output;
+}
+// The one logging sink: every structured line of this proxy goes through it.
+function emitDiagnostic(text, secrets = []) {
+  console.error(redactDiagnostic(text, secrets));
+}
+// Reads at most `limit` bytes from a web stream and cancels the rest, so an oversized
+// provider error body is never fully buffered. One extra byte is read to detect truncation.
+async function readBoundedBody(body, limit) {
+  const reader = body.getReader();
+  const chunks = [];
+  let total = 0, truncated = false;
+  try {
+    while (total <= limit) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const allowed = limit + 1 - total;
+      if (value.byteLength >= allowed) {
+        if (allowed > 0) chunks.push(value.subarray(0, allowed));
+        total += Math.max(0, allowed);
+        truncated = true;
+        break;
+      }
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+  return { text: Buffer.concat(chunks).subarray(0, limit).toString('utf8'), truncated };
+}
 
 // Diagnostic mirror: routing events also land in a file so a session can be explained afterwards.
 // The launcher sets ROUTE_LOG_PATH for OpenRouter sessions; without it nothing is written.
@@ -604,6 +658,10 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     if (status >= 200 && status < 300) return 'transient';
     return 'request';
   };
+  // Diagnostics are redacted once, at the sink: the configured credentials are the most
+  // specific secrets and the generic rules catch any provider text that echoed a token.
+  const secrets = [key, localKey].filter(secret => typeof secret === 'string' && secret.length >= 4);
+  const diagnostics = text => emitDiagnostic(text, secrets);
   // Counters stay in memory and are written to a small file at most once a second, so the
   // dashboard can read routing load without talking to this process.
   const metrics = { startedAt: Date.now(), requests: 0, ok: 0, failed: 0, streams: 0, attempts: 0,
@@ -708,7 +766,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       res.writeHead(status, { 'content-type': 'application/json', ...headers });
       // Keep Anthropic's error vocabulary: a rate limit is not a generic API failure.
       const type = status === 429 ? 'rate_limit_error' : status === 529 ? 'overloaded_error' : 'api_error';
-      res.end(JSON.stringify({ type: 'error', error: { type, message } }));
+      // A message assembled from upstream text passes the same redaction as the logs.
+      res.end(JSON.stringify({ type: 'error', error: { type, message: redactDiagnostic(String(message), secrets) } }));
     };
     if (!tokenMatches(req.headers['x-local-route-token'])) return reject(403, 'Local authorization required');
     if (req.method === 'HEAD' && req.url === '/api/hello') { res.writeHead(200); res.end(); return; }
@@ -772,6 +831,10 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     let failureStatus = null, retryAfterHintMs = null;
     inflight += 1;
     ownsTurn = true;
+    // A short correlation id ties every diagnostic line of this turn together. It is an
+    // additive correlation key, not request data, so logs stay parseable and greppable.
+    const traceId = randomBytes(4).toString('hex');
+    const logEvent = fields => diagnostics(JSON.stringify({ traceId, ...fields }));
     try {
       const chunks = [];
       let size = 0;
@@ -791,7 +854,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           metrics.aborted += 1;
           metrics.failed += 1;
           scheduleMetricsFlush();
-          console.error(JSON.stringify({ event: 'client_body_timeout', provider, idle_ms: requestIdleTimeoutMs }));
+          logEvent({ event: 'client_body_timeout', provider, idle_ms: requestIdleTimeoutMs });
           client.abort('client_body_timeout');
           req.destroy();
         }, requestIdleTimeoutMs);
@@ -856,7 +919,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           metrics.ttfb.push(Number(firstByteMs.toFixed(2)));
           if (metrics.ttfb.length > LATENCY_WINDOW) metrics.ttfb.shift();
         }
-        metrics.last = { ts: new Date().toISOString(), route: routeKind || 'none', reason: routeReason,
+        metrics.last = { ts: new Date().toISOString(), traceId, route: routeKind || 'none', reason: routeReason,
           status: aborted ? 499 : res.statusCode, ms: elapsed,
           // Exposed so a rate-limit answer stays visible to the dashboard (and to the circuit
           // work that will consume it); null means no usable Retry-After was seen.
@@ -898,10 +961,10 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               ` Send a new request to check ${label} recovery.`;
             message = `[${code}] ${description}${retryHint} Plan fallback disabled.`;
           }
-          console.error(JSON.stringify({ event: `${errorPrefix}_mode_rejected`, provider, reason, ...(detail ? { detail } : {}),
+          logEvent({ event: `${errorPrefix}_mode_rejected`, provider, reason, ...(detail ? { detail } : {}),
             ...(code ? { code } : {}), ...(retryAfterSeconds !== undefined ? { retry_after_seconds: retryAfterSeconds } : {}),
             ...(previousErrorCode ? { previous_error_code: previousErrorCode } : {}),
-            ...(betas.length ? { beta_features: betaFeatures, unsupported_beta_count: betas.length } : {}) }));
+            ...(betas.length ? { beta_features: betaFeatures, unsupported_beta_count: betas.length } : {}) });
           return reject(400, message);
         }
         if (!oauthOK) return reject(403, 'Saved subscription OAuth required');
@@ -909,9 +972,9 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         // The model that actually serves a Plan request may differ from the client alias.
         const planModel = model === DEEPSEEK || (configuredAlias && !isPro(model) && !isSonnet(model)) ? fallbackModel : model;
         noteRoute('plan', reason);
-        console.error(JSON.stringify({ event: 'route_selected', provider: 'plan', reason, ...(detail ? { detail } : {}),
+        logEvent({ event: 'route_selected', provider: 'plan', reason, ...(detail ? { detail } : {}),
           model: planModel,
-          ...(betas.length ? { beta_features: betaFeatures, unsupported_beta_count: betas.length } : {}) }));
+          ...(betas.length ? { beta_features: betaFeatures, unsupported_beta_count: betas.length } : {}) });
         const headers = {};
         for (const [name, value] of Object.entries(req.headers))
           if (typeof value === 'string' && !['host', 'content-length', 'accept-encoding', 'connection',
@@ -931,6 +994,26 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         const responseHeaders = {};
         for (const [name, value] of upstream.headers)
           if (!['connection', 'transfer-encoding', 'content-length', 'content-encoding'].includes(name)) responseHeaders[name] = value;
+        // An upstream error body is relayed only after the same redaction pass used for
+        // logs; a successful response stays a stream so latency and framing are unchanged.
+        // This is the one path where provider error text reaches the client verbatim.
+        if (upstream.status >= 400 && upstream.body) {
+          // The body is read with a hard cap: an error page cannot be buffered in full just
+          // to relay a diagnostic excerpt, and the remainder is cancelled.
+          const { text: errorBody, truncated } = await readBoundedBody(upstream.body, MAX_ERROR_BODY);
+          const scrubbed = redactDiagnostic(errorBody, secrets);
+          const redacted = scrubbed !== errorBody;
+          if (truncated || redacted) {
+            logEvent({ event: truncated ? 'upstream_error_truncated' : 'upstream_error_redacted',
+              provider: 'plan', status: upstream.status,
+              ...(truncated ? { truncated: true, bytes: MAX_ERROR_BODY } : {}),
+              // The excerpt goes to the logging sink raw; the sink performs the redaction.
+              ...(redacted ? { excerpt: errorBody.slice(0, 512) } : {}) });
+          }
+          res.writeHead(upstream.status, responseHeaders);
+          res.end(scrubbed);
+          return;
+        }
         res.writeHead(upstream.status, responseHeaders);
         if (upstream.body) {
           const reader = upstream.body.getReader();
@@ -988,7 +1071,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         const logReplacement = () => {
           if (routeLogged) return;
           routeLogged = true;
-          console.error(JSON.stringify({ event: 'route_selected', provider, reason: 'replacement', model: externalModel }));
+          logEvent({ event: 'route_selected', provider, reason: 'replacement', model: externalModel });
           noteRoute('external', 'replacement');
         };
         const headers = { 'content-type': 'application/json', 'anthropic-version': req.headers['anthropic-version'] || '2023-06-01' };
@@ -1080,8 +1163,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
                     (typeof block.provider_specific_fields !== 'object' || Array.isArray(block.provider_specific_fields))))
                   throw new Error('Unsupported Local response fields');
                 if (extraFields.length) {
-                  console.error(JSON.stringify({ event: 'local_response_unsupported_fields', fields: extraFields.slice(0, 8).map(name =>
-                    ['signature', 'thought_signature', 'extra_content', 'provider_specific_fields', 'index'].includes(name) ? name : '[redacted]') }));
+                  logEvent({ event: 'local_response_unsupported_fields', fields: extraFields.slice(0, 8).map(name =>
+                    ['signature', 'thought_signature', 'extra_content', 'provider_specific_fields', 'index'].includes(name) ? name : '[redacted]') });
                   throw new Error('Unsupported Local response fields');
                 }
               }
@@ -1094,7 +1177,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             client.signal.throwIfAborted();
             succeeded = true;
             if (claimedGeneration === generation) {
-              if (openUntil) console.error(JSON.stringify({ event: 'circuit_recovered', provider }));
+              if (openUntil) logEvent({ event: 'circuit_recovered', provider });
               openUntil = 0;
             }
             logReplacement();
@@ -1109,7 +1192,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             if (error?.streamed || res.headersSent) {
               // Headers are already on the wire, so retrying or falling back would corrupt
               // the response; report the failure inside the stream and stop here.
-              console.error(JSON.stringify({ event: 'stream_broken', provider, category: 'upstream' }));
+              logEvent({ event: 'stream_broken', provider, category: 'upstream' });
               try {
                 res.write(`event: error\ndata: ${JSON.stringify({ type: 'error',
                   error: { type: 'api_error', message: 'upstream stream failed' } })}\n\n`);
@@ -1127,11 +1210,11 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               status === 401 || status === 403 ? 'authentication_failed' : status === 402 ? 'payment_required' : validation === 'empty_response' ? 'empty_response' : 'upstream_error';
             if (Number.isInteger(status)) failureStatus = status;
             failureClass = failureClassOf(status, controller.signal.reason === 'attempt_timeout');
-            console.error(JSON.stringify({ event: 'external_attempt_failed', provider, attempt: attempt + 1,
+            logEvent({ event: 'external_attempt_failed', provider, attempt: attempt + 1,
               ...(Number.isInteger(status) ? { status } : {}), ...(validation ? { validation } : {}),
               ...(retryAfterMs ? { retry_after_ms: retryAfterMs } : {}),
               failure: failureClass,
-              category: controller.signal.reason === 'attempt_timeout' ? 'timeout' : 'upstream' }));
+              category: controller.signal.reason === 'attempt_timeout' ? 'timeout' : 'upstream' });
             controller.abort('attempt_failed');
             // This attempt is discarded, so its first byte is not the response's.
             firstByteMs = null;
@@ -1161,8 +1244,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             : cooldownMs;
           openUntil = now() + cooldown;
           metrics.circuitOpens += 1;
-          console.error(JSON.stringify({ event: 'circuit_open', provider, failure: failureClass,
-            ...(failureClass === 'rate_limit' ? { retry_after_ms: retryAfterHintMs, cooldown_ms: cooldown } : {}) }));
+          logEvent({ event: 'circuit_open', provider, failure: failureClass,
+            ...(failureClass === 'rate_limit' ? { retry_after_ms: retryAfterHintMs, cooldown_ms: cooldown } : {}) });
         }
       } finally {
         if (probe) probing = false;
@@ -1170,7 +1253,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       if (!succeeded) await sendPro('fallback', noPlan ? localFailure : undefined);
     } catch {
       if (!client.signal.aborted) {
-        console.error(JSON.stringify({ event: 'route_failed', category: 'upstream' }));
+        logEvent({ event: 'route_failed', category: 'upstream' });
         if (res.headersSent) {
           // Part of the answer is already on the wire: report the failure inside the stream.
           try {
@@ -1230,7 +1313,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     const server = createProxy(config);
     if (process.argv.slice(2).includes('--parent-pipe')) {
       const parentClosed = () => {
-        console.error(JSON.stringify({ event: config.openrouterCompat ? 'openrouter_parent_disconnected' : config.localOnly ? 'local_parent_disconnected' : 'parent_disconnected', provider: config.provider }));
+        emitDiagnostic(JSON.stringify({ event: config.openrouterCompat ? 'openrouter_parent_disconnected' : config.localOnly ? 'local_parent_disconnected' : 'parent_disconnected', provider: config.provider }));
         process.exit(0);
       };
       process.stdin.once('end', parentClosed);

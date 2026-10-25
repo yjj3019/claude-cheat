@@ -175,7 +175,9 @@ for (const [detail, extra, headers = proHeaders, path = '/v1/messages'] of exclu
     assert.equal(calls[0].url, 'https://api.anthropic.com' + path);
     assert.deepEqual(calls[0].parsedBody, body);
     const entries = log.mock.calls.map(call => JSON.parse(call.arguments[0]));
-    assert.deepEqual(entries, [{ event: 'route_selected', provider: 'plan', reason: 'native_feature', detail,
+    // traceId is additive correlation, not request data, so its form is asserted once.
+    assert.match(entries[0].traceId, /^[0-9a-f]{8,12}$/);
+    assert.deepEqual(entries, [{ traceId: entries[0].traceId, event: 'route_selected', provider: 'plan', reason: 'native_feature', detail,
       model: SONNET,
       ...(detail === 'unsupported_beta' ? { beta_features: ['[redacted]'], unsupported_beta_count: 1 } : {}) }]);
     assert.equal(JSON.stringify(entries).includes('private-'), false);
