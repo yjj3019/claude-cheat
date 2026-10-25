@@ -462,6 +462,9 @@ def scan_sessions(projects=None, max_files=SCAN_FILES, now=None, pricing=None):
                 lines, next_offset = _read_appended(path, state)
             except OSError:
                 continue
+            # Parse the whole chunk first: applying a line and only then failing would
+            # re-read (and double count) every line applied before the failure.
+            parsed = []
             for line in lines:
                 if b'"assistant"' not in line:
                     continue
@@ -475,20 +478,22 @@ def scan_sessions(projects=None, max_files=SCAN_FILES, now=None, pricing=None):
                 if not isinstance(message, dict):
                     continue
                 usage = message.get("usage")
-                if not isinstance(usage, dict):
-                    usage = {}
-                source = _classify(message.get("id"))
-                delta = [int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0),
-                         int(usage.get("cache_read_input_tokens") or 0),
-                         int(usage.get("cache_creation_input_tokens") or 0)]
+                usage = usage if isinstance(usage, dict) else {}
+                try:
+                    delta = [int(usage.get(name) or 0) for name in
+                             ("input_tokens", "output_tokens", "cache_read_input_tokens",
+                              "cache_creation_input_tokens")]
+                except (TypeError, ValueError):
+                    continue  # one bad record must not stop the file
+                parsed.append((_classify(message.get("id")), delta, message.get("model"),
+                               record.get("timestamp")))
+            for source, delta, model, stamp in parsed:
                 state["turns"] += 1
                 state[source] += 1
                 for index in range(4):
                     state["tokens"][source][index] += delta[index]
-                model = message.get("model")
                 if model:
                     state["models"][model] = state["models"].get(model, 0) + 1
-                stamp = record.get("timestamp")
                 if stamp:
                     state["last_ts"] = stamp
                     hour = _local_hour(stamp)

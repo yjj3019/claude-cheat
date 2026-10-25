@@ -69,6 +69,22 @@ class AuditRegressionTests(unittest.TestCase):
         self.assertEqual(usage["totals"]["external"][0], 7)
         self.assertEqual(usage["totals"]["external"][1], 3)
 
+    def test_a_bad_token_count_is_skipped_without_double_counting(self):
+        projects = self.root / "projects"
+        (projects / "p").mkdir(parents=True)
+        transcript = projects / "p" / "s.jsonl"
+        good = {"type": "assistant", "timestamp": "2026-10-25T01:00:00+00:00",
+                "message": {"model": "vendor/model", "usage": {"input_tokens": 5, "output_tokens": 2}}}
+        bad = {"type": "assistant", "timestamp": "2026-10-25T01:00:01+00:00",
+               "message": {"model": "vendor/model", "usage": {"input_tokens": "many"}}}
+        transcript.write_text(json.dumps(good) + "\n" + json.dumps(bad) + "\n" + json.dumps(good) + "\n",
+                              encoding="utf-8")
+        dash._SESSIONS.clear()
+        first = dash.scan_sessions(projects=projects, now=datetime.now())
+        second = dash.scan_sessions(projects=projects, now=datetime.now())
+        self.assertEqual(first["totals"]["external"][0], 10)
+        self.assertEqual(second["totals"]["external"][0], 10, "a rescan must not double count")
+
     # --- route log concurrency -----------------------------------------------
     def test_concurrent_reads_do_not_double_count(self):
         log = self.root / ".route.log"
