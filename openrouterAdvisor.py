@@ -245,13 +245,42 @@ def port_open(port, timeout=0.5):
         return probe.connect_ex(("127.0.0.1", port)) == 0
 
 
-def request_handover(port, nonce, timeout=25):
-    """Ask the running proxy to drain and exit so this launcher can rebind its port."""
+def handover_timeout_seconds() -> float:
+    """Client wait must cover the proxy's drain cap, or the launcher fails first."""
+    try:
+        milliseconds = int(os.environ.get("ROUTE_HANDOVER_TIMEOUT_MS") or 120000)
+    except ValueError:
+        milliseconds = 120000
+    return max(milliseconds, 1000) / 1000 + 5
+
+
+def request_handover(port, nonce, timeout=None):
+    """Ask the running proxy to drain and exit so this launcher can rebind its port.
+
+    A 409 means the drain cap expired with turns still active and the proxy reverted to
+    serving; the body carries the report, so surface it instead of a bare HTTP error.
+    """
+    if timeout is None:
+        timeout = handover_timeout_seconds()
     request = urllib.request.Request(f"http://127.0.0.1:{port}/api/handover", data=b"",
                                      method="POST", headers={"x-local-route-token": nonce})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(request, timeout=timeout) as response:
-        return json.loads(response.read() or b"{}")
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            return json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as error:
+        try:
+            report = json.loads(error.read() or b"{}")
+        except ValueError:
+            report = {}
+        finally:
+            # An unclosed HTTPError keeps the socket until GC; close it explicitly.
+            error.close()
+        if error.code == 409 and report.get("reverted"):
+            raise RuntimeError(
+                "The proxy kept serving an active turn and reverted the handover; "
+                "retry after it finishes") from None
+        raise RuntimeError(f"The proxy answered the handover with HTTP {error.code}") from None
 
 
 def wait_for_port_release(port, timeout=25):
@@ -548,6 +577,10 @@ def takeover(provider: str = "openrouter", debug: bool = False) -> int:
         report = request_handover(port, nonce)
     except (OSError, ValueError) as error:
         raise RuntimeError(f"The running proxy refused the handover: {error}") from None
+    if not report.get("drained"):
+        # A revert means the proxy is still listening and serving; starting a replacement
+        # now would race it for the port, so stop here instead of killing anything.
+        raise RuntimeError("The previous proxy is still serving an active turn; retry later")
     if not wait_for_port_release(port):
         raise RuntimeError("The previous proxy did not release its port")
     log_route_marker(f"takeover port={port} provider={provider}")

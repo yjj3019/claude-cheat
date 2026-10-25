@@ -598,7 +598,36 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   };
   if (metricsPath) process.once('exit', flushMetrics);
   let inflight = 0;
-  let handover = false;
+  let drainState = 'serving'; // 'serving' → 'draining' → 'closed', or back to 'serving' on a revert
+  let handoverRun = null;
+  // Drain in-flight turns, then close the listener so a fresh proxy can bind the same
+  // port. If the cap expires with turns still active, revert instead of cutting them:
+  // resuming service costs the operator a retry, while killing the process would drop
+  // every CLI mid-turn and leave nothing listening until a replacement starts.
+  const runHandover = async () => {
+    if (drainState === 'closed') {
+      return { status: 503, report: { type: 'error', error: { type: 'api_error', message: 'Proxy is handing over' } } };
+    }
+    drainState = 'draining';
+    const started = Date.now();
+    const deadline = started + handoverTimeoutMs;
+    while (inflight > 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
+    if (inflight > 0) {
+      drainState = 'serving';
+      return { status: 409, report: { drained: false, reverted: true, inflight,
+                                      waitedMs: Date.now() - started, forced: false,
+                                      reason: 'drain_timeout' } };
+    }
+    // server.close() on Windows tears down sockets that are still streaming, which would
+    // truncate a reply the client is reading right now; draining first prevents that.
+    drainState = 'closed';
+    server.close();
+    // The exit side effect belongs to the drain, not to a caller: concurrent POSTs join
+    // one run and must not stack exit timers or callbacks.
+    if (typeof onHandover === 'function') onHandover();
+    else setTimeout(() => process.exit(0), 100);
+    return { status: 200, report: { drained: true, inflight: 0, waitedMs: Date.now() - started, forced: false } };
+  };
   const server = http.createServer(async (req, res) => {
     const reject = (status, message) => {
       if (res.destroyed) return;
@@ -607,30 +636,22 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message } }));
     };
     if (!tokenMatches(req.headers['x-local-route-token'])) return reject(403, 'Local authorization required');
-    if (handover) {
-      // Tell the client to retry shortly: the replacement proxy is binding the same port.
-      res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '1', 'cache-control': 'no-store' });
-      return res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'Proxy is handing over' } }));
-    }
     if (req.method === 'HEAD' && req.url === '/api/hello') { res.writeHead(200); res.end(); return; }
     if (req.method === 'POST' && req.url === '/api/handover') {
-      // Stop accepting, let in-flight turns finish, then exit so a fresh proxy can bind the
-      // same port. The client keeps its port and only sees a brief reconnect.
-      handover = true;
-      // Drain before closing: server.close() on Windows tears down sockets that are still
-      // streaming, which would truncate a reply the client is reading right now. A long turn
-      // is worth waiting for (the new proxy binds right after), so the cap is generous.
-      const started = Date.now();
-      const deadline = started + handoverTimeoutMs;
-      while (inflight > 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
-      const forced = inflight > 0;
-      server.close();
-      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
-      res.end(JSON.stringify({ drained: !forced, inflight, waitedMs: Date.now() - started, forced }));
-      // Tests inject a callback: exiting would kill the runner.
-      if (typeof onHandover === 'function') onHandover();
-      else setTimeout(() => process.exit(0), 100);
+      // One drain run serves every concurrent request: a duplicate POST joins the same
+      // wait instead of starting a second countdown. A run that hit the cap reverts, so
+      // the next POST may try again while the proxy keeps serving.
+      if (!handoverRun) handoverRun = runHandover();
+      const outcome = await handoverRun.finally(() => { handoverRun = null; });
+      res.writeHead(outcome.status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+      res.end(JSON.stringify(outcome.report));
       return;
+    }
+    if (drainState !== 'serving') {
+      // Tell the client to retry shortly: the replacement proxy is binding the same port,
+      // or a drain is still waiting for an active turn to finish.
+      res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '1', 'cache-control': 'no-store' });
+      return res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'Proxy is handing over' } }));
     }
     if (req.method === 'GET' && /^\/api\/metrics(?:\?.*)?$/.test(req.url)) {
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
