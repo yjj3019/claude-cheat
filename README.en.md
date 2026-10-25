@@ -372,6 +372,8 @@ A failed check exits with code 1 and never invokes Plan fallback. A successful m
 
 A routed session also appends its routing events to `.route.log` beside the launcher: a `proxy start` line per session, then timestamped `route_selected`, `external_attempt_failed` and `circuit_open` entries. This explains past sessions that ran without `-Debug`, and the file is excluded from Git by the `*.log` rule.
 
+The lines of one turn share an **8-hex `traceId`** (also exposed as `metrics.last.traceId`), so four `external_attempt_failed` events plus the `circuit_open` and `route_selected` can be reconstructed together. All diagnostics pass **one logging sink that scrubs credentials**: the configured API key, `Bearer …`, `sk-*`/`sk-ant-*`/`sk-or-*` and `x-api-key` values become `[redacted:provider-key|bearer-token|api-key]` tags while model names, status codes and trace ids survive. A provider error body is read up to **64KiB**, scrubbed the same way and relayed, with a truncation event for longer bodies. Scrubbing is pattern-based, so it cannot guarantee detection of obfuscated credentials.
+
 Exit and relaunch to change providers. `/model` selects Claude models, not OpenRouter versus Local. To return to ordinary Plan use `claude` in a clean terminal. This launcher does not modify the parent terminal, but old user/system `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` or `CLAUDE_CONFIG_DIR` variables may still be inherited. Do not delete saved login or MCP settings as a blanket fix.
 
 The security model, trust boundaries, CSRF/DNS-rebinding handling and residual risks are documented in [`docs/SECURITY.ko.md`](docs/SECURITY.ko.md) (Korean).

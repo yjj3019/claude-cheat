@@ -487,6 +487,8 @@ python routeDashboard.py --status --offline  # OpenRouter 호출 생략
 
 라우팅 세션은 판단 근거를 실행기 폴더의 `.route.log`에 함께 남깁니다. 세션을 시작할 때마다 `proxy start` 줄이 추가되고, `route_selected`·`external_attempt_failed`·`circuit_open` 같은 이벤트가 시각과 함께 쌓입니다. `-Debug`를 켜지 않은 지난 세션도 이 파일로 확인할 수 있으며, `*.log` 규칙으로 Git에서 제외됩니다.
 
+같은 턴의 로그 줄은 **8자리 `traceId`** 로 묶이므로 `external_attempt_failed` 4회와 `circuit_open`·`route_selected`를 한 번에 재구성할 수 있습니다(`metrics.last.traceId`에도 같은 값). 로그는 **단일 sink에서 자격증명을 세척**합니다: 설정된 API 키, `Bearer …`, `sk-*`/`sk-ant-*`/`sk-or-*`, `x-api-key` 값은 `[redacted:provider-key|bearer-token|api-key]` 태그로 바뀌고 모델명·상태코드·traceId는 유지됩니다. 제공자 오류 본문은 최대 **64KiB**까지만 읽어 같은 규칙으로 세척한 뒤 전달하며, 더 긴 본문은 잘렸다는 이벤트를 남깁니다. 세척은 패턴 기반이므로 문자열이 난독화된 자격증명까지 보장하지는 않습니다.
+
 코드나 설정을 수정한 뒤에는 라우팅 세션을 종료하고 다시 실행해야 합니다. 일반 Plan 환경으로 돌아가려면 **깨끗한 새 터미널**에서 평소처럼 실행하세요.
 
 ```powershell

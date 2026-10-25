@@ -9,7 +9,7 @@
 | 라우팅 프록시 | `127.0.0.1:<임시 포트>` | 로컬 사용자만 접근. `X-Local-Route-Token`(세션마다 생성) 없으면 403 |
 | 대시보드 | `127.0.0.1:8787` (고정) | 로컬 사용자만 접근. 읽기는 공개, 쓰기는 세션 토큰 필요 |
 | 설정 파일 | 실행기 폴더의 `.env.openrouter` / `.env.local-llm` | 사용자 소유 파일. Git 제외(`.env.*`) |
-| 로그·메트릭 | `.route.log`, `.proxy-metrics.json` | 진단용. 키·프롬프트·본문은 기록하지 않음 |
+| 로그·메트릭 | `.route.log`, `.proxy-metrics.json` | 진단용. 키·프롬프트·본문은 기록하지 않음. 턴별 `traceId`로 상관, sink에서 자격증명 패턴 세척 |
 
 프록시와 대시보드는 **모두 루프백에만 바인딩**합니다. 외부 인터페이스로 열리는 경로는 없습니다.
 
@@ -52,13 +52,16 @@
 | 모델 목록 URL | 같은 출처 또는 명시 설정, `http(s)` |
 | 요청 본문 | `Content-Length` 0~64KB, 음수 거부, JSON 객체만 |
 | 프록시 본문 | 최대 32MiB, 엄격한 필드 화이트리스트(알 수 없는 필드는 Plan 우회) |
+| 요청 유휴 | 본문·헤더가 30초(기본, `ROUTE_REQUEST_IDLE_TIMEOUT_MS`) 동안 진행하지 않으면 연결을 끊고 점유 턴을 반납(slowloris로 드레인이 막히지 않게 함) |
 
 `LOCAL_LLM_*` URL은 사용자가 직접 설정하는 값이며, 형식 검증만 수행합니다. **신뢰할 수 없는 출처의 URL을 넣지 마세요**(SSRF 표면).
 
 ## 5. 비밀값 취급
 
 - 키는 `.env.*`(Git 제외)에만 존재하고, 자식 프로세스 env로 전달된 뒤 **프록시 시작 시 env에서 삭제**됩니다.
-- 로그에는 키·프롬프트·요청 본문을 남기지 않습니다(`route_selected`, 실패 코드, 바이트 수만).
+- 로그에는 키·프롬프트·요청 본문을 남기지 않습니다(`route_selected`, 실패 코드, traceId, 바이트 수만). 모든 진단 출력은 **단일 sink**를 지나며, 설정된 키·`Bearer …`·`sk-*`·`x-api-key` 값을 `[redacted:provider-key|bearer-token|api-key]` 태그로 바꿉니다(모델명·상태코드·traceId는 유지). 같은 세척을 프록시가 만드는 오류 응답과 전달하는 Plan 오류 본문에도 적용합니다.
+- 제공자 오류 본문은 **최대 64KiB**까지만 읽어 세척 후 전달하고 나머지는 취소합니다. 잘린 경우 `upstream_error_truncated` 이벤트를 남깁니다.
+- 세척은 패턴 기반이므로 **난독화·분할된 자격증명**은 탐지하지 못할 수 있습니다. 근본 통제는 키를 로그·본문에 넣지 않는 것입니다.
 - 설정 저장은 **원자적 교체**(임시 파일 → rename) + 이전 내용 `.bak`. 읽기 실패 시 파일을 건드리지 않습니다.
 - `installLauncher.ps1`의 포워더는 체크아웃 경로만 담고, 자기 자신을 덮어쓰거나 지우지 않습니다(마커 검사).
 
@@ -77,7 +80,8 @@
 1. **로컬 사용자 신뢰**: 같은 PC의 다른 사용자·프로세스는 루프백 포트에 접근할 수 있습니다. 토큰이 없으면 읽기(대시보드)는 가능하니, 공용 PC에서는 대시보드를 띄우지 마세요.
 2. **세션 토큰 노출**: 토큰은 페이지 HTML에 포함됩니다. 브라우저 확장·화면 공유로 노출될 수 있습니다.
 3. **SSRF**: `LOCAL_LLM_*` URL은 사용자가 넣은 값입니다. 신뢰할 수 없는 값을 넣지 마세요.
-4. **감사 범위**: 정적 검토 + 회귀 테스트이며, 퍼징·침투 테스트는 수행하지 않았습니다.
+4. **자격증명 세척의 한계**: 로그·오류 본문 세척은 패턴 기반입니다. Base64·분할·변형된 키는 통과할 수 있고, 64KiB를 넘는 오류 본문은 잘립니다.
+5. **감사 범위**: 정적 검토 + 회귀 테스트이며, 침투 테스트는 수행하지 않았습니다(퍼징은 별도 스위트).
 
 ## 8. 확인 방법
 
@@ -92,4 +96,4 @@ Invoke-WebRequest -Uri 'http://127.0.0.1:8787/api/config' -Method Post -Body '{}
 Invoke-WebRequest -Uri 'http://127.0.0.1:8787/api/models?provider=openrouter'
 ```
 
-자동 검증: `python -m unittest tests.test_route_dashboard`(Host·헤더·토큰), `node tests/claudeRouteProxy.test.mjs`(프록시 인증·격리).
+자동 검증: `python -m unittest tests.test_route_dashboard`(Host·헤더·토큰), `node tests/claudeRouteProxy.test.mjs`(프록시 인증·격리), `node tests/observability.test.mjs`(traceId 상관·자격증명 세척·오류 본문 상한).
