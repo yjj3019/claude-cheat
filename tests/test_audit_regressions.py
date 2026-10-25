@@ -123,7 +123,7 @@ class AuditRegressionTests(unittest.TestCase):
         # Inside the 7-day scan window, while still distinct between rewrites.
         return int((time.time() - seconds_ago) * 1_000_000_000)
 
-    def scan_usage(self, cache, restart=False, save=False):
+    def scan_usage(self, cache, restart=False, save=False, max_files=None):
         """Scan the fixture projects with the repo's cache file patched out."""
         if restart:
             dash._SESSIONS.clear()
@@ -131,13 +131,21 @@ class AuditRegressionTests(unittest.TestCase):
             dash._USAGE_CACHE["data"] = None
         dash._USAGE_CACHE["key"] = None
         projects = self.root / "projects"
+        options = {} if max_files is None else {"max_files": max_files}
         with mock.patch.object(dash, "USAGE_CACHE_FILE", cache):
             if not save:
-                return dash.scan_sessions(projects=projects, now=datetime.now())
+                return dash.scan_sessions(projects=projects, now=datetime.now(), **options)
             # Force the throttled save so the restore path can be exercised.
             with mock.patch.object(dash, "_USAGE_CACHE_META", {"saved_at": 0.0}), \
                  mock.patch.object(dash.time, "monotonic", return_value=1_000_000.0):
-                return dash.scan_sessions(projects=projects, now=datetime.now())
+                return dash.scan_sessions(projects=projects, now=datetime.now(), **options)
+
+    def deferred_of(self, path):
+        return dash._SESSIONS[str(path)].get("deferred", 0)
+
+    def age_out(self, path):
+        old = int((time.time() - (dash.SCAN_DAYS + 1) * 86400) * 1_000_000_000)
+        os.utime(path, ns=(old, old))
 
     def cached_claims(self, cache):
         payload = json.loads(cache.read_text(encoding="utf-8"))
@@ -639,6 +647,185 @@ class AuditRegressionTests(unittest.TestCase):
         self.assertEqual(second["totals"]["external"], [30, 4, 0, 0])
         self.assertGreaterEqual(second["totals"]["external"][0], first["totals"]["external"][0])
         self.assertEqual(third["totals"]["external"], [30, 4, 0, 0])
+
+    # --- usage cache: deferred claims -----------------------------------------
+    def fixture_owner_and_copy(self, cache):
+        """Owner claims the turn first; the copy is skipped and flagged deferred."""
+        owner = self.root / "projects" / "p1" / "owner.jsonl"
+        copy = self.root / "projects" / "p1" / "copy.jsonl"
+        row = self.assistant_turn(10, message_id="msg_defer", request_id="req_defer")
+        self.write_transcript(owner, [row], self.recent_mtime_ns(300))
+        self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [10, 1, 0, 0])
+        self.write_transcript(copy, [dict(row)], self.recent_mtime_ns(200))
+        self.assertEqual(self.scan_usage(cache)["totals"]["external"], [10, 1, 0, 0])
+        return owner, copy, row
+
+    def test_an_owner_aging_out_promotes_the_deferred_copy(self):
+        # Pins: once the owner leaves the window its claimed turn was counted nowhere.
+        cache = self.root / ".usage-cache.json"
+        owner, copy, _row = self.fixture_owner_and_copy(cache)
+        self.assertEqual(self.deferred_of(copy), 1)
+        self.assertEqual(self.deferred_of(owner), 0)
+        self.age_out(owner)
+        promoted = self.scan_usage(cache, save=True)
+        self.assertEqual(promoted["totals"]["external"], [10, 1, 0, 0])
+        self.assertEqual(promoted["session_count"], 1)
+        self.assertEqual(self.deferred_of(copy), 0)
+        self.assertEqual(self.scan_usage(cache)["totals"]["external"], [10, 1, 0, 0])
+        self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [10, 1, 0, 0])
+
+    def test_a_removed_owner_promotes_the_deferred_copy(self):
+        cache = self.root / ".usage-cache.json"
+        owner, _copy, _row = self.fixture_owner_and_copy(cache)
+        owner.unlink()
+        self.assertEqual(self.scan_usage(cache, save=True)["totals"]["external"], [10, 1, 0, 0])
+        self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [10, 1, 0, 0])
+
+    def test_an_owner_dropped_by_the_file_cap_promotes_the_deferred_copy(self):
+        cache = self.root / ".usage-cache.json"
+        _owner, _copy, _row = self.fixture_owner_and_copy(cache)
+        # mtime order is copy then owner, so a cap of one keeps only the copy.
+        self.assertEqual(self.scan_usage(cache, save=True, max_files=1)["totals"]["external"],
+                         [10, 1, 0, 0])
+        self.assertEqual(self.scan_usage(cache, restart=True, max_files=1)["totals"]["external"],
+                         [10, 1, 0, 0])
+
+    def test_an_owner_identity_rewrite_promotes_the_deferred_copy(self):
+        # Pins: releasing claims on a rewrite dropped the turn because the copy was
+        # already committed and never re-read.
+        cache = self.root / ".usage-cache.json"
+        owner, copy, _row = self.fixture_owner_and_copy(cache)
+        self.write_transcript(owner, [self.assistant_turn(7, message_id="msg_new",
+                                                          request_id="req_new")],
+                              self.recent_mtime_ns(100))
+        promoted = self.scan_usage(cache, save=True)
+        self.assertEqual(promoted["totals"]["external"], [17, 2, 0, 0])
+        self.assertEqual(promoted["session_count"], 2)
+        self.assertEqual(self.deferred_of(copy), 0)
+        self.assertEqual(self.scan_usage(cache)["totals"]["external"], [17, 2, 0, 0])
+        self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [17, 2, 0, 0])
+
+    def test_the_owner_returning_after_promotion_keeps_the_turn_counted_once(self):
+        cache = self.root / ".usage-cache.json"
+        owner, copy, row = self.fixture_owner_and_copy(cache)
+        self.age_out(owner)
+        self.assertEqual(self.scan_usage(cache, save=True)["totals"]["external"], [10, 1, 0, 0])
+        self.write_transcript(owner, [dict(row)], self.recent_mtime_ns(100))
+        back = self.scan_usage(cache, save=True)
+        self.assertEqual(back["totals"]["external"], [10, 1, 0, 0])
+        self.assertEqual(self.deferred_of(owner), 1)
+        # When the copy leaves, the owner's deferred copy takes the turn back.
+        self.age_out(copy)
+        self.assertEqual(self.scan_usage(cache, save=True)["totals"]["external"], [10, 1, 0, 0])
+        self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [10, 1, 0, 0])
+
+    def test_only_deferred_files_are_re_read_when_the_owner_leaves(self):
+        cache = self.root / ".usage-cache.json"
+        owner, copy, _row = self.fixture_owner_and_copy(cache)
+        unrelated = self.root / "projects" / "p1" / "unrelated.jsonl"
+        self.write_transcript(unrelated, [self.assistant_turn(5, message_id="msg_unrelated",
+                                                              request_id="req_unrelated")],
+                              self.recent_mtime_ns(250))
+        self.assertEqual(self.scan_usage(cache)["totals"]["external"], [15, 2, 0, 0])
+        self.age_out(owner)
+        calls, reads = {}, {}
+        real_read = dash._read_appended
+
+        def spy(path, state):
+            calls[path.name] = calls.get(path.name, 0) + 1
+            lines, next_offset, identity, stale = real_read(path, state)
+            reads[path.name] = reads.get(path.name, 0) + (1 if lines else 0)
+            return lines, next_offset, identity, stale
+
+        with mock.patch.object(dash, "_read_appended", side_effect=spy):
+            promoted = self.scan_usage(cache, save=True)
+        self.assertEqual(promoted["totals"]["external"], [15, 2, 0, 0])
+        self.assertEqual(calls.get("copy.jsonl"), 2, "main pass + one promotion re-read")
+        self.assertEqual(calls.get("unrelated.jsonl"), 1, "unchanged file is not re-read")
+        self.assertNotIn("owner.jsonl", calls)
+        self.assertEqual(reads.get("copy.jsonl"), 1)
+        self.assertEqual(reads.get("unrelated.jsonl"), 0)
+
+    def test_promotion_keeps_the_deferred_files_own_turns_counted_once(self):
+        # The promotion reset clears the file's own counters and claims; the re-read must
+        # restore them without double counting or dropping them.
+        cache = self.root / ".usage-cache.json"
+        owner = self.root / "projects" / "p1" / "owner.jsonl"
+        copy = self.root / "projects" / "p1" / "copy.jsonl"
+        shared = self.assistant_turn(10, message_id="msg_shared_a", request_id="req_shared_a")
+        own = self.assistant_turn(4, message_id="msg_copy_own", request_id="req_copy_own")
+        self.write_transcript(owner, [shared], self.recent_mtime_ns(300))
+        self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [10, 1, 0, 0])
+        self.write_transcript(copy, [dict(shared), own], self.recent_mtime_ns(200))
+        both = self.scan_usage(cache)
+        self.assertEqual(both["totals"]["external"], [14, 2, 0, 0])
+        self.assertEqual(self.deferred_of(copy), 1)
+        self.age_out(owner)
+        promoted = self.scan_usage(cache, save=True)
+        self.assertEqual(promoted["totals"]["external"], [14, 2, 0, 0])
+        self.assertEqual(promoted["session_count"], 1)
+        self.assertEqual(self.deferred_of(copy), 0)
+        self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [14, 2, 0, 0])
+
+    def test_a_restart_promotes_a_deferred_copy_after_the_owner_ages_out(self):
+        # Pins: the deferred flag must survive in the cache so a restart can promote it.
+        cache = self.root / ".usage-cache.json"
+        owner, _copy, _row = self.fixture_owner_and_copy(cache)
+        self.assertEqual(self.scan_usage(cache, restart=True, save=True)["totals"]["external"],
+                         [10, 1, 0, 0])
+        payload = json.loads(cache.read_text(encoding="utf-8"))
+        deferred = {path: entry["deferred"] for path, entry in payload["files"].items()}
+        self.assertEqual(sorted(deferred.values()), [0, 1])
+        self.age_out(owner)
+        promoted = self.scan_usage(cache, restart=True, save=True)
+        self.assertEqual(promoted["totals"]["external"], [10, 1, 0, 0])
+        self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [10, 1, 0, 0])
+
+    def test_a_deferred_file_that_rewrites_drops_its_pending_flag(self):
+        cache = self.root / ".usage-cache.json"
+        _owner, copy, _row = self.fixture_owner_and_copy(cache)
+        self.write_transcript(copy, [self.assistant_turn(4, message_id="msg_copy_new",
+                                                         request_id="req_copy_new")],
+                              self.recent_mtime_ns(100))
+        rewritten = self.scan_usage(cache, save=True)
+        self.assertEqual(rewritten["totals"]["external"], [14, 2, 0, 0])
+        self.assertEqual(self.deferred_of(copy), 0)
+
+    def test_rows_without_a_claim_do_not_set_a_deferred_flag(self):
+        cache = self.root / ".usage-cache.json"
+        path = self.root / "projects" / "p1" / "plain.jsonl"
+        self.write_transcript(path, [self.assistant(3), self.assistant(4)],
+                              self.recent_mtime_ns(300))
+        usage = self.scan_usage(cache, restart=True)
+        self.assertEqual(usage["totals"]["external"], [7, 2, 0, 0])
+        self.assertEqual(self.deferred_of(path), 0)
+
+    def test_a_cache_with_a_broken_deferred_field_is_rescanned(self):
+        cache = self.root / ".usage-cache.json"
+        owner, copy, _row = self.fixture_owner_and_copy(cache)
+        self.assertEqual(self.scan_usage(cache, restart=True, save=True)["totals"]["external"],
+                         [10, 1, 0, 0])
+        payload = json.loads(cache.read_text(encoding="utf-8"))
+        keys = [str(owner), str(copy)]
+        variants = [lambda entry: entry.pop("deferred", None),
+                    lambda entry: entry.update({"deferred": "many"}),
+                    lambda entry: entry.update({"deferred": -1}),
+                    lambda entry: entry.update({"deferred": True})]
+        for mutate in variants:
+            damaged = json.loads(json.dumps(payload))
+            for key in keys:
+                entry = damaged["files"][key]
+                mutate(entry)
+                # Poisoned totals prove the entry was rejected, not silently trusted.
+                entry["turns"] = 9
+                entry["tokens"] = {"external": [9, 9, 0, 0], "plan": [0, 0, 0, 0]}
+            cache.write_text(json.dumps(damaged), encoding="utf-8")
+            usage = self.scan_usage(cache, restart=True)
+            self.assertEqual(usage["totals"]["external"], [10, 1, 0, 0], str(damaged)[:40])
+        # An older cache version is not trusted either.
+        cache.write_text(json.dumps({"version": dash.USAGE_CACHE_VERSION - 1,
+                                     "files": payload["files"]}), encoding="utf-8")
+        self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [10, 1, 0, 0])
 
     # --- route log concurrency -----------------------------------------------
     def test_concurrent_reads_do_not_double_count(self):

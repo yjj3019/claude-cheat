@@ -383,15 +383,17 @@ def _new_session_state():
     # ``claims`` owns the turns this file was the first to see, so a message copied by
     # /resume or a fork is counted once across the whole scan window. ``tokens_1h`` is
     # the 1-hour-TTL share of cache writes, kept off the four compatible token axes.
+    # ``deferred`` counts committed rows here that were skipped because another file owns
+    # them: if that owner later disappears, this file must be re-read to count them.
     return {"offset": 0, "size": None, "mtime_ns": None, "head_sha": None, "tail_sha": None,
             "turns": 0, "external": 0, "plan": 0, "last_ts": None,
             "tokens": {"external": [0, 0, 0, 0], "plan": [0, 0, 0, 0]},
             "tokens_1h": {"external": 0, "plan": 0},
-            "models": {}, "hours": {}, "claims": {}}
+            "models": {}, "hours": {}, "claims": {}, "deferred": 0}
 
 
 USAGE_CACHE_FILE = ROOT / ".usage-cache.json"
-USAGE_CACHE_VERSION = 5
+USAGE_CACHE_VERSION = 6
 USAGE_IDENTITY_BYTES = 4096
 # The claim ledger is a cross-file exactly-once index, so it must not grow without a
 # bound. Above this many claims the oldest transcripts' claims are dropped whole.
@@ -534,6 +536,9 @@ def _state_from_cache(entry):
     claims = entry.get("claims", {})
     if not _valid_claims(claims):
         return None
+    deferred = entry.get("deferred")
+    if not isinstance(deferred, int) or isinstance(deferred, bool) or deferred < 0:
+        return None
     return {"offset": entry["offset"], "size": size, "mtime_ns": mtime_ns,
             "head_sha": entry["head_sha"], "tail_sha": entry["tail_sha"],
             "turns": entry["turns"], "external": entry["external"],
@@ -542,34 +547,46 @@ def _state_from_cache(entry):
             "tokens_1h": {source: tokens_1h[source] for source in ("external", "plan")},
             "models": dict(models),
             "hours": dict(hours),
-            "claims": {claim_key: list(values) for claim_key, values in claims.items()}}
+            "claims": {claim_key: list(values) for claim_key, values in claims.items()},
+            "deferred": deferred}
 
 
 def _restore_claims(cached_states, allowed):
     """Rebuild the in-memory claim index from the persisted per-file ledger.
 
-    Returns the validated states to restore, or None when the ledger itself is corrupt
-    (one turn owned by two files, or more claims than the cap) so the caller rescans.
-    Claims of transcripts outside the current scan window are forgotten with them.
+    Returns ``(states, released)``: the validated states to restore and how many claims
+    the cache held that this scan cannot own any more (their file is out of the window,
+    was removed, or its entry is no longer valid). ``released > 0`` is the signal that
+    files holding deferred copies of those turns must be re-read. ``states`` is None
+    when the ledger itself is corrupt (one turn owned by two files, over the cap), so
+    the caller rescans everything.
     """
     _CLAIM_OWNER.clear()
     states, index = {}, {}
+    released = 0
     for path, entry in cached_states.items():
         state = _state_from_cache(entry)
-        if state is not None:
-            states[path] = state
+        if state is None:
+            raw_claims = entry.get("claims") if isinstance(entry, dict) else None
+            if isinstance(raw_claims, dict):
+                released += len(raw_claims)
+            elif raw_claims is not None:
+                released += 1
+            continue
+        states[path] = state
     for path, state in states.items():
         if path not in allowed:
+            released += len(state["claims"])
             state["claims"] = {}
             continue
         for claim_key in state["claims"]:
             if claim_key in index:
-                return None
+                return None, 0
             index[claim_key] = path
     if len(index) > USAGE_CLAIM_CAP:
-        return None
+        return None, 0
     _CLAIM_OWNER.update(index)
-    return states
+    return states, released
 
 
 def _save_usage_states(states, now=None):
@@ -605,7 +622,7 @@ def _save_usage_states(states, now=None):
                       "last_ts": state["last_ts"], "tokens": state["tokens"],
                       "tokens_1h": state["tokens_1h"],
                       "models": state["models"], "hours": hours,
-                      "claims": state["claims"]}
+                      "claims": state["claims"], "deferred": state["deferred"]}
     payload = {"version": USAGE_CACHE_VERSION, "claims_evicted": evicted,
                "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "files": files}
     try:
@@ -751,6 +768,148 @@ def _cost_status(state, pricing):
     return "included"
 
 
+def _apply_lines(key, state, lines):
+    """Fold one committed chunk of transcript rows into ``state`` exactly once.
+
+    Parse the whole chunk first: applying a line and only then failing would re-read
+    (and double count) every line applied before the failure.
+    """
+    if not lines:
+        return
+    parsed = []
+    for line in lines:
+        if b'"assistant"' not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict) or record.get("type") != "assistant":
+            continue
+        message = record.get("message")
+        if not isinstance(message, dict):
+            continue
+        usage = message.get("usage")
+        usage = usage if isinstance(usage, dict) else {}
+        try:
+            delta = [int(usage.get(name) or 0) for name in
+                     ("input_tokens", "output_tokens", "cache_read_input_tokens",
+                      "cache_creation_input_tokens")]
+        except (TypeError, ValueError):
+            continue  # one bad record must not stop the file
+        # Claude Code records the 1h/5m TTL split beside the cache-write total
+        # (usage.cache_creation.ephemeral_1h_input_tokens); older rows omit it.
+        creation = usage.get("cache_creation")
+        write_1h = 0
+        if isinstance(creation, dict):
+            try:
+                write_1h = int(creation.get("ephemeral_1h_input_tokens") or 0)
+            except (TypeError, ValueError):
+                write_1h = 0
+        delta.append(min(max(write_1h, 0), max(delta[3], 0)))
+        claim = _usage_claim_key(message, record)
+        parsed.append((_classify(message.get("id")), delta, message.get("model"),
+                       record.get("timestamp"),
+                       _claim_hash(claim) if claim else None))
+    for source, delta, model, stamp, claim_key in parsed:
+        full_turn = True
+        if claim_key is not None:
+            owner = _CLAIM_OWNER.get(claim_key)
+            if owner is None:
+                state["claims"][claim_key] = list(delta[:4])
+                _CLAIM_OWNER[claim_key] = key
+            else:
+                if owner != key:
+                    # A copy lives here but another file's row owns the turn; if that
+                    # owner later disappears this file must be re-read to count it.
+                    state["deferred"] += 1
+                full_turn = False
+                owner_state = _SESSIONS.get(owner)
+                claimed = owner_state["claims"].get(claim_key) if owner_state else None
+                if claimed is None:
+                    # The owning file's state is gone; take the claim back.
+                    state["claims"][claim_key] = list(delta[:4])
+                    _CLAIM_OWNER[claim_key] = key
+                    full_turn = True
+                else:
+                    # Later streaming rows can carry more complete usage for the same
+                    # turn: add only the per-field increase, never a negative, to the
+                    # owning file's bucket for that turn (orca applies its token
+                    # corrections to the claimed projection too). The 1h TTL split is
+                    # fixed when the request is made, so a duplicate never adds it again
+                    # (the claim keeps the four priced axes).
+                    raised = [max(old, new) for old, new in zip(claimed, delta)]
+                    delta = [new - old for old, new in zip(claimed, raised)]
+                    claimed[:] = raised
+                    if not any(delta):
+                        if stamp:
+                            owner_state["last_ts"] = stamp
+                        continue
+                    for index in range(4):
+                        owner_state["tokens"][source][index] += delta[index]
+                    if stamp:
+                        owner_state["last_ts"] = stamp
+                        hour = _local_hour(stamp)
+                        if hour:
+                            bucket = owner_state["hours"].setdefault(hour, _new_hour_bucket())
+                            for index in range(4):
+                                bucket[source]["tokens"][index] += delta[index]
+                    continue
+        if full_turn:
+            state["turns"] += 1
+            state[source] += 1
+            if model:
+                state["models"][model] = state["models"].get(model, 0) + 1
+        for index in range(4):
+            state["tokens"][source][index] += delta[index]
+        state["tokens_1h"][source] += delta[4]
+        if stamp:
+            state["last_ts"] = stamp
+            hour = _local_hour(stamp)
+            if hour:
+                bucket = state["hours"].setdefault(hour, _new_hour_bucket())
+                if full_turn:
+                    bucket[source]["turns"] += 1
+                for index in range(4):
+                    bucket[source]["tokens"][index] += delta[index]
+                bucket[source]["tokens_1h"] += delta[4]
+
+
+def _promote_deferred(released_owners):
+    """Re-read the candidate files that skipped turns whose owner just disappeared.
+
+    One bounded pass: the reset/re-read path is the same one used for a rewritten
+    transcript, so identity, claims and deferred flags are rebuilt consistently. A file
+    that is still waiting on a live owner is left alone; only deferred files are read.
+    """
+    changed = False
+    for state_key in [item for item, state in _SESSIONS.items() if state.get("deferred")]:
+        if state_key in released_owners:
+            continue
+        state = _SESSIONS.get(state_key)
+        if state is None:
+            continue
+        stale = _reset_session_state(state)
+        for claim_key in stale:
+            if _CLAIM_OWNER.get(claim_key) == state_key:
+                del _CLAIM_OWNER[claim_key]
+        try:
+            lines, next_offset, identity, _stale = _read_appended(Path(state_key), state)
+        except OSError:
+            continue
+        # The rewrite that forced this reset may have dropped claims of its own.
+        for claim_key in _stale:
+            if _CLAIM_OWNER.get(claim_key) == state_key:
+                del _CLAIM_OWNER[claim_key]
+        if lines:
+            changed = True
+        _apply_lines(state_key, state, lines)
+        state["offset"] = next_offset
+        if identity is not None:
+            state["size"], state["mtime_ns"], state["head_sha"], state["tail_sha"] = identity
+    return changed
+
+
 def _transcript_files(root):
     """Yield (path, mtime, size) for transcript files.
 
@@ -804,13 +963,15 @@ def scan_sessions(projects=None, max_files=SCAN_FILES, now=None, pricing=None):
     with _LOCK:
         # Only a cold start needs the file: afterwards _SESSIONS and _CLAIM_OWNER are
         # the source of truth and re-parsing 80KB on every refresh would be waste.
-        cached_states = {}
+        cached_states, released_claims = {}, 0
         if not _SESSIONS:
-            restored = _restore_claims(_load_usage_states(),
-                                       {str(path) for _mtime, path in candidates})
+            restored, released_claims = _restore_claims(
+                _load_usage_states(), {str(path) for _mtime, path in candidates})
             # None means the ledger itself is corrupt (duplicate owners / over the cap):
             # dropping every state and claim forces the full rescan that repairs it.
             cached_states = restored or {}
+        released = bool(released_claims)
+        released_owners = set()
         cached_hit = False
         for _mtime, path in candidates:
             # Restore every candidate up front: a claim's owner must already be live
@@ -833,120 +994,36 @@ def scan_sessions(projects=None, max_files=SCAN_FILES, now=None, pricing=None):
                 lines, next_offset, identity, stale_claims = _read_appended(path, state)
             except OSError:
                 continue
-            for claim_key in stale_claims:
-                if _CLAIM_OWNER.get(claim_key) == key:
-                    del _CLAIM_OWNER[claim_key]
+            if stale_claims:
+                # Its rewrite dropped claims: other files may now own a deferred copy.
+                released = True
+                released_owners.add(key)
+                for claim_key in stale_claims:
+                    if _CLAIM_OWNER.get(claim_key) == key:
+                        del _CLAIM_OWNER[claim_key]
             if lines:
                 changed = True
-            # Parse the whole chunk first: applying a line and only then failing would
-            # re-read (and double count) every line applied before the failure.
-            parsed = []
-            for line in lines:
-                if b'"assistant"' not in line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(record, dict) or record.get("type") != "assistant":
-                    continue
-                message = record.get("message")
-                if not isinstance(message, dict):
-                    continue
-                usage = message.get("usage")
-                usage = usage if isinstance(usage, dict) else {}
-                try:
-                    delta = [int(usage.get(name) or 0) for name in
-                             ("input_tokens", "output_tokens", "cache_read_input_tokens",
-                              "cache_creation_input_tokens")]
-                except (TypeError, ValueError):
-                    continue  # one bad record must not stop the file
-                # Claude Code records the 1h/5m TTL split beside the cache-write total
-                # (usage.cache_creation.ephemeral_1h_input_tokens); older rows omit it.
-                creation = usage.get("cache_creation")
-                write_1h = 0
-                if isinstance(creation, dict):
-                    try:
-                        write_1h = int(creation.get("ephemeral_1h_input_tokens") or 0)
-                    except (TypeError, ValueError):
-                        write_1h = 0
-                delta.append(min(max(write_1h, 0), max(delta[3], 0)))
-                claim = _usage_claim_key(message, record)
-                parsed.append((_classify(message.get("id")), delta, message.get("model"),
-                               record.get("timestamp"),
-                               _claim_hash(claim) if claim else None))
-            for source, delta, model, stamp, claim_key in parsed:
-                full_turn = True
-                if claim_key is not None:
-                    owner = _CLAIM_OWNER.get(claim_key)
-                    if owner is None:
-                        state["claims"][claim_key] = list(delta[:4])
-                        _CLAIM_OWNER[claim_key] = key
-                    else:
-                        full_turn = False
-                        owner_state = _SESSIONS.get(owner)
-                        claimed = owner_state["claims"].get(claim_key) if owner_state else None
-                        if claimed is None:
-                            # The owning file's state is gone; take the claim back.
-                            state["claims"][claim_key] = list(delta[:4])
-                            _CLAIM_OWNER[claim_key] = key
-                            full_turn = True
-                        else:
-                            # Later streaming rows can carry more complete usage for the
-                            # same turn: add only the per-field increase, never a negative,
-                            # to the owning file's bucket for that turn (orca applies its
-                            # token corrections to the claimed projection too). The 1h TTL
-                            # split is fixed when the request is made, so a duplicate never
-                            # adds it again (the claim keeps the four priced axes).
-                            raised = [max(old, new) for old, new in zip(claimed, delta)]
-                            delta = [new - old for old, new in zip(claimed, raised)]
-                            claimed[:] = raised
-                            if not any(delta):
-                                if stamp:
-                                    owner_state["last_ts"] = stamp
-                                continue
-                            for index in range(4):
-                                owner_state["tokens"][source][index] += delta[index]
-                            if stamp:
-                                owner_state["last_ts"] = stamp
-                                hour = _local_hour(stamp)
-                                if hour:
-                                    bucket = owner_state["hours"].setdefault(
-                                        hour, _new_hour_bucket())
-                                    for index in range(4):
-                                        bucket[source]["tokens"][index] += delta[index]
-                            continue
-                if full_turn:
-                    state["turns"] += 1
-                    state[source] += 1
-                    if model:
-                        state["models"][model] = state["models"].get(model, 0) + 1
-                for index in range(4):
-                    state["tokens"][source][index] += delta[index]
-                state["tokens_1h"][source] += delta[4]
-                if stamp:
-                    state["last_ts"] = stamp
-                    hour = _local_hour(stamp)
-                    if hour:
-                        bucket = state["hours"].setdefault(hour, _new_hour_bucket())
-                        if full_turn:
-                            bucket[source]["turns"] += 1
-                        for index in range(4):
-                            bucket[source]["tokens"][index] += delta[index]
-                        bucket[source]["tokens_1h"] += delta[4]
+            _apply_lines(key, state, lines)
             state["offset"] = next_offset
             if identity is not None:
                 state["size"], state["mtime_ns"], state["head_sha"], state["tail_sha"] = identity
+        for key in list(_SESSIONS):
+            if key not in seen:
+                dropped = _SESSIONS[key]["claims"]
+                for claim_key in dropped:
+                    if _CLAIM_OWNER.get(claim_key) == key:
+                        del _CLAIM_OWNER[claim_key]
+                if dropped:
+                    released = True
+                del _SESSIONS[key]
+        if released:
+            # An owner left the window or released its claims, so the copies skipped
+            # while it owned them can be counted exactly once now.
+            changed = _promote_deferred(released_owners) or changed
         if changed or (cached_hit and time.monotonic() - _USAGE_CACHE_META["saved_at"] > 300):
             # Throttled: the scan runs every few seconds, the cache only needs to survive a restart.
             if time.monotonic() - _USAGE_CACHE_META["saved_at"] > 5:
                 _save_usage_states(_SESSIONS, now)
-        for key in list(_SESSIONS):
-            if key not in seen:
-                for claim_key in _SESSIONS[key]["claims"]:
-                    if _CLAIM_OWNER.get(claim_key) == key:
-                        del _CLAIM_OWNER[claim_key]
-                del _SESSIONS[key]
 
         sessions, totals = [], {"external": [0, 0, 0, 0], "plan": [0, 0, 0, 0]}
         totals_1h = {"external": 0, "plan": 0}
