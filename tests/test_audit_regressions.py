@@ -237,6 +237,46 @@ class AuditRegressionTests(unittest.TestCase):
         self.assertIn("stale_record", output.getvalue())
         self.assertFalse(pid_file.exists(), "a stale record must be cleared, not signalled")
 
+    # --- transfer size --------------------------------------------------------
+    def test_the_page_is_compressed_when_the_client_accepts_gzip(self):
+        import gzip as gzip_module
+        import threading
+        import urllib.request
+
+        server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            request = urllib.request.Request(f"http://127.0.0.1:{port}/", headers={"accept-encoding": "gzip"})
+            with opener.open(request, timeout=15) as response:
+                compressed = response.read()
+                encoding = response.headers.get("content-encoding")
+                self.assertEqual(response.status, 200)
+                self.assertEqual(encoding, "gzip")
+                self.assertEqual(response.headers.get("vary"), "accept-encoding")
+            plain = urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+                f"http://127.0.0.1:{port}/", timeout=15).read()
+            self.assertEqual(gzip_module.decompress(compressed), plain)
+            self.assertLess(len(compressed), len(plain) * 0.6, "compression should be worth it")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a_large_route_log_is_read_from_the_tail_only(self):
+        log = self.root / ".route.log"
+        with log.open("w", encoding="utf-8") as handle:
+            for index in range(4000):
+                handle.write(f"2026-10-25T01:{index % 60:02d}:00+00:00 " + json.dumps(
+                    {"event": "route_selected", "provider": "openrouter", "reason": "replacement"}) + "\n")
+        with mock.patch.object(dash, "ROUTE_TAIL_BYTES", 4096):
+            events = dash.parse_route_log(log, limit=5000, incremental=False)
+        self.assertTrue(events)
+        self.assertLessEqual(len(events), 5000)
+        self.assertEqual(events[-1]["event"], "route_selected")
+        # The parked offset is the real end of the file, so the next refresh stays incremental.
+        self.assertEqual(dash._ROUTE_TAIL["offset"], log.stat().st_size)
+
     # --- rate limiting --------------------------------------------------------
     def test_write_requests_are_rate_limited_per_minute(self):
         with mock.patch.dict(dash._RATE, {"window": -1, "counts": {}}, clear=True):

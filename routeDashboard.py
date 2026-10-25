@@ -13,6 +13,7 @@ prompt text and never writes anything. Run it next to a routing session:
 """
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -106,6 +107,9 @@ HELP_SECTION = {
                 ["크레딧·단가", "OpenRouter /api/v1/key, /api/v1/models"],
                 ["상태 JSON", "GET /api/status 또는 python routeDashboard.py --status"]],
 }
+ROUTE_TAIL_BYTES = 4 * 1024 * 1024
+
+
 SCAN_DAYS = 7
 SCAN_FILES = 300
 
@@ -174,13 +178,26 @@ def _parse_route_log_unlocked(path=None, limit=5000, incremental=True):
                     and state["offset"] <= info.st_size):
                 start = state["offset"]
             else:
-                start = 0
+                # A cold read only needs the tail: a log that grew for weeks must not be
+                # parsed in full on every dashboard start.
+                start = max(0, info.st_size - ROUTE_TAIL_BYTES) if info.st_size > ROUTE_TAIL_BYTES else 0
+                skip_partial = start > 0
                 state["events"] = []
-            if start <= len(prefix):
-                chunk = prefix[start:] + handle.read()
-            else:
+            skip_partial = start > len(prefix)
+            if skip_partial:
                 handle.seek(start)
                 chunk = handle.read()
+            else:
+                chunk = prefix[start:] + handle.read()
+            if skip_partial and chunk:
+                # The tail almost certainly starts mid-line; drop that fragment but keep the
+                # offset absolute so the next refresh stays incremental.
+                newline = chunk.find(b"\n")
+                if newline >= 0:
+                    start += newline + 1
+                    chunk = chunk[newline + 1:]
+                else:
+                    chunk = b""
     except OSError:
         return list(state["events"])
     if chunk:
@@ -1553,7 +1570,14 @@ class Handler(BaseHTTPRequestHandler):
         body = payload.encode("utf-8")
         self.send_response(status)
         self.send_header("content-type", content_type)
+        # The page is ~40KB of inline CSS/JS; gzip turns that into a few KB on every load.
+        if len(body) > 1024 and "gzip" in (self.headers.get("accept-encoding") or "").lower():
+            compressed = gzip.compress(body, 6)
+            if len(compressed) < len(body):
+                body = compressed
+                self.send_header("content-encoding", "gzip")
         self.send_header("content-length", str(len(body)))
+        self.send_header("vary", "accept-encoding")
         self.send_header("cache-control", "no-store")
         self.send_header("x-content-type-options", "nosniff")
         self.send_header("referrer-policy", "no-referrer")
