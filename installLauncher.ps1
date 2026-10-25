@@ -1,4 +1,4 @@
-param([switch]$Remove)
+param([switch]$Remove, [string]$Target = (Join-Path $HOME '.local\bin'))
 # Installs bare commands that forward to this checkout:
 #   OpenClaude.ps1            -> routing session
 #   OpenClaudeDashboard.ps1   -> dashboard
@@ -7,7 +7,7 @@ param([switch]$Remove)
 #   .\installLauncher.ps1          # install or refresh
 #   .\installLauncher.ps1 -Remove  # delete every installed forwarder
 $ErrorActionPreference = 'Stop'
-$target = Join-Path $HOME '.local\bin'
+$target = $Target
 
 $commands = [ordered]@{
     'OpenClaude.ps1'            = @('OpenClaude.ps1', 'routing session')

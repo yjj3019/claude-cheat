@@ -352,7 +352,12 @@ node --test tests/*.test.mjs
 python -m unittest discover -s tests -p 'test_*.py' -v
 python openrouterAdvisor.py --self-test
 node --check claudeRouteProxy.mjs
+node tests/simulate.mjs --soak 3000        # synthetic traffic, long session, memory
+python tests/live_smoke.py --dry-run       # report which settings exist, no billing
 ```
+
+- The Windows process-tree tests (`test_local_lifecycle`) need **Git Bash**. `C:\Windows\System32\bash.exe` is WSL and cannot run the Windows python path the harness passes, so those tests skip themselves.
+- Real provider calls stay out of the suite. After a configuration change, confirm once with `python tests/live_smoke.py` (16 tokens, well under a cent per run).
 
 The tests cover payload preservation, authentication isolation, tool-result round trips, the initial request plus three retries, Plan fallback, recovery, cancellation, timeouts, and empty responses. Synthetic success does not establish live-provider or full native-feature parity.
 

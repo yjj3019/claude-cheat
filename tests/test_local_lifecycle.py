@@ -17,7 +17,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = Path(__file__).resolve().parents[1]
 NODE = shutil.which("node")
-BASH = shutil.which("bash") or (str(Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/bin/bash.exe"))
+# Prefer Git Bash: C:\Windows\System32\bash.exe is WSL, which cannot run the Windows
+# python path this harness passes as $1, so the synthetic grandchild never starts.
+_GIT_BASH = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/bin/bash.exe"
+_WSL_BASH = Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32/bash.exe"
+if _GIT_BASH.is_file():
+    BASH = str(_GIT_BASH)
+else:
+    _found = shutil.which("bash") or shutil.which("bash.exe")
+    BASH = None if (_found and Path(_found).resolve() == _WSL_BASH.resolve()) else _found
 CLI = r"""
 import http.client,json,subprocess,sys,time,urllib.request
 from pathlib import Path
@@ -61,7 +69,7 @@ with patch.object(a,'check_connection',return_value=0),patch.object(a,'provider_
 """
 
 
-@unittest.skipUnless(os.name == "nt" and NODE and Path(BASH).is_file(), "Windows, Node.js and Git Bash required")
+@unittest.skipUnless(os.name == "nt" and NODE and BASH and Path(BASH).is_file(), "Windows, Node.js and Git Bash required")
 class LocalLifecycleTests(unittest.TestCase):
     def setUp(self):
         self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
