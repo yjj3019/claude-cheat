@@ -11,8 +11,9 @@ import { test } from 'node:test';
 import {
   CLIENT_MODEL, EXIT, UsageError, UPSTREAM_MODEL, aggregateProcesses, describeExternalPayload,
   evaluateVerdict, expectedExternalBody, externalPayloadExpectation, fixtureMessage, fixtureSse,
-  historyPayload, median, parseArgs, percentile, resolveConfig, sizePayload, streamPayload,
-  summarizeSamples, summarizeSoak, validateHttpResponse, verifyMetrics, verifyUpstreamReport,
+  SOAK_SAMPLE_CAP, createSampleReservoir, historyPayload, median, parseArgs, percentile,
+  resolveConfig, sizePayload, streamPayload, summarizeSamples, summarizeSoak, validateHttpResponse,
+  verifyMetrics, verifyUpstreamReport,
 } from './bench_proxy.mjs';
 
 const sha256 = text => createHash('sha256').update(text).digest('hex');
@@ -404,4 +405,47 @@ test('evaluateVerdict folds soak growth failures into the verdict', () => {
 test('exit codes are stable contract values', () => {
   assert.deepEqual(EXIT, { pass: 0, fail: 1, usage: 2 });
   assert.equal(new UsageError('bad').exitCode, EXIT.usage);
+});
+
+test('summarizeSamples folds min/max without a spread overflow on soak-sized input', () => {
+  const values = new Array(300_001);
+  for (let index = 0; index < values.length; index += 1) values[index] = index + 1;
+  const stats = summarizeSamples(values);
+  assert.equal(stats.count, 300_001);
+  assert.equal(stats.minMs, 1, 'the smallest sample survives');
+  assert.equal(stats.maxMs, 300_001, 'the largest sample survives');
+  assert.equal(stats.medianMs, 150_001);
+  assert.equal(stats.p90Ms, 270_001);
+});
+
+test('a soak reservoir keeps the exact count but a bounded sample', () => {
+  const reservoir = createSampleReservoir(1000, 7);
+  assert.equal(SOAK_SAMPLE_CAP > 0, true);
+  for (let index = 0; index < 1_000_000; index += 1) reservoir.record(0, index + 1);
+  assert.deepEqual(reservoir.counts(), [1_000_000, 0, 0], 'every request is counted');
+  assert.deepEqual(reservoir.sampledCounts(), [1000, 0, 0], 'samples stay bounded');
+  assert.equal(reservoir.samples().length, 1000);
+  const stats = summarizeSamples(reservoir.samples().map(sample => sample.wallMs));
+  assert.ok(Math.abs(stats.medianMs - 500_000) < 60_000, `reservoir median ${stats.medianMs}`);
+  assert.ok(stats.minMs >= 1 && stats.maxMs <= 1_000_000);
+  const again = createSampleReservoir(1000, 7);
+  for (let index = 0; index < 1_000_000; index += 1) again.record(0, index + 1);
+  assert.deepEqual(again.samples(), reservoir.samples(), 'the seeded reservoir is reproducible');
+  assert.throws(() => reservoir.record(3, 1), RangeError);
+});
+
+test('summarizeSoak reports exact phase counts beside the sampled statistics', () => {
+  const reservoir = createSampleReservoir(50, 11);
+  for (let index = 0; index < 10_000; index += 1) reservoir.record(0, 10);
+  for (let index = 0; index < 1_000; index += 1) reservoir.record(1, 20);
+  const soak = summarizeSoak({ samples: reservoir.samples(), counts: reservoir.counts() });
+  assert.deepEqual(soak.buckets.map(bucket => bucket.count), [10_000, 1_000, 0]);
+  assert.deepEqual(soak.buckets.map(bucket => bucket.sampled), [50, 50, 0]);
+  assert.equal(soak.buckets[0].medianMs, 10);
+  assert.equal(soak.buckets[1].medianMs, 20);
+  assert.equal(soak.buckets[2].medianMs, null);
+  // Without counts the sample count is the reported count, as before the reservoir existed.
+  const plain = summarizeSoak({ samples: [{ phase: 0, wallMs: 5 }, { phase: 0, wallMs: 7 }] });
+  assert.equal(plain.buckets[0].count, 2);
+  assert.equal(plain.buckets[0].sampled, undefined);
 });

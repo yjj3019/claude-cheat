@@ -94,8 +94,46 @@ export function percentile(values, fraction) {
 export function summarizeSamples(values) {
   if (!Array.isArray(values) || values.length === 0)
     return { count: 0, medianMs: null, p90Ms: null, minMs: null, maxMs: null };
+  // An hour-long soak produces millions of samples; spread arguments would exceed V8's
+  // call-stack limit, so min/max are folded instead of passed through Math.min(...).
+  let min = Infinity, max = -Infinity;
+  for (const value of values) {
+    if (value < min) min = value;
+    if (value > max) max = value;
+  }
   return { count: values.length, medianMs: round(median(values)), p90Ms: round(percentile(values, 0.9)),
-    minMs: round(Math.min(...values)), maxMs: round(Math.max(...values)) };
+    minMs: round(min), maxMs: round(max) };
+}
+
+// A soak cannot keep every latency sample: at thousands of requests per second an hour
+// would retain millions of numbers and write them all into the result JSON. Each phase
+// keeps a bounded uniform reservoir for the percentiles while the exact count is kept
+// separately; the pseudo-random generator is seeded so a run can be reproduced.
+export const SOAK_SAMPLE_CAP = 20000;
+export function createSampleReservoir(cap = SOAK_SAMPLE_CAP, seed = 0x9e3779b9) {
+  const buckets = [[], [], []];
+  const counts = [0, 0, 0];
+  let state = seed >>> 0;
+  const next = () => {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    return state / 4294967296;
+  };
+  return {
+    cap,
+    record(phase, wallMs) {
+      if (!(phase >= 0 && phase <= 2)) throw new RangeError('phase must be 0..2');
+      counts[phase] += 1;
+      const bucket = buckets[phase];
+      if (bucket.length < cap) { bucket.push(wallMs); return; }
+      const index = Math.floor(next() * counts[phase]);
+      if (index < cap) bucket[index] = wallMs;
+    },
+    samples() {
+      return buckets.flatMap((bucket, phase) => bucket.map(wallMs => ({ phase, wallMs })));
+    },
+    counts() { return counts.slice(); },
+    sampledCounts() { return buckets.map(bucket => bucket.length); },
+  };
 }
 
 // Per-process medians are the unit of aggregation: pooling raw requests from different
@@ -250,9 +288,15 @@ export function verifyMetrics(metrics, expected = {}) {
   return { ok: failures.length === 0, failures };
 }
 
-export function summarizeSoak({ samples = [], memory = {}, thresholds = {} } = {}) {
-  const buckets = [0, 1, 2].map(phase => ({ phase,
-    ...summarizeSamples(samples.filter(sample => sample.phase === phase).map(sample => sample.wallMs)) }));
+export function summarizeSoak({ samples = [], counts = null, memory = {}, thresholds = {} } = {}) {
+  // ``samples`` may be a bounded reservoir: ``counts`` carries the exact per-phase totals
+  // so the report never confuses "measured" with "sampled".
+  const buckets = [0, 1, 2].map(phase => {
+    const stats = summarizeSamples(samples.filter(sample => sample.phase === phase).map(sample => sample.wallMs));
+    const total = Array.isArray(counts) ? counts[phase] : stats.count;
+    return { phase, ...stats, count: total,
+      ...(Array.isArray(counts) ? { sampled: stats.count } : {}) };
+  });
   const start = memory.start, mid = memory.mid, end = memory.end;
   const failures = [];
   const growth = { gcAvailable: Boolean(start?.gc && end?.gc), rssGrowthMb: null, heapGrowthMb: null,
@@ -655,7 +699,7 @@ async function runSoak(config) {
     await Promise.all(Array.from({ length: config.soakConcurrency }, warmupLoop));
 
     const startMemory = await worker.sample();
-    const samples = [];
+    const reservoir = createSampleReservoir();
     const errors = [];
     let sent = 0;
     // Two contiguous load windows with a clean memory sample in between: the GC that
@@ -677,7 +721,7 @@ async function runSoak(config) {
           sent += 1;
           const check = validateHttpResponse(observed, expected);
           if (!check.ok && errors.length < 5) errors.push(check.failures.join('; '));
-          samples.push({ wallMs: observed.wallMs, phase });
+          reservoir.record(phase, observed.wallMs);
         }
       };
       await Promise.all(Array.from({ length: config.soakConcurrency }, loop));
@@ -689,7 +733,10 @@ async function runSoak(config) {
     const endMemory = await worker.sample();
     const report = await worker.report();
     const metrics = await fetchMetrics(worker.port);
-    const soak = summarizeSoak({ samples, memory: { start: startMemory, mid: midMemory, end: endMemory },
+    const samples = reservoir.samples();
+    const sampleCounts = reservoir.counts();
+    const soak = summarizeSoak({ samples, counts: sampleCounts,
+      memory: { start: startMemory, mid: midMemory, end: endMemory },
       thresholds: { maxRssGrowthMb: config.maxRssGrowthMb, maxHeapGrowthMb: config.maxHeapGrowthMb } });
     const allFailures = [...soak.failures, ...errors];
     const totalSent = warmupRequests + sent;
@@ -703,7 +750,10 @@ async function runSoak(config) {
     }
     return { pass: allFailures.length === 0, failures: allFailures, requests: sent, totalRequests: totalSent,
       warmupRequests, warmupMs, errors: errors.length, rps: round(sent / config.soakSeconds),
-      samplesMs: samples.map(sample => round(sample.wallMs)), buckets: soak.buckets, growth: soak.growth,
+      // samplesMs keeps the bounded reservoir (see SOAK_SAMPLE_CAP); sampleCounts has the
+      // exact totals, so an hour-long report stays small without hiding how much was sent.
+      samplesMs: samples.map(sample => round(sample.wallMs)), sampleCounts, sampleCap: reservoir.cap,
+      sampledSamples: samples.length, buckets: soak.buckets, growth: soak.growth,
       memory: { start: startMemory, mid: midMemory, end: endMemory },
       expectation: { hash: expectation.hash, bytes: expectation.bytes }, metricsAttempts: metrics.attempts,
       upstream: report.upstream };
