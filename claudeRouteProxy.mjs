@@ -333,7 +333,7 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false)
   };
 }
 
-async function bufferedResponse(upstream, model, clientModel, stream, signal, onProgress, strictMeta = false, onFrame = null, rejectThinking = false) {
+async function bufferedResponse(upstream, model, clientModel, stream, signal, onProgress, strictMeta = false, onFrame = null, rejectThinking = false, onDrain = null) {
   if (!upstream.ok) throw new Error('External request failed');
   if (!upstream.body) throw new Error('Empty message response');
   const sse = (upstream.headers.get('content-type') || '').includes('text/event-stream');
@@ -347,15 +347,22 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal, on
   const validator = sse ? streamValidator(model, clientModel, strictMeta, rejectThinking) : null;
   const cancel = () => { reader.cancel().catch(() => {}); };
   signal.addEventListener('abort', cancel, { once: true });
+  const drainIfNeeded = async () => {
+    if (!backpressured) return;
+    backpressured = false;
+    if (onDrain) await onDrain();
+  };
   // A frame is forwarded as soon as it validates, so the client sees tokens while the
   // provider is still generating. An invalid frame after that point can no longer fall
   // back, so it is reported with `streamed` for the caller to close the response.
   const pending = [];
   let committed = false;
+  let backpressured = false;
   const forward = text => {
     if (!onFrame || !text) return;
     try {
-      onFrame(text);
+      // write() === false means the socket buffer is full; the caller must wait for drain.
+      backpressured = onFrame(text) === false;
       forwarded = true;
     } catch { /* client went away; the close handler aborts */ }
   };
@@ -383,6 +390,7 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal, on
       size += value.byteLength;
       if (size > MAX_RESPONSE) throw new Error('Response too large');
       if (!sse) chunks.push(Buffer.from(value));
+      await drainIfNeeded();
       if (sse) {
         eventPending += eventDecoder.decode(value, { stream: true });
         let boundary, terminal = false;
@@ -833,12 +841,18 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
                   res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store' });
                   logReplacement();
                 }
-                res.write(text);
+                return res.write(text);
               };
+              // A slow client must slow the upstream read instead of buffering the reply here.
+              const onDrain = () => new Promise(resolve => {
+                const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
+                res.once('drain', done);
+                res.once('close', done);
+              });
               const streaming = streamPassthrough && !noPlan && body.stream === true;
               const validated = await bufferedResponse(response, externalModel, model, noPlan ? false : body.stream,
                 controller.signal, () => { noteFirstByte(); if (!noPlan) arm(); }, provider === 'openrouter',
-                streaming ? onFrame : null, !compatProfile && !localOnly);
+                streaming ? onFrame : null, !compatProfile && !localOnly, streaming ? onDrain : null);
               if (compatProfile) {
                 const content = JSON.parse(validated.text).content;
                 if (content.some(block => Object.keys(block).some(name =>

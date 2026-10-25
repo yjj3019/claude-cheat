@@ -358,6 +358,8 @@ A routed session also appends its routing events to `.route.log` beside the laun
 
 Exit and relaunch to change providers. `/model` selects Claude models, not OpenRouter versus Local. To return to ordinary Plan use `claude` in a clean terminal. This launcher does not modify the parent terminal, but old user/system `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` or `CLAUDE_CONFIG_DIR` variables may still be inherited. Do not delete saved login or MCP settings as a blanket fix.
 
+The security model, trust boundaries, CSRF/DNS-rebinding handling and residual risks are documented in [`docs/SECURITY.ko.md`](docs/SECURITY.ko.md) (Korean).
+
 ## Validation and limitations
 
 Personal machine configurations, account usage, billing records, and live session logs are not stored in this repository. Run synthetic tests without external model inference:

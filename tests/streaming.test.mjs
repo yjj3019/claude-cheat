@@ -120,6 +120,46 @@ test('passthrough keeps a recoverable failure recoverable before any token', asy
   }
 });
 
+test('a slow client is respected instead of buffering the whole reply in the proxy', async () => {
+  // 300 frames of 4 KiB force the socket buffer full while the client is not reading, so
+  // write() returns false and the proxy must wait for drain rather than queue everything.
+  const frames = [
+    frame('message_start', { message: { ...META, model: 'stream/model' } }),
+    frame('content_block_start', { index: 0, content_block: { type: 'text', text: '' } }),
+  ];
+  for (let index = 0; index < 300; index += 1) {
+    frames.push(frame('content_block_delta', { index: 0, delta: { type: 'text_delta', text: 'x'.repeat(4096) } }));
+  }
+  frames.push(frame('content_block_stop', { index: 0 }));
+  frames.push(frame('message_delta', { delta: { stop_reason: 'end_turn' } }));
+  frames.push(frame('message_stop', {}));
+  const { server, base } = await start({ passthrough: true, chunks: frames });
+  try {
+    const response = await fetch(base, { method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-local-route-token': NONCE,
+        authorization: 'Bearer sk-ant-oat-stream', 'anthropic-beta': BETA },
+      body: JSON.stringify({ model: MODEL, max_tokens: 64000, stream: true,
+        messages: [{ role: 'user', content: 'long' }] }) });
+    const reader = response.body.getReader();
+    let body = '';
+    let reads = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      body += new TextDecoder().decode(value);
+      reads += 1;
+      await new Promise(resolve => setTimeout(resolve, 3)); // slow consumer
+    }
+    assert.equal(response.status, 200);
+    assert.match(body, /message_stop/);
+    assert.equal((body.match(/"type":"content_block_delta"/g) || []).length, 300);
+    assert.ok(reads > 1, 'the reply must arrive in several chunks');
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
 test('passthrough still delivers a control-stop reply that has no content', async () => {
   // A refusal carries no usable text, so nothing may be forwarded early; the client must
   // still receive the whole stream instead of an empty 200.
