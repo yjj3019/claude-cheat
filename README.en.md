@@ -263,13 +263,17 @@ The **insights** card ranks *what changed, why, and what to do next* instead of 
 | Last 60 minutes | Replacement versus Plan counts, circuit opens |
 | Bypass reasons | Counts per `native_feature` `detail` with **meaning and action**, external failure statuses and validation classes |
 | Credits | Key limit, spend this period, remaining, reset date (OpenRouter `/api/v1/key`) |
-| Today | Replacement and Plan tokens, input/output, cache, **estimated cost** |
+| Today | Replacement and Plan tokens, input/output, cache (**5m and 1h TTL split**), **cost with its status** |
 | Hourly tokens | The last 24 hours as replacement versus Plan bars |
 | Route transitions | When the route changed, its reason, model, count and duration (last 12) |
-| Per session | Turns, replacement/Plan turns, replacement tokens, **estimated cost**, model |
+| Per session | **Unique turns** (deduplicated), replacement/Plan turns, replacement tokens, **cost and status**, model |
 | Help | CLI commands (`--status` and options), HTTP API, reason code table (meaning/action), state badges, exit codes, data sources |
 
-Estimated cost uses the model rates from OpenRouter `/api/v1/models`; confirm actual charges against the provider's own records. The **model that actually answered** is recorded by the proxy just before a response is delivered; the name the CLI shows is the request alias (`claude-sonnet-5-5` and so on), so this value is the real provider model.
+**Turns are counted exactly once.** Claude Code writes one assistant row per streamed update, and `/resume` or a fork copies the history into another transcript, so per-file totals count the same turn several times (42% of assistant rows were duplicates in this machine's 7-day window). The dashboard identifies a turn by `message.id`+`requestId` (falling back to `msg:`/`uuid:`), so a duplicate adds no turn and only its larger token delta is applied. Lower turn counts than earlier versions are therefore expected.
+
+**Cost carries a status.** Replacement traffic priced from the catalog is **estimated**, Plan traffic is **included** (a $0 attribution), and a model without a rate card is **unknown** (null cost). Cache-write tokens are split between the 5m and 1h TTLs, priced at the 1h rate when the card has one and at the standard write rate otherwise, with the choice shown. Confirm actual charges against the provider's records. The **model that actually answered** is recorded by the proxy just before a response is delivered; the name the CLI shows is the request alias (`claude-sonnet-5-5` and so on), so this value is the real provider model.
+
+The aggregation cache (`.usage-cache.json`) carries the turn-ownership ledger and is about **0.5MB** for a real 7-day window (5.4MB for a synthetic 2,000-file/100k-turn fixture; above 200k claims the oldest files' claims are evicted whole). A cache version change forces one full rescan.
 
 The page shows no key, prompt or request body. It writes only `.env.openrouter` and `.env.local-llm` beside the launcher, and only when a save is requested. It is a separate process, so it can run beside the routing session.
 
@@ -417,7 +421,7 @@ Reference numbers (this development machine, Node 24). Simulator and soak figure
 | Retry cost | 1MB + one retry 10.7ms vs 12.8ms before, four failures 9.8ms vs 12.1ms (~17–19% better) |
 | Circuit | 4 failures → Plan fallback, Plan during cooldown, external again after recovery |
 | Long soak | 150,000 requests at 266MB; **1.2M requests reached 1.09GB RSS** (V8 heap expansion — a 256MB cap run passes, so it is collectable) |
-| Session-cache restart | Cold scan **1,119ms → 20ms** on real data (357 files, 464MB): per-file aggregates live in `.usage-cache.json` (80KB) and are validated by size/offset |
+| Session-cache restart | Cold scan **1,119ms → 20ms** on real data (357 files, 464MB): `.usage-cache.json` (v5) stores per-file aggregates with size, mtime and head/tail 4KB sha256 fingerprints plus the turn-ownership ledger, so an in-place rewrite is rescanned and unchanged files are not read |
 | Page transfer | 39.3KB → **12.0KB** with gzip when the client accepts it; loopback render 2.7ms per request |
 | Large route log | A cold read parses only the **last 4MB** while keeping the offset absolute, so a weeks-old log does not slow startup |
 | Heap cap | The launcher starts the proxy with `--max-old-space-size=512`; a 1.2M-request re-measure peaks at **510MB with a 239MB drift** (1.09GB without the cap) |
