@@ -253,6 +253,8 @@ Every interactive launch now makes one minimal provider-only inference check bef
 
 A **read-only** page bound to `127.0.0.1`. The port is **fixed at 8787**; an older dashboard instance is stopped automatically so the same port is reused. If another program holds that port the server fails with a message instead of silently moving; pass `--allow-port-fallback` to pick a free port instead.
 
+Stopping a previous instance (including `python routeDashboard.py --stop`) happens **only when both the pid and the process creation time stored in `.dashboard.pid` match**. A recycled pid, our own or an ancestor process, or a legacy record without identity is refused with one line (`identity_mismatch` / `own_tree_pid` / `identity_unverifiable`) and the stale record is overwritten on the next start. Right after an upgrade, stop an older dashboard manually once (`Ctrl+C`) before starting. Non-Windows has no creation-time primitive, so the documented behavior is to refuse rather than signal a bare pid.
+
 The refresh interval follows the situation: two seconds while routing is active, ten seconds while idle, fifteen when the tab is hidden. The header shows a one-line summary (`오늘 43.8M토큰 · $1.42 · 남은 한도 $48.25 · 우선 확인: …`).
 
 The **insights** card ranks *what changed, why, and what to do next* instead of listing numbers, with the measurements it used as chips. A banner that shares an insight's cause is not repeated.
