@@ -366,7 +366,7 @@ The security model, trust boundaries, CSRF/DNS-rebinding handling and residual r
 OpenClaude -Takeover        # run in a second terminal
 ```
 
-The new launcher reads the live port and token from `.session-handoff.json`, asks the running proxy to drain (`POST /api/handover`, session token required), answers new requests with 503 + `Retry-After: 1`, waits for in-flight turns (default cap **120 s**, `ROUTE_HANDOVER_TIMEOUT_MS`; the reply reports `forced: true` when the cap is hit), and only then rebinds the same port with the same token. The CLI keeps its base URL and simply reconnects; new requests during the drain get 503.
+The new launcher reads the live port and token from `.session-handoff.json`, asks the running proxy to drain (`POST /api/handover`, session token required), answers new requests with 503 + `Retry-After: 1`, and waits for in-flight turns (default cap **120 s**, `ROUTE_HANDOVER_TIMEOUT_MS`) before rebinding the same port with the same token. If the cap expires while a turn is still active, the proxy does **not** exit: it reverts to serving and replies HTTP **409** with `{"drained": false, "reverted": true, …}`; the launcher then aborts the replacement and reports a retryable error instead of truncating the live response. Concurrent handover requests share one drain run and the exit hook fires once. The CLI keeps its base URL and simply reconnects; new requests during the drain get 503.
 
 ## Validation and limitations
 

@@ -19,7 +19,7 @@
 | --- | --- |
 | 프록시 `/v1/messages` | `X-Local-Route-Token`(32바이트 랜덤, 상수시간 비교) + OAuth Bearer(`sk-ant-oat…`) 필요. Plan 경로는 추가로 first-party 로그인 확인 |
 | 프록시 `/api/metrics` | 같은 세션 토큰 필요 |
-| 프록시 `POST /api/handover` | 같은 세션 토큰 필요. 새 요청에는 503(+`Retry-After`)을 주고 진행 중인 턴만 마친 뒤 종료합니다(기본 상한 120초, 초과 시 `forced`) |
+| 프록시 `POST /api/handover` | 같은 세션 토큰 필요. 새 요청에는 503(+`Retry-After`)을 주고 진행 중인 턴만 마친 뒤 종료합니다(기본 상한 120초). 상한을 넘기면 **종료 대신 서비스로 되돌리고 409**(`reverted: true`)로 알립니다. 동시 요청은 하나의 드레인으로 합쳐집니다 |
 | 대시보드 쓰기(`POST /api/config`, `/api/test`) | **세션 토큰**(페이지에 내장, `x-dashboard-token`) **+ 동일 출처(Origin)** 검사 + **분당 30회 제한**(초과 시 429) |
 | 대시보드 읽기(`/`, `/api/status`, `/api/snapshot`) | 인증 없음. 루프백 한정 + **Host 허용목록** |
 | 비밀값 | 응답에 절대 포함하지 않음(`sk-or-…ccd0` 마스킹). 저장 시 빈 값이면 기존 키 유지 |

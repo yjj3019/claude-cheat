@@ -131,6 +131,57 @@ test('concurrent handover requests share one drain run and one report', async t 
   assert.equal(one.drained, true);
   assert.equal(handedOver, 1, 'the exit hook must run exactly once');
 });
+test('a handover retried after a revert drains normally once the turn is gone', async t => {
+  const disposables = [];
+  t.after(() => { for (const dispose of disposables) dispose(); });
+  // The same endless stream as the revert case: only the client can end it.
+  const encoder = new TextEncoder();
+  let timer = null;
+  const stalled = new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(frame('message_start', { message: META })));
+      controller.enqueue(encoder.encode(frame('content_block_start', { index: 0,
+        content_block: { type: 'text', text: '' } })));
+      timer = setInterval(() => {
+        try {
+          controller.enqueue(encoder.encode(frame('content_block_delta', { index: 0,
+            delta: { type: 'text_delta', text: 'tick' } })));
+        } catch { clearInterval(timer); }
+      }, 50);
+    },
+    cancel() { clearInterval(timer); },
+  }), { headers: { 'content-type': 'text/event-stream' } });
+  const server = createProxy({ key: 'sk-or-handover', nonce: NONCE, openrouterModel: MODEL,
+    streamPassthrough: true, handoverTimeoutMs: 200, fetchImpl: async () => stalled,
+    onHandover: () => {} });
+  await listenSafe(server);
+  disposables.push(() => clearInterval(timer), () => server.closeAllConnections(),
+                    () => { if (server.listening) server.close(); });
+  const port = server.address().port;
+  const headers = { 'content-type': 'application/json', 'x-local-route-token': NONCE,
+    authorization: 'Bearer sk-ant-oat-handover', 'anthropic-beta': 'interleaved-thinking-2025-05-14' };
+  const response = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: 'POST', headers,
+    body: JSON.stringify({ model: 'claude-sonnet-5-5', max_tokens: 1024, stream: true,
+      messages: [{ role: 'user', content: 'stall then leave' }] }) });
+  assert.equal(response.status, 200);
+  const reader = response.body.getReader();
+  await reader.read();
+  const reverted = await fetch(`http://127.0.0.1:${port}/api/handover`, { method: 'POST',
+    headers: { 'x-local-route-token': NONCE } });
+  assert.equal(reverted.status, 409);
+  // The client gives up: its turn is over, so the proxy is free to drain next time.
+  await reader.cancel().catch(() => {});
+  let drained = null;
+  for (let attempt = 0; attempt < 40 && !drained; attempt++) {
+    const retry = await fetch(`http://127.0.0.1:${port}/api/handover`, { method: 'POST',
+      headers: { 'x-local-route-token': NONCE } });
+    if (retry.status === 200) drained = await retry.json();
+    else await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  assert.ok(drained, 'the retry after the turn ended must drain');
+  assert.equal(drained.drained, true);
+});
+
 test('a stream in flight finishes while the listener drains and stops accepting', async t => {
   let handedOver = false;
   const slowStream = [
