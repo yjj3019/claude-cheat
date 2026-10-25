@@ -528,6 +528,8 @@ export async function checkConnection({ provider, key, openrouterModel, fetchImp
 // A value beyond 10 minutes is clamped: a client may be told to wait, but the proxy never
 // trusts an unbounded number from a provider.
 const RETRY_AFTER_MAX_MS = 10 * 60 * 1000;
+// A 429 may name its own recovery window; the breaker trusts it only up to the same cap.
+const RATE_LIMIT_COOLDOWN_MAX_MS = 10 * 60 * 1000;
 // Date.parse is lenient enough to read arbitrary text as a year, so dates are shape-checked
 // first against the three HTTP-date forms (IMF-fixdate, RFC 850, asctime).
 const MONTH = 'Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec';
@@ -588,9 +590,20 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   if (!Number.isFinite(requestIdleTimeoutMs) || requestIdleTimeoutMs < 0) throw new Error('Invalid request idle timeout');
   if (!Number.isFinite(retryMaxWaitMs) || retryMaxWaitMs < 0) throw new Error('Invalid retry wait');
   let openUntil = 0, probing = false, generation = 0, lastLocalFailure = 'upstream_error';
-  // The last rate-limit answer a provider gave, kept for the circuit/fencing work: today it
-  // is only recorded and exposed, never used to skip or delay a route.
+  // The last rate-limit answer a provider gave; kept for exposure and the breaker decision.
   let lastRateLimit = null;
+  // Breaker classification. Transport/timeout, 5xx and unusable 2xx answers mean the provider
+  // itself is unhealthy; 401/402/403 are provider-wide configuration failures that keep their
+  // existing cooldown; a 429 names its own wait. A request-level 4xx answer must never open the
+  // breaker: the request was wrong, the provider was not.
+  const failureClassOf = (status, timedOut) => {
+    if (timedOut || !Number.isInteger(status)) return 'transient';
+    if (status === 429) return 'rate_limit';
+    if (status === 401 || status === 402 || status === 403) return 'provider';
+    if (status >= 500 || status === 408) return 'transient';
+    if (status >= 200 && status < 300) return 'transient';
+    return 'request';
+  };
   // Counters stay in memory and are written to a small file at most once a second, so the
   // dashboard can read routing load without talking to this process.
   const metrics = { startedAt: Date.now(), requests: 0, ok: 0, failed: 0, streams: 0, attempts: 0,
@@ -946,11 +959,14 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       const nativeDetail = req.url.startsWith('/v1/messages/count_tokens') ? 'token_count' : compatProfile ?
         compatExclusion(body, req.headers['anthropic-beta']) : isPro(model) ? 'plan_model' : externalExclusion(body, req.headers['anthropic-beta'], localOnly);
       if (nativeDetail) return await sendPro('native_feature', nativeDetail);
+      // An expired breaker admits exactly one half-open probe: the first request takes the
+      // lease synchronously, everyone else falls back to Plan (or is told recovery is in
+      // progress) until that probe settles. The generation snapshot fences late completions.
       if (openUntil && (now() < openUntil || probing)) return await sendPro('circuit_open');
       const probe = Boolean(openUntil);
       if (probe) probing = true;
       const claimedGeneration = generation;
-      let succeeded = false, localFailure = 'upstream_error';
+      let succeeded = false, localFailure = 'upstream_error', failureClass = null;
       try {
         const externalModel = provider === 'local' ? localModel : openrouterModel;
         const externalBody = { ...body, model: externalModel };
@@ -1011,7 +1027,11 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
                 // keep their fixed delay even when the provider sends a Retry-After.
                 if (status === 429 || status === 503) {
                   if (hint !== null) retryAfterMs = hint;
-                  lastRateLimit = { status, retryAfterMs: hint, at: new Date().toISOString() };
+                  // Fence the exposed observation: a stale request must not overwrite the
+                  // rate-limit state a newer generation already established.
+                  if (claimedGeneration === generation) {
+                    lastRateLimit = { status, retryAfterMs: hint, at: new Date().toISOString() };
+                  }
                 }
                 await response.body?.cancel();
                 throw new Error('External request failed');
@@ -1106,9 +1126,11 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             if (noPlan) localFailure = controller.signal.reason === 'attempt_timeout' ? 'timeout' :
               status === 401 || status === 403 ? 'authentication_failed' : status === 402 ? 'payment_required' : validation === 'empty_response' ? 'empty_response' : 'upstream_error';
             if (Number.isInteger(status)) failureStatus = status;
+            failureClass = failureClassOf(status, controller.signal.reason === 'attempt_timeout');
             console.error(JSON.stringify({ event: 'external_attempt_failed', provider, attempt: attempt + 1,
               ...(Number.isInteger(status) ? { status } : {}), ...(validation ? { validation } : {}),
               ...(retryAfterMs ? { retry_after_ms: retryAfterMs } : {}),
+              failure: failureClass,
               category: controller.signal.reason === 'attempt_timeout' ? 'timeout' : 'upstream' }));
             controller.abort('attempt_failed');
             // This attempt is discarded, so its first byte is not the response's.
@@ -1128,12 +1150,19 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             client.signal.addEventListener('abort', () => { clearTimeout(timeout); resolve(); }, { once: true });
           }), client.signal);
         }
-        if (!requestRejected && claimedGeneration === generation) {
+        if (!requestRejected && failureClass !== 'request' && claimedGeneration === generation) {
           generation++;
           if (noPlan) lastLocalFailure = localFailure;
-          openUntil = now() + cooldownMs;
+          // A 429 states its own recovery window: honor the parsed Retry-After (bounded)
+          // instead of the generic cooldown, so the provider is not hammered while it asked
+          // to be left alone. Without a hint, the operator's cooldown still applies.
+          const cooldown = failureClass === 'rate_limit' && retryAfterHintMs !== null
+            ? Math.min(RATE_LIMIT_COOLDOWN_MAX_MS, retryAfterHintMs)
+            : cooldownMs;
+          openUntil = now() + cooldown;
           metrics.circuitOpens += 1;
-          console.error(JSON.stringify({ event: 'circuit_open', provider }));
+          console.error(JSON.stringify({ event: 'circuit_open', provider, failure: failureClass,
+            ...(failureClass === 'rate_limit' ? { retry_after_ms: retryAfterHintMs, cooldown_ms: cooldown } : {}) }));
         }
       } finally {
         if (probe) probing = false;
