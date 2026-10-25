@@ -569,7 +569,9 @@ class LocalProcessGuardTests(unittest.TestCase):
         out = io.StringIO()
         with mock.patch.object(guard, "_kernel", return_value=kernel), contextlib.redirect_stdout(out):
             self.assertEqual(guard._watch(123), 1)
-        self.assertEqual(json.loads(out.getvalue()), {"ready": False})
+        payload = json.loads(out.getvalue())
+        self.assertFalse(payload["ready"])
+        self.assertEqual(payload["step"], "AssignProcessToJobObject")
         kernel.AssignProcessToJobObject.assert_called_once_with(456, 123)
         self.assertEqual(kernel.SetInformationJobObject.call_args.args[2]._obj.basic.flags, 0x2000)
         kernel.WaitForSingleObject.assert_not_called()

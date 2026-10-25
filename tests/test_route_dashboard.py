@@ -999,6 +999,32 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertFalse(catalog["ok"])
         self.assertEqual(catalog["error"], "empty_catalog")
 
+    def test_negative_content_length_is_rejected(self):
+        import socket as socket_module
+        import threading
+
+        server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with socket_module.create_connection(("127.0.0.1", port), timeout=10) as connection:
+                connection.sendall(
+                    b"POST /api/config HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                    + b"x-dashboard-token: " + dash.TOKEN.encode() + b"\r\n"
+                    + b"content-type: application/json\r\nContent-Length: -1\r\nConnection: close\r\n\r\n")
+                chunks = []
+                while True:
+                    piece = connection.recv(2048)
+                    if not piece:
+                        break
+                    chunks.append(piece)
+                reply = b"".join(chunks).decode("utf-8", "replace")
+            self.assertIn("400", reply.splitlines()[0])
+            self.assertIn("invalid_length", reply)
+        finally:
+            server.shutdown()
+            server.server_close()
+
     def test_models_endpoint_requires_the_token(self):
         import threading
         import urllib.error
@@ -1037,7 +1063,7 @@ class InsightTests(unittest.TestCase):
 
     def usage(self, cost=1.0, external=None):
         return {"today": {"external": external or [1000, 100, 5000, 0], "plan": [0, 0, 0, 0]},
-                "cost_usd": cost}
+                "cost_usd": 21.0, "today_cost_usd": cost}
 
     def test_circuit_open_ranks_first(self):
         routing = self.routing(short={"minutes": 10, "counts": {"external": 2, "plan": 8},

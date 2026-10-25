@@ -1481,7 +1481,7 @@ test('request-level 4xx is not retried and does not open the provider circuit', 
   assert.equal(calls[2].url, externalURL);
 });
 
-for (const status of [401, 402, 403, 404]) {
+for (const status of [401, 402, 403]) {
   test(`provider-level HTTP ${status} is not retried and opens the circuit`, async t => {
     const { calls, request } = await fixture(t, (url, options) => url === proURL ? jsonResponse(url, options) : new Response('no', { status }), { now: () => 1000 });
     await (await request(requestBody(SONNET), { headers: proHeaders })).text();
@@ -1489,6 +1489,15 @@ for (const status of [401, 402, 403, 404]) {
     assert.deepEqual(calls.map(call => call.url), [externalURL, proURL, proURL]);
   });
 }
+
+test('HTTP 404 falls back to Plan without opening the provider circuit', async t => {
+  // A renamed or deleted model is a configuration error: silencing the provider for the
+  // whole cooldown would hide it, so only the request itself is rejected.
+  const { calls, request } = await fixture(t, (url, options) => url === proURL ? jsonResponse(url, options) : new Response('no', { status: 404 }), { now: () => 1000 });
+  await (await request(requestBody(SONNET), { headers: proHeaders })).text();
+  await (await request(requestBody(SONNET), { headers: proHeaders })).text();
+  assert.deepEqual(calls.map(call => call.url), [externalURL, proURL, externalURL, proURL]);
+});
 
 test('SSE response to a non-stream request is rejected and retried', async t => {
   const { calls, request } = await fixture(t, (url, options) => url === proURL ? jsonResponse(url, options) : sseResponse([complete(DEEPSEEK)]));
@@ -1533,7 +1542,11 @@ test('stalled Plan stream is cut after the idle timeout', async t => {
     { headers: { 'content-type': 'text/event-stream' } });
   const { request } = await fixture(t, () => stalled, { planIdleMs: 100, planHeaderMs: 100 });
   const response = await request(requestBody(OPUS, { stream: true }), { headers: proHeaders });
-  await assert.rejects(async () => { await response.text(); });
+  // The stream already started, so a stalled body ends the stream with an error frame
+  // instead of destroying the socket under the client.
+  const body = await response.text();
+  assert.match(body, /event: error/);
+  assert.match(body, /upstream stream failed/);
 });
 
 test('request body up to 32 MiB reaches routing instead of being rejected at 16 MiB', async t => {

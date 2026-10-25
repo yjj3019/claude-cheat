@@ -120,6 +120,68 @@ test('passthrough keeps a recoverable failure recoverable before any token', asy
   }
 });
 
+test('passthrough still delivers a control-stop reply that has no content', async () => {
+  // A refusal carries no usable text, so nothing may be forwarded early; the client must
+  // still receive the whole stream instead of an empty 200.
+  const refusal = [
+    frame('message_start', { message: { ...META, model: 'stream/model' } }),
+    frame('content_block_start', { index: 0, content_block: { type: 'text', text: '' } }),
+    frame('content_block_stop', { index: 0 }),
+    frame('message_delta', { delta: { stop_reason: 'refusal' } }),
+    frame('message_stop', {}),
+  ];
+  const { server, base } = await start({ passthrough: true, chunks: refusal });
+  try {
+    const result = await request(base);
+    assert.equal(result.status, 200);
+    assert.match(result.body, /message_stop/);
+    assert.match(result.body, /refusal/);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test('a transport failure after the first frame ends the stream instead of retrying', async () => {
+  // The client already has bytes, so retrying would duplicate them and falling back is
+  // impossible; the proxy must finish with an error frame and make exactly one call.
+  const planCalls = [];
+  const pieces = [
+    frame('message_start', { message: { ...META, model: 'stream/model' } }),
+    frame('content_block_start', { index: 0, content_block: { type: 'text', text: '' } }),
+    frame('content_block_delta', { index: 0, delta: { type: 'text_delta', text: 'hello' } }),
+  ];
+  const server = createProxy({
+    key: 'sk-or-stream', nonce: NONCE, openrouterModel: 'stream/model', retryDelayMs: 0,
+    attemptTimeoutMs: 5000, streamPassthrough: true,
+    fetchImpl: async (url, request) => {
+      if (url === PLAN) { planCalls.push(url); return jsonReply('plan'); }
+      const stream = new ReadableStream({
+        async start(controller) {
+          const encoder = new TextEncoder();
+          for (const piece of pieces) {
+            controller.enqueue(encoder.encode(piece));
+            await new Promise(resolve => setTimeout(resolve, 40));
+          }
+          controller.error(new Error('socket reset'));
+        },
+      });
+      return new Response(stream, { headers: { 'content-type': 'text/event-stream' } });
+    },
+  });
+  await listenSafe(server);
+  try {
+    const result = await request(`http://127.0.0.1:${server.address().port}/v1/messages`);
+    assert.equal(result.status, 200);
+    assert.match(result.body, /hello/);
+    assert.match(result.body, /upstream stream failed/);
+    assert.equal(planCalls.length, 0);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
 test('passthrough closes the stream when a later frame is invalid', async () => {
   // Text arrives first (so the client has bytes), then the protocol breaks: the proxy
   // must not fall back, because that would duplicate output the client already saw.

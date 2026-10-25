@@ -1,18 +1,33 @@
 import http from 'node:http';
 import { once } from 'node:events';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { appendFileSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 // Diagnostic mirror: routing events also land in a file so a session can be explained afterwards.
 // The launcher sets ROUTE_LOG_PATH for OpenRouter sessions; without it nothing is written.
 const routeLogPath = process.env.ROUTE_LOG_PATH;
+const ROUTE_LOG_LIMIT = 8 * 1024 * 1024;
 if (routeLogPath) {
   delete process.env.ROUTE_LOG_PATH;
   const emit = console.error.bind(console);
+  let writes = 0;
+  // The log is diagnostic, not a journal: rotate it so a long-running session cannot
+  // fill the disk. The dashboard notices the new file through its prefix fingerprint.
+  const rotate = () => {
+    try {
+      if (statSync(routeLogPath).size < ROUTE_LOG_LIMIT) return;
+      renameSync(routeLogPath, `${routeLogPath}.1`);
+    } catch {}
+  };
   console.error = (...args) => {
     emit(...args);
-    try { appendFileSync(routeLogPath, `${new Date().toISOString()} ${args.join(' ')}\n`); } catch {}
+    try {
+      // Check before writing so the line that triggers the rotation lands in the new file.
+      if (writes % 200 === 0) rotate();
+      appendFileSync(routeLogPath, `${new Date().toISOString()} ${args.join(' ')}\n`);
+      writes += 1;
+    } catch {}
   };
   // Record which source revision this process loaded so a stale run is visible afterwards.
   const codeStamp = (() => {
@@ -358,7 +373,7 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal, on
       onProgress?.();
       size += value.byteLength;
       if (size > MAX_RESPONSE) throw new Error('Response too large');
-      chunks.push(Buffer.from(value));
+      if (!sse) chunks.push(Buffer.from(value));
       if (sse) {
         eventPending += eventDecoder.decode(value, { stream: true });
         let boundary, terminal = false;
@@ -391,16 +406,23 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal, on
     return { contentType: 'application/json', text: JSON.stringify(response), streamed: false };
   }
   const tail = eventPending;
-  if (tail.trim() && tail.trim() !== 'data: [DONE]' && tail.trim() !== 'data:[DONE]')
-    throw guarded(() => { throw new Error('Trailing incomplete event'); });
+  // A split [DONE] or ping after message_stop must not turn a valid answer into a retry,
+  // while a truncated real event still does.
+  const tailText = tail.trim();
+  const benignTail = !tailText || tailText === 'event: ping' || /^data:\s*\[D?O?N?E?\]?$/.test(tailText);
+  if (!benignTail) throw guarded(() => { throw new Error('Trailing incomplete event'); });
   guarded(() => validator.finish());
-  if (onFrame) return { contentType: 'text/event-stream', text: '', streamed: forwarded };
+  if (onFrame) return { contentType: 'text/event-stream', text: committed ? '' : pending.join(''), streamed: forwarded };
   return { contentType: 'text/event-stream', text: output.join(''), streamed: false };
 }
 
-function jsonMessageStream(text) {
+function jsonMessageStream(text, requireMeta = true) {
   const message = JSON.parse(text);
-  if (!validMessageMeta(message)) throw new Error('Invalid stream metadata');
+  // Local compatibility servers return Messages-shaped bodies without OpenRouter metadata;
+  // local-only (and OpenRouter) still require it.
+  if (requireMeta && !validMessageMeta(message)) throw new Error('Invalid stream metadata');
+  if (!message || typeof message !== 'object' || !Array.isArray(message.content))
+    throw new Error('Invalid message response');
   const frame = (type, fields = {}) => `event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`;
   let output = frame('message_start', { message: { ...message, content: [], stop_reason: null, stop_sequence: null,
     usage: { ...message.usage, output_tokens: 0 } } });
@@ -514,7 +536,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   // Counters stay in memory and are written to a small file at most once a second, so the
   // dashboard can read routing load without talking to this process.
   const metrics = { startedAt: Date.now(), requests: 0, ok: 0, failed: 0, streams: 0, attempts: 0,
-    retries: 0, bytesIn: 0, bytesOut: 0, circuitOpens: 0, routes: { external: 0, plan: 0 },
+    retries: 0, externalAttempts: 0, aborted: 0, bytesIn: 0, bytesOut: 0, circuitOpens: 0,
+    routes: { external: 0, plan: 0 },
     reasons: {}, latency: { external: [], plan: [] }, ttfb: [], last: null };
   const LATENCY_WINDOW = 512;
   const latencySummary = values => {
@@ -528,7 +551,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     uptimeMs: Date.now() - metrics.startedAt,
     requests: metrics.requests, ok: metrics.ok, failed: metrics.failed,
     streams: metrics.streams, attempts: metrics.attempts, retries: metrics.retries,
-    routes: { ...metrics.routes }, reasons: { ...metrics.reasons },
+    routes: { ...metrics.routes }, externalAttempts: metrics.externalAttempts, aborted: metrics.aborted,
+    reasons: { ...metrics.reasons },
     bytesIn: metrics.bytesIn, bytesOut: metrics.bytesOut, circuitOpens: metrics.circuitOpens,
     latencyMs: { external: latencySummary(metrics.latency.external), plan: latencySummary(metrics.latency.plan),
       ttfb: latencySummary(metrics.ttfb) },
@@ -540,7 +564,12 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     lastFlushAt = Date.now();
     if (!metricsDirty || !metricsPath) return;
     metricsDirty = false;
-    try { writeFileSync(metricsPath, JSON.stringify(metricsSnapshot())); } catch {}
+    try {
+      // Replace atomically: a reader must never see a half-written snapshot.
+      const temporary = `${metricsPath}.tmp`;
+      writeFileSync(temporary, JSON.stringify(metricsSnapshot()));
+      renameSync(temporary, metricsPath);
+    } catch {}
   };
   const scheduleMetricsFlush = () => {
     metricsDirty = true;
@@ -565,7 +594,13 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     }
     if (req.method !== 'POST' || !/^\/v1\/messages(?:\/count_tokens)?(?:\?beta=true)?$/.test(req.url)) return reject(403, 'Endpoint blocked');
     const client = new AbortController();
-    res.on('close', () => { if (!res.writableFinished) client.abort('client_close'); });
+    let recordRequest = () => {};
+    res.on('close', () => {
+      if (!res.writableFinished) {
+        recordRequest(true);
+        client.abort('client_close');
+      }
+    });
     req.on('aborted', () => client.abort('client_close'));
     try {
       const chunks = [];
@@ -596,7 +631,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         if (chunk) metrics.bytesOut += Buffer.byteLength(chunk);
         return originalEnd(chunk, encoding, callback);
       };
-      let routeKind = null, routeReason = null;
+      let routeKind = null, routeReason = null, recorded = false;
       const noteRoute = (kind, reason) => {
         if (routeKind) return;
         routeKind = kind;
@@ -604,9 +639,13 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         metrics.routes[kind] += 1;
         metrics.reasons[reason] = (metrics.reasons[reason] || 0) + 1;
       };
-      res.on('finish', () => {
+      recordRequest = aborted => {
+        if (recorded) return;
+        recorded = true;
         const elapsed = Number((performance.now() - startedAt).toFixed(2));
-        if (res.statusCode < 400) metrics.ok += 1; else metrics.failed += 1;
+        if (aborted) { metrics.aborted += 1; metrics.failed += 1; }
+        else if (res.statusCode < 400) metrics.ok += 1;
+        else metrics.failed += 1;
         if (routeKind) {
           const bucket = metrics.latency[routeKind];
           bucket.push(elapsed);
@@ -617,9 +656,10 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           if (metrics.ttfb.length > LATENCY_WINDOW) metrics.ttfb.shift();
         }
         metrics.last = { ts: new Date().toISOString(), route: routeKind || 'none', reason: routeReason,
-          status: res.statusCode, ms: elapsed };
+          status: aborted ? 499 : res.statusCode, ms: elapsed };
         scheduleMetricsFlush();
-      });
+      };
+      res.on('finish', () => recordRequest(false));
       const compatAlias = compatProfile && ['sonnet', 'opus', 'haiku', 'fable'].includes(model);
       const configuredAlias = provider === 'openrouter' && model === openrouterModel;
       if (!compatAlias && !configuredAlias && !isPro(model) && !isSonnet(model) && model !== DEEPSEEK) return reject(403, 'Model blocked');
@@ -679,7 +719,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         client.signal.addEventListener('abort', cancelPlan, { once: true });
         let stall;
         const arm = ms => { clearTimeout(stall); stall = setTimeout(() => plan.abort('plan_timeout'), ms); };
-        if (body.stream === true) arm(planHeaderMs);
+        arm(planHeaderMs);
         try {
         metrics.attempts += 1;
         const upstream = await abortable(fetchImpl('https://api.anthropic.com' + req.url,
@@ -753,6 +793,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         let requestRejected = false;
         for (let attempt = 0; attempt < attempts; attempt++) {
           metrics.attempts += 1;
+          if (attempt === 0) metrics.externalAttempts += 1;
           if (attempt > 0) metrics.retries += 1;
           client.signal.throwIfAborted();
           const controller = new AbortController();
@@ -779,9 +820,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               // whole body (compat/local modes, non-stream clients) keeps the buffered path.
               let streamStarted = false;
               const onFrame = text => {
-                if (!streamStarted) {
+                if (!res.headersSent) {
                   res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store' });
-                  streamStarted = true;
                   logReplacement();
                 }
                 res.write(text);
@@ -822,7 +862,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               // shortcut: textual match can false-positive on a tool_use input object containing this literal; refine if seen.
               if (!validated.streamed && !compatProfile && !localOnly && /"type"\s*:\s*"(?:redacted_thinking|thinking|thinking_delta|signature_delta)"/.test(validated.text))
                 throw new Error('Thinking response in ordinary mode');
-              return noPlan && body.stream === true ? jsonMessageStream(validated.text) : validated;
+              return noPlan && body.stream === true ? jsonMessageStream(validated.text, !compatProfile) : validated;
             })();
             const response = await abortable(operation, controller.signal);
             client.signal.throwIfAborted();
@@ -838,7 +878,9 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             return;
           } catch (error) {
             client.signal.throwIfAborted();
-            if (error?.streamed) {
+            // Headers on the wire means the client already has part of the answer: retrying
+            // would duplicate it and falling back is impossible, so finish the stream.
+            if (error?.streamed || res.headersSent) {
               // Headers are already on the wire, so retrying or falling back would corrupt
               // the response; report the failure inside the stream and stop here.
               console.error(JSON.stringify({ event: 'stream_broken', provider, category: 'upstream' }));
@@ -861,7 +903,10 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               ...(Number.isInteger(status) ? { status } : {}), ...(validation ? { validation } : {}),
               category: controller.signal.reason === 'attempt_timeout' ? 'timeout' : 'upstream' }));
             controller.abort('attempt_failed');
-            if ([400, 413, 422].includes(status) || error?.message === 'Thinking response in ordinary mode') requestRejected = true;
+            // This attempt is discarded, so its first byte is not the response's.
+            firstByteMs = null;
+            // 404 is request-level too: a renamed model must not open the provider circuit.
+            if ([400, 404, 413, 422].includes(status) || error?.message === 'Thinking response in ordinary mode') requestRejected = true;
             if (requestRejected || [401, 402, 403, 404].includes(status)) break;
           } finally {
             clearTimeout(timer);
@@ -887,7 +932,16 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     } catch {
       if (!client.signal.aborted) {
         console.error(JSON.stringify({ event: 'route_failed', category: 'upstream' }));
-        reject(502, 'Upstream request failed');
+        if (res.headersSent) {
+          // Part of the answer is already on the wire: report the failure inside the stream.
+          try {
+            res.write(`event: error\ndata: ${JSON.stringify({ type: 'error',
+              error: { type: 'api_error', message: 'upstream stream failed' } })}\n\n`);
+          } catch {}
+          res.end();
+        } else {
+          reject(502, 'Upstream request failed');
+        }
       }
     }
   });

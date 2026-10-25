@@ -61,11 +61,22 @@ def ensure_windows_local_tree():
     threading.Thread(target=read_ready, daemon=True).start()
     try:
         message = json.loads(ready.get(timeout=15))
-        if not isinstance(message, dict) or set(message) != {"ready"} or message["ready"] is not True:
-            raise ValueError("Guardian not ready")
-    except (queue.Empty, ValueError, TypeError):
+        # Exactly {"ready": true} means success; a failure may add step/error for diagnosis.
+        if not isinstance(message, dict) or message.get("ready") is not True:
+            extra = set(message) - {"ready", "step", "error"} if isinstance(message, dict) else set()
+            step = (message or {}).get("step") if isinstance(message, dict) else None
+            detail = (message or {}).get("error") if isinstance(message, dict) else None
+            suffix = f" ({step} failed, Win32 {detail})" if step else ""
+            if extra:
+                raise ValueError("Guardian not ready (unexpected fields)")
+            raise ValueError(f"Guardian not ready{suffix}")
+        if set(message) != {"ready"}:
+            raise ValueError("Guardian not ready (unexpected fields)")
+    except queue.Empty:
+        raise RuntimeError("Local process cleanup unavailable (guardian produced no answer)") from None
+    except (ValueError, TypeError) as error:
         # Killing this guardian could kill its parent; the CLI entry point must exit instead.
-        raise RuntimeError("Local process cleanup unavailable") from None
+        raise RuntimeError(f"Local process cleanup unavailable: {error}") from None
     _guardian.stdout.close()
 
 
@@ -84,8 +95,16 @@ def _watch(parent):
     try:
         limits = ExtendedLimits()
         limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE; no breakaway.
-        if not job or not kernel.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)) or not kernel.AssignProcessToJobObject(job, parent):
-            print(json.dumps({"ready": False}), flush=True)
+        step, detail = None, 0
+        if not job:
+            step, detail = "CreateJobObjectW", ctypes.get_last_error()
+        elif not kernel.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            step, detail = "SetInformationJobObject", ctypes.get_last_error()
+        elif not kernel.AssignProcessToJobObject(job, parent):
+            step, detail = "AssignProcessToJobObject", ctypes.get_last_error()
+        if step:
+            # Name the failing call: "check permissions" alone cannot be acted on.
+            print(json.dumps({"ready": False, "step": step, "error": detail}), flush=True)
             return 1
         print(json.dumps({"ready": True}), flush=True)
         return 0 if kernel.WaitForSingleObject(parent, 0xFFFFFFFF) == 0 else 1

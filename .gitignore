@@ -14,3 +14,4 @@ SESSION_LOG.md
 *.un~
 .claude/.verification/
 .proxy-metrics.json
+*.log.*

@@ -41,6 +41,9 @@ async function start(options = {}) {
     attemptTimeoutMs: 4000, cooldownMs: 0,
     fetchImpl: async (url, request) => {
       const body = JSON.parse(request.body);
+      if (options.failAlways && url.includes('openrouter.ai')) {
+        return new Response('down', { status: 503 });
+      }
       if (options.failOnce && url.includes('openrouter.ai') && body.messages?.[0]?.content === 'retry-me') {
         if (!failures.has('retry-me')) {
           failures.add('retry-me');
@@ -110,6 +113,21 @@ test('counters follow the routes the proxy takes', async () => {
     assert.equal(payload.last.route, 'plan');
     assert.equal(payload.last.status, 200);
     assert.ok(payload.uptimeMs >= 0);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test('a request that ends on Plan still shows the external attempt, without a first byte', async () => {
+  const { server, base, metrics } = await start({ failAlways: true });
+  try {
+    assert.equal(await send(base, { content: 'fallback' }), 200);
+    const payload = await (await fetch(metrics, { headers: { 'x-local-route-token': NONCE } })).json();
+    assert.equal(payload.routes.external, 0, 'served by Plan');
+    assert.equal(payload.routes.plan, 1);
+    assert.equal(payload.externalAttempts, 1, 'the OpenRouter attempt must be visible');
+    assert.equal(payload.latencyMs.ttfb.count, 0, 'a discarded attempt must not report a first byte');
   } finally {
     server.closeAllConnections();
     server.close();

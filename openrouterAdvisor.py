@@ -1,5 +1,6 @@
 """Session-only Claude Code launcher and one stdio MCP advisor tool."""
 
+import http.client
 import json
 import os
 from datetime import datetime, timezone
@@ -183,6 +184,8 @@ def check_local() -> dict:
         return {**base, "reason": "connection_failed"}
     except (TimeoutError, OSError):
         return {**base, "reason": "connection_failed"}
+    except http.client.HTTPException:
+        return {**base, "reason": "connection_failed"}
     except (ValueError, UnicodeError):
         return {**base, "reason": "invalid_configuration_or_response"}
 
@@ -209,7 +212,7 @@ def run_owned(args: list, env: dict, cwd: str, prompt: str = "", timeout: int = 
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                text=True, encoding="utf-8")
     try:
-        output, _ = process.communicate(prompt, timeout=timeout)
+        output, error_text = process.communicate(prompt, timeout=timeout)
     except (subprocess.TimeoutExpired, KeyboardInterrupt):
         try:
             if os.name == "nt":
@@ -220,7 +223,9 @@ def run_owned(args: list, env: dict, cwd: str, prompt: str = "", timeout: int = 
             process.communicate(timeout=5)
         raise
     if process.returncode:
-        raise RuntimeError("Claude Plan request failed; no fallback attempted")
+        detail = " ".join((error_text or "").split())[:300]
+        raise RuntimeError("Claude Plan request failed; no fallback attempted"
+                           + (f" (exit {process.returncode}: {detail})" if detail else f" (exit {process.returncode})"))
     result = json.loads(output)
     if not isinstance(result, dict):
         raise ValueError("Expected Claude JSON response")
@@ -278,7 +283,14 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
         env["CLAUDE_CONFIG_DIR"] = str(Path.home() / ".claude")
     command = [claude]
     if not isolated:
-        auth = run_owned(command + ["auth", "status", "--json"], env, str(Path.home()), timeout=60)
+        # The probe reads the user's own login, including an env-provided OAuth token that
+        # the routed child must not inherit. Base it on the caller's environment.
+        probe_env = dict(os.environ)
+        probe_env["CLAUDE_CONFIG_DIR"] = env["CLAUDE_CONFIG_DIR"]
+        probe_env.pop("ANTHROPIC_BASE_URL", None)
+        probe_env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        probe_env.pop("ANTHROPIC_API_KEY", None)
+        auth = run_owned(command + ["auth", "status", "--json"], probe_env, str(Path.home()), timeout=60)
         if not (auth.get("loggedIn") is True and auth.get("authMethod") == "claude.ai"
                 and auth.get("apiProvider") == "firstParty" and auth.get("subscriptionType") == "pro"):
             raise RuntimeError("Existing first-party Plan login required; no API fallback")
@@ -643,15 +655,19 @@ def main(argv=None) -> int:
                    "message": str(exc)}
         if isinstance(exc, OpenRouterConfigError):
             payload.update({"action": "open_dashboard", "dashboard": "http://127.0.0.1:8787/",
-                            "command": "powershell -File OpenClaudeDashboard.ps1"})
+                            "command": f"powershell -File \"{ROOT / 'OpenClaudeDashboard.ps1'}\""})
             print("[setup required] .env.openrouter is missing or invalid", file=sys.stderr)
-            print("  powershell -File OpenClaudeDashboard.ps1   ->  http://127.0.0.1:8787/", file=sys.stderr)
+            print(f"  powershell -File \"{ROOT / 'OpenClaudeDashboard.ps1'}\"   ->  http://127.0.0.1:8787/",
+                  file=sys.stderr)
             print("  fill the OpenRouter settings there, save, then run OpenClaude.ps1 again",
                   file=sys.stderr)
         print(json.dumps(payload), file=sys.stderr)
         return 1
-    except (OSError, RuntimeError, EOFError, ValueError, subprocess.SubprocessError) as exc:
-        print(json.dumps({"event": "openrouter_start_failed", "kind": type(exc).__name__}), file=sys.stderr)
+    except (OSError, RuntimeError, EOFError, ValueError, subprocess.SubprocessError,
+            http.client.HTTPException) as exc:
+        message = " ".join(str(exc).split())[:300]
+        print(json.dumps({"event": "openrouter_start_failed", "kind": type(exc).__name__,
+                          **({"message": message} if message else {})}), file=sys.stderr)
         return 1
 
 
