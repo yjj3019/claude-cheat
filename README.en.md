@@ -253,7 +253,7 @@ The **insights** card ranks *what changed, why, and what to do next* instead of 
 | Limit exhaustion forecast | today's burn rate exhausts the limit within 7 days | adjust model price or volume |
 | Burn rate | days of headroom estimate | reference |
 | Cache reuse low | ≥200k prompt tokens with <15% reuse | keep the prompt prefix stable |
-| Latency | session p95 ≥20s | check before the circuit opens |
+| Latency | session p95 ≥20s | splits **first-byte time from generation time** so a proxy problem is not confused with model speed |
 | Session idle | no decision for 30 minutes | reference |
 
 | Panel | Content |

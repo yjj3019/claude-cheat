@@ -105,6 +105,8 @@ test('counters follow the routes the proxy takes', async () => {
     assert.equal(payload.streams, 1);
     assert.ok(payload.bytesIn > 0 && payload.bytesOut > 0);
     assert.equal(payload.latencyMs.external.count, 2);
+    assert.ok(payload.latencyMs.ttfb.count >= 2, 'first-byte timing missing');
+    assert.ok(payload.latencyMs.ttfb.p95 >= 0);
     assert.equal(payload.last.route, 'plan');
     assert.equal(payload.last.status, 200);
     assert.ok(payload.uptimeMs >= 0);

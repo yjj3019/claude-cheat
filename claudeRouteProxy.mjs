@@ -515,7 +515,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   // dashboard can read routing load without talking to this process.
   const metrics = { startedAt: Date.now(), requests: 0, ok: 0, failed: 0, streams: 0, attempts: 0,
     retries: 0, bytesIn: 0, bytesOut: 0, circuitOpens: 0, routes: { external: 0, plan: 0 },
-    reasons: {}, latency: { external: [], plan: [] }, last: null };
+    reasons: {}, latency: { external: [], plan: [] }, ttfb: [], last: null };
   const LATENCY_WINDOW = 512;
   const latencySummary = values => {
     if (!values.length) return { count: 0, p50: null, p95: null, max: null };
@@ -530,7 +530,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     streams: metrics.streams, attempts: metrics.attempts, retries: metrics.retries,
     routes: { ...metrics.routes }, reasons: { ...metrics.reasons },
     bytesIn: metrics.bytesIn, bytesOut: metrics.bytesOut, circuitOpens: metrics.circuitOpens,
-    latencyMs: { external: latencySummary(metrics.latency.external), plan: latencySummary(metrics.latency.plan) },
+    latencyMs: { external: latencySummary(metrics.latency.external), plan: latencySummary(metrics.latency.plan),
+      ttfb: latencySummary(metrics.ttfb) },
     last: metrics.last,
   });
   let flushTimer = null, lastFlushAt = 0, metricsDirty = false;
@@ -581,6 +582,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       const model = body.model;
       // Everything from here to the response is a routed request; count it once.
       const startedAt = performance.now();
+      let firstByteMs = null;
+      const noteFirstByte = () => { if (firstByteMs === null) firstByteMs = performance.now() - startedAt; };
       metrics.requests += 1;
       metrics.bytesIn += raw.length;
       if (body.stream === true) metrics.streams += 1;
@@ -608,6 +611,10 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           const bucket = metrics.latency[routeKind];
           bucket.push(elapsed);
           if (bucket.length > LATENCY_WINDOW) bucket.shift();
+        }
+        if (firstByteMs !== null) {
+          metrics.ttfb.push(Number(firstByteMs.toFixed(2)));
+          if (metrics.ttfb.length > LATENCY_WINDOW) metrics.ttfb.shift();
         }
         metrics.last = { ts: new Date().toISOString(), route: routeKind || 'none', reason: routeReason,
           status: res.statusCode, ms: elapsed };
@@ -781,7 +788,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               };
               const streaming = streamPassthrough && !noPlan && body.stream === true;
               const validated = await bufferedResponse(response, externalModel, model, noPlan ? false : body.stream,
-                controller.signal, noPlan ? undefined : arm, provider === 'openrouter',
+                controller.signal, () => { noteFirstByte(); if (!noPlan) arm(); }, provider === 'openrouter',
                 streaming ? onFrame : null, !compatProfile && !localOnly);
               if (compatProfile) {
                 const content = JSON.parse(validated.text).content;

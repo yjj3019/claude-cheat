@@ -1084,6 +1084,17 @@ class InsightTests(unittest.TestCase):
         self.assertEqual(len(cache), 1)
         self.assertIn("0%", cache[0]["detail"])
 
+    def test_latency_insight_separates_first_byte_from_generation(self):
+        metrics = {"requests": 9, "failed": 0, "latencyMs": {
+            "external": {"p50": 9000, "p95": 24_000}, "ttfb": {"p50": 1800, "p95": 2400}}}
+        insights = dash.build_insights(self.routing(), self.usage(), {"ok": False}, None,
+                                       metrics=metrics, now=self.NOW)
+        latency = [item for item in insights if item["title"] == "응답 지연"][0]
+        self.assertIn("첫 바이트까지 2.4초", latency["detail"])
+        self.assertIn("21.6초는 생성 대기", latency["detail"])
+        self.assertIn("-Stream", latency["detail"])
+        self.assertEqual(latency["evidence"], ["p95 24.0s", "첫 바이트 2.4s"])
+
     def test_latency_and_failures_come_from_proxy_metrics(self):
         metrics = {"requests": 40, "failed": 2, "latencyMs": {"external": {"p50": 900, "p95": 25_000}}}
         insights = dash.build_insights(self.routing(), self.usage(), {"ok": False}, None,
