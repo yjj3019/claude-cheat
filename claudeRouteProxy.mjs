@@ -524,12 +524,46 @@ export async function checkConnection({ provider, key, openrouterModel, fetchImp
     ...(Number.isInteger(result.status) ? { status: result.status } : {}) };
 }
 
+// Retry-After is delta-seconds or an HTTP-date (RFC 7231); the proxy works in milliseconds.
+// A value beyond 10 minutes is clamped: a client may be told to wait, but the proxy never
+// trusts an unbounded number from a provider.
+const RETRY_AFTER_MAX_MS = 10 * 60 * 1000;
+// Date.parse is lenient enough to read arbitrary text as a year, so dates are shape-checked
+// first against the three HTTP-date forms (IMF-fixdate, RFC 850, asctime).
+const MONTH = 'Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec';
+const SHORT_DAY = 'Mon|Tue|Wed|Thu|Fri|Sat|Sun';
+const LONG_DAY = 'Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday';
+const HTTP_DATE = new RegExp(`^(?:(?:${SHORT_DAY}), \\d{2} (?:${MONTH}) \\d{4} \\d{2}:\\d{2}:\\d{2} GMT|` +
+  `(?:${LONG_DAY}), \\d{2}-(?:${MONTH})-\\d{2} \\d{2}:\\d{2}:\\d{2} GMT|` +
+  `(?:${SHORT_DAY}) (?:${MONTH}) [ \\d]\\d \\d{2}:\\d{2}:\\d{2} \\d{4})$`);
+export function parseRetryAfter(value, nowMs = Date.now()) {
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (!text) return null;
+  // Tolerate fractional seconds: providers send them even though the RFC does not.
+  if (/^\d+(?:\.\d+)?$/.test(text)) return Math.min(Number(text) * 1000, RETRY_AFTER_MAX_MS);
+  if (!HTTP_DATE.test(text)) return null;
+  // The asctime form carries no zone marker but is defined as GMT; Date.parse would read it
+  // as local time and turn a future wait into a past date outside a UTC host.
+  const at = Date.parse(/ GMT$/.test(text) ? text : `${text} GMT`);
+  if (!Number.isFinite(at)) return null;
+  const reference = Number.isFinite(nowMs) ? nowMs : Date.now();
+  return Math.min(Math.max(at - reference, 0), RETRY_AFTER_MAX_MS);
+}
+
 export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrouter', openrouterModel, localUrl,
   localModel, localKey, localAllowRemote = false, localHttpUrl, localOnly = false, localCompat = false, openrouterCompat = false, fallbackModel = 'claude-sonnet-5-5', retryDelayMs = 1000,
   cooldownMs = 30000, attemptTimeoutMs = localOnly || openrouterCompat ? 120000 : 30000, planHeaderMs = 120000, planIdleMs = 300000, attemptCeilingMs = 300000, now = Date.now,
   metricsPath = process.env.ROUTE_METRICS_PATH,
   streamPassthrough = process.env.ROUTE_STREAM_PASSTHROUGH === '1',
   handoverTimeoutMs = Number(process.env.ROUTE_HANDOVER_TIMEOUT_MS) || 120000,
+  // Idle, not total: a client may send for minutes as long as it keeps sending. 0 disables it.
+  requestIdleTimeoutMs = Number.isFinite(Number(process.env.ROUTE_REQUEST_IDLE_TIMEOUT_MS))
+    ? Number(process.env.ROUTE_REQUEST_IDLE_TIMEOUT_MS) : 30000,
+  // A provider may ask for a long wait, but a CLI turn must not freeze for minutes: retries
+  // wait at most this long and the full hint reaches the client as Retry-After instead.
+  retryMaxWaitMs = Number.isFinite(Number(process.env.ROUTE_RETRY_MAX_WAIT_MS))
+    ? Number(process.env.ROUTE_RETRY_MAX_WAIT_MS) : 10000,
   onHandover = null }) {
   if (typeof localOnly !== 'boolean' || (localOnly && provider !== 'local')) throw new Error('Local-only mode requires local provider');
   if (typeof localCompat !== 'boolean' || (localCompat && (!localOnly || provider !== 'local')))
@@ -551,7 +585,12 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   if (!isSonnet(fallbackModel)) throw new Error('Fallback must be a native Sonnet model');
   for (const value of [retryDelayMs, cooldownMs, attemptTimeoutMs, planHeaderMs, planIdleMs, attemptCeilingMs])
     if (!Number.isFinite(value) || value < 0) throw new Error('Invalid routing timeout');
+  if (!Number.isFinite(requestIdleTimeoutMs) || requestIdleTimeoutMs < 0) throw new Error('Invalid request idle timeout');
+  if (!Number.isFinite(retryMaxWaitMs) || retryMaxWaitMs < 0) throw new Error('Invalid retry wait');
   let openUntil = 0, probing = false, generation = 0, lastLocalFailure = 'upstream_error';
+  // The last rate-limit answer a provider gave, kept for the circuit/fencing work: today it
+  // is only recorded and exposed, never used to skip or delay a route.
+  let lastRateLimit = null;
   // Counters stay in memory and are written to a small file at most once a second, so the
   // dashboard can read routing load without talking to this process.
   const metrics = { startedAt: Date.now(), requests: 0, ok: 0, failed: 0, streams: 0, attempts: 0,
@@ -576,6 +615,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     latencyMs: { external: latencySummary(metrics.latency.external), plan: latencySummary(metrics.latency.plan),
       ttfb: latencySummary(metrics.ttfb) },
     last: metrics.last,
+    rateLimit: lastRateLimit ? { ...lastRateLimit } : null,
   });
   let flushTimer = null, lastFlushAt = 0, metricsDirty = false;
   const flushMetrics = () => {
@@ -622,18 +662,40 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     // truncate a reply the client is reading right now; draining first prevents that.
     drainState = 'closed';
     server.close();
+    const report = { drained: true, inflight: 0, waitedMs: Date.now() - started, forced: false };
     // The exit side effect belongs to the drain, not to a caller: concurrent POSTs join
     // one run and must not stack exit timers or callbacks.
-    if (typeof onHandover === 'function') onHandover();
-    else setTimeout(() => process.exit(0), 100);
-    return { status: 200, report: { drained: true, inflight: 0, waitedMs: Date.now() - started, forced: false } };
+    if (typeof onHandover === 'function') {
+      onHandover();
+      return { status: 200, report };
+    }
+    // Report first, leave second: a launcher that reads the 200 must not see a reset because
+    // the process exited before its body was on the wire. The caller invokes `reported()`
+    // once the handover response has flushed; the linger bounds a write that never does.
+    let exited = false, reportFlushed = false;
+    const exitLater = () => {
+      if (exited) return;
+      exited = true;
+      setTimeout(() => process.exit(0), 50);
+    };
+    const linger = setTimeout(() => { if (!reportFlushed) exitLater(); }, 250);
+    linger.unref?.();
+    return { status: 200, report,
+      reported: () => {
+        if (reportFlushed) return;
+        reportFlushed = true;
+        clearTimeout(linger);
+        exitLater();
+      } };
   };
   const server = http.createServer(async (req, res) => {
-    const reject = (status, message) => {
+    const reject = (status, message, headers) => {
       if (res.destroyed) return;
       if (res.headersSent) return res.destroy();
-      res.writeHead(status, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message } }));
+      res.writeHead(status, { 'content-type': 'application/json', ...headers });
+      // Keep Anthropic's error vocabulary: a rate limit is not a generic API failure.
+      const type = status === 429 ? 'rate_limit_error' : status === 529 ? 'overloaded_error' : 'api_error';
+      res.end(JSON.stringify({ type: 'error', error: { type, message } }));
     };
     if (!tokenMatches(req.headers['x-local-route-token'])) return reject(403, 'Local authorization required');
     if (req.method === 'HEAD' && req.url === '/api/hello') { res.writeHead(200); res.end(); return; }
@@ -643,8 +705,21 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       // the next POST may try again while the proxy keeps serving.
       if (!handoverRun) handoverRun = runHandover();
       const outcome = await handoverRun.finally(() => { handoverRun = null; });
+      if (res.destroyed) return;
       res.writeHead(outcome.status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
       res.end(JSON.stringify(outcome.report));
+      if (outcome.reported) {
+        // Exit only once this very response (or its socket) has flushed; the drain keeps its
+        // own bounded linger, so a write that never completes still cannot pin the process.
+        const reported = () => {
+          res.off('finish', reported);
+          res.off('close', reported);
+          outcome.reported();
+        };
+        res.once('finish', reported);
+        res.once('close', reported);
+        if (res.writableFinished || res.destroyed) reported();
+      }
       return;
     }
     if (drainState !== 'serving') {
@@ -679,16 +754,49 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       releaseTurn();
     });
     req.on('aborted', () => client.abort('client_close'));
+    // A failed external attempt can still decide the client-facing result: if the route
+    // downstream fails too, the provider's own status and wait are more useful than a 502.
+    let failureStatus = null, retryAfterHintMs = null;
     inflight += 1;
     ownsTurn = true;
     try {
       const chunks = [];
       let size = 0;
-      for await (const chunk of req) {
-        size += chunk.length;
-        if (size > MAX_RESPONSE) return reject(413, 'Request too large');
-        chunks.push(chunk);
+      // A client that stalls mid-body must not hold its turn: Node's default requestTimeout
+      // (300s) is longer than the handover cap, so a drain could never finish. The timer is
+      // idle-based and re-armed per chunk, so a slow but live upload is never cut short.
+      let idleTimer = null, bodyTimedOut = false;
+      const clearIdle = () => { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; } };
+      const armIdle = () => {
+        if (!requestIdleTimeoutMs) return;
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          idleTimer = null;
+          bodyTimedOut = true;
+          // A self-timeout is not peer interference, so it gets its own event and is
+          // counted as an aborted request instead of vanishing with the socket.
+          metrics.aborted += 1;
+          metrics.failed += 1;
+          scheduleMetricsFlush();
+          console.error(JSON.stringify({ event: 'client_body_timeout', provider, idle_ms: requestIdleTimeoutMs }));
+          client.abort('client_body_timeout');
+          req.destroy();
+        }, requestIdleTimeoutMs);
+        idleTimer.unref?.();
+      };
+      armIdle();
+      try {
+        for await (const chunk of req) {
+          armIdle();
+          size += chunk.length;
+          if (size > MAX_RESPONSE) return reject(413, 'Request too large');
+          chunks.push(chunk);
+        }
+      } finally {
+        clearIdle();
       }
+      // A destroyed request may still end the iterator cleanly; never route a partial body.
+      if (bodyTimedOut) return;
       const raw = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
       let body;
       try { body = JSON.parse(raw.toString('utf8')); } catch { return reject(400, 'Invalid JSON'); }
@@ -736,7 +844,10 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           if (metrics.ttfb.length > LATENCY_WINDOW) metrics.ttfb.shift();
         }
         metrics.last = { ts: new Date().toISOString(), route: routeKind || 'none', reason: routeReason,
-          status: aborted ? 499 : res.statusCode, ms: elapsed };
+          status: aborted ? 499 : res.statusCode, ms: elapsed,
+          // Exposed so a rate-limit answer stays visible to the dashboard (and to the circuit
+          // work that will consume it); null means no usable Retry-After was seen.
+          retryAfterMs: retryAfterHintMs };
         scheduleMetricsFlush();
       };
       res.on('finish', () => recordRequest(false));
@@ -891,8 +1002,17 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               const response = await fetchImpl(externalUrl, { method: 'POST', headers,
                 body: externalPayload, redirect: 'error', signal: controller.signal });
               status = response.status;
-              if (status === 429) { const seconds = Number(response.headers.get('retry-after')); if (seconds > 0) retryAfterMs = seconds * 1000; }
               if (!response.ok) {
+                // Only a failed answer carries a wait for the client; a Retry-After on a
+                // successful response is not part of the result and must not taint metrics.
+                const hint = parseRetryAfter(response.headers.get('retry-after'), now());
+                if (hint !== null) retryAfterHintMs = hint;
+                // Only a rate-limit answer changes the retry delay, as before; other failures
+                // keep their fixed delay even when the provider sends a Retry-After.
+                if (status === 429 || status === 503) {
+                  if (hint !== null) retryAfterMs = hint;
+                  lastRateLimit = { status, retryAfterMs: hint, at: new Date().toISOString() };
+                }
                 await response.body?.cancel();
                 throw new Error('External request failed');
               }
@@ -985,8 +1105,10 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               'Local thinking response disabled': 'thinking_response', 'Thinking response in ordinary mode': 'thinking_response', 'Unsupported Local response fields': 'unsupported_content_fields' }[error?.message];
             if (noPlan) localFailure = controller.signal.reason === 'attempt_timeout' ? 'timeout' :
               status === 401 || status === 403 ? 'authentication_failed' : status === 402 ? 'payment_required' : validation === 'empty_response' ? 'empty_response' : 'upstream_error';
+            if (Number.isInteger(status)) failureStatus = status;
             console.error(JSON.stringify({ event: 'external_attempt_failed', provider, attempt: attempt + 1,
               ...(Number.isInteger(status) ? { status } : {}), ...(validation ? { validation } : {}),
+              ...(retryAfterMs ? { retry_after_ms: retryAfterMs } : {}),
               category: controller.signal.reason === 'attempt_timeout' ? 'timeout' : 'upstream' }));
             controller.abort('attempt_failed');
             // This attempt is discarded, so its first byte is not the response's.
@@ -999,8 +1121,10 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             clearTimeout(ceiling);
             client.signal.removeEventListener('abort', cancel);
           }
-          if (attempt + 1 < attempts && retryDelayMs) await abortable(new Promise(resolve => {
-            const timeout = setTimeout(resolve, Math.min(Math.max(retryDelayMs, retryAfterMs), 10000));
+          if (attempt + 1 < attempts) await abortable(new Promise(resolve => {
+            // A provider may ask for minutes; the turn should not sit that long, so the
+            // in-proxy wait is capped and the full hint is handed to the client instead.
+            const timeout = setTimeout(resolve, Math.min(Math.max(retryDelayMs, retryAfterMs), retryMaxWaitMs));
             client.signal.addEventListener('abort', () => { clearTimeout(timeout); resolve(); }, { once: true });
           }), client.signal);
         }
@@ -1025,12 +1149,24 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               error: { type: 'api_error', message: 'upstream stream failed' } })}\n\n`);
           } catch {}
           res.end();
+        } else if (failureStatus === 429 || failureStatus === 529) {
+          // The provider already explained the refusal. A generic 502 would hide both the
+          // cause and the wait the client has to observe, so surface its status and hint.
+          const headers = retryAfterHintMs === null ? {}
+            : { 'retry-after': String(Math.ceil(retryAfterHintMs / 1000)) };
+          reject(failureStatus, failureStatus === 429 ? 'Upstream rate limited' : 'Upstream overloaded', headers);
         } else {
           reject(502, 'Upstream request failed');
         }
       }
     }
   });
+  // A stalled header never reaches the request handler, so it is bounded by the server's
+  // own header timeout; Node checks it on a coarse interval, which must shrink with the cap.
+  if (requestIdleTimeoutMs > 0) {
+    server.headersTimeout = requestIdleTimeoutMs;
+    server.connectionsCheckingInterval = Math.min(requestIdleTimeoutMs, 1000);
+  }
   return server;
 }
 
