@@ -814,11 +814,18 @@ class PortTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(dash.main(["--stop"]), 1)
         self.assertIn("no_record", output.getvalue())
-        self.pid_file.write_text(json.dumps({"pid": 4321, "port": 8787}), encoding="utf-8")
-        with mock.patch.object(dash.os, "kill") as killer, contextlib.redirect_stdout(io.StringIO()) as output:
+        # The record carries the pid's creation time, so a stop is only sent when the live
+        # process still matches it; the mocked port keeps this independent of a real dashboard.
+        self.pid_file.write_text(json.dumps({"pid": 4321, "port": 8787, "process_created": 111}),
+                                 encoding="utf-8")
+        with mock.patch.object(dash, "process_identity", return_value=(4321, 111)), \
+             mock.patch.object(dash, "own_tree_pids", return_value=set()), \
+             mock.patch.object(dash, "_port_open", return_value=True), \
+             mock.patch.object(dash.os, "kill") as killer, \
+             contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(dash.main(["--stop"]), 0)
         killer.assert_called_once()
-        self.assertEqual(killer.call_args.args[0], 4321)
+        self.assertEqual(killer.call_args.args, (4321, dash.signal.SIGTERM))
         self.assertIn('"stopped": true', output.getvalue())
 
     def test_default_port_is_stable(self):

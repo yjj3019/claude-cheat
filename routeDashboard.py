@@ -21,6 +21,7 @@ import re
 import secrets
 import signal
 import socket
+import sys
 import threading
 import time
 import urllib.error
@@ -29,6 +30,18 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 from pathlib import Path
+# Reuse the launcher's Windows process identity: a recorded pid is only a dashboard while
+# its creation time matches. Without the primitive (non-Windows) nothing can be verified,
+# so the identity helpers refuse every signal instead of falling back to a bare pid kill.
+try:
+    from localProcessTree import own_tree_pids, process_identity
+except (ImportError, ValueError):
+    def process_identity(pid):
+        return None
+
+    def own_tree_pids():
+        return {os.getpid()}
+
 
 ROOT = Path(__file__).resolve().parent
 ROUTE_LOG = ROOT / ".route.log"
@@ -2299,7 +2312,11 @@ def _display_host(host):
 
 
 def _read_pid_record(path=None):
-    """Previous instance record, so a redeploy can take the same port instead of moving."""
+    """Previous instance record, so a redeploy can take the same port instead of moving.
+
+    Records written by older versions carry only pid/port: they stay readable, but the
+    identity of that pid cannot be proven, so they never authorize a signal.
+    """
     try:
         data = json.loads(Path(path or PID_FILE).read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -2310,13 +2327,48 @@ def _read_pid_record(path=None):
 
 
 def _write_pid_record(port, path=None):
+    """Persist this instance with the identity a later stop must prove before signalling."""
     record = {"pid": os.getpid(), "port": port,
               "started": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    identity = process_identity(os.getpid())
+    if identity is not None:
+        record["process_created"] = identity[1]
     try:
         Path(path or PID_FILE).write_text(json.dumps(record), encoding="utf-8")
     except OSError:
         pass
     return record
+
+
+def _verify_pid_record(record):
+    """Classify a recorded pid: "verified", "mismatch", "own_tree" or "unverifiable".
+
+    Only "verified" may authorize a signal. A pid in our own tree would take the
+    dashboard (or a shell it depends on) down with it; a changed creation time means the
+    pid was recycled; a record without an identity is a legacy file, and a process whose
+    identity cannot be read is unknown, so neither is ever signalled. That also covers
+    platforms without a creation-time primitive (process_identity returns None there):
+    stop stays refused there until a platform primitive exists.
+    """
+    pid = record.get("pid")
+    if not isinstance(pid, int):
+        return "unverifiable"
+    if pid in own_tree_pids():
+        return "own_tree"
+    created = record.get("process_created")
+    if not isinstance(created, int):
+        return "unverifiable"
+    identity = process_identity(pid)
+    if identity is None:
+        return "unverifiable"
+    return "verified" if tuple(identity) == (pid, created) else "mismatch"
+
+
+def _refusal_report(record, verdict):
+    """One clear line for a refused stop, so the cause is visible without a debugger."""
+    reason = {"mismatch": "identity_mismatch", "own_tree": "own_tree_pid",
+              "unverifiable": "identity_unverifiable"}[verdict]
+    return {"pid": record.get("pid"), "port": record.get("port"), "reason": reason}
 
 
 def _port_open(port, host="127.0.0.1"):
@@ -2326,11 +2378,21 @@ def _port_open(port, host="127.0.0.1"):
 
 
 def _stop_previous(port, path=None, timeout=5.0):
-    """Terminate a dashboard this launcher started before, keeping the requested port stable."""
+    """Terminate a dashboard this launcher started before, keeping the requested port stable.
+
+    A signal is only sent when the record's pid still carries the recorded creation time.
+    A legacy, recycled, unreadable or own-tree pid is reported on stderr and left
+    untouched; the caller then proceeds and overwrites the stale record when it binds.
+    """
     record = _read_pid_record(path)
-    if not record or record.get("pid") == os.getpid() or record.get("port") != port:
+    if not record or record.get("port") != port:
         return False
     if not _port_open(port):
+        return False
+    verdict = _verify_pid_record(record)
+    if verdict != "verified":
+        print(json.dumps({"event": "dashboard_previous_instance_refused",
+                          **_refusal_report(record, verdict)}), file=sys.stderr, flush=True)
         return False
     try:
         os.kill(record["pid"], signal.SIGTERM)
@@ -2472,6 +2534,12 @@ def main(argv=None):
             except OSError:
                 pass
             print(json.dumps({"stopped": False, "reason": "stale_record", "pid": record.get("pid")}))
+            return 1
+        verdict = _verify_pid_record(record)
+        if verdict != "verified":
+            # Never signal a pid that is not provably the recorded dashboard. The record is
+            # reported (not deleted) and the next start overwrites it.
+            print(json.dumps({"stopped": False, **_refusal_report(record, verdict)}))
             return 1
         try:
             os.kill(record["pid"], signal.SIGTERM)
