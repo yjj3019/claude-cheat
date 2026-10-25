@@ -465,7 +465,8 @@ def local_cli_command(claude: str, compat: bool = False) -> list:
             "--no-chrome", "--settings", json.dumps(settings), "--append-system-prompt", workspace_context]
 
 
-def launch(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False, openrouter_compat: bool = False, debug: bool = False) -> int:
+def launch(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False, openrouter_compat: bool = False, debug: bool = False,
+           print_prompt: str | None = None, print_json: bool = True) -> int:
     if (local_only and provider != "local") or (local_compat and not local_only):
         raise ValueError("Local CLI mode requires the local provider")
     if openrouter_compat and (provider != "openrouter" or local_only or local_compat):
@@ -473,6 +474,11 @@ def launch(provider: str = "openrouter", local_only: bool = False, local_compat:
     isolated = local_only or openrouter_compat
     compat = local_compat or openrouter_compat
     startup_error = OpenRouterStartupError if openrouter_compat else LocalStartupError
+    # --print runs one non-interactive turn through the same proxy, which is what makes an
+    # automated end-to-end check possible.
+    print_args = []
+    if print_prompt is not None:
+        print_args = ["-p", print_prompt] + (["--output-format", "json"] if print_json else [])
     claude = shutil.which("claude")
     if not claude:
         if isolated:
@@ -519,14 +525,14 @@ def launch(provider: str = "openrouter", local_only: bool = False, local_compat:
                 settings["env"][name] = ""
             command[settings_index] = json.dumps(settings)
             try:
-                return subprocess.call(command, env=env)
+                return subprocess.call(command + print_args, env=env)
             except OSError:
                 raise startup_error("local_cli_start_failed") from None
     print(f"Sonnet replacement: {provider}. Opus/Haiku/Fable keep Claude Plan OAuth.")
     print("Initial request + 3 retries, then Plan fallback (subscription Sonnet); recovery checked on a later request.")
     print("Native-only features stay on Plan. Replacement replies are buffered until validated.")
     with routed_session(provider, debug=debug) as env:
-        return subprocess.call([claude, "--model", "sonnet"], env=env)
+        return subprocess.call([claude, "--model", "sonnet"] + print_args, env=env)
 
 
 def self_test() -> None:
@@ -631,6 +637,10 @@ def main(argv=None) -> int:
         parser.add_argument("--local-compat", action="store_true", help="Opt-in Local-only CLI compatibility mode with client integrations and no Plan fallback")
         parser.add_argument("--openrouter-compat", action="store_true", help="Opt-in OpenRouter-only CLI compatibility mode with client integrations and no Plan fallback")
         parser.add_argument("--debug", action="store_true", help="Show proxy routing logs (route_selected, circuit_open, ...) on stderr")
+        parser.add_argument("--print", dest="print_prompt", metavar="PROMPT",
+                            help="Run one non-interactive turn through the proxy and exit (automation/CI)")
+        parser.add_argument("--print-text", action="store_true",
+                            help="With --print, keep the CLI's human output instead of JSON")
         options = parser.parse_args(arguments)
         if options.openrouter_compat and (options.provider != "openrouter" or options.local_mode or options.local_compat or options.check_local or options.diagnose_local):
             parser.error("--openrouter-compat requires --provider openrouter and cannot be combined with Local modes or diagnostic checks")
@@ -652,7 +662,10 @@ def main(argv=None) -> int:
             except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
                 error = OpenRouterStartupError if options.openrouter_compat else LocalStartupError
                 raise error("local_process_cleanup_failed") from None
-        return launch(options.provider, local_only=options.local_mode or options.local_compat, local_compat=options.local_compat, openrouter_compat=options.openrouter_compat, debug=options.debug)
+        return launch(options.provider, local_only=options.local_mode or options.local_compat,
+                      local_compat=options.local_compat, openrouter_compat=options.openrouter_compat,
+                      debug=options.debug, print_prompt=options.print_prompt,
+                      print_json=not options.print_text)
     except (LocalStartupError, OpenRouterConfigError) as exc:
         payload = {"event": "openrouter_start_failed", "kind": type(exc).__name__,
                    "code": exc.code if isinstance(exc, LocalStartupError) else "openrouter_configuration_invalid",

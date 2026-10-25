@@ -490,6 +490,7 @@ python -m unittest discover -s tests -p 'test_*.py' -v
 python openrouterAdvisor.py --self-test
 node --check claudeRouteProxy.mjs
 node tests/simulate.mjs --soak 3000        # 합성 트래픽·장기 세션·메모리
+python openrouterAdvisor.py --print "Reply with exactly OK"   # 실제 CLI 1턴(자동화용)
 python tests/live_smoke.py --dry-run       # 설정 존재 여부만 확인(무과금)
 ```
 
@@ -497,6 +498,7 @@ python tests/live_smoke.py --dry-run       # 설정 존재 여부만 확인(무�
 - 프로세스 트리 테스트는 **Git Bash**가 필요합니다. `C:\Windows\System32\bash.exe`(WSL)는 Windows 파이썬 경로를 실행하지 못해 자동으로 건너뜁니다.
 - 대시보드는 **Host 허용목록**(127.0.0.1·localhost·::1)으로 DNS 리바인딩을 막고, `nosniff`·`no-referrer`·`frame-ancestors DENY`(X-Frame-Options) 헤더를 보냅니다. 쓰기 API는 세션 토큰 + 동일 출처를 함께 요구합니다.
 - 실제 제공자 호출은 기본 스위트에서 제외되어 있습니다. 설정 변경 후 한 번 확인하려면 `python tests/live_smoke.py`(16토큰, 약 1회 0.01센트 미만)를 사용하세요.
+- 실행기에는 **비대화형 `--print "프롬프트"`** 모드가 있습니다(기본 JSON 출력, `--print-text`로 사람용). 실제 CLI 1턴을 자동 검증하려면 `$env:CLAUDE_CHEAT_LIVE = '1'; python -m unittest tests.test_cli_integration`.
 
 검사 대상은 요청·응답 보존, 인증 격리, 도구 결과 왕복, 최초 요청과 재시도 3회, Plan fallback, 회로 복구, 취소·타임아웃·빈 응답 처리입니다. 합성 테스트 통과를 실제 서비스나 모든 Claude Code 기능의 통과로 해석하면 안 됩니다.
 

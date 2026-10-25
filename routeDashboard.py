@@ -1537,6 +1537,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, "application/json; charset=utf-8", json.dumps({"error": "not_found"}))
         if not self._authorized():
             return self._send(403, "application/json; charset=utf-8", json.dumps({"error": "token_required"}))
+        if not _rate_ok(self.client_address[0]):
+            return self._send(429, "application/json; charset=utf-8",
+                              json.dumps({"error": "rate_limited", "limit_per_minute": RATE_LIMIT_PER_MINUTE}))
         origin = self.headers.get("origin")
         port = self.server.server_address[1]
         bound = self.server.server_address[0]
@@ -1598,6 +1601,22 @@ class DashboardServer(ThreadingHTTPServer):
         if os.name == "nt":
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         super().server_bind()
+
+
+RATE_LIMIT_PER_MINUTE = 30
+_RATE = {"window": -1, "counts": {}}
+
+
+def _rate_ok(client, now=None, limit=RATE_LIMIT_PER_MINUTE):
+    """Sliding minute window per client; a local user never needs a burst above this."""
+    now = time.monotonic() if now is None else now
+    window = int(now // 60)
+    if _RATE["window"] != window:
+        _RATE["window"] = window
+        _RATE["counts"].clear()
+    count = _RATE["counts"].get(client, 0) + 1
+    _RATE["counts"][client] = count
+    return count <= limit
 
 
 ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}

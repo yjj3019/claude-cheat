@@ -172,6 +172,15 @@ class AuditRegressionTests(unittest.TestCase):
         self.assertIn("stale_record", output.getvalue())
         self.assertFalse(pid_file.exists(), "a stale record must be cleared, not signalled")
 
+    # --- rate limiting --------------------------------------------------------
+    def test_write_requests_are_rate_limited_per_minute(self):
+        with mock.patch.dict(dash._RATE, {"window": -1, "counts": {}}, clear=True):
+            for index in range(dash.RATE_LIMIT_PER_MINUTE):
+                self.assertTrue(dash._rate_ok("127.0.0.1", now=100.0), f"request {index + 1} should pass")
+            self.assertFalse(dash._rate_ok("127.0.0.1", now=100.0), "the burst limit must stop here")
+            self.assertTrue(dash._rate_ok("127.0.0.1", now=160.0), "a new minute starts fresh")
+            self.assertTrue(dash._rate_ok("127.0.0.2", now=160.0), "clients are counted separately")
+
     # --- IPv6 ----------------------------------------------------------------
     def test_ipv6_hosts_are_bracketed(self):
         self.assertEqual(dash._display_host("127.0.0.1"), "127.0.0.1")
