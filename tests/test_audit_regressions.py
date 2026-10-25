@@ -98,6 +98,20 @@ class AuditRegressionTests(unittest.TestCase):
                 "message": {"model": "vendor/model",
                             "usage": {"input_tokens": tokens, "output_tokens": 1}}}
 
+    def assistant_turn(self, tokens, message_id=None, request_id=None, row_uuid=None,
+                       output=1, model="vendor/model", stamp=None):
+        record = {"type": "assistant",
+                  "timestamp": stamp or datetime.now(timezone.utc).isoformat(),
+                  "message": {"model": model,
+                              "usage": {"input_tokens": tokens, "output_tokens": output}}}
+        if message_id is not None:
+            record["message"]["id"] = message_id
+        if request_id is not None:
+            record["requestId"] = request_id
+        if row_uuid is not None:
+            record["uuid"] = row_uuid
+        return record
+
     def write_transcript(self, path, records, mtime_ns, partial=""):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("".join(json.dumps(record) + "\n" for record in records) + partial,
@@ -113,6 +127,7 @@ class AuditRegressionTests(unittest.TestCase):
         """Scan the fixture projects with the repo's cache file patched out."""
         if restart:
             dash._SESSIONS.clear()
+            getattr(dash, "_CLAIM_OWNER", {}).clear()
             dash._USAGE_CACHE["data"] = None
         dash._USAGE_CACHE["key"] = None
         projects = self.root / "projects"
@@ -123,6 +138,11 @@ class AuditRegressionTests(unittest.TestCase):
             with mock.patch.object(dash, "_USAGE_CACHE_META", {"saved_at": 0.0}), \
                  mock.patch.object(dash.time, "monotonic", return_value=1_000_000.0):
                 return dash.scan_sessions(projects=projects, now=datetime.now())
+
+    def cached_claims(self, cache):
+        payload = json.loads(cache.read_text(encoding="utf-8"))
+        return payload, {path: entry.get("claims", {})
+                         for path, entry in payload.get("files", {}).items()}
 
     def test_usage_cache_avoids_rereading_unchanged_transcripts(self):
         def record(tokens):
@@ -390,6 +410,235 @@ class AuditRegressionTests(unittest.TestCase):
         path.write_bytes(b"a" * 19999 + b"c")
         with path.open("rb") as raw:
             self.assertNotEqual(dash._source_identity(raw, 20000)[1], tail_sha)
+
+    # --- usage cache: cross-file exactly-once ledger ---------------------------
+    def test_a_duplicate_row_copied_to_another_transcript_is_counted_once(self):
+        # Pins: each file was aggregated on its own, so /resume copies double counted.
+        cache = self.root / ".usage-cache.json"
+        original = self.root / "projects" / "p1" / "a.jsonl"
+        copy = self.root / "projects" / "p1" / "b.jsonl"
+        row = self.assistant_turn(10, message_id="msg_dup", request_id="req_dup")
+        self.write_transcript(original, [row], self.recent_mtime_ns(300))
+        first = self.scan_usage(cache, restart=True)
+        self.assertEqual(first["totals"]["external"], [10, 1, 0, 0])
+        copied = dict(row)
+        copied["uuid"] = "copied-row-uuid"
+        self.write_transcript(copy, [copied], self.recent_mtime_ns(200))
+        second = self.scan_usage(cache)
+        self.assertEqual(second["totals"]["external"], [10, 1, 0, 0])
+        self.assertEqual(second["session_count"], 1)
+
+    def test_a_larger_duplicate_corrects_only_the_difference(self):
+        # Pins: a streamed row that grew was added again instead of correcting the claim.
+        cache = self.root / ".usage-cache.json"
+        original = self.root / "projects" / "p1" / "a.jsonl"
+        duplicate = self.root / "projects" / "p1" / "b.jsonl"
+        row = self.assistant_turn(10, message_id="msg_grow", request_id="req_grow", output=2)
+        self.write_transcript(original, [row], self.recent_mtime_ns(300))
+        self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [10, 2, 0, 0])
+        grown = dict(row)
+        grown["message"] = dict(row["message"])
+        grown["message"]["usage"] = {"input_tokens": 12, "output_tokens": 9}
+        self.write_transcript(duplicate, [grown], self.recent_mtime_ns(200))
+        usage = self.scan_usage(cache)
+        self.assertEqual(usage["totals"]["external"], [12, 9, 0, 0])
+        self.assertEqual(usage["sessions"][0]["turns"], 1)
+
+    def test_a_smaller_duplicate_never_subtracts(self):
+        cache = self.root / ".usage-cache.json"
+        original = self.root / "projects" / "p1" / "a.jsonl"
+        duplicate = self.root / "projects" / "p1" / "b.jsonl"
+        row = self.assistant_turn(10, message_id="msg_small", request_id="req_small", output=5)
+        self.write_transcript(original, [row], self.recent_mtime_ns(300))
+        self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [10, 5, 0, 0])
+        shrunk = dict(row)
+        shrunk["message"] = dict(row["message"])
+        shrunk["message"]["usage"] = {"input_tokens": 4, "output_tokens": 2}
+        self.write_transcript(duplicate, [shrunk], self.recent_mtime_ns(200))
+        usage = self.scan_usage(cache)
+        self.assertEqual(usage["totals"]["external"], [10, 5, 0, 0])
+        self.assertEqual(usage["sessions"][0]["turns"], 1)
+
+    def test_streamed_rows_of_one_message_are_counted_once_with_their_maxima(self):
+        # Pins: real Claude Code transcripts repeat one message.id as output grows.
+        cache = self.root / ".usage-cache.json"
+        path = self.root / "projects" / "p1" / "s.jsonl"
+        rows = [self.assistant_turn(10, message_id="msg_stream", request_id="req_stream", output=2),
+                self.assistant_turn(10, message_id="msg_stream", request_id="req_stream", output=9),
+                self.assistant_turn(10, message_id="msg_stream", request_id="req_stream", output=9)]
+        self.write_transcript(path, rows, self.recent_mtime_ns(300))
+        usage = self.scan_usage(cache, restart=True)
+        self.assertEqual(usage["totals"]["external"], [10, 9, 0, 0])
+        self.assertEqual(usage["sessions"][0]["turns"], 1)
+        self.assertEqual(usage["sessions"][0]["models"], [("vendor/model", 1)])
+
+    def test_two_turns_sharing_a_message_id_with_different_request_ids_both_count(self):
+        # Preservation: the requestId is part of the key, so separate API calls stay separate.
+        cache = self.root / ".usage-cache.json"
+        first = self.root / "projects" / "p1" / "a.jsonl"
+        second = self.root / "projects" / "p1" / "b.jsonl"
+        self.write_transcript(first, [self.assistant_turn(10, message_id="msg_shared", request_id="req_1")],
+                              self.recent_mtime_ns(300))
+        self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [10, 1, 0, 0])
+        self.write_transcript(second, [self.assistant_turn(20, message_id="msg_shared", request_id="req_2")],
+                              self.recent_mtime_ns(200))
+        usage = self.scan_usage(cache)
+        self.assertEqual(usage["totals"]["external"], [30, 2, 0, 0])
+        self.assertEqual(usage["session_count"], 2)
+
+    def test_a_fork_copy_with_one_new_turn_counts_only_the_new_turn(self):
+        cache = self.root / ".usage-cache.json"
+        parent = self.root / "projects" / "p1" / "parent.jsonl"
+        fork = self.root / "projects" / "p1" / "fork.jsonl"
+        history = [self.assistant_turn(10, message_id="msg_1", request_id="req_1", row_uuid="uuid-1"),
+                   self.assistant_turn(20, message_id="msg_2", request_id="req_2", row_uuid="uuid-2")]
+        self.write_transcript(parent, history, self.recent_mtime_ns(300))
+        self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [30, 2, 0, 0])
+        copied = [dict(record) for record in history]
+        copied.append(self.assistant_turn(5, message_id="msg_3", request_id="req_3", row_uuid="uuid-3"))
+        self.write_transcript(fork, copied, self.recent_mtime_ns(200))
+        usage = self.scan_usage(cache)
+        self.assertEqual(usage["totals"]["external"], [35, 3, 0, 0])
+        self.assertEqual(usage["session_count"], 2)
+
+    def test_the_message_id_fallback_dedupes_without_a_request_id(self):
+        cache = self.root / ".usage-cache.json"
+        first = self.root / "projects" / "p1" / "a.jsonl"
+        second = self.root / "projects" / "p1" / "b.jsonl"
+        self.write_transcript(first, [self.assistant_turn(10, message_id="msg_only", row_uuid="uuid-a")],
+                              self.recent_mtime_ns(300))
+        self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [10, 1, 0, 0])
+        self.write_transcript(second, [self.assistant_turn(10, message_id="msg_only", row_uuid="uuid-b")],
+                              self.recent_mtime_ns(200))
+        self.assertEqual(self.scan_usage(cache)["totals"]["external"], [10, 1, 0, 0])
+
+    def test_the_uuid_fallback_dedupes_rows_without_a_message_id(self):
+        cache = self.root / ".usage-cache.json"
+        first = self.root / "projects" / "p1" / "a.jsonl"
+        second = self.root / "projects" / "p1" / "b.jsonl"
+        self.write_transcript(first, [self.assistant_turn(10, row_uuid="row-uuid-1")],
+                              self.recent_mtime_ns(300))
+        self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [10, 1, 0, 0])
+        self.write_transcript(second, [self.assistant_turn(10, row_uuid="row-uuid-1")],
+                              self.recent_mtime_ns(200))
+        self.assertEqual(self.scan_usage(cache)["totals"]["external"], [10, 1, 0, 0])
+
+    def test_rows_without_any_identity_are_still_counted(self):
+        # Preservation: a row with no message.id and no uuid has no key, so it counts as before.
+        cache = self.root / ".usage-cache.json"
+        first = self.root / "projects" / "p1" / "a.jsonl"
+        second = self.root / "projects" / "p1" / "b.jsonl"
+        self.write_transcript(first, [self.assistant(10), self.assistant(20)], self.recent_mtime_ns(300))
+        self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [30, 2, 0, 0])
+        self.write_transcript(second, [self.assistant(30)], self.recent_mtime_ns(200))
+        self.assertEqual(self.scan_usage(cache)["totals"]["external"], [60, 3, 0, 0])
+
+    def test_the_persisted_claim_ledger_adds_nothing_on_a_restart(self):
+        cache = self.root / ".usage-cache.json"
+        path = self.root / "projects" / "p1" / "s.jsonl"
+        row = self.assistant_turn(10, message_id="msg_persist", request_id="req_persist")
+        self.write_transcript(path, [row], self.recent_mtime_ns(300))
+        self.assertEqual(self.scan_usage(cache, restart=True, save=True)["totals"]["external"],
+                         [10, 1, 0, 0])
+        payload, claims = self.cached_claims(cache)
+        self.assertEqual(payload["version"], dash.USAGE_CACHE_VERSION)
+        self.assertEqual(payload["claims_evicted"], 0)
+        flat = [values for file_claims in claims.values() for values in file_claims.values()]
+        self.assertEqual(flat, [[10, 1, 0, 0]])
+        self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [10, 1, 0, 0])
+        self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [10, 1, 0, 0])
+        appended = [row, self.assistant_turn(7, message_id="msg_persist2", request_id="req_persist2")]
+        self.write_transcript(path, appended, self.recent_mtime_ns(200))
+        self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [17, 2, 0, 0])
+
+    def test_a_persisted_claim_corrects_a_duplicate_after_a_restart(self):
+        cache = self.root / ".usage-cache.json"
+        original = self.root / "projects" / "p1" / "a.jsonl"
+        duplicate = self.root / "projects" / "p1" / "b.jsonl"
+        row = self.assistant_turn(10, message_id="msg_restart", request_id="req_restart")
+        self.write_transcript(original, [row], self.recent_mtime_ns(300))
+        self.assertEqual(self.scan_usage(cache, restart=True, save=True)["totals"]["external"],
+                         [10, 1, 0, 0])
+        grown = dict(row)
+        grown["message"] = dict(row["message"])
+        grown["message"]["usage"] = {"input_tokens": 25, "output_tokens": 1}
+        self.write_transcript(duplicate, [grown], self.recent_mtime_ns(200))
+        self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [25, 1, 0, 0])
+        self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [25, 1, 0, 0])
+
+    def test_a_reset_transcript_releases_its_claims(self):
+        # Pins: the identity reset must hand ownership back, or the re-read rows are
+        # skipped as duplicates of the counts that were just cleared.
+        cache = self.root / ".usage-cache.json"
+        path = self.root / "projects" / "p1" / "a.jsonl"
+        duplicate = self.root / "projects" / "p1" / "b.jsonl"
+        row = self.assistant_turn(10, message_id="msg_reset", request_id="req_reset")
+        self.write_transcript(path, [row], self.recent_mtime_ns(300))
+        self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [10, 1, 0, 0])
+        rewritten = self.assistant_turn(12, message_id="msg_reset", request_id="req_reset")
+        self.write_transcript(path, [rewritten], self.recent_mtime_ns(200))
+        self.assertEqual(self.scan_usage(cache)["totals"]["external"], [12, 1, 0, 0])
+        self.write_transcript(duplicate, [rewritten], self.recent_mtime_ns(100))
+        self.assertEqual(self.scan_usage(cache)["totals"]["external"], [12, 1, 0, 0])
+
+    def test_malformed_claim_ledgers_are_rejected_and_rescanned(self):
+        cache = self.root / ".usage-cache.json"
+        first = self.root / "projects" / "p1" / "a.jsonl"
+        second = self.root / "projects" / "p1" / "b.jsonl"
+        self.write_transcript(first, [self.assistant_turn(10, message_id="msg_a", request_id="req_a")],
+                              self.recent_mtime_ns(300))
+        self.write_transcript(second, [self.assistant_turn(20, message_id="msg_b", request_id="req_b")],
+                              self.recent_mtime_ns(200))
+        self.assertEqual(self.scan_usage(cache, restart=True, save=True)["totals"]["external"],
+                         [30, 2, 0, 0])
+        payload = json.loads(cache.read_text(encoding="utf-8"))
+        key = str(first)
+        claim_key = next(iter(payload["files"][key]["claims"]))
+        damaged_variants = [
+            [],
+            {claim_key: [1, 2, 3]},
+            {claim_key: [1, 2, 3, 4, 5]},
+            {claim_key: [1, -1, 0, 0]},
+            {"not-a-hex-key": [1, 2, 3, 4]},
+        ]
+        for claims in damaged_variants:
+            damaged = json.loads(json.dumps(payload))
+            damaged["files"][key]["claims"] = claims
+            cache.write_text(json.dumps(damaged), encoding="utf-8")
+            self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"],
+                             [30, 2, 0, 0], str(claims)[:40])
+        # One turn owned by two files is a corrupt ledger: rescan from scratch.
+        twice_owned = json.loads(json.dumps(payload))
+        twice_owned["files"][str(second)]["claims"][claim_key] = [10, 1, 0, 0]
+        cache.write_text(json.dumps(twice_owned), encoding="utf-8")
+        self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [30, 2, 0, 0])
+        # More claims than the cap is oversized, not trusted.
+        with mock.patch.object(dash, "USAGE_CLAIM_CAP", 0, create=True):
+            cache.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"],
+                             [30, 2, 0, 0])
+
+    def test_claim_eviction_at_the_cap_keeps_the_totals_monotonic(self):
+        cache = self.root / ".usage-cache.json"
+        oldest = self.root / "projects" / "p1" / "oldest.jsonl"
+        newest = self.root / "projects" / "p1" / "newest.jsonl"
+        self.write_transcript(oldest, [self.assistant_turn(10, message_id="msg_a1", request_id="req_a1"),
+                                       self.assistant_turn(10, message_id="msg_a2", request_id="req_a2")],
+                              self.recent_mtime_ns(300))
+        first = self.scan_usage(cache, restart=True, save=True)
+        self.assertEqual(first["totals"]["external"], [20, 2, 0, 0])
+        with mock.patch.object(dash, "USAGE_CLAIM_CAP", 2):
+            self.write_transcript(newest, [self.assistant_turn(5, message_id="msg_b1", request_id="req_b1"),
+                                           self.assistant_turn(5, message_id="msg_b2", request_id="req_b2")],
+                                  self.recent_mtime_ns(200))
+            second = self.scan_usage(cache, save=True)
+            payload, claims = self.cached_claims(cache)
+            self.assertEqual(payload["claims_evicted"], 2)
+            self.assertEqual(sum(len(file_claims) for file_claims in claims.values()), 2)
+            third = self.scan_usage(cache, restart=True, save=True)
+        self.assertEqual(second["totals"]["external"], [30, 4, 0, 0])
+        self.assertGreaterEqual(second["totals"]["external"][0], first["totals"]["external"][0])
+        self.assertEqual(third["totals"]["external"], [30, 4, 0, 0])
 
     # --- route log concurrency -----------------------------------------------
     def test_concurrent_reads_do_not_double_count(self):

@@ -380,17 +380,28 @@ def _classify(message_id):
 def _new_session_state():
     # The identity fields describe the bytes up to ``offset``; a transcript rewritten in
     # place keeps the offset but not the fingerprints, so both must be persisted together.
+    # ``claims`` owns the turns this file was the first to see, so a message copied by
+    # /resume or a fork is counted once across the whole scan window. ``tokens_1h`` is
+    # the 1-hour-TTL share of cache writes, kept off the four compatible token axes.
     return {"offset": 0, "size": None, "mtime_ns": None, "head_sha": None, "tail_sha": None,
             "turns": 0, "external": 0, "plan": 0, "last_ts": None,
             "tokens": {"external": [0, 0, 0, 0], "plan": [0, 0, 0, 0]},
-            "models": {}, "hours": {}}
+            "tokens_1h": {"external": 0, "plan": 0},
+            "models": {}, "hours": {}, "claims": {}}
 
 
 USAGE_CACHE_FILE = ROOT / ".usage-cache.json"
-USAGE_CACHE_VERSION = 3
+USAGE_CACHE_VERSION = 5
 USAGE_IDENTITY_BYTES = 4096
+# The claim ledger is a cross-file exactly-once index, so it must not grow without a
+# bound. Above this many claims the oldest transcripts' claims are dropped whole.
+USAGE_CLAIM_CAP = 200_000
+USAGE_CLAIM_KEY_CHARS = 20
 _USAGE_CACHE_META = {"saved_at": 0.0}
 _USAGE_DIRTY = {"flag": False, "at": 0.0}
+
+# Hash of the turn's dedupe key -> path of the transcript that counted it first.
+_CLAIM_OWNER = {}
 
 
 def _load_usage_states():
@@ -424,6 +435,54 @@ def _valid_hour_bucket(bucket):
         if not isinstance(values, list) or len(values) != 4 or any(
                 not isinstance(value, int) or value < 0 for value in values):
             return False
+        if "tokens_1h" in part and (
+                not isinstance(part["tokens_1h"], int) or part["tokens_1h"] < 0):
+            return False
+    return True
+
+
+def _claim_hash(claim_key):
+    """Compact fixed-size ledger key; the raw message id never needs to be persisted."""
+    return hashlib.sha256(claim_key.encode("utf-8")).hexdigest()[:USAGE_CLAIM_KEY_CHARS]
+
+
+def _usage_claim_key(message, record):
+    """Identity of one assistant API message, or None for a row that carries none.
+
+    Claude Code writes one row per streamed update of the same message and /resume or
+    fork copies repeat rows in another transcript. The fallback order matches orca's
+    transcript-record-parser: ``message.id``+``requestId``, then ``message.id``, then
+    the row ``uuid``; a row without any of them is counted the old way (no dedupe).
+    """
+    message_id = message.get("id")
+    if isinstance(message_id, str) and message_id.strip():
+        message_id = message_id.strip()
+        request_id = record.get("requestId")
+        if isinstance(request_id, str) and request_id.strip():
+            return f"{message_id}:{request_id.strip()}"
+        return f"msg:{message_id}"
+    row_uuid = record.get("uuid")
+    if isinstance(row_uuid, str) and row_uuid.strip():
+        return f"uuid:{row_uuid.strip()}"
+    return None
+
+
+def _valid_claim_key(value):
+    return (isinstance(value, str) and len(value) == USAGE_CLAIM_KEY_CHARS
+            and all(character in "0123456789abcdef" for character in value))
+
+
+def _valid_claims(value):
+    """A malformed ledger would silently drop or duplicate turns, so it is rejected."""
+    if not isinstance(value, dict):
+        return False
+    for claim_key, tokens in value.items():
+        if not _valid_claim_key(claim_key):
+            return False
+        if not isinstance(tokens, list) or len(tokens) != 4:
+            return False
+        if any(not isinstance(token, int) or token < 0 for token in tokens):
+            return False
     return True
 
 
@@ -455,6 +514,13 @@ def _state_from_cache(entry):
         if not isinstance(values, list) or len(values) != 4 or any(
                 not isinstance(value, int) or value < 0 for value in values):
             return None
+    tokens_1h = entry.get("tokens_1h")
+    if not isinstance(tokens_1h, dict):
+        return None
+    for source in ("external", "plan"):
+        value = tokens_1h.get(source)
+        if not isinstance(value, int) or value < 0:
+            return None
     models = entry.get("models", {})
     if not isinstance(models, dict) or any(
             not isinstance(count, int) or count < 0 for count in models.values()):
@@ -465,19 +531,70 @@ def _state_from_cache(entry):
     for hour, bucket in hours.items():
         if not isinstance(hour, str) or not _valid_hour_bucket(bucket):
             return None
+    claims = entry.get("claims", {})
+    if not _valid_claims(claims):
+        return None
     return {"offset": entry["offset"], "size": size, "mtime_ns": mtime_ns,
             "head_sha": entry["head_sha"], "tail_sha": entry["tail_sha"],
             "turns": entry["turns"], "external": entry["external"],
             "plan": entry["plan"], "last_ts": entry.get("last_ts"),
             "tokens": {source: list(tokens[source]) for source in ("external", "plan")},
+            "tokens_1h": {source: tokens_1h[source] for source in ("external", "plan")},
             "models": dict(models),
-            "hours": dict(hours)}
+            "hours": dict(hours),
+            "claims": {claim_key: list(values) for claim_key, values in claims.items()}}
+
+
+def _restore_claims(cached_states, allowed):
+    """Rebuild the in-memory claim index from the persisted per-file ledger.
+
+    Returns the validated states to restore, or None when the ledger itself is corrupt
+    (one turn owned by two files, or more claims than the cap) so the caller rescans.
+    Claims of transcripts outside the current scan window are forgotten with them.
+    """
+    _CLAIM_OWNER.clear()
+    states, index = {}, {}
+    for path, entry in cached_states.items():
+        state = _state_from_cache(entry)
+        if state is not None:
+            states[path] = state
+    for path, state in states.items():
+        if path not in allowed:
+            state["claims"] = {}
+            continue
+        for claim_key in state["claims"]:
+            if claim_key in index:
+                return None
+            index[claim_key] = path
+    if len(index) > USAGE_CLAIM_CAP:
+        return None
+    _CLAIM_OWNER.update(index)
+    return states
 
 
 def _save_usage_states(states, now=None):
-    """Write the aggregates atomically; a failed save only costs a rescan next time."""
+    """Write the aggregates atomically; a failed save only costs a rescan next time.
+
+    The claim ledger stays bounded: above USAGE_CLAIM_CAP the claims of the transcript
+    files touched longest ago are dropped whole (never mid-file) and the number dropped
+    is recorded in the payload as ``claims_evicted``.
+    """
     now = now or datetime.now()
     horizon = (now - timedelta(days=SCAN_DAYS + 2)).strftime("%Y-%m-%dT%H")
+    claimed = sum(len(state["claims"]) for state in states.values())
+    evicted = 0
+    if claimed > USAGE_CLAIM_CAP:
+        oldest = sorted(states.items(), key=lambda item: (item[1].get("mtime_ns") or 0, item[0]))
+        for path, state in oldest:
+            if claimed <= USAGE_CLAIM_CAP:
+                break
+            dropped = len(state["claims"])
+            for claim_key in state["claims"]:
+                if _CLAIM_OWNER.get(claim_key) == path:
+                    del _CLAIM_OWNER[claim_key]
+            state["claims"] = {}
+            claimed -= dropped
+            evicted += dropped
     files = {}
     for key, state in list(states.items()):
         hours = {hour: bucket for hour, bucket in state["hours"].items() if hour >= horizon}
@@ -486,8 +603,10 @@ def _save_usage_states(states, now=None):
                       "tail_sha": state["tail_sha"], "turns": state["turns"],
                       "external": state["external"], "plan": state["plan"],
                       "last_ts": state["last_ts"], "tokens": state["tokens"],
-                      "models": state["models"], "hours": hours}
-    payload = {"version": USAGE_CACHE_VERSION,
+                      "tokens_1h": state["tokens_1h"],
+                      "models": state["models"], "hours": hours,
+                      "claims": state["claims"]}
+    payload = {"version": USAGE_CACHE_VERSION, "claims_evicted": evicted,
                "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "files": files}
     try:
         temporary = USAGE_CACHE_FILE.with_suffix(USAGE_CACHE_FILE.suffix + ".tmp")
@@ -519,65 +638,117 @@ def _source_identity(handle, offset):
     return hashlib.sha256(handle.read(USAGE_IDENTITY_BYTES)).hexdigest(), tail
 
 
+def _reset_session_state(state):
+    """Forget a rewritten transcript's totals and return the claims it must release."""
+    stale = list(state.get("claims") or ())
+    state.clear()
+    state.update(_new_session_state())
+    return stale
+
+
 def _read_appended(path, state):
-    """Return complete new JSONL lines, the offset to commit and the new source identity.
+    """Return new JSONL lines, the offset to commit, the source identity and stale claims.
 
     A transcript can be rewritten in place (compaction, retry, an editor save), which
     keeps the byte offset but changes the bytes before it. The identity saved with the
     offset is checked before that offset is trusted, so a rewrite is rescanned from 0
-    instead of being silently under- or over-counted.
+    instead of being silently under- or over-counted. A reset also releases the file's
+    claims, so the rows read again are counted (and re-owned) instead of being skipped.
     """
     stat = path.stat()
     size, mtime_ns = stat.st_size, stat.st_mtime_ns
     offset = state.get("offset", 0)
+    stale = []
     if size < offset:
-        state.clear()
-        state.update(_new_session_state())
+        stale = _reset_session_state(state)
         offset = 0
     elif size == offset and state.get("mtime_ns") == mtime_ns:
-        return [], offset, None  # unchanged: not even a fingerprint read
+        return [], offset, None, stale  # unchanged: not even a fingerprint read
     with path.open("rb") as handle:
         saved = (state.get("head_sha"), state.get("tail_sha"))
         if offset and (saved[0] is None or saved[1] is None
                        or _source_identity(handle, offset) != saved):
-            state.clear()
-            state.update(_new_session_state())
+            stale = _reset_session_state(state)
             offset = 0
         if size == offset:
             # Only the metadata changed; the bytes already counted are still there.
             state["size"], state["mtime_ns"] = size, mtime_ns
-            return [], offset, None
+            return [], offset, None, stale
         handle.seek(offset)
         chunk = handle.read(size - offset)
         head, sep, _tail = chunk.rpartition(b"\n")
         if not sep:
-            return [], offset, None
+            return [], offset, None, stale
         # The caller commits the offset only after every line was parsed, so one bad
         # record cannot swallow the lines after it.
         next_offset = offset + len(head) + 1
         identity = (size, mtime_ns) + _source_identity(handle, next_offset)
-    return head.split(b"\n"), next_offset, identity
+    return head.split(b"\n"), next_offset, identity, stale
 
 
 def _new_hour_bucket():
-    return {"external": {"turns": 0, "tokens": [0, 0, 0, 0]},
-            "plan": {"turns": 0, "tokens": [0, 0, 0, 0]}}
+    return {"external": {"turns": 0, "tokens": [0, 0, 0, 0], "tokens_1h": 0},
+            "plan": {"turns": 0, "tokens": [0, 0, 0, 0], "tokens_1h": 0}}
+
+
+def _new_cost_bucket():
+    return {"turns": 0, "tokens": [0, 0, 0, 0], "cache_write_1h": 0}
+
+
+def _empty_cost():
+    """Cost provenance for "nothing billable yet"; never claims a dollar estimate."""
+    return {"status": "included", "estimated_usd": None, "today_estimated_usd": None,
+            "pricing_version": None, "fetched_at": None, "normalized_model": None,
+            "cache_write_1h_rate": None,
+            "buckets": {name: _new_cost_bucket()
+                        for name in ("estimated", "included", "unknown")}}
 
 
 def _empty_usage(now=None):
     now = now or datetime.now()
     zero = {"external": [0, 0, 0, 0], "plan": [0, 0, 0, 0]}
+    zero_1h = {"external": 0, "plan": 0}
     return {"totals": {k: list(v) for k, v in zero.items()},
             "today": {k: list(v) for k, v in zero.items()},
-            "timeline": [], "cost_usd": None, "today_cost_usd": None,
+            "cache_write_1h": dict(zero_1h), "today_cache_write_1h": dict(zero_1h),
+            "timeline": [], "cost_usd": None, "today_cost_usd": None, "cost": _empty_cost(),
             "current_hour": now.strftime("%Y-%m-%dT%H"), "sessions": [], "session_count": 0}
 
 
-def _session_cost(tokens, pricing):
+def _cache_write_1h_tokens(tokens, cache_write_1h):
+    """The 1h share cannot exceed the cache-write total it is a subset of."""
+    try:
+        share = int(cache_write_1h or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, min(share, max(int(tokens[3] or 0), 0)))
+
+
+def _cache_write_1h_rate(pricing):
+    """The 1h cache-write rate when the card has one, else the standard write rate."""
+    rate = pricing.get("cache_write_1h") if isinstance(pricing, dict) else None
+    if isinstance(rate, (int, float)) and not isinstance(rate, bool) and rate >= 0:
+        return float(rate), "explicit"
+    fallback = (pricing or {}).get("cache_write")
+    return float(fallback or 0.0), "fallback"
+
+
+def _session_cost(tokens, pricing, cache_write_1h=0):
     if not pricing or not pricing.get("ok"):
         return None
+    write_1h = _cache_write_1h_tokens(tokens, cache_write_1h)
+    rate_1h, _source = _cache_write_1h_rate(pricing)
     return (tokens[0] * pricing["prompt"] + tokens[1] * pricing["completion"] +
-            tokens[2] * pricing["cache_read"] + tokens[3] * pricing["cache_write"])
+            tokens[2] * pricing["cache_read"] +
+            (tokens[3] - write_1h) * pricing["cache_write"] + write_1h * rate_1h)
+
+
+def _cost_status(state, pricing):
+    """estimated = priced OpenRouter usage; included = Plan only; unknown = unpriced usage."""
+    external = state["tokens"]["external"]
+    if any(external) or state["tokens_1h"]["external"]:
+        return "estimated" if pricing and pricing.get("ok") else "unknown"
+    return "included"
 
 
 def _transcript_files(root):
@@ -620,7 +791,8 @@ def scan_sessions(projects=None, max_files=SCAN_FILES, now=None, pricing=None):
             candidates.append((modified, path))
     # Nothing was appended, removed or touched since the previous scan: reuse the result.
     price_key = None if not pricing else (pricing.get("prompt"), pricing.get("completion"),
-                                          pricing.get("cache_read"), pricing.get("cache_write"))
+                                          pricing.get("cache_read"), pricing.get("cache_write"),
+                                          pricing.get("cache_write_1h"))
     cache_key = (str(projects), len(candidates), newest, total_size, now.strftime("%Y%m%d%H"),
                  price_key, max_files)
     if _USAGE_CACHE["key"] == cache_key and _USAGE_CACHE["data"] is not None:
@@ -630,10 +802,23 @@ def scan_sessions(projects=None, max_files=SCAN_FILES, now=None, pricing=None):
         candidates = candidates[:max_files]
 
     with _LOCK:
-        # Only a cold start needs the file: afterwards _SESSIONS is the source of truth
-        # and re-parsing 80KB on every refresh would be waste.
-        cached_states = _load_usage_states() if not _SESSIONS else {}
+        # Only a cold start needs the file: afterwards _SESSIONS and _CLAIM_OWNER are
+        # the source of truth and re-parsing 80KB on every refresh would be waste.
+        cached_states = {}
+        if not _SESSIONS:
+            restored = _restore_claims(_load_usage_states(),
+                                       {str(path) for _mtime, path in candidates})
+            # None means the ledger itself is corrupt (duplicate owners / over the cap):
+            # dropping every state and claim forces the full rescan that repairs it.
+            cached_states = restored or {}
         cached_hit = False
+        for _mtime, path in candidates:
+            # Restore every candidate up front: a claim's owner must already be live
+            # when a copy in another file is parsed, even if that file sorts later.
+            key = str(path)
+            if key not in _SESSIONS and key in cached_states:
+                _SESSIONS[key] = cached_states.pop(key)
+                cached_hit = True
         changed = False
         seen = set()
         for _mtime, path in candidates:
@@ -641,13 +826,16 @@ def scan_sessions(projects=None, max_files=SCAN_FILES, now=None, pricing=None):
             seen.add(key)
             state = _SESSIONS.get(key)
             if state is None:
-                state = _state_from_cache(cached_states.get(key)) or _new_session_state()
+                state = _new_session_state()
                 _SESSIONS[key] = state
                 cached_hit = True
             try:
-                lines, next_offset, identity = _read_appended(path, state)
+                lines, next_offset, identity, stale_claims = _read_appended(path, state)
             except OSError:
                 continue
+            for claim_key in stale_claims:
+                if _CLAIM_OWNER.get(claim_key) == key:
+                    del _CLAIM_OWNER[claim_key]
             if lines:
                 changed = True
             # Parse the whole chunk first: applying a line and only then failing would
@@ -673,23 +861,79 @@ def scan_sessions(projects=None, max_files=SCAN_FILES, now=None, pricing=None):
                               "cache_creation_input_tokens")]
                 except (TypeError, ValueError):
                     continue  # one bad record must not stop the file
+                # Claude Code records the 1h/5m TTL split beside the cache-write total
+                # (usage.cache_creation.ephemeral_1h_input_tokens); older rows omit it.
+                creation = usage.get("cache_creation")
+                write_1h = 0
+                if isinstance(creation, dict):
+                    try:
+                        write_1h = int(creation.get("ephemeral_1h_input_tokens") or 0)
+                    except (TypeError, ValueError):
+                        write_1h = 0
+                delta.append(min(max(write_1h, 0), max(delta[3], 0)))
+                claim = _usage_claim_key(message, record)
                 parsed.append((_classify(message.get("id")), delta, message.get("model"),
-                               record.get("timestamp")))
-            for source, delta, model, stamp in parsed:
-                state["turns"] += 1
-                state[source] += 1
+                               record.get("timestamp"),
+                               _claim_hash(claim) if claim else None))
+            for source, delta, model, stamp, claim_key in parsed:
+                full_turn = True
+                if claim_key is not None:
+                    owner = _CLAIM_OWNER.get(claim_key)
+                    if owner is None:
+                        state["claims"][claim_key] = list(delta[:4])
+                        _CLAIM_OWNER[claim_key] = key
+                    else:
+                        full_turn = False
+                        owner_state = _SESSIONS.get(owner)
+                        claimed = owner_state["claims"].get(claim_key) if owner_state else None
+                        if claimed is None:
+                            # The owning file's state is gone; take the claim back.
+                            state["claims"][claim_key] = list(delta[:4])
+                            _CLAIM_OWNER[claim_key] = key
+                            full_turn = True
+                        else:
+                            # Later streaming rows can carry more complete usage for the
+                            # same turn: add only the per-field increase, never a negative,
+                            # to the owning file's bucket for that turn (orca applies its
+                            # token corrections to the claimed projection too). The 1h TTL
+                            # split is fixed when the request is made, so a duplicate never
+                            # adds it again (the claim keeps the four priced axes).
+                            raised = [max(old, new) for old, new in zip(claimed, delta)]
+                            delta = [new - old for old, new in zip(claimed, raised)]
+                            claimed[:] = raised
+                            if not any(delta):
+                                if stamp:
+                                    owner_state["last_ts"] = stamp
+                                continue
+                            for index in range(4):
+                                owner_state["tokens"][source][index] += delta[index]
+                            if stamp:
+                                owner_state["last_ts"] = stamp
+                                hour = _local_hour(stamp)
+                                if hour:
+                                    bucket = owner_state["hours"].setdefault(
+                                        hour, _new_hour_bucket())
+                                    for index in range(4):
+                                        bucket[source]["tokens"][index] += delta[index]
+                            continue
+                if full_turn:
+                    state["turns"] += 1
+                    state[source] += 1
+                    if model:
+                        state["models"][model] = state["models"].get(model, 0) + 1
                 for index in range(4):
                     state["tokens"][source][index] += delta[index]
-                if model:
-                    state["models"][model] = state["models"].get(model, 0) + 1
+                state["tokens_1h"][source] += delta[4]
                 if stamp:
                     state["last_ts"] = stamp
                     hour = _local_hour(stamp)
                     if hour:
                         bucket = state["hours"].setdefault(hour, _new_hour_bucket())
-                        bucket[source]["turns"] += 1
+                        if full_turn:
+                            bucket[source]["turns"] += 1
                         for index in range(4):
                             bucket[source]["tokens"][index] += delta[index]
+                        bucket[source]["tokens_1h"] += delta[4]
             state["offset"] = next_offset
             if identity is not None:
                 state["size"], state["mtime_ns"], state["head_sha"], state["tail_sha"] = identity
@@ -699,18 +943,27 @@ def scan_sessions(projects=None, max_files=SCAN_FILES, now=None, pricing=None):
                 _save_usage_states(_SESSIONS, now)
         for key in list(_SESSIONS):
             if key not in seen:
+                for claim_key in _SESSIONS[key]["claims"]:
+                    if _CLAIM_OWNER.get(claim_key) == key:
+                        del _CLAIM_OWNER[claim_key]
                 del _SESSIONS[key]
 
         sessions, totals = [], {"external": [0, 0, 0, 0], "plan": [0, 0, 0, 0]}
+        totals_1h = {"external": 0, "plan": 0}
         hour_totals = {"external": [0, 0, 0, 0], "plan": [0, 0, 0, 0]}
+        hour_totals_1h = {"external": 0, "plan": 0}
         buckets = {}
         today = now.strftime("%Y-%m-%d")
         current_hour = now.strftime("%Y-%m-%dT%H")
         total_cost = 0.0
+        priced = bool(pricing and pricing.get("ok"))
+        cost_buckets = {name: _new_cost_bucket()
+                        for name in ("estimated", "included", "unknown")}
         for path, state in _SESSIONS.items():
             if not state["turns"]:
                 continue
-            cost = _session_cost(state["tokens"]["external"], pricing)
+            cost = _session_cost(state["tokens"]["external"], pricing,
+                                 state["tokens_1h"]["external"])
             total_cost += cost or 0.0
             sessions.append({
                 "project": Path(path).parent.name.replace("D--", "").replace("--", "/"),
@@ -720,20 +973,37 @@ def scan_sessions(projects=None, max_files=SCAN_FILES, now=None, pricing=None):
                 "external": state["external"],
                 "plan": state["plan"],
                 "tokens": {name: list(value) for name, value in state["tokens"].items()},
+                "cache_write_1h": dict(state["tokens_1h"]),
                 "cost_usd": round(cost, 6) if cost is not None else None,
+                "cost_status": _cost_status(state, pricing),
                 "models": sorted(state["models"].items(), key=lambda item: -item[1])[:3],
             })
             for name in ("external", "plan"):
                 for index in range(4):
                     totals[name][index] += state["tokens"][name][index]
+                totals_1h[name] += state["tokens_1h"][name]
+            # Provenance buckets partition the same totals: priced OpenRouter tokens are
+            # estimated, Plan tokens are subscription-included, and unpriced OpenRouter
+            # tokens are unknown instead of being presented as $0.
+            external_bucket = cost_buckets["estimated" if priced else "unknown"]
+            external_bucket["turns"] += state["external"]
+            external_bucket["cache_write_1h"] += state["tokens_1h"]["external"]
+            included_bucket = cost_buckets["included"]
+            included_bucket["turns"] += state["plan"]
+            included_bucket["cache_write_1h"] += state["tokens_1h"]["plan"]
+            for index in range(4):
+                external_bucket["tokens"][index] += state["tokens"]["external"][index]
+                included_bucket["tokens"][index] += state["tokens"]["plan"][index]
             for hour, bucket in state["hours"].items():
                 merged = buckets.setdefault(hour, _new_hour_bucket())
                 for name in ("external", "plan"):
                     merged[name]["turns"] += bucket[name]["turns"]
+                    merged[name]["tokens_1h"] += bucket[name].get("tokens_1h", 0)
                     for index in range(4):
                         merged[name]["tokens"][index] += bucket[name]["tokens"][index]
                 if hour.startswith(today):
                     for name in ("external", "plan"):
+                        hour_totals_1h[name] += bucket[name].get("tokens_1h", 0)
                         for index in range(4):
                             hour_totals[name][index] += bucket[name]["tokens"][index]
 
@@ -747,12 +1017,29 @@ def scan_sessions(projects=None, max_files=SCAN_FILES, now=None, pricing=None):
                              "plan": {"turns": bucket["plan"]["turns"],
                                       "tokens": bucket["plan"]["tokens"]}})
         sessions.sort(key=lambda item: item["last"] or "", reverse=True)
-        today_cost = _session_cost(hour_totals["external"], pricing) if pricing and pricing.get("ok") else None
+        today_cost = (_session_cost(hour_totals["external"], pricing,
+                                    hour_totals_1h["external"]) if priced else None)
+        if cost_buckets["estimated"]["turns"]:
+            cost_status = "estimated"
+        elif cost_buckets["unknown"]["turns"]:
+            cost_status = "unknown"
+        else:
+            cost_status = "included"
         usage = {"totals": totals, "today": hour_totals, "current_hour": current_hour,
+                 "cache_write_1h": totals_1h, "today_cache_write_1h": hour_totals_1h,
                  "timeline": timeline,
                  # cost_usd is the retained window (7 days); today_cost_usd is today's spend.
-                 "cost_usd": round(total_cost, 6) if pricing and pricing.get("ok") else None,
+                 "cost_usd": round(total_cost, 6) if priced else None,
                  "today_cost_usd": round(today_cost, 6) if today_cost is not None else None,
+                 "cost": {"status": cost_status,
+                          "estimated_usd": round(total_cost, 6) if priced else None,
+                          "today_estimated_usd":
+                              round(today_cost, 6) if today_cost is not None else None,
+                          "pricing_version": pricing.get("pricing_version") if pricing else None,
+                          "fetched_at": pricing.get("fetched_at") if pricing else None,
+                          "normalized_model": pricing.get("normalized_model") if pricing else None,
+                          "cache_write_1h_rate": _cache_write_1h_rate(pricing)[1] if priced else None,
+                          "buckets": cost_buckets},
                  "sessions": sessions[:8], "session_count": len(sessions)}
         _USAGE_CACHE["key"] = cache_key
         _USAGE_CACHE["data"] = usage
@@ -830,8 +1117,77 @@ def account_state(key, cache=None, now=None):
     return result
 
 
+_MODEL_ALIASES = {"model_placeholder_m26": "claude-opus-4-6",
+                  "model_placeholder_m35": "claude-sonnet-4-6"}
+_MODEL_FAMILIES = "fable|mythos|opus|sonnet|haiku"
+# Date stamps and context suffixes (-1m) are not part of the minor version.
+_MODEL_FAMILY_FIRST = re.compile(
+    rf"(?:^|[^a-z])({_MODEL_FAMILIES})-(\d{{1,2}})(?:-(\d{{1,2}})(?![0-9a-z]))?(?![0-9])")
+# Legacy version-first ids from historical logs, e.g. claude-3-5-sonnet-20241022.
+_MODEL_VERSION_FIRST = re.compile(
+    rf"(?:^|[^0-9a-z])(\d{{1,2}})(?:-(\d{{1,2}}))?-({_MODEL_FAMILIES})(?![a-z])")
+_DATE_SUFFIX = re.compile(r"(?:-|@)(\d{4}-\d{2}-\d{2}|\d{8})$")
+_BUILD_SUFFIX = re.compile(r"-(latest|preview|beta|exp)$")
+
+
+def normalize_model_id(model):
+    """Canonical model id used for the pricing lookup; None when nothing is parseable.
+
+    Mirrors orca's claude-model-pricing normalizer: lowercase, ``.`` -> ``-``, then a
+    small alias map for opaque placeholders, the family-first form
+    (``claude-sonnet-4-5-20250929`` -> ``claude-sonnet-4-5``) and the legacy version-first
+    form (``claude-3-5-sonnet-20241022`` -> ``claude-sonnet-3-5``). Other provider ids keep
+    their vendor prefix and lose only a trailing date/build suffix, so two vendors'
+    ``model`` ids never collide.
+    """
+    if not isinstance(model, str) or not model.strip():
+        return None
+    lowered = model.strip().lower().replace(".", "-")
+    alias = _MODEL_ALIASES.get(lowered)
+    if alias:
+        return alias
+    match = _MODEL_FAMILY_FIRST.search(lowered)
+    if match:
+        family, major, minor = match.groups()
+        return f"claude-{family}-{major}-{minor}" if minor else f"claude-{family}-{major}"
+    match = _MODEL_VERSION_FIRST.search(lowered)
+    if match:
+        major, minor, family = match.groups()
+        return f"claude-{family}-{major}-{minor}" if minor else f"claude-{family}-{major}"
+    stripped = _DATE_SUFFIX.sub("", lowered)
+    stripped = _BUILD_SUFFIX.sub("", stripped)
+    return stripped or None
+
+
+def _pricing_version(rates):
+    """Stable short id for the fetched rate card; a changed price invalidates estimates."""
+    fingerprint = "|".join(repr(rates.get(name)) for name in
+                           ("prompt", "completion", "cache_read", "cache_write",
+                            "cache_write_1h"))
+    return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:12]
+
+
+def _optional_rate(pricing, names):
+    """The first available per-token rate among ``names``, else None (never fake $0)."""
+    for name in names:
+        if pricing.get(name) is None:
+            continue
+        try:
+            value = float(pricing[name])
+        except (TypeError, ValueError):
+            return None
+        return value if value >= 0 else None
+    return None
+
+
 def model_pricing(key, model, cache=None, now=None):
-    """USD per token for the configured model, cached for an hour."""
+    """USD per token for the configured model, cached for an hour.
+
+    The catalog row is matched by normalizing both sides, so a transcript id with a date
+    suffix still finds the configured rate card. The result carries provenance
+    (``normalized_model``, ``pricing_version``, ``fetched_at``) and the optional 1h
+    cache-write rate; an unknown model stays ``ok: False`` rather than looking like $0.
+    """
     now = time.monotonic() if now is None else float(now)
     cache = _PRICING if cache is None else cache
     cached = cache.get("data")
@@ -850,6 +1206,13 @@ def model_pricing(key, model, cache=None, now=None):
                 data = json.loads(response.read(4 * 1024 * 1024 + 1))
             rows = data.get("data") if isinstance(data, dict) else None
             row = next((entry for entry in rows or [] if isinstance(entry, dict) and entry.get("id") == model), None)
+            if row is None:
+                # A transcript/alias id ("...-20250929", "anthropic/...4.5") still finds
+                # the configured catalog row once both sides are normalized.
+                wanted = normalize_model_id(model)
+                row = next((entry for entry in rows or [] if isinstance(entry, dict)
+                            and wanted is not None
+                            and normalize_model_id(entry.get("id")) == wanted), None)
             pricing = (row or {}).get("pricing") or {}
             if not pricing:
                 result["error"] = "model_not_found"
@@ -860,8 +1223,15 @@ def model_pricing(key, model, cache=None, now=None):
                     except (TypeError, ValueError):
                         return 0.0
                 result = {"ok": True, "error": None, "prompt": rate("prompt"),
-                          "completion": rate("completion"), "cache_read": rate("input_cache_read"),
-                          "cache_write": rate("input_cache_write")}
+                          "completion": rate("completion"),
+                          "cache_read": rate("input_cache_read"),
+                          "cache_write": rate("input_cache_write"),
+                          # Optional TTL tier; absent means the standard write rate is used.
+                          "cache_write_1h": _optional_rate(
+                              pricing, ("input_cache_write_1h", "cache_write_1h")),
+                          "normalized_model": normalize_model_id(model),
+                          "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+                result["pricing_version"] = _pricing_version(result)
         except urllib.error.HTTPError as error:
             result["error"] = f"http_{error.code}"
             error.close()
@@ -1613,7 +1983,9 @@ PAGE_CSS = "\n:root{\n color-scheme:dark;\n --bg:#070b12; --bg-soft:#0b1119; --p
 
 JS_SHARED = "\nconst TOKEN = \"__DASHBOARD_TOKEN__\";\nconst esc = value => String(value ?? '').replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));\nconst num = value => value === null || value === undefined || value === '' ? '\u2014' : Number(value).toLocaleString('ko-KR');\nconst usd = (value, digits = 3) => value === null || value === undefined ? '\u2014' : '$' + Number(value).toFixed(digits);\nconst tokens = row => row ? row.reduce((sum, value) => sum + value, 0) : 0;\nconst stateText = {external:'OpenRouter \uc0ac\uc6a9 \uc911', plan:'Plan \uc6b0\ud68c \uc911', idle:'\uc720\ud734', unknown:'\uae30\ub85d \uc5c6\uc74c'};\nconst statePill = {external:'pill-ok', plan:'pill-warn', idle:'pill-mute', unknown:'pill-mute'};\nconst PROVIDERS = {\n  openrouter: {title:'OpenRouter', file:'.env.openrouter', fields:[\n    ['OPENROUTER_MODEL','\ubaa8\ub378 ID','text','vendor/model','OpenRouter \ubaa8\ub378 \ubaa9\ub85d\uc758 \uc815\ud655\ud55c ID','\ud544\uc218'],\n    ['ANTHROPIC_AUTH_TOKEN','API \ud0a4','password','sk-or-...','\ube44\uc6cc \ub450\uba74 \uc800\uc7a5\ub41c \ud0a4\ub97c \uc720\uc9c0\ud569\ub2c8\ub2e4','\ud544\uc218']]},\n  local: {title:'Local LLM', file:'.env.local-llm', fields:[\n    ['LOCAL_LLM_URL','Messages URL','text','http://127.0.0.1:11434/v1/messages','Anthropic \ud638\ud658 /v1/messages \uc8fc\uc18c','\ud544\uc218'],\n    ['LOCAL_LLM_MODEL','\ubaa8\ub378 ID','text','\uc124\uce58\ub41c \ubaa8\ub378 ID','\uc11c\ubc84\uc5d0 \uc2e4\uc81c\ub85c \uc788\ub294 \ubaa8\ub378 \uc774\ub984','\ud544\uc218'],\n    ['LOCAL_LLM_API_KEY','\uc11c\ubc84 \ud0a4','password','\uc120\ud0dd \uc0ac\ud56d','\ube44\uc6cc \ub450\uba74 \uc800\uc7a5\ub41c \ud0a4\ub97c \uc720\uc9c0\ud569\ub2c8\ub2e4','\uc120\ud0dd'],\n    ['LOCAL_LLM_ALLOW_REMOTE','\uc6d0\uaca9 HTTPS \ud5c8\uc6a9','switch','','\ub8e8\ud504\ubc31\uc774 \uc544\ub2cc HTTPS \uc11c\ubc84\ub97c \ud5c8\uc6a9\ud569\ub2c8\ub2e4','\uc120\ud0dd'],\n    ['LOCAL_LLM_HTTP_URL','\ub0b4\ubd80 HTTP \uc608\uc678','text','http://host/v1/messages','\uc0ac\ub0b4 \uc11c\ubc84\uc6a9 \uc608\uc678 \uc8fc\uc18c (\uc120\ud0dd)','\uc120\ud0dd'],\n    ['LOCAL_LLM_MODELS_URL','\ubaa8\ub378 \ubaa9\ub85d URL','text','\uae30\ubcf8: /v1/models','\ubaa8\ub378 \ud655\uc778\uc5d0 \uc0ac\uc6a9\ud560 \uac19\uc740 \ucd9c\ucc98 \uc8fc\uc18c','\uc120\ud0dd']]},\n};\nconst ERROR_TEXT = {\n  unknown_provider:'\uc54c \uc218 \uc5c6\ub294 \uc81c\uacf5\uc790', invalid_values:'\uc785\ub825 \ud615\uc2dd \uc624\ub958', invalid_value:'\uac12 \ud615\uc2dd \uc624\ub958',\n  invalid_model:'\ubaa8\ub378 ID \ud615\uc2dd\uc774 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4', invalid_key:'API \ud0a4 \ud615\uc2dd\uc774 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4 (sk-or-...)',\n  missing_anthropic_auth_token:'API \ud0a4\uac00 \ud544\uc694\ud569\ub2c8\ub2e4', missing_openrouter_model:'\ubaa8\ub378 ID\uac00 \ud544\uc694\ud569\ub2c8\ub2e4',\n  missing_local_llm_url:'Messages URL\uc774 \ud544\uc694\ud569\ub2c8\ub2e4', missing_local_llm_model:'\ubaa8\ub378 ID\uac00 \ud544\uc694\ud569\ub2c8\ub2e4',\n  invalid_local_url:'Local URL \uaddc\uce59 \uc704\ubc18 (http(s), /v1/messages, \ub8e8\ud504\ubc31 \ub610\ub294 \ud5c8\uc6a9\ub41c HTTPS)',\n  invalid_local_model:'\ubaa8\ub378 ID\uac00 \ube44\uc5b4 \uc788\uac70\ub098 \uc798\ubabb\ub418\uc5c8\uc2b5\ub2c8\ub2e4', invalid_local_key:'\uc11c\ubc84 \ud0a4\uc5d0 \uc81c\uc5b4 \ubb38\uc790\uac00 \uc788\uc2b5\ub2c8\ub2e4',\n  invalid_allow_remote:'\uc6d0\uaca9 \ud5c8\uc6a9 \uac12\uc740 true/false\uc5ec\uc57c \ud569\ub2c8\ub2e4', invalid_models_url:'\ubaa8\ub378 \ubaa9\ub85d URL\uc774 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4',\n  invalid_configuration:'\uc124\uc815\uc774 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4', write_failed:'\ud30c\uc77c\uc744 \uc4f0\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4',\n  token_required:'\uc138\uc158 \ud1a0\ud070\uc774 \uc5c6\uc2b5\ub2c8\ub2e4 (\ud398\uc774\uc9c0 \uc0c8\ub85c\uace0\uce68 \ud6c4 \ub2e4\uc2dc \uc2dc\ub3c4)', origin_rejected:'\ub2e4\ub978 \ucd9c\ucc98\uc758 \uc694\uccad\uc785\ub2c8\ub2e4',\n  request_too_large:'\uc694\uccad\uc774 \ub108\ubb34 \ud07d\ub2c8\ub2e4', invalid_json:'JSON \ud615\uc2dd \uc624\ub958', invalid_payload:'\uc694\uccad \ud615\uc2dd \uc624\ub958',\n  invalid_mode:'\uc54c \uc218 \uc5c6\ub294 \ud14c\uc2a4\ud2b8 \ubaa8\ub4dc',\n  empty_catalog:'\ubaa8\ub378 \ubaa9\ub85d\uc774 \ube44\uc5b4 \uc788\uc2b5\ub2c8\ub2e4', http_error:'HTTP \uc624\ub958',\n  models_failed:'\ubaa9\ub85d\uc744 \uac00\uc838\uc624\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4', invalid_length:'\uc694\uccad \uae38\uc774 \uc624\ub958',\n};\nconst TEST_TEXT = {\n  ready:'\uc5f0\uacb0\uacfc \ucd94\ub860\uc774 \uc815\uc0c1\uc785\ub2c8\ub2e4', model_found:'\ubaa8\ub378\uc744 \ucc3e\uc558\uc2b5\ub2c8\ub2e4', model_not_found:'\uc124\uc815\ud55c \ubaa8\ub378\uc774 \ubaa9\ub85d\uc5d0 \uc5c6\uc2b5\ub2c8\ub2e4',\n  wrong_model:'\ub2e4\ub978 \ubaa8\ub378\uc774 \uc751\ub2f5\ud588\uc2b5\ub2c8\ub2e4', empty_reply:'\uc751\ub2f5 \ubcf8\ubb38\uc774 \ube44\uc5b4 \uc788\uc2b5\ub2c8\ub2e4', http_error:'HTTP \uc624\ub958',\n  connection_failed:'\uc5f0\uacb0 \uc2e4\ud328', invalid_response:'\uc751\ub2f5 \ud615\uc2dd \uc624\ub958', configuration_missing:'\uc124\uc815\uc774 \uba3c\uc800 \ud544\uc694\ud569\ub2c8\ub2e4',\n  invalid_configuration:'\uc800\uc7a5\ub41c \uc124\uc815\uc774 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4',\n};\n\nlet CONFIG = null, SNAP = null;\nconst DIRTY = new Set(), BUSY = new Set(), RESULTS = {};\n\nfunction toast(kind, text) {\n  const host = document.getElementById('toasts');\n  const node = document.createElement('div');\n  node.className = 'toast ' + kind;\n  node.innerHTML = `<span class=\"dot\"></span><span>${esc(text)}</span>`;\n  host.appendChild(node);\n  setTimeout(() => { node.classList.add('out'); setTimeout(() => node.remove(), 260); }, 3400);\n}\n\nfunction card(title, subtitle, body, span) {\n  return `<section class=\"card ${span || 'col-12'}\">\n    <header class=\"card-h\"><div><h2>${esc(title)}</h2>${subtitle ? `<p class=\"sub\">${esc(subtitle)}</p>` : ''}</div></header>\n    <div class=\"card-b\">${body}</div></section>`;\n}\n\nfunction kv(label, value, mono) {\n  return `<div class=\"row-kv\"><span class=\"k\">${esc(label)}</span><span class=\"v${mono ? ' mono' : ''}\">${value}</span></div>`;\n}\n\nasync function loadConfig() {\n  try {\n    CONFIG = await (await fetch('/api/config', {cache:'no-store'})).json();\n    if (typeof renderSettings === 'function') renderSettings(true);\n  } catch (error) { /* keep the previous view */ }\n}\n\nfunction providerReady(provider) {\n  const fields = (CONFIG && CONFIG[provider] && CONFIG[provider].fields) || {};\n  return PROVIDERS[provider].fields\n    .filter(([, , , , , badge]) => badge === '\ud544\uc218')\n    .every(([name]) => {\n      const field = fields[name] || {};\n      return field.set || field.value;\n    });\n}\n\nwindow.addEventListener('error', event => {\n  const stamp = document.getElementById('stamp');\n  if (stamp) stamp.textContent = '\uc2a4\ud06c\ub9bd\ud2b8 \uc624\ub958: ' + (event.message || 'unknown');\n});\n\ndocument.addEventListener('click', event => {\n  const button = event.target.closest('[data-copy]');\n  if (!button) return;\n  const text = button.dataset.copy;\n  if (navigator.clipboard && navigator.clipboard.writeText) {\n    navigator.clipboard.writeText(text).then(() => toast('ok', '\ubcf5\uc0ac\ud588\uc2b5\ub2c8\ub2e4: ' + text))\n      .catch(() => toast('warn', '\ubcf5\uc0ac\ud560 \uc218 \uc5c6\uc2b5\ub2c8\ub2e4: ' + text));\n  } else {\n    toast('warn', '\ubcf5\uc0ac\ud560 \uc218 \uc5c6\uc2b5\ub2c8\ub2e4: ' + text);\n  }\n});\n"
 
-JS_DASHBOARD = "/* ---------- dashboard ---------- */\nfunction renderHeader(data) {\n  const routing = data.routing || {};\n  const state = routing.state || 'unknown';\n  const pill = document.getElementById('live-pill');\n  pill.className = 'pill ' + (statePill[state] || 'pill-mute');\n  document.getElementById('live-text').textContent = stateText[state] || state;\n  const age = routing.last && routing.last.age_seconds;\n  const ageText = age === null || age === undefined ? '\uae30\ub85d \uc5c6\uc74c'\n    : age < 60 ? `${Math.round(age)}\ucd08 \uc804` : `${Math.round(age / 60)}\ubd84 \uc804`;\n  const stamp = document.getElementById('stamp');\n  stamp.textContent = data.summary || `${data.model || '\ubaa8\ub378 \ubbf8\uc124\uc815'} \u00b7 \ub9c8\uc9c0\ub9c9 \uacb0\uc815 ${ageText}`;\n  stamp.title = `${data.model || '\ubaa8\ub378 \ubbf8\uc124\uc815'} \u00b7 \ub9c8\uc9c0\ub9c9 \uacb0\uc815 ${ageText} \u00b7 \uac31\uc2e0 ${new Date(data.generated_at).toLocaleTimeString('ko-KR')}`;\n}\n\n\nfunction renderAlerts(data) {\n  const host = document.getElementById('alerts');\n  const alerts = data.alerts || [];\n  const guide = data.configured ? '' :\n    `<div class=\"alert info\"><span class=\"icon\">i</span><div><b>\ucc98\uc74c \uc124\uc815\ud558\uae30</b>\n      <span class=\"txt\">\uc544\ub798 \uc124\uc815\uc5d0\uc11c \ubaa8\ub378\uacfc \ud0a4\ub97c \uc785\ub825\ud558\uace0 <b>\ubaa8\ub378 \ud655\uc778</b> \u2192 <b>\uc800\uc7a5</b>\uc744 \ub204\ub978 \ub4a4\n      <code>OpenClaude.ps1</code>\ub85c \uc138\uc158\uc744 \uc2dc\uc791\ud558\uc138\uc694. \uc800\uc7a5\ud55c \uac12\uc740 \uc0c8 \uc138\uc158\ubd80\ud130 \uc801\uc6a9\ub429\ub2c8\ub2e4.</span></div></div>`;\n  // An insight with the same code already explains the banner in place, so show it once.\n  const explained = new Set((data.insights || []).map(item => item.code));\n  const shown = alerts.filter(alert => !explained.has(alert.code));\n  host.innerHTML = guide + shown.map(alert => {\n    const icon = alert.level === 'critical' ? '!' : alert.level === 'warn' ? '!' : 'i';\n    const action = alert.command\n      ? `<button class=\"btn btn-sm btn-ghost\" style=\"margin-top:9px\" data-copy=\"${esc(alert.command)}\">\uba85\ub839 \ubcf5\uc0ac</button>`\n      : '';\n    return `<div class=\"alert ${esc(alert.level)}\"><span class=\"icon\">${icon}</span>\n      <div><b>${esc(alert.title)}</b><span class=\"txt\">${esc(alert.detail)}</span>${action}</div></div>`;\n  }).join('');\n}\n\nfunction renderGrid(data) {\n  const routing = data.routing || {}, usage = data.usage || {}, account = data.account || {};\n  const last = routing.last || {};\n  const counts = routing.counts || {external:0, plan:0};\n  const short = routing.short || {minutes:10, counts:{external:0, plan:0}};\n  const total = (counts.external || 0) + (counts.plan || 0);\n  const share = total ? Math.round((counts.external || 0) / total * 100) : 0;\n\n  const statusCard = card('\uc9c0\uae08 \uc0c1\ud0dc', '\ub9c8\uc9c0\ub9c9 \ub77c\uc6b0\ud305 \uacb0\uc815',\n    `<div class=\"metric\"><span class=\"k\">\uacbd\ub85c</span>\n       <span class=\"v\" style=\"font-size:19px\">${esc(stateText[routing.state] || routing.state || '\u2014')}</span></div>\n     <div class=\"metric-list\">\n       ${kv('\uc0ac\uc720', esc([last.reason, last.detail].filter(Boolean).join(' / ') || '\u2014'), true)}\n       ${kv('\ubaa8\ub378', `<span class=\"mono\">${esc(last.model || '\u2014')}</span>`)}\n       ${kv('\ud504\ub85d\uc2dc \uc2dc\uc791', esc(routing.proxy_started_at ? new Date(routing.proxy_started_at).toLocaleString('ko-KR') : '\u2014'))}\n       ${kv('\ud504\ub85d\uc2dc \ucf54\ub4dc', esc(routing.proxy_code ? new Date(routing.proxy_code).toLocaleString('ko-KR') : '\u2014'))}\n       ${kv('\uc18c\uc2a4 \uc218\uc815', esc(data.proxy_modified_at ? new Date(data.proxy_modified_at).toLocaleString('ko-KR') : '\u2014'))}\n       ${data.proxy_stale ? '<div class=\"row-kv\"><span class=\"k\">\ud504\ub85d\uc2dc</span><span class=\"v\" style=\"color:var(--warn)\">\ucf54\ub4dc\ubcf4\ub2e4 \uc624\ub798\ub428 \u00b7 \uc7ac\uc2dc\uc791 \ud544\uc694</span></div>' : ''}\n     </div>`, 'col-3');\n\n  const splitCard = card(`\ucd5c\uadfc ${routing.window_minutes || 60}\ubd84`, '\uc678\ubd80 \ub300 Plan \ube44\uc728',\n    `<div class=\"metric\"><span class=\"k\">OpenRouter</span><span class=\"v\">${share}<small>%</small></span></div>\n     <div class=\"bar\"><i style=\"width:${share}%\"></i></div>\n     <div class=\"metric-list\">\n       ${kv('OpenRouter', num(counts.external) + '\uac74')}\n       ${kv('Plan', num(counts.plan) + '\uac74')}\n       ${kv(`\ucd5c\uadfc ${short.minutes}\ubd84`, `\uc678\ubd80 ${num(short.counts.external)} / Plan ${num(short.counts.plan)}`)}\n       ${kv('\ud68c\ub85c \ucc28\ub2e8', num(routing.circuit_opens) + '\ud68c')}\n     </div>`, 'col-3');\n\n  const limit = account.limit_usd, spent = account.spent_usd, remaining = account.remaining_usd;\n  const used = limit && spent !== null && spent !== undefined ? Math.min(100, Math.round(spent / limit * 100)) : 0;\n  const creditCard = card('\ud06c\ub808\ub527', 'OpenRouter \ud0a4 \ud55c\ub3c4',\n    account.ok ? `<div class=\"metric\"><span class=\"k\">\ub0a8\uc740 \uae08\uc561</span><span class=\"v\">${usd(remaining)}</span></div>\n      <div class=\"bar\"><i style=\"width:${used}%\"></i></div>\n      <div class=\"metric-list\">\n        ${kv('\uc774\ubc88 \ub2ec \uc0ac\uc6a9', usd(spent))}\n        ${kv('\ud55c\ub3c4', usd(limit))}\n        ${kv('\ub9ac\uc14b', esc(account.reset || '\u2014') + (account.resets_at ? ' \u00b7 ' + new Date(account.resets_at).toLocaleDateString('ko-KR') : ''))}\n      </div>`\n    : `<div class=\"metric\"><span class=\"k\">\uc0c1\ud0dc</span><span class=\"v\" style=\"font-size:18px;color:var(--fg-3)\">\ud655\uc778 \ubd88\uac00</span></div>\n       <div class=\"metric-list\">${kv('\uc0ac\uc720', esc(account.error || 'unknown'), true)}</div>`, 'col-3');\n\n  const today = usage.today || {external:[0,0,0,0], plan:[0,0,0,0]};\n  const tokensCard = card('\uc624\ub298 \uc0ac\uc6a9\ub7c9', '\ud1a0\ud070\uacfc \ucd94\uc815 \ube44\uc6a9',\n    `<div class=\"metric\"><span class=\"k\">OpenRouter \ud1a0\ud070</span><span class=\"v\">${num(tokens(today.external))}</span></div>\n     <div class=\"metric-list\">\n       ${kv('Plan \ud1a0\ud070', num(tokens(today.plan)))}\n       ${kv('\uc785\ub825 / \ucd9c\ub825', `${num(today.external[0])} / ${num(today.external[1])}`)}\n       ${kv('\uce90\uc2dc \uc77d\uae30 / \uc0dd\uc131', `${num(today.external[2])} / ${num(today.external[3])}`)}\n       ${kv('\ucd94\uc815 \ube44\uc6a9(\uc624\ub298)', `<span style=\"color:var(--ok)\">${usd(usage.today_cost_usd ?? usage.cost_usd)}</span>`)}\n     </div>`, 'col-3');\n\n  const pm = data.proxy_metrics;\n  const strip = list => `<div class=\"metrics-strip\">${list.map(([key, value]) =>\n    `<div class=\"m\"><span class=\"k\">${esc(key)}</span><span class=\"v\">${value}</span></div>`).join('')}</div>`;\n  const proxyCard = card('\ud504\ub85d\uc2dc \ucc98\ub9ac\ub7c9', pm ? (pm.stale ? `\uac31\uc2e0 ${pm.age_seconds}\ucd08 \uc9c0\uc5f0` : '\uc138\uc158 \uc2e4\ud589\uae30 \uc2e4\uc2dc\uac04') : '\uae30\ub85d \uc5c6\uc74c',\n    pm ? strip([\n      ['\uc694\uccad', num(pm.requests)],\n      ['\ucc98\ub9ac\uc728', `${(pm.requests / Math.max(1, (pm.uptimeMs || 1) / 1000)).toFixed(1)} req/s`],\n      ['\uc678\ubd80 / Plan', `${num(pm.routes?.external || 0)} / ${num(pm.routes?.plan || 0)}`],\n      ['p50 / p95', `${pm.latencyMs?.external?.p50 ?? '\u2014'} / ${pm.latencyMs?.external?.p95 ?? '\u2014'} ms`],\n      ['\uccab \ubc14\uc774\ud2b8 p50 / p95', `${pm.latencyMs?.ttfb?.p50 ?? '\u2014'} / ${pm.latencyMs?.ttfb?.p95 ?? '\u2014'} ms`],\n      ['\uc7ac\uc2dc\ub3c4', num(pm.retries)],\n      ['\uc2a4\ud2b8\ub9bc', num(pm.streams)],\n      ['\ud68c\ub85c', num(pm.circuitOpens)],\n      ['\uc1a1\uc2e0 / \uc218\uc2e0', `${((pm.bytesIn || 0) / 1048576).toFixed(1)} / ${((pm.bytesOut || 0) / 1048576).toFixed(1)} MB`],\n    ]) : '<p class=\"empty\">\uc774 \uc138\uc158\uc5d0\uc11c \ud504\ub85d\uc2dc \uae30\ub85d\uc774 \uc544\uc9c1 \uc5c6\uc2b5\ub2c8\ub2e4. \uc2e4\ud589\uae30\ub97c \uc2dc\uc791\ud558\uba74 \ucc44\uc6cc\uc9d1\ub2c8\ub2e4.</p>', 'col-12');\n  const insights = data.insights || [];\n  const insightRow = item => `<div class=\"insight ${esc(item.level)}\">\n      <div class=\"insight-head\"><span class=\"dot\"></span><b>${esc(item.title)}</b>\n        ${item.action ? `<button class=\"btn btn-sm btn-ghost\" data-copy=\"${esc(item.action)}\">\ubcf5\uc0ac</button>` : ''}</div>\n      <p>${esc(item.detail)}</p>\n      ${item.evidence && item.evidence.length\n        ? `<div class=\"chips\">${item.evidence.map(entry => `<span class=\"chip\">${esc(entry)}</span>`).join('')}</div>`\n        : ''}</div>`;\n  const insightsCard = card('\uc778\uc0ac\uc774\ud2b8', insights.length ? `${insights.length}\uac1c \u00b7 \uc6b0\uc120\uc21c\uc704\uc21c` : '\uc870\uce58\ud560 \ud56d\ubaa9 \uc5c6\uc74c',\n    insights.length ? `<div class=\"insights\">${insights.map(insightRow).join('')}</div>`\n      : '<p class=\"empty\">\uce21\uc815\uac12\uc774 \uc815\uc0c1 \ubc94\uc704\uc785\ub2c8\ub2e4. \uc0c1\ud0dc \uce74\ub4dc\uc758 \uc218\uce58\uac00 \uae30\uc900\uc785\ub2c8\ub2e4.</p>', 'col-12');\n  const reasons = (routing.plan_reasons || []).length\n    ? routing.plan_reasons.map(([code, count]) => {\n        const help = ((data.help || {}).reasons || {})[code];\n        return `<div style=\"padding:9px 0;border-bottom:1px dashed rgba(255,255,255,.05)\">\n          <div class=\"row-kv\"><span class=\"mono\">${esc(code)}</span><span class=\"v\">${num(count)}</span></div>\n          ${help ? `<p class=\"hint\" style=\"margin-top:4px\"><b>${esc(help[0])}</b> \u2014 ${esc(help[1])}</p>` : ''}</div>`;\n      }).join('')\n    : '<p class=\"empty\">Plan \uc6b0\ud68c \uc5c6\uc74c</p>';\n  const failures = (routing.failures || []).length\n    ? routing.failures.map(([code, count]) => kv(code, num(count), true)).join('')\n    : kv('\uc678\ubd80 \uc2e4\ud328', '\uc5c6\uc74c');\n  const reasonsCard = card('Plan \uc6b0\ud68c \uc0ac\uc720', '\ucd5c\uadfc 60\ubd84',\n    reasons + '<div class=\"hairline\"></div>' + failures, 'col-4');\n\n  const timeline = usage.timeline || [];\n  const peak = Math.max(1, ...timeline.map(hour => tokens(hour.external.tokens) + tokens(hour.plan.tokens)));\n  const bars = timeline.map(hour => {\n    const ext = tokens(hour.external.tokens), plan = tokens(hour.plan.tokens);\n    return `<div class=\"tl-col\" title=\"${esc(hour.hour)}\uc2dc \u00b7 OpenRouter ${num(ext)} \u00b7 Plan ${num(plan)}\">\n      <div class=\"tl-plan\" style=\"height:${Math.round(plan / peak * 100)}%\"></div>\n      <div class=\"tl-ext\" style=\"height:${Math.round(ext / peak * 100)}%\"></div></div>`;\n  }).join('');\n  const labels = timeline.map((hour, index) =>\n    `<span>${index % 3 === 0 ? hour.hour.slice(11) + '\uc2dc' : ''}</span>`).join('');\n  const timelineCard = card('\uc2dc\uac04\ub300\ubcc4 \ud1a0\ud070', '\ucd5c\uadfc 24\uc2dc\uac04',\n    `<div class=\"timeline\">${bars || '<p class=\"empty\">\ub370\uc774\ud130 \uc5c6\uc74c</p>'}</div>\n     <div class=\"tl-labels\">${labels}</div>\n     <div class=\"legend\"><span><i style=\"background:#43d9a3\"></i>OpenRouter</span>\n     <span><i style=\"background:#f2b95e\"></i>Plan</span></div>`, 'col-8');\n\n  const transitions = (routing.transitions || []).slice().reverse().map(entry => {\n    const duration = entry.ongoing ? '<span class=\"pill pill-ok\" style=\"height:22px\">\uc9c4\ud589 \uc911</span>'\n      : entry.seconds === null || entry.seconds === undefined ? '\u2014'\n      : entry.seconds < 90 ? `${Math.round(entry.seconds)}\ucd08` : `${Math.round(entry.seconds / 60)}\ubd84`;\n    return `<tr>\n      <td class=\"id\">${new Date(entry.first_ts).toLocaleTimeString('ko-KR')}</td>\n      <td><span class=\"pill ${entry.state === 'external' ? 'pill-ok' : 'pill-warn'}\" style=\"height:24px\">\n        ${esc(stateText[entry.state] || entry.state)}</span></td>\n      <td class=\"id\">${esc([entry.reason, entry.detail].filter(Boolean).join(' / ') || '\u2014')}</td>\n      <td class=\"id\">${esc(entry.model || '\u2014')}</td>\n      <td class=\"num\">${num(entry.count)}</td><td class=\"num\">${duration}</td></tr>`;\n  }).join('');\n  const transitionsCard = card('\ub77c\uc6b0\ud305 \uc804\ud658 \uae30\ub85d', '\ucd5c\uadfc 12\ud68c',\n    (routing.transitions || []).length\n      ? `<table><thead><tr><th>\uc2dc\uc791</th><th>\uacbd\ub85c</th><th>\uc0ac\uc720</th><th>\ubaa8\ub378</th><th class=\"num\">\uac74\uc218</th><th class=\"num\">\uc9c0\uc18d</th></tr></thead><tbody>${transitions}</tbody></table>`\n      : '<p class=\"empty\">\uc544\uc9c1 \uc804\ud658 \uae30\ub85d\uc774 \uc5c6\uc2b5\ub2c8\ub2e4. \uc2e4\ud589\uae30 \uc138\uc158\uc5d0\uc11c \uba54\uc2dc\uc9c0\ub97c \ubcf4\ub0b4\uba74 \uc313\uc785\ub2c8\ub2e4.</p>');\n\n  const sessions = (usage.sessions || []).map(row => `<tr>\n      <td>${esc(row.project)}</td><td class=\"id\">${esc(row.session)}</td>\n      <td class=\"num\">${num(row.turns)}</td><td class=\"num\">${num(row.external)}</td><td class=\"num\">${num(row.plan)}</td>\n      <td class=\"num\">${num(tokens(row.tokens.external))}</td><td class=\"num\">${usd(row.cost_usd, 4)}</td>\n      <td class=\"id\">${esc((row.models[0] || ['\u2014'])[0])}</td></tr>`).join('');\n  const sessionsCard = card('\uc138\uc158\ubcc4 \uc0ac\uc6a9', `${num(usage.session_count)}\uac1c \uc138\uc158 \u00b7 \ucd5c\uadfc \ud65c\ub3d9\uc21c`,\n    (usage.sessions || []).length\n      ? `<table><thead><tr><th>\ud504\ub85c\uc81d\ud2b8</th><th>\uc138\uc158</th><th class=\"num\">\ud134</th><th class=\"num\">\uc678\ubd80</th>\n         <th class=\"num\">Plan</th><th class=\"num\">\uc678\ubd80 \ud1a0\ud070</th><th class=\"num\">\ube44\uc6a9</th><th>\ubaa8\ub378</th></tr></thead>\n         <tbody>${sessions}</tbody></table>`\n      : '<p class=\"empty\">\uc138\uc158 \uae30\ub85d \uc5c6\uc74c</p>');\n\n  const recent = (routing.recent || []).slice().reverse().map(event => `<tr>\n      <td class=\"id\">${new Date(event.ts).toLocaleTimeString('ko-KR')}</td>\n      <td class=\"id\">${esc(event.event || '\u2014')}</td>\n      <td>${esc(event.provider || '\u2014')}</td>\n      <td class=\"id\">${esc([event.reason, event.detail].filter(Boolean).join(' / ') || '\u2014')}</td>\n      <td class=\"num\">${esc(event.status ?? '')}</td></tr>`).join('');\n  const recentCard = card('\ucd5c\uadfc \ub77c\uc6b0\ud305 \uc774\ubca4\ud2b8', '\ucd5c\ub300 15\uac74',\n    (routing.recent || []).length\n      ? `<table><thead><tr><th>\uc2dc\uac01</th><th>\uc774\ubca4\ud2b8</th><th>\uacbd\ub85c</th><th>\uc0ac\uc720</th><th class=\"num\">HTTP</th></tr></thead><tbody>${recent}</tbody></table>`\n      : '<p class=\"empty\">\uc544\uc9c1 \uae30\ub85d\uc774 \uc5c6\uc2b5\ub2c8\ub2e4.</p>');\n\n  document.getElementById('grid').innerHTML =\n    [insightsCard, statusCard, splitCard, creditCard, tokensCard, proxyCard, reasonsCard, timelineCard, transitionsCard, sessionsCard, recentCard].join('');\n}\n\nfunction renderHelp(data) {\n  const help = data.help || {};\n  const commands = (help.commands || []).map(([command, description]) =>\n    `${command.padEnd(52)}# ${description}`).join('\\n');\n  const rows = list => (list || []).map(([left, right]) =>\n    `<div class=\"row-kv\"><span class=\"k mono\">${esc(left)}</span><span class=\"v\">${esc(right)}</span></div>`).join('');\n  const reasons = Object.entries(help.reasons || {}).map(([code, values]) =>\n    `<tr><td class=\"id\">${esc(code)}</td><td>${esc(values[0])}</td><td>${esc(values[1])}</td></tr>`).join('');\n  const body = `<details open><summary>\ud130\ubbf8\ub110 \uba85\ub839</summary>\n      <pre class=\"code\">${esc(commands)}</pre></details>\n    <details><summary>HTTP API</summary><div class=\"card-b\">${rows(help.endpoints)}</div></details>\n    <details><summary>\ub77c\uc6b0\ud305 \uc0ac\uc720 \ucf54\ub4dc ${Object.keys(help.reasons || {}).length}\uac1c</summary>\n      <table><thead><tr><th>\ucf54\ub4dc</th><th>\uc758\ubbf8</th><th>\uc870\uce58</th></tr></thead><tbody>${reasons}</tbody></table></details>\n    <details><summary>\uc0c1\ud0dc \u00b7 \uc885\ub8cc \ucf54\ub4dc \u00b7 \ub370\uc774\ud130 \ucd9c\ucc98</summary>\n      <div class=\"card-b\">\n        <div class=\"row-kv\" style=\"color:var(--fg-4)\"><span class=\"k\">\uc0c1\ud0dc</span><span class=\"v\">\uc758\ubbf8</span></div>\n        ${rows(help.states)}<div class=\"hairline\"></div>\n        <div class=\"row-kv\" style=\"color:var(--fg-4)\"><span class=\"k\">\uc885\ub8cc \ucf54\ub4dc</span><span class=\"v\">\uc758\ubbf8</span></div>\n        ${rows(help.exit_codes)}<div class=\"hairline\"></div>\n        <div class=\"row-kv\" style=\"color:var(--fg-4)\"><span class=\"k\">\ub370\uc774\ud130</span><span class=\"v\">\ucd9c\ucc98</span></div>\n        ${rows(help.sources)}\n      </div></details>`;\n  document.getElementById('help').innerHTML =\n    `<section class=\"card col-12\" id=\"help-card\"><header class=\"card-h\">\n      <div><h2>\ub3c4\uc6c0\ub9d0 \u2014 \ud654\uba74 \uc77d\ub294 \ubc95</h2><p class=\"sub\">\uc0c1\ud0dc \ubc30\uc9c0 \u00b7 \uc0ac\uc720 \ucf54\ub4dc \u00b7 CLI \u00b7 API</p></div></header>\n      <div class=\"card-b\">${body}</div></section>`;\n}\n\nfunction render(data) {\n  SNAP = data;\n  renderHeader(data);\n  renderAlerts(data);\n  renderGrid(data);\n  renderHelp(data);\n}\n\nasync function tick(force) {\n  try {\n    const response = await fetch('/api/snapshot', {cache:'no-store'});\n    const data = await response.json();\n    render(data);\n    if (force) toast('ok', '\uc0c8\ub85c\uace0\uce68\ud588\uc2b5\ub2c8\ub2e4');\n    return data;\n  } catch (error) {\n    document.getElementById('live-text').textContent = '\uc5f0\uacb0 \ub04a\uae40';\n    document.getElementById('live-pill').className = 'pill pill-bad';\n    return null;\n  }\n}\nloadConfig();\nlet pollTimer = null;\nasync function poll() {\n  clearTimeout(pollTimer);\n  const data = await tick();\n  const base = document.hidden ? 15000 : (data && data.refresh_ms ? data.refresh_ms : 5000);\n  pollTimer = setTimeout(poll, Math.max(1000, base));\n}\ndocument.addEventListener('visibilitychange', () => {\n  clearTimeout(pollTimer);\n  if (!document.hidden) poll();\n});\npoll();\n"
+JS_SHARED += "\n// Cost provenance labels: never leave an unpriced model looking like $0.\nconst COST_STATUS_TEXT = {estimated:'\ucd94\uc815', included:'Plan \ud3ec\ud568', unknown:'\ub2e8\uac00 \ubbf8\ud655\uc778'};\nfunction costStatusSuffix(status) { return status && status !== 'estimated' ? ` (${COST_STATUS_TEXT[status] || status})` : ''; }\nfunction costProvenanceTip(cost) { if (!cost) return ''; const parts = []; if (cost.normalized_model) parts.push(cost.normalized_model); if (cost.pricing_version) parts.push('pricing ' + cost.pricing_version); if (cost.fetched_at) parts.push('fetched ' + cost.fetched_at); if (cost.cache_write_1h_rate) parts.push('cache 1h ' + cost.cache_write_1h_rate); return parts.join(' / '); }\n"
+
+JS_DASHBOARD = "/* ---------- dashboard ---------- */\nfunction renderHeader(data) {\n  const routing = data.routing || {};\n  const state = routing.state || 'unknown';\n  const pill = document.getElementById('live-pill');\n  pill.className = 'pill ' + (statePill[state] || 'pill-mute');\n  document.getElementById('live-text').textContent = stateText[state] || state;\n  const age = routing.last && routing.last.age_seconds;\n  const ageText = age === null || age === undefined ? '\uae30\ub85d \uc5c6\uc74c'\n    : age < 60 ? `${Math.round(age)}\ucd08 \uc804` : `${Math.round(age / 60)}\ubd84 \uc804`;\n  const stamp = document.getElementById('stamp');\n  stamp.textContent = data.summary || `${data.model || '\ubaa8\ub378 \ubbf8\uc124\uc815'} \u00b7 \ub9c8\uc9c0\ub9c9 \uacb0\uc815 ${ageText}`;\n  stamp.title = `${data.model || '\ubaa8\ub378 \ubbf8\uc124\uc815'} \u00b7 \ub9c8\uc9c0\ub9c9 \uacb0\uc815 ${ageText} \u00b7 \uac31\uc2e0 ${new Date(data.generated_at).toLocaleTimeString('ko-KR')}`;\n}\n\n\nfunction renderAlerts(data) {\n  const host = document.getElementById('alerts');\n  const alerts = data.alerts || [];\n  const guide = data.configured ? '' :\n    `<div class=\"alert info\"><span class=\"icon\">i</span><div><b>\ucc98\uc74c \uc124\uc815\ud558\uae30</b>\n      <span class=\"txt\">\uc544\ub798 \uc124\uc815\uc5d0\uc11c \ubaa8\ub378\uacfc \ud0a4\ub97c \uc785\ub825\ud558\uace0 <b>\ubaa8\ub378 \ud655\uc778</b> \u2192 <b>\uc800\uc7a5</b>\uc744 \ub204\ub978 \ub4a4\n      <code>OpenClaude.ps1</code>\ub85c \uc138\uc158\uc744 \uc2dc\uc791\ud558\uc138\uc694. \uc800\uc7a5\ud55c \uac12\uc740 \uc0c8 \uc138\uc158\ubd80\ud130 \uc801\uc6a9\ub429\ub2c8\ub2e4.</span></div></div>`;\n  // An insight with the same code already explains the banner in place, so show it once.\n  const explained = new Set((data.insights || []).map(item => item.code));\n  const shown = alerts.filter(alert => !explained.has(alert.code));\n  host.innerHTML = guide + shown.map(alert => {\n    const icon = alert.level === 'critical' ? '!' : alert.level === 'warn' ? '!' : 'i';\n    const action = alert.command\n      ? `<button class=\"btn btn-sm btn-ghost\" style=\"margin-top:9px\" data-copy=\"${esc(alert.command)}\">\uba85\ub839 \ubcf5\uc0ac</button>`\n      : '';\n    return `<div class=\"alert ${esc(alert.level)}\"><span class=\"icon\">${icon}</span>\n      <div><b>${esc(alert.title)}</b><span class=\"txt\">${esc(alert.detail)}</span>${action}</div></div>`;\n  }).join('');\n}\n\nfunction renderGrid(data) {\n  const routing = data.routing || {}, usage = data.usage || {}, account = data.account || {};\n  const last = routing.last || {};\n  const counts = routing.counts || {external:0, plan:0};\n  const short = routing.short || {minutes:10, counts:{external:0, plan:0}};\n  const total = (counts.external || 0) + (counts.plan || 0);\n  const share = total ? Math.round((counts.external || 0) / total * 100) : 0;\n\n  const statusCard = card('\uc9c0\uae08 \uc0c1\ud0dc', '\ub9c8\uc9c0\ub9c9 \ub77c\uc6b0\ud305 \uacb0\uc815',\n    `<div class=\"metric\"><span class=\"k\">\uacbd\ub85c</span>\n       <span class=\"v\" style=\"font-size:19px\">${esc(stateText[routing.state] || routing.state || '\u2014')}</span></div>\n     <div class=\"metric-list\">\n       ${kv('\uc0ac\uc720', esc([last.reason, last.detail].filter(Boolean).join(' / ') || '\u2014'), true)}\n       ${kv('\ubaa8\ub378', `<span class=\"mono\">${esc(last.model || '\u2014')}</span>`)}\n       ${kv('\ud504\ub85d\uc2dc \uc2dc\uc791', esc(routing.proxy_started_at ? new Date(routing.proxy_started_at).toLocaleString('ko-KR') : '\u2014'))}\n       ${kv('\ud504\ub85d\uc2dc \ucf54\ub4dc', esc(routing.proxy_code ? new Date(routing.proxy_code).toLocaleString('ko-KR') : '\u2014'))}\n       ${kv('\uc18c\uc2a4 \uc218\uc815', esc(data.proxy_modified_at ? new Date(data.proxy_modified_at).toLocaleString('ko-KR') : '\u2014'))}\n       ${data.proxy_stale ? '<div class=\"row-kv\"><span class=\"k\">\ud504\ub85d\uc2dc</span><span class=\"v\" style=\"color:var(--warn)\">\ucf54\ub4dc\ubcf4\ub2e4 \uc624\ub798\ub428 \u00b7 \uc7ac\uc2dc\uc791 \ud544\uc694</span></div>' : ''}\n     </div>`, 'col-3');\n\n  const splitCard = card(`\ucd5c\uadfc ${routing.window_minutes || 60}\ubd84`, '\uc678\ubd80 \ub300 Plan \ube44\uc728',\n    `<div class=\"metric\"><span class=\"k\">OpenRouter</span><span class=\"v\">${share}<small>%</small></span></div>\n     <div class=\"bar\"><i style=\"width:${share}%\"></i></div>\n     <div class=\"metric-list\">\n       ${kv('OpenRouter', num(counts.external) + '\uac74')}\n       ${kv('Plan', num(counts.plan) + '\uac74')}\n       ${kv(`\ucd5c\uadfc ${short.minutes}\ubd84`, `\uc678\ubd80 ${num(short.counts.external)} / Plan ${num(short.counts.plan)}`)}\n       ${kv('\ud68c\ub85c \ucc28\ub2e8', num(routing.circuit_opens) + '\ud68c')}\n     </div>`, 'col-3');\n\n  const limit = account.limit_usd, spent = account.spent_usd, remaining = account.remaining_usd;\n  const used = limit && spent !== null && spent !== undefined ? Math.min(100, Math.round(spent / limit * 100)) : 0;\n  const creditCard = card('\ud06c\ub808\ub527', 'OpenRouter \ud0a4 \ud55c\ub3c4',\n    account.ok ? `<div class=\"metric\"><span class=\"k\">\ub0a8\uc740 \uae08\uc561</span><span class=\"v\">${usd(remaining)}</span></div>\n      <div class=\"bar\"><i style=\"width:${used}%\"></i></div>\n      <div class=\"metric-list\">\n        ${kv('\uc774\ubc88 \ub2ec \uc0ac\uc6a9', usd(spent))}\n        ${kv('\ud55c\ub3c4', usd(limit))}\n        ${kv('\ub9ac\uc14b', esc(account.reset || '\u2014') + (account.resets_at ? ' \u00b7 ' + new Date(account.resets_at).toLocaleDateString('ko-KR') : ''))}\n      </div>`\n    : `<div class=\"metric\"><span class=\"k\">\uc0c1\ud0dc</span><span class=\"v\" style=\"font-size:18px;color:var(--fg-3)\">\ud655\uc778 \ubd88\uac00</span></div>\n       <div class=\"metric-list\">${kv('\uc0ac\uc720', esc(account.error || 'unknown'), true)}</div>`, 'col-3');\n\n  const today = usage.today || {external:[0,0,0,0], plan:[0,0,0,0]};\n  const tokensCard = card('\uc624\ub298 \uc0ac\uc6a9\ub7c9', '\ud1a0\ud070\uacfc \ucd94\uc815 \ube44\uc6a9',\n    `<div class=\"metric\"><span class=\"k\">OpenRouter \ud1a0\ud070</span><span class=\"v\">${num(tokens(today.external))}</span></div>\n     <div class=\"metric-list\">\n       ${kv('Plan \ud1a0\ud070', num(tokens(today.plan)))}\n       ${kv('\uc785\ub825 / \ucd9c\ub825', `${num(today.external[0])} / ${num(today.external[1])}`)}\n       ${kv('\uce90\uc2dc \uc77d\uae30 / \uc0dd\uc131', `${num(today.external[2])} / ${num(today.external[3])}`)}\n       ${kv('\uce90\uc2dc 1h \uc0dd\uc131', num((usage.today_cache_write_1h || {}).external || 0))}\n       ${kv('\ucd94\uc815 \ube44\uc6a9(\uc624\ub298)', `<span style=\"color:var(--ok)\" title=\"${esc(costProvenanceTip(usage.cost))}\">${usd(usage.today_cost_usd ?? usage.cost_usd)}${costStatusSuffix(usage.cost && usage.cost.status)}</span>`)}\n     </div>`, 'col-3');\n\n  const pm = data.proxy_metrics;\n  const strip = list => `<div class=\"metrics-strip\">${list.map(([key, value]) =>\n    `<div class=\"m\"><span class=\"k\">${esc(key)}</span><span class=\"v\">${value}</span></div>`).join('')}</div>`;\n  const proxyCard = card('\ud504\ub85d\uc2dc \ucc98\ub9ac\ub7c9', pm ? (pm.stale ? `\uac31\uc2e0 ${pm.age_seconds}\ucd08 \uc9c0\uc5f0` : '\uc138\uc158 \uc2e4\ud589\uae30 \uc2e4\uc2dc\uac04') : '\uae30\ub85d \uc5c6\uc74c',\n    pm ? strip([\n      ['\uc694\uccad', num(pm.requests)],\n      ['\ucc98\ub9ac\uc728', `${(pm.requests / Math.max(1, (pm.uptimeMs || 1) / 1000)).toFixed(1)} req/s`],\n      ['\uc678\ubd80 / Plan', `${num(pm.routes?.external || 0)} / ${num(pm.routes?.plan || 0)}`],\n      ['p50 / p95', `${pm.latencyMs?.external?.p50 ?? '\u2014'} / ${pm.latencyMs?.external?.p95 ?? '\u2014'} ms`],\n      ['\uccab \ubc14\uc774\ud2b8 p50 / p95', `${pm.latencyMs?.ttfb?.p50 ?? '\u2014'} / ${pm.latencyMs?.ttfb?.p95 ?? '\u2014'} ms`],\n      ['\uc7ac\uc2dc\ub3c4', num(pm.retries)],\n      ['\uc2a4\ud2b8\ub9bc', num(pm.streams)],\n      ['\ud68c\ub85c', num(pm.circuitOpens)],\n      ['\uc1a1\uc2e0 / \uc218\uc2e0', `${((pm.bytesIn || 0) / 1048576).toFixed(1)} / ${((pm.bytesOut || 0) / 1048576).toFixed(1)} MB`],\n    ]) : '<p class=\"empty\">\uc774 \uc138\uc158\uc5d0\uc11c \ud504\ub85d\uc2dc \uae30\ub85d\uc774 \uc544\uc9c1 \uc5c6\uc2b5\ub2c8\ub2e4. \uc2e4\ud589\uae30\ub97c \uc2dc\uc791\ud558\uba74 \ucc44\uc6cc\uc9d1\ub2c8\ub2e4.</p>', 'col-12');\n  const insights = data.insights || [];\n  const insightRow = item => `<div class=\"insight ${esc(item.level)}\">\n      <div class=\"insight-head\"><span class=\"dot\"></span><b>${esc(item.title)}</b>\n        ${item.action ? `<button class=\"btn btn-sm btn-ghost\" data-copy=\"${esc(item.action)}\">\ubcf5\uc0ac</button>` : ''}</div>\n      <p>${esc(item.detail)}</p>\n      ${item.evidence && item.evidence.length\n        ? `<div class=\"chips\">${item.evidence.map(entry => `<span class=\"chip\">${esc(entry)}</span>`).join('')}</div>`\n        : ''}</div>`;\n  const insightsCard = card('\uc778\uc0ac\uc774\ud2b8', insights.length ? `${insights.length}\uac1c \u00b7 \uc6b0\uc120\uc21c\uc704\uc21c` : '\uc870\uce58\ud560 \ud56d\ubaa9 \uc5c6\uc74c',\n    insights.length ? `<div class=\"insights\">${insights.map(insightRow).join('')}</div>`\n      : '<p class=\"empty\">\uce21\uc815\uac12\uc774 \uc815\uc0c1 \ubc94\uc704\uc785\ub2c8\ub2e4. \uc0c1\ud0dc \uce74\ub4dc\uc758 \uc218\uce58\uac00 \uae30\uc900\uc785\ub2c8\ub2e4.</p>', 'col-12');\n  const reasons = (routing.plan_reasons || []).length\n    ? routing.plan_reasons.map(([code, count]) => {\n        const help = ((data.help || {}).reasons || {})[code];\n        return `<div style=\"padding:9px 0;border-bottom:1px dashed rgba(255,255,255,.05)\">\n          <div class=\"row-kv\"><span class=\"mono\">${esc(code)}</span><span class=\"v\">${num(count)}</span></div>\n          ${help ? `<p class=\"hint\" style=\"margin-top:4px\"><b>${esc(help[0])}</b> \u2014 ${esc(help[1])}</p>` : ''}</div>`;\n      }).join('')\n    : '<p class=\"empty\">Plan \uc6b0\ud68c \uc5c6\uc74c</p>';\n  const failures = (routing.failures || []).length\n    ? routing.failures.map(([code, count]) => kv(code, num(count), true)).join('')\n    : kv('\uc678\ubd80 \uc2e4\ud328', '\uc5c6\uc74c');\n  const reasonsCard = card('Plan \uc6b0\ud68c \uc0ac\uc720', '\ucd5c\uadfc 60\ubd84',\n    reasons + '<div class=\"hairline\"></div>' + failures, 'col-4');\n\n  const timeline = usage.timeline || [];\n  const peak = Math.max(1, ...timeline.map(hour => tokens(hour.external.tokens) + tokens(hour.plan.tokens)));\n  const bars = timeline.map(hour => {\n    const ext = tokens(hour.external.tokens), plan = tokens(hour.plan.tokens);\n    return `<div class=\"tl-col\" title=\"${esc(hour.hour)}\uc2dc \u00b7 OpenRouter ${num(ext)} \u00b7 Plan ${num(plan)}\">\n      <div class=\"tl-plan\" style=\"height:${Math.round(plan / peak * 100)}%\"></div>\n      <div class=\"tl-ext\" style=\"height:${Math.round(ext / peak * 100)}%\"></div></div>`;\n  }).join('');\n  const labels = timeline.map((hour, index) =>\n    `<span>${index % 3 === 0 ? hour.hour.slice(11) + '\uc2dc' : ''}</span>`).join('');\n  const timelineCard = card('\uc2dc\uac04\ub300\ubcc4 \ud1a0\ud070', '\ucd5c\uadfc 24\uc2dc\uac04',\n    `<div class=\"timeline\">${bars || '<p class=\"empty\">\ub370\uc774\ud130 \uc5c6\uc74c</p>'}</div>\n     <div class=\"tl-labels\">${labels}</div>\n     <div class=\"legend\"><span><i style=\"background:#43d9a3\"></i>OpenRouter</span>\n     <span><i style=\"background:#f2b95e\"></i>Plan</span></div>`, 'col-8');\n\n  const transitions = (routing.transitions || []).slice().reverse().map(entry => {\n    const duration = entry.ongoing ? '<span class=\"pill pill-ok\" style=\"height:22px\">\uc9c4\ud589 \uc911</span>'\n      : entry.seconds === null || entry.seconds === undefined ? '\u2014'\n      : entry.seconds < 90 ? `${Math.round(entry.seconds)}\ucd08` : `${Math.round(entry.seconds / 60)}\ubd84`;\n    return `<tr>\n      <td class=\"id\">${new Date(entry.first_ts).toLocaleTimeString('ko-KR')}</td>\n      <td><span class=\"pill ${entry.state === 'external' ? 'pill-ok' : 'pill-warn'}\" style=\"height:24px\">\n        ${esc(stateText[entry.state] || entry.state)}</span></td>\n      <td class=\"id\">${esc([entry.reason, entry.detail].filter(Boolean).join(' / ') || '\u2014')}</td>\n      <td class=\"id\">${esc(entry.model || '\u2014')}</td>\n      <td class=\"num\">${num(entry.count)}</td><td class=\"num\">${duration}</td></tr>`;\n  }).join('');\n  const transitionsCard = card('\ub77c\uc6b0\ud305 \uc804\ud658 \uae30\ub85d', '\ucd5c\uadfc 12\ud68c',\n    (routing.transitions || []).length\n      ? `<table><thead><tr><th>\uc2dc\uc791</th><th>\uacbd\ub85c</th><th>\uc0ac\uc720</th><th>\ubaa8\ub378</th><th class=\"num\">\uac74\uc218</th><th class=\"num\">\uc9c0\uc18d</th></tr></thead><tbody>${transitions}</tbody></table>`\n      : '<p class=\"empty\">\uc544\uc9c1 \uc804\ud658 \uae30\ub85d\uc774 \uc5c6\uc2b5\ub2c8\ub2e4. \uc2e4\ud589\uae30 \uc138\uc158\uc5d0\uc11c \uba54\uc2dc\uc9c0\ub97c \ubcf4\ub0b4\uba74 \uc313\uc785\ub2c8\ub2e4.</p>');\n\n  const sessions = (usage.sessions || []).map(row => `<tr>\n      <td>${esc(row.project)}</td><td class=\"id\">${esc(row.session)}</td>\n      <td class=\"num\">${num(row.turns)}</td><td class=\"num\">${num(row.external)}</td><td class=\"num\">${num(row.plan)}</td>\n      <td class=\"num\">${num(tokens(row.tokens.external))}</td><td class=\"num\">${usd(row.cost_usd, 4)}${costStatusSuffix(row.cost_status)}</td>\n      <td class=\"id\">${esc((row.models[0] || ['\u2014'])[0])}</td></tr>`).join('');\n  const sessionsCard = card('\uc138\uc158\ubcc4 \uc0ac\uc6a9', `${num(usage.session_count)}\uac1c \uc138\uc158 \u00b7 \ucd5c\uadfc \ud65c\ub3d9\uc21c${(usage.cost && usage.cost.status === 'unknown') ? ' \u00b7 \ub2e8\uac00 \ubbf8\ud655\uc778' : ''}`,\n    (usage.sessions || []).length\n      ? `<table><thead><tr><th>\ud504\ub85c\uc81d\ud2b8</th><th>\uc138\uc158</th><th class=\"num\">\ud134</th><th class=\"num\">\uc678\ubd80</th>\n         <th class=\"num\">Plan</th><th class=\"num\">\uc678\ubd80 \ud1a0\ud070</th><th class=\"num\">\ube44\uc6a9</th><th>\ubaa8\ub378</th></tr></thead>\n         <tbody>${sessions}</tbody></table>`\n      : '<p class=\"empty\">\uc138\uc158 \uae30\ub85d \uc5c6\uc74c</p>');\n\n  const recent = (routing.recent || []).slice().reverse().map(event => `<tr>\n      <td class=\"id\">${new Date(event.ts).toLocaleTimeString('ko-KR')}</td>\n      <td class=\"id\">${esc(event.event || '\u2014')}</td>\n      <td>${esc(event.provider || '\u2014')}</td>\n      <td class=\"id\">${esc([event.reason, event.detail].filter(Boolean).join(' / ') || '\u2014')}</td>\n      <td class=\"num\">${esc(event.status ?? '')}</td></tr>`).join('');\n  const recentCard = card('\ucd5c\uadfc \ub77c\uc6b0\ud305 \uc774\ubca4\ud2b8', '\ucd5c\ub300 15\uac74',\n    (routing.recent || []).length\n      ? `<table><thead><tr><th>\uc2dc\uac01</th><th>\uc774\ubca4\ud2b8</th><th>\uacbd\ub85c</th><th>\uc0ac\uc720</th><th class=\"num\">HTTP</th></tr></thead><tbody>${recent}</tbody></table>`\n      : '<p class=\"empty\">\uc544\uc9c1 \uae30\ub85d\uc774 \uc5c6\uc2b5\ub2c8\ub2e4.</p>');\n\n  document.getElementById('grid').innerHTML =\n    [insightsCard, statusCard, splitCard, creditCard, tokensCard, proxyCard, reasonsCard, timelineCard, transitionsCard, sessionsCard, recentCard].join('');\n}\n\nfunction renderHelp(data) {\n  const help = data.help || {};\n  const commands = (help.commands || []).map(([command, description]) =>\n    `${command.padEnd(52)}# ${description}`).join('\\n');\n  const rows = list => (list || []).map(([left, right]) =>\n    `<div class=\"row-kv\"><span class=\"k mono\">${esc(left)}</span><span class=\"v\">${esc(right)}</span></div>`).join('');\n  const reasons = Object.entries(help.reasons || {}).map(([code, values]) =>\n    `<tr><td class=\"id\">${esc(code)}</td><td>${esc(values[0])}</td><td>${esc(values[1])}</td></tr>`).join('');\n  const body = `<details open><summary>\ud130\ubbf8\ub110 \uba85\ub839</summary>\n      <pre class=\"code\">${esc(commands)}</pre></details>\n    <details><summary>HTTP API</summary><div class=\"card-b\">${rows(help.endpoints)}</div></details>\n    <details><summary>\ub77c\uc6b0\ud305 \uc0ac\uc720 \ucf54\ub4dc ${Object.keys(help.reasons || {}).length}\uac1c</summary>\n      <table><thead><tr><th>\ucf54\ub4dc</th><th>\uc758\ubbf8</th><th>\uc870\uce58</th></tr></thead><tbody>${reasons}</tbody></table></details>\n    <details><summary>\uc0c1\ud0dc \u00b7 \uc885\ub8cc \ucf54\ub4dc \u00b7 \ub370\uc774\ud130 \ucd9c\ucc98</summary>\n      <div class=\"card-b\">\n        <div class=\"row-kv\" style=\"color:var(--fg-4)\"><span class=\"k\">\uc0c1\ud0dc</span><span class=\"v\">\uc758\ubbf8</span></div>\n        ${rows(help.states)}<div class=\"hairline\"></div>\n        <div class=\"row-kv\" style=\"color:var(--fg-4)\"><span class=\"k\">\uc885\ub8cc \ucf54\ub4dc</span><span class=\"v\">\uc758\ubbf8</span></div>\n        ${rows(help.exit_codes)}<div class=\"hairline\"></div>\n        <div class=\"row-kv\" style=\"color:var(--fg-4)\"><span class=\"k\">\ub370\uc774\ud130</span><span class=\"v\">\ucd9c\ucc98</span></div>\n        ${rows(help.sources)}\n      </div></details>`;\n  document.getElementById('help').innerHTML =\n    `<section class=\"card col-12\" id=\"help-card\"><header class=\"card-h\">\n      <div><h2>\ub3c4\uc6c0\ub9d0 \u2014 \ud654\uba74 \uc77d\ub294 \ubc95</h2><p class=\"sub\">\uc0c1\ud0dc \ubc30\uc9c0 \u00b7 \uc0ac\uc720 \ucf54\ub4dc \u00b7 CLI \u00b7 API</p></div></header>\n      <div class=\"card-b\">${body}</div></section>`;\n}\n\nfunction render(data) {\n  SNAP = data;\n  renderHeader(data);\n  renderAlerts(data);\n  renderGrid(data);\n  renderHelp(data);\n}\n\nasync function tick(force) {\n  try {\n    const response = await fetch('/api/snapshot', {cache:'no-store'});\n    const data = await response.json();\n    render(data);\n    if (force) toast('ok', '\uc0c8\ub85c\uace0\uce68\ud588\uc2b5\ub2c8\ub2e4');\n    return data;\n  } catch (error) {\n    document.getElementById('live-text').textContent = '\uc5f0\uacb0 \ub04a\uae40';\n    document.getElementById('live-pill').className = 'pill pill-bad';\n    return null;\n  }\n}\nloadConfig();\nlet pollTimer = null;\nasync function poll() {\n  clearTimeout(pollTimer);\n  const data = await tick();\n  const base = document.hidden ? 15000 : (data && data.refresh_ms ? data.refresh_ms : 5000);\n  pollTimer = setTimeout(poll, Math.max(1000, base));\n}\ndocument.addEventListener('visibilitychange', () => {\n  clearTimeout(pollTimer);\n  if (!document.hidden) poll();\n});\npoll();\n"
 
 JS_SETTINGS = "/* ---------- settings ---------- */\nfunction fieldValue(provider, name) {\n  const fields = (CONFIG && CONFIG[provider] && CONFIG[provider].fields) || {};\n  return fields[name] || {value:'', set:false, preview:'', secret:false};\n}\n\nfunction renderSettings(force) {\n  if (!CONFIG) return;\n  const host = document.getElementById('settings');\n  if (!force && host.contains(document.activeElement)) return;\n  host.innerHTML = Object.entries(PROVIDERS).map(([provider, spec]) => {\n    const rows = spec.fields.map(([name, label, type, placeholder, hint, badge]) => {\n      const field = fieldValue(provider, name);\n      const id = `cfg-${provider}-${name}`;\n      const dirty = DIRTY.has(`${provider}:${name}`);\n      if (type === 'switch') {\n        return `<div class=\"field\"><label>${esc(label)}<span class=\"req\">${esc(badge)}</span></label>\n          <label class=\"switch\"><input type=\"checkbox\" id=\"${id}\" data-provider=\"${provider}\" data-name=\"${name}\"\n            ${field.value === 'true' ? 'checked' : ''}><span class=\"track\"></span>\n            <span>${field.value === 'true' ? '\ud5c8\uc6a9' : '\ud5c8\uc6a9 \uc548 \ud568'}</span></label>\n          <p class=\"hint\">${esc(hint)}</p></div>`;\n      }\n      const value = field.secret ? '' : esc(field.value || '');\n      const effectivePlaceholder = field.secret && field.set\n        ? `\uc800\uc7a5\ub428 (${field.preview}) \u2014 \ubcc0\uacbd\ud560 \ub54c\ub9cc \uc785\ub825` : placeholder;\n      const picker = name.endsWith('_MODEL')\n        ? `<button class=\"btn btn-sm btn-ghost\" type=\"button\" data-picker=\"${provider}\">\ubaa9\ub85d</button>` : '';\n      const reveal = field.secret\n        ? `<button class=\"btn btn-sm btn-ghost\" type=\"button\" data-reveal=\"${id}\">\ubcf4\uae30</button>` : '';\n      return `<div class=\"field${dirty ? ' invalid' : ''}\" data-field=\"${provider}:${name}\">\n        <label for=\"${id}\">${esc(label)}<span class=\"req\">${esc(badge)}</span></label>\n        <div class=\"input-group\"><input class=\"input\" id=\"${id}\" type=\"${type}\" value=\"${value}\"\n          placeholder=\"${esc(effectivePlaceholder)}\" data-provider=\"${provider}\" data-name=\"${name}\"\n          data-secret=\"${field.secret ? '1' : '0'}\" autocomplete=\"off\" spellcheck=\"false\">${reveal}${picker}</div>\n        <p class=\"hint\">${esc(hint)}</p></div>`;\n    }).join('');\n    const dirtyCount = spec.fields.filter(([name]) => DIRTY.has(`${provider}:${name}`)).length;\n    const stored = spec.fields.map(([name, label]) => {\n      const field = fieldValue(provider, name);\n      if (field.secret) {\n        return kv(label, field.set ? `<span class=\"mono\">${esc(field.preview)}</span>`\n                                   : '<span class=\"empty\">\uc124\uc815 \uc548 \ub428</span>');\n      }\n      return kv(label, field.value ? esc(field.value) : '<span class=\"empty\">\uc124\uc815 \uc548 \ub428</span>');\n    }).join('');\n    return `<section class=\"card col-6\" id=\"card-${provider}\">\n      <header class=\"card-h\">\n        <div><h2>${esc(spec.title)}</h2><p class=\"sub\">${esc(spec.file)}</p></div>\n        <span class=\"save-state ${dirtyCount ? 'dirty' : ''}\" id=\"state-${provider}\">\n          ${dirtyCount ? `\uc800\uc7a5\ub418\uc9c0 \uc54a\uc740 \ubcc0\uacbd ${dirtyCount}` : '\uc800\uc7a5\ub428'}</span>\n      </header>\n      <div class=\"card-b\">\n        ${providerReady(provider) ? '' : `<div class=\"notice\"><b>\uc544\uc9c1 \uc124\uc815\uc774 \uc5c6\uc2b5\ub2c8\ub2e4.</b>\n          \uac12\uc744 \uc785\ub825\ud558\uace0 <b>\ubaa8\ub378 \ud655\uc778</b>\uc73c\ub85c \uac80\uc99d\ud55c \ub4a4 <b>\uc800\uc7a5</b>\ud558\uc138\uc694. \ubaa8\ub378 \ud655\uc778\uc740 \uc800\uc7a5 \uc804 \uac12\uc73c\ub85c\ub3c4 \uc2e4\ud589\ub429\ub2c8\ub2e4.</div>`}\n        <div class=\"setting-form\">${rows}</div>\n        <div class=\"actions\">\n          <button class=\"btn btn-primary\" data-busy-key=\"${provider}\" onclick=\"saveSettings('${provider}')\">\uc800\uc7a5</button>\n          <button class=\"btn\" data-busy-key=\"${provider}:metadata\" onclick=\"runTest('${provider}','metadata')\">\ubaa8\ub378 \ud655\uc778</button>\n          <button class=\"btn\" data-busy-key=\"${provider}:inference\" onclick=\"runTest('${provider}','inference')\">\ucd94\ub860 \ud14c\uc2a4\ud2b8</button>\n        </div>\n        <div class=\"result\" id=\"res-${provider}\"></div>\n        <div class=\"hairline\"></div>\n        <div class=\"stored\"><span class=\"stored-title\">\ud604\uc7ac \uc800\uc7a5\ub41c \uac12</span>${stored}</div>\n      </div></section>`;\n  }).join('');\n  wireSettings();\n  Object.keys(PROVIDERS).forEach(provider => renderResult(provider));\n}\n\nfunction wireSettings() {\n  document.querySelectorAll('#settings .input').forEach(input => {\n    input.addEventListener('input', () => {\n      const key = `${input.dataset.provider}:${input.dataset.name}`;\n      const original = fieldValue(input.dataset.provider, input.dataset.name);\n      const current = input.dataset.secret === '1' ? input.value : input.value;\n      const changed = input.dataset.secret === '1' ? current !== '' : current !== (original.value || '');\n      if (changed) DIRTY.add(key); else DIRTY.delete(key);\n      const field = input.closest('.field');\n      if (field) field.classList.toggle('invalid', false);\n      updateSaveState(input.dataset.provider);\n    });\n  });\n  document.querySelectorAll('#settings .switch input').forEach(input => {\n    input.addEventListener('change', () => {\n      DIRTY.add(`${input.dataset.provider}:${input.dataset.name}`);\n      const label = input.parentElement.querySelector('span:last-child');\n      if (label) label.textContent = input.checked ? '\ud5c8\uc6a9' : '\ud5c8\uc6a9 \uc548 \ud568';\n      updateSaveState(input.dataset.provider);\n    });\n  });\n  document.querySelectorAll('#settings [data-picker]').forEach(button => {\n    button.addEventListener('click', () => openModelPicker(button.dataset.picker));\n  });\n  document.querySelectorAll('#settings [data-reveal]').forEach(button => {\n    button.addEventListener('click', () => {\n      const input = document.getElementById(button.dataset.reveal);\n      if (!input) return;\n      const reveal = input.type === 'password';\n      input.type = reveal ? 'text' : 'password';\n      button.textContent = reveal ? '\uc228\uae30\uae30' : '\ubcf4\uae30';\n    });\n  });\n}\n\nfunction updateSaveState(provider) {\n  const spec = PROVIDERS[provider];\n  const count = spec.fields.filter(([name]) => DIRTY.has(`${provider}:${name}`)).length;\n  const node = document.getElementById(`state-${provider}`);\n  if (!node) return;\n  node.textContent = count ? `\uc800\uc7a5\ub418\uc9c0 \uc54a\uc740 \ubcc0\uacbd ${count}` : '\uc800\uc7a5\ub428';\n  node.classList.toggle('dirty', count > 0);\n}\n\nfunction setBusy(key, flag) {\n  if (flag) BUSY.add(key); else BUSY.delete(key);\n  document.querySelectorAll(`[data-busy-key=\"${key}\"]`).forEach(button => {\n    button.disabled = flag;\n    button.classList.toggle('loading', flag);\n  });\n}\n\nfunction collect(provider) {\n  const values = {};\n  for (const [name, , type] of PROVIDERS[provider].fields) {\n    const element = document.getElementById(`cfg-${provider}-${name}`);\n    if (!element) continue;\n    values[name] = type === 'switch' ? (element.checked ? 'true' : 'false') : element.value;\n  }\n  return values;\n}\n\nasync function post(path, payload) {\n  const response = await fetch(path, {method:'POST',\n    headers:{'content-type':'application/json', 'x-dashboard-token':TOKEN},\n    body: JSON.stringify(payload)});\n  return response.json();\n}\n\nasync function saveSettings(provider) {\n  setBusy(provider, true);\n  let result;\n  try { result = await post('/api/config', {provider, values: collect(provider)}); }\n  catch (error) { result = {saved:false, error:'connection_failed'}; }\n  setBusy(provider, false);\n  if (result.saved) {\n    PROVIDERS[provider].fields.forEach(([name]) => DIRTY.delete(`${provider}:${name}`));\n    CONFIG = result.config;\n    RESULTS[provider] = {ok:true, reason:'saved'};\n    renderSettings(true);\n    renderResult(provider, '\uc800\uc7a5\ud588\uc2b5\ub2c8\ub2e4. \uc0c8 \uc138\uc158\ubd80\ud130 \uc801\uc6a9\ub429\ub2c8\ub2e4.');\n    toast('ok', `${PROVIDERS[provider].title} \uc124\uc815\uc744 \uc800\uc7a5\ud588\uc2b5\ub2c8\ub2e4`);\n  } else {\n    RESULTS[provider] = {error: result.error};\n    renderSettings(true);\n    renderResult(provider);\n    toast('bad', ERROR_TEXT[result.error] || '\uc800\uc7a5\uc5d0 \uc2e4\ud328\ud588\uc2b5\ub2c8\ub2e4');\n  }\n}\n\nasync function runTest(provider, mode) {\n  const key = `${provider}:${mode}`;\n  setBusy(key, true);\n  renderResult(provider, mode === 'inference' ? '\ucd94\ub860\uc744 \ud655\uc778\ud558\ub294 \uc911\u2026' : '\ubaa8\ub378 \ubaa9\ub85d\uc744 \ud655\uc778\ud558\ub294 \uc911\u2026');\n  let result;\n  try { result = await post('/api/test', {provider, mode, values: collect(provider)}); }\n  catch (error) { result = {ok:false, reason:'connection_failed', mode}; }\n  setBusy(key, false);\n  RESULTS[provider] = {...result, mode};\n  renderResult(provider);\n  toast(result.ok ? 'ok' : 'warn',\n    `${PROVIDERS[provider].title} ${mode === 'inference' ? '\ucd94\ub860 \ud14c\uc2a4\ud2b8' : '\ubaa8\ub378 \ud655\uc778'} ${result.ok ? '\uc131\uacf5' : '\uc2e4\ud328'}`);\n}\n\nfunction renderResult(provider, pending) {\n  const box = document.getElementById(`res-${provider}`);\n  if (!box) return;\n  if (pending) { box.innerHTML = `<p class=\"empty\">${esc(pending)}</p>`; return; }\n  const result = RESULTS[provider];\n  if (!result) { box.innerHTML = '<p class=\"empty\">\uc544\uc9c1 \ud14c\uc2a4\ud2b8\ud558\uc9c0 \uc54a\uc558\uc2b5\ub2c8\ub2e4. \ubcc0\uacbd \uc0ac\ud56d\uc740 \uc0c8 \uc138\uc158\ubd80\ud130 \uc801\uc6a9\ub429\ub2c8\ub2e4.</p>'; return; }\n  if (result.reason === 'saved') {\n    box.innerHTML = '<div class=\"result-line ok\"><span class=\"dot\"></span>\uc800\uc7a5 \uc644\ub8cc \u00b7 \uc0c8 \uc138\uc158\ubd80\ud130 \uc801\uc6a9\ub429\ub2c8\ub2e4</div>';\n    return;\n  }\n  if (result.error) {\n    box.innerHTML = `<div class=\"result-line bad\"><span class=\"dot\"></span>${esc(ERROR_TEXT[result.error] || result.error)}</div>`;\n    return;\n  }\n  const label = result.mode === 'inference' ? '\ucd94\ub860 \ud14c\uc2a4\ud2b8' : '\ubaa8\ub378 \ud655\uc778';\n  const text = TEST_TEXT[result.reason] || result.reason || '\uc54c \uc218 \uc5c6\ub294 \uacb0\uacfc';\n  const chips = [\n    result.model ? `<span class=\"chip\">${esc(result.model)}</span>` : '',\n    result.status ? `<span class=\"chip\">HTTP ${esc(result.status)}</span>` : '',\n    result.model_count !== undefined ? `<span class=\"chip\">\ubaa8\ub378 ${num(result.model_count)}\uac1c</span>` : '',\n  ].filter(Boolean).join('');\n  box.innerHTML = `<div class=\"result-line ${result.ok ? 'ok' : 'bad'}\"><span class=\"dot\"></span>${esc(label)} \u00b7 ${esc(text)}</div>\n    ${chips ? `<div class=\"result-meta\">${chips}</div>` : ''}`;\n}\n\nloadConfig();\n\nconst GUIDE = `<section class=\"card col-12\"><header class=\"card-h\">\n  <div><h2>\uc800\uc7a5\ud55c \uc124\uc815 \uc801\uc6a9\ud558\uae30</h2><p class=\"sub\">\uc124\uc815\uc740 \uc0c8 \uc138\uc158\ubd80\ud130 \uc801\uc6a9\ub429\ub2c8\ub2e4</p></div></header>\n  <div class=\"card-b\">\n    <ol class=\"steps\">\n      <li>\uac12\uc744 \uc785\ub825\ud558\uace0 <b>\ubaa8\ub378 \ud655\uc778</b>\uc73c\ub85c \uac80\uc99d\ud55c \ub4a4 <b>\uc800\uc7a5</b>\ud569\ub2c8\ub2e4.</li>\n      <li>\uc2e4\ud589 \uc911\uc778 \uc138\uc158\uc744 \uc885\ub8cc\ud558\uace0 <code>OpenClaude.ps1</code>\uc744 \ub2e4\uc2dc \uc2e4\ud589\ud569\ub2c8\ub2e4.</li>\n      <li>Local LLM\uc740 <code>OpenClaude.ps1 -Provider Local</code>\ub85c \uc2dc\uc791\ud569\ub2c8\ub2e4.</li>\n    </ol>\n    <div class=\"hairline\"></div>\n    <div class=\"meta-line\"><span class=\"k\">\ubcf4\uc548</span><span>\ud0a4\ub294 \ube0c\ub77c\uc6b0\uc800\ub85c \ub2e4\uc2dc \uc804\uc1a1\ub418\uc9c0 \uc54a\uace0, \uc800\uc7a5\uc5d0\ub294 \uc138\uc158 \ud1a0\ud070\uc774 \ud544\uc694\ud569\ub2c8\ub2e4.</span></div>\n    <div class=\"meta-line\"><span class=\"k\">\ubc31\uc5c5</span><span>\uc800\uc7a5 \uc804 \ub0b4\uc6a9\uc740 <span class=\"mono\">.env.*.bak</span>\uc5d0 \ub0a8\uc2b5\ub2c8\ub2e4.</span></div>\n    <div class=\"actions\"><a class=\"btn\" href=\"/\">\ub300\uc2dc\ubcf4\ub4dc\ub85c \uc774\ub3d9</a></div>\n  </div></section>`;\n\nasync function openModelPicker(provider) {\n  const spec = PROVIDERS[provider];\n  const modelField = spec.fields.find(([name]) => name.endsWith('_MODEL'))?.[0];\n  const target = modelField ? document.getElementById(`cfg-${provider}-${modelField}`) : null;\n  const modal = document.createElement('div');\n  modal.className = 'modal-backdrop';\n  modal.innerHTML = `<div class=\"modal\" role=\"dialog\" aria-modal=\"true\" aria-label=\"${esc(spec.title)} \ubaa8\ub378 \ubaa9\ub85d\">\n    <header class=\"modal-h\">\n      <div><h3>${esc(spec.title)} \ubaa8\ub378</h3><p class=\"hint\" id=\"picker-note\">\ubd88\ub7ec\uc624\ub294 \uc911\u2026</p></div>\n      <button class=\"btn btn-sm btn-ghost\" type=\"button\" data-close>\ub2eb\uae30</button>\n    </header>\n    <div class=\"modal-b\">\n      <input class=\"input\" id=\"picker-search\" placeholder=\"\ubaa8\ub378 \uac80\uc0c9\u2026\" autocomplete=\"off\" spellcheck=\"false\">\n      <div class=\"model-list\" id=\"picker-list\"><p class=\"empty\">\ubd88\ub7ec\uc624\ub294 \uc911\u2026</p></div>\n    </div></div>`;\n  document.body.appendChild(modal);\n  const close = () => modal.remove();\n  modal.addEventListener('click', event => {\n    if (event.target === modal || event.target.closest('[data-close]')) close();\n  });\n  const onKey = event => {\n    if (event.key === 'Escape') { close(); document.removeEventListener('keydown', onKey); }\n  };\n  document.addEventListener('keydown', onKey);\n\n  let models = [];\n  try {\n    const response = await fetch(`/api/models?provider=${provider}`, { headers: { 'x-dashboard-token': TOKEN } });\n    const data = await response.json();\n    models = Array.isArray(data.models) ? data.models : [];\n    document.getElementById('picker-note').textContent = data.ok\n      ? `${models.length}\uac1c \ubaa8\ub378${data.cached ? ' \u00b7 \uce90\uc2dc' : ''}` +\n        (data.age_seconds ? ` \u00b7 ${Math.round(data.age_seconds)}\ucd08 \uc804` : '')\n      : (ERROR_TEXT[data.error] || data.error || '\ubaa9\ub85d\uc744 \uac00\uc838\uc624\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4');\n  } catch (error) {\n    document.getElementById('picker-note').textContent = '\ubaa9\ub85d\uc744 \uac00\uc838\uc624\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4';\n  }\n\n  const list = document.getElementById('picker-list');\n  const renderRows = filter => {\n    const needle = (filter || '').toLowerCase();\n    const rows = models.filter(model => !needle ||\n      model.id.toLowerCase().includes(needle) || model.name.toLowerCase().includes(needle));\n    list.innerHTML = rows.length ? rows.slice(0, 400).map(model => {\n      const meta = [model.context_length ? num(model.context_length) + ' ctx' : '',\n        model.prompt_usd_per_m != null ? '$' + model.prompt_usd_per_m + '/M' : ''].filter(Boolean).join(' \u00b7 ');\n      return `<button type=\"button\" class=\"model-row\" data-id=\"${esc(model.id)}\">\n        <span class=\"mono\">${esc(model.id)}</span><span class=\"meta\">${esc(meta)}</span></button>`;\n    }).join('') : '<p class=\"empty\">\uc77c\uce58\ud558\ub294 \ubaa8\ub378\uc774 \uc5c6\uc2b5\ub2c8\ub2e4</p>';\n  };\n  renderRows('');\n  document.getElementById('picker-search').addEventListener('input', event =>\n    renderRows(event.target.value.trim()));\n  list.addEventListener('click', event => {\n    const row = event.target.closest('.model-row');\n    if (!row || !target) return;\n    target.value = row.dataset.id;\n    target.dispatchEvent(new Event('input', { bubbles: true }));\n    close();\n    document.removeEventListener('keydown', onKey);\n    toast('ok', row.dataset.id + ' \uc120\ud0dd \u00b7 \uc800\uc7a5\uc744 \ub20c\ub7ec \uc801\uc6a9');\n  });\n}\n\ndocument.getElementById('guide').innerHTML = GUIDE;\ndocument.getElementById('stamp').textContent = '\ubaa8\ub378\u00b7\ud0a4 \uc124\uc815\uacfc \uc5f0\uacb0 \ud655\uc778 \u00b7 \uc800\uc7a5\uc740 \uc0c8 \uc138\uc158\ubd80\ud130 \uc801\uc6a9';\nloadConfig();\n"
 
@@ -1978,6 +2350,9 @@ def status_report(include_usage=False, offline=False):
     }
     if include_usage:
         report["usage"] = {"today": usage["today"], "cost_usd": usage["cost_usd"],
+                           "cost": usage.get("cost"),
+                           "cache_write_1h": usage.get("cache_write_1h"),
+                           "today_cache_write_1h": usage.get("today_cache_write_1h"),
                            "session_count": usage["session_count"]}
     return report
 

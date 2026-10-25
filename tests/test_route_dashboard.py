@@ -186,6 +186,186 @@ class SessionScanTests(unittest.TestCase):
         self.assertEqual(usage["totals"]["external"], [0, 0, 0, 0])
 
 
+class CostProvenanceTests(unittest.TestCase):
+    NOW = datetime(2026, 10, 25, 11, 0)
+    RATES = {"ok": True, "prompt": 0.000003, "completion": 0.000015,
+             "cache_read": 0.0000003, "cache_write": 0.00000375,
+             "cache_write_1h": 0.000006,
+             "pricing_version": "abc123def456",
+             "fetched_at": "2026-10-25T02:00:00+00:00",
+             "normalized_model": "claude-sonnet-4-5"}
+
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.projects = self.root / "projects"
+        self.session = self.projects / "D--project" / "cost.jsonl"
+        self.session.parent.mkdir(parents=True)
+        self.enterContext(mock.patch.object(dash, "_SESSIONS", {}))
+        self.enterContext(mock.patch.object(dash, "_CLAIM_OWNER", {}, create=True))
+        self.enterContext(mock.patch.object(
+            dash, "USAGE_CACHE_FILE", self.root / ".usage-cache.json"))
+        dash._USAGE_CACHE["key"] = None
+
+    def append(self, records):
+        with self.session.open("a", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+        dash._USAGE_CACHE["key"] = None
+
+    def assistant(self, message_id="msg_other", model="claude-sonnet-4-5-20250929",
+                  tokens=(10, 2, 0, 0), cache_1h=None, stamp="2026-10-25T02:10:00.000Z"):
+        usage = {"input_tokens": tokens[0], "output_tokens": tokens[1],
+                 "cache_read_input_tokens": tokens[2],
+                 "cache_creation_input_tokens": tokens[3]}
+        if cache_1h is not None:
+            usage["cache_creation"] = {"ephemeral_1h_input_tokens": cache_1h,
+                                       "ephemeral_5m_input_tokens": tokens[3] - cache_1h}
+        return {"type": "assistant", "timestamp": stamp,
+                "message": {"id": message_id, "model": model, "usage": usage}}
+
+    def scan(self, pricing=None):
+        return dash.scan_sessions(projects=self.projects, now=self.NOW, pricing=pricing)
+
+    def opener(self, payload):
+        body = io.BytesIO(json.dumps(payload).encode())
+        opener = mock.Mock()
+        opener.open.return_value.__enter__ = mock.Mock(return_value=mock.Mock(read=lambda *_: body.read()))
+        opener.open.return_value.__exit__ = mock.Mock(return_value=False)
+        return opener
+
+    def test_model_ids_are_normalized_like_orca(self):
+        cases = {
+            "claude-sonnet-4-5-20250929": "claude-sonnet-4-5",
+            "claude-3-5-sonnet-20241022": "claude-sonnet-3-5",
+            "anthropic/claude-sonnet-4.5": "claude-sonnet-4-5",
+            "CLAUDE-HAIKU-3-5": "claude-haiku-3-5",
+            "claude-sonnet-4-5-1m": "claude-sonnet-4-5",
+            "model_placeholder_m26": "claude-opus-4-6",
+            "vendor/some-model-2025-09-29": "vendor/some-model",
+            "vendor/model": "vendor/model",
+        }
+        for raw, expected in cases.items():
+            self.assertEqual(dash.normalize_model_id(raw), expected, raw)
+        for empty in (None, "", "   ", 7):
+            self.assertIsNone(dash.normalize_model_id(empty))
+
+    def test_pricing_lookup_normalizes_the_catalog_row(self):
+        payload = {"data": [{"id": "anthropic/claude-sonnet-4.5",
+                             "pricing": {"prompt": "0.000003", "completion": "0.000015",
+                                         "input_cache_read": "0.0000003",
+                                         "input_cache_write": "0.00000375",
+                                         "input_cache_write_1h": "0.000006"}}]}
+        cache = {"at": 0.0, "data": None}
+        with mock.patch.object(dash.urllib.request, "build_opener",
+                               return_value=self.opener(payload)):
+            result = dash.model_pricing("sk-or-synthetic", "anthropic/claude-sonnet-4.5-20250929",
+                                        cache=cache, now=10.0)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["normalized_model"], "claude-sonnet-4-5")
+        self.assertAlmostEqual(result["cache_write_1h"], 0.000006)
+        self.assertRegex(result["pricing_version"], r"^[0-9a-f]{12}$")
+        self.assertTrue(result["fetched_at"].endswith("+00:00"))
+
+    def test_an_unpriced_model_is_unknown_not_zero(self):
+        self.append([self.assistant(tokens=(100, 10, 0, 0))])
+        usage = self.scan(pricing={"ok": False, "error": "model_not_found"})
+        self.assertIsNone(usage["cost_usd"])
+        self.assertIsNone(usage["today_cost_usd"])
+        cost = usage["cost"]
+        self.assertEqual(cost["status"], "unknown")
+        self.assertIsNone(cost["estimated_usd"])
+        self.assertEqual(cost["buckets"]["estimated"]["tokens"], [0, 0, 0, 0])
+        self.assertEqual(cost["buckets"]["unknown"]["tokens"], [100, 10, 0, 0])
+        self.assertEqual(cost["buckets"]["included"]["tokens"], [0, 0, 0, 0])
+        self.assertEqual(usage["sessions"][0]["cost_status"], "unknown")
+        self.assertIsNone(usage["sessions"][0]["cost_usd"])
+
+    def test_plan_usage_is_included_not_estimated(self):
+        self.append([self.assistant(message_id="msg_011ABC", tokens=(10, 2, 0, 4))])
+        usage = self.scan(pricing=self.RATES)
+        self.assertEqual(usage["totals"]["plan"], [10, 2, 0, 4])
+        self.assertEqual(usage["cost_usd"], 0.0)
+        self.assertEqual(usage["cost"]["status"], "included")
+        self.assertEqual(usage["cost"]["buckets"]["included"]["tokens"], [10, 2, 0, 4])
+        self.assertEqual(usage["cost"]["buckets"]["estimated"]["tokens"], [0, 0, 0, 0])
+        self.assertEqual(usage["sessions"][0]["cost_status"], "included")
+        self.assertEqual(usage["sessions"][0]["cost_usd"], 0.0)
+
+    def test_cache_write_ttl_split_is_separated_and_priced(self):
+        self.append([self.assistant(tokens=(10, 2, 0, 100), cache_1h=60)])
+        usage = self.scan(pricing=self.RATES)
+        # The four compatible token axes stay untouched; the 1h share is a new axis.
+        self.assertEqual(usage["totals"]["external"], [10, 2, 0, 100])
+        self.assertEqual(usage["cache_write_1h"]["external"], 60)
+        self.assertEqual(usage["today_cache_write_1h"]["external"], 60)
+        row = usage["sessions"][0]
+        self.assertEqual(row["cache_write_1h"], {"external": 60, "plan": 0})
+        expected = 10 * 0.000003 + 2 * 0.000015 + 40 * 0.00000375 + 60 * 0.000006
+        self.assertAlmostEqual(usage["cost_usd"], expected, places=9)
+        self.assertAlmostEqual(row["cost_usd"], expected, places=9)
+        self.assertEqual(usage["cost"]["cache_write_1h_rate"], "explicit")
+
+    def test_cache_write_1h_falls_back_to_the_standard_rate(self):
+        self.append([self.assistant(tokens=(0, 0, 0, 100), cache_1h=60)])
+        pricing = dict(self.RATES)
+        pricing.pop("cache_write_1h")
+        usage = self.scan(pricing=pricing)
+        self.assertAlmostEqual(usage["cost_usd"], 100 * pricing["cache_write"], places=9)
+        self.assertEqual(usage["cost"]["cache_write_1h_rate"], "fallback")
+
+    def test_cost_buckets_partition_the_totals(self):
+        self.append([self.assistant(message_id="msg_other", tokens=(10, 2, 0, 4), cache_1h=4),
+                     self.assistant(message_id="msg_011ABC", tokens=(5, 1, 2, 3), cache_1h=1)])
+        usage = self.scan(pricing=self.RATES)
+        cost = usage["cost"]
+        self.assertEqual(cost["status"], "estimated")
+        for index in range(4):
+            self.assertEqual(cost["buckets"]["estimated"]["tokens"][index]
+                             + cost["buckets"]["unknown"]["tokens"][index],
+                             usage["totals"]["external"][index])
+            self.assertEqual(cost["buckets"]["included"]["tokens"][index],
+                             usage["totals"]["plan"][index])
+        self.assertEqual(cost["buckets"]["estimated"]["cache_write_1h"]
+                         + cost["buckets"]["included"]["cache_write_1h"],
+                         usage["cache_write_1h"]["external"] + usage["cache_write_1h"]["plan"])
+        self.assertEqual(cost["buckets"]["estimated"]["turns"]
+                         + cost["buckets"]["included"]["turns"], 2)
+
+    def test_a_malformed_ttl_split_is_ignored_safely(self):
+        broken_text = self.assistant(message_id="msg_1", tokens=(1, 1, 0, 10))
+        broken_text["message"]["usage"]["cache_creation"] = "nope"
+        broken_value = self.assistant(message_id="msg_2", tokens=(1, 1, 0, 10))
+        broken_value["message"]["usage"]["cache_creation"] = {"ephemeral_1h_input_tokens": "many"}
+        over_limit = self.assistant(message_id="msg_3", tokens=(1, 1, 0, 10), cache_1h=999)
+        self.append([broken_text, broken_value, over_limit])
+        usage = self.scan(pricing=self.RATES)
+        self.assertEqual(usage["totals"]["external"], [3, 3, 0, 30])
+        # A split above the cache-write total is clamped to it, never exceeding it.
+        self.assertEqual(usage["cache_write_1h"]["external"], 10)
+
+    def test_existing_payload_fields_are_unchanged_for_normal_data(self):
+        self.append([self.assistant(message_id="msg_other",
+                                    tokens=(1_000_000, 1_000_000, 1_000_000, 0)),
+                     self.assistant(message_id="msg_011ABC", tokens=(5, 5, 5, 5))])
+        pricing = {"ok": True, "prompt": 0.00000015, "completion": 0.0000006,
+                   "cache_read": 0.000000003, "cache_write": 0.0000009}
+        usage = self.scan(pricing=pricing)
+        self.assertEqual(usage["totals"]["external"], [1_000_000, 1_000_000, 1_000_000, 0])
+        self.assertEqual(len(usage["sessions"][0]["tokens"]["external"]), 4)
+        self.assertEqual(set(usage["timeline"][-1]["external"]), {"turns", "tokens"})
+        self.assertAlmostEqual(usage["cost_usd"], 0.15 + 0.6 + 0.003, places=6)
+        self.assertAlmostEqual(usage["sessions"][0]["cost_usd"], 0.15 + 0.6 + 0.003, places=6)
+        self.assertEqual(usage["sessions"][0]["cost_status"], "estimated")
+        self.assertEqual(usage["cost"]["cache_write_1h_rate"], "fallback")
+
+    def test_status_report_exposes_cost_provenance(self):
+        with mock.patch.object(dash, "scan_sessions", return_value=dash._empty_usage()), \
+             mock.patch.object(dash, "parse_route_log", return_value=[]):
+            report = dash.status_report(include_usage=True, offline=True)
+        self.assertEqual(report["usage"]["cost"]["status"], "included")
+        self.assertIn("cache_write_1h", report["usage"])
+
+
 class AccountTests(unittest.TestCase):
     def payload(self):
         body = {"data": {"limit": 50, "limit_remaining": 49.5, "limit_reset": "monthly",
