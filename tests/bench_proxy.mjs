@@ -288,7 +288,17 @@ export function verifyMetrics(metrics, expected = {}) {
   return { ok: failures.length === 0, failures };
 }
 
-export function summarizeSoak({ samples = [], counts = null, memory = {}, thresholds = {} } = {}) {
+// Windows can suspend the whole host in the middle of a long soak. performance.now() and
+// the measured window then pause while wall time does not, so the run spans far more wall
+// time than its window and any in-flight sockets die on resume. That is an invalid run,
+// not a proxy failure, and must be reported as such instead of hiding among request errors.
+export function detectSoakInterruption({ wallElapsedMs, windowMs, slackMs = 120000 } = {}) {
+  if (!Number.isFinite(wallElapsedMs) || !Number.isFinite(windowMs)) return null;
+  const excess = wallElapsedMs - windowMs;
+  return excess > slackMs ? { excessMs: Math.round(excess) } : null;
+}
+
+export function summarizeSoak({ samples = [], counts = null, memory = {}, thresholds = {}, wall = null } = {}) {
   // ``samples`` may be a bounded reservoir: ``counts`` carries the exact per-phase totals
   // so the report never confuses "measured" with "sampled".
   const buckets = [0, 1, 2].map(phase => {
@@ -299,6 +309,14 @@ export function summarizeSoak({ samples = [], counts = null, memory = {}, thresh
   });
   const start = memory.start, mid = memory.mid, end = memory.end;
   const failures = [];
+  const interruption = wall
+    ? detectSoakInterruption({ wallElapsedMs: wall.endMs - wall.startMs, windowMs: wall.windowMs,
+        slackMs: wall.slackMs })
+    : null;
+  if (interruption) {
+    failures.push(`soak interrupted: wall clock ${round((wall.endMs - wall.startMs) / 1000)}s ` +
+      `vs ${round((wall.windowMs || 0) / 1000)}s window (host sleep/resume?)`);
+  }
   const growth = { gcAvailable: Boolean(start?.gc && end?.gc), rssGrowthMb: null, heapGrowthMb: null,
     midRssGrowthMb: null, midHeapGrowthMb: null };
   if (start && end && Number.isFinite(start.rss) && Number.isFinite(end.rss)) {
@@ -317,7 +335,8 @@ export function summarizeSoak({ samples = [], counts = null, memory = {}, thresh
     growth.midRssGrowthMb = round((mid.rss - start.rss) / 1048576);
   if (start && mid && growth.gcAvailable && mid.gc)
     growth.midHeapGrowthMb = round((mid.heapUsed - start.heapUsed) / 1048576);
-  return { pass: failures.length === 0, failures, buckets, growth };
+  return { pass: failures.length === 0, failures, buckets, growth,
+    ...(interruption ? { interrupted: true, interruptionMs: interruption.excessMs } : {}) };
 }
 
 export function evaluateVerdict({ correctnessFailures = [], workloads = [], retry = [], soak = null,
@@ -699,6 +718,7 @@ async function runSoak(config) {
     await Promise.all(Array.from({ length: config.soakConcurrency }, warmupLoop));
 
     const startMemory = await worker.sample();
+    const wallStart = Date.now();
     const reservoir = createSampleReservoir();
     const errors = [];
     let sent = 0;
@@ -731,12 +751,14 @@ async function runSoak(config) {
     await load(soakMs / 2, elapsed => elapsed < soakMs / 4 ? 1 : 2);
     await delay(150);
     const endMemory = await worker.sample();
+    const wallEnd = Date.now();
     const report = await worker.report();
     const metrics = await fetchMetrics(worker.port);
     const samples = reservoir.samples();
     const sampleCounts = reservoir.counts();
     const soak = summarizeSoak({ samples, counts: sampleCounts,
       memory: { start: startMemory, mid: midMemory, end: endMemory },
+      wall: { startMs: wallStart, endMs: wallEnd, windowMs: soakMs },
       thresholds: { maxRssGrowthMb: config.maxRssGrowthMb, maxHeapGrowthMb: config.maxHeapGrowthMb } });
     const allFailures = [...soak.failures, ...errors];
     const totalSent = warmupRequests + sent;
@@ -754,6 +776,8 @@ async function runSoak(config) {
       // exact totals, so an hour-long report stays small without hiding how much was sent.
       samplesMs: samples.map(sample => round(sample.wallMs)), sampleCounts, sampleCap: reservoir.cap,
       sampledSamples: samples.length, buckets: soak.buckets, growth: soak.growth,
+      interrupted: Boolean(soak.interrupted),
+      ...(soak.interruptionMs ? { interruptionMs: soak.interruptionMs } : {}),
       memory: { start: startMemory, mid: midMemory, end: endMemory },
       expectation: { hash: expectation.hash, bytes: expectation.bytes }, metricsAttempts: metrics.attempts,
       upstream: report.upstream };

@@ -11,9 +11,9 @@ import { test } from 'node:test';
 import {
   CLIENT_MODEL, EXIT, UsageError, UPSTREAM_MODEL, aggregateProcesses, describeExternalPayload,
   evaluateVerdict, expectedExternalBody, externalPayloadExpectation, fixtureMessage, fixtureSse,
-  SOAK_SAMPLE_CAP, createSampleReservoir, historyPayload, median, parseArgs, percentile,
-  resolveConfig, sizePayload, streamPayload, summarizeSamples, summarizeSoak, validateHttpResponse,
-  verifyMetrics, verifyUpstreamReport,
+  SOAK_SAMPLE_CAP, createSampleReservoir, detectSoakInterruption, historyPayload, median, parseArgs,
+  percentile, resolveConfig, sizePayload, streamPayload, summarizeSamples, summarizeSoak,
+  validateHttpResponse, verifyMetrics, verifyUpstreamReport,
 } from './bench_proxy.mjs';
 
 const sha256 = text => createHash('sha256').update(text).digest('hex');
@@ -448,4 +448,24 @@ test('summarizeSoak reports exact phase counts beside the sampled statistics', (
   const plain = summarizeSoak({ samples: [{ phase: 0, wallMs: 5 }, { phase: 0, wallMs: 7 }] });
   assert.equal(plain.buckets[0].count, 2);
   assert.equal(plain.buckets[0].sampled, undefined);
+});
+
+test('a host suspension is reported as an interrupted soak, not a proxy failure', () => {
+  assert.equal(detectSoakInterruption({ wallElapsedMs: 600_000, windowMs: 600_000 }), null);
+  assert.equal(detectSoakInterruption({ wallElapsedMs: 720_000, windowMs: 600_000 }), null,
+    'slack at the boundary is tolerated');
+  assert.deepEqual(detectSoakInterruption({ wallElapsedMs: 1_000_000, windowMs: 600_000 }),
+    { excessMs: 400_000 });
+  assert.equal(detectSoakInterruption({}), null);
+  const memory = { start: { rss: 100, heapUsed: 1, gc: true }, end: { rss: 110, heapUsed: 1, gc: true } };
+  const soak = summarizeSoak({ samples: [{ phase: 0, wallMs: 5 }], counts: [1, 0, 0], memory,
+    wall: { startMs: 0, endMs: 1_000_000, windowMs: 600_000 } });
+  assert.equal(soak.pass, false);
+  assert.equal(soak.interrupted, true);
+  assert.equal(soak.interruptionMs, 400_000);
+  assert.match(soak.failures.join(' '), /soak interrupted: wall clock 1000s vs 600s window/);
+  const clean = summarizeSoak({ samples: [{ phase: 0, wallMs: 5 }], counts: [1, 0, 0], memory,
+    wall: { startMs: 0, endMs: 600_000, windowMs: 600_000 } });
+  assert.equal(clean.pass, true, 'an uninterrupted run adds no failure');
+  assert.equal(clean.interrupted, undefined);
 });
