@@ -13,6 +13,8 @@ import threading
 
 _guardian = None
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_PROCESS_SET_QUOTA = 0x0100
+_PROCESS_TERMINATE = 0x0001
 _TH32CS_SNAPPROCESS = 0x2
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 # A stuck taskkill must never block launcher shutdown.
@@ -193,31 +195,79 @@ def ensure_windows_local_tree():
     _guardian.stdout.close()
 
 
-def _watch(parent):
-    class BasicLimits(ctypes.Structure):
-        _fields_ = [("process_time", ctypes.c_int64), ("job_time", ctypes.c_int64),
-                    ("flags", wintypes.DWORD), ("min_working_set", ctypes.c_size_t),
-                    ("max_working_set", ctypes.c_size_t), ("active_processes", wintypes.DWORD),
-                    ("affinity", ctypes.c_size_t), ("priority", wintypes.DWORD), ("scheduling", wintypes.DWORD)]
-    class ExtendedLimits(ctypes.Structure):
-        _fields_ = [("basic", BasicLimits), ("io", ctypes.c_uint64 * 6),
-                    ("process_memory", ctypes.c_size_t), ("job_memory", ctypes.c_size_t),
-                    ("peak_process_memory", ctypes.c_size_t), ("peak_job_memory", ctypes.c_size_t)]
-    kernel = _kernel()
+class _BasicLimits(ctypes.Structure):
+    _fields_ = [("process_time", ctypes.c_int64), ("job_time", ctypes.c_int64),
+                ("flags", wintypes.DWORD), ("min_working_set", ctypes.c_size_t),
+                ("max_working_set", ctypes.c_size_t), ("active_processes", wintypes.DWORD),
+                ("affinity", ctypes.c_size_t), ("priority", wintypes.DWORD), ("scheduling", wintypes.DWORD)]
+
+
+class _ExtendedLimits(ctypes.Structure):
+    _fields_ = [("basic", _BasicLimits), ("io", ctypes.c_uint64 * 6),
+                ("process_memory", ctypes.c_size_t), ("job_memory", ctypes.c_size_t),
+                ("peak_process_memory", ctypes.c_size_t), ("peak_job_memory", ctypes.c_size_t)]
+
+
+def _make_kill_on_close_job(kernel):
+    """Return ``(job_handle, failing_step, win32_error)`` for an anonymous kill-on-close job."""
     job = kernel.CreateJobObjectW(None, None)
+    if not job:
+        return None, "CreateJobObjectW", ctypes.get_last_error()
+    limits = _ExtendedLimits()
+    limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE; no breakaway.
+    if not kernel.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+        detail = ctypes.get_last_error()
+        kernel.CloseHandle(job)
+        return None, "SetInformationJobObject", detail
+    return job, None, 0
+
+
+def close_job(job):
+    """Close a job handle; every process still in the job is terminated."""
+    if job:
+        _kernel().CloseHandle(job)
+
+
+def create_job_for(pid):
+    """Put one already-started process in a kill-on-close job and return its handle.
+
+    Closing the handle terminates descendants the process left behind even when its root
+    has exited, which ``taskkill /T`` can no longer find at that point. Returns None on
+    non-Windows or when the job cannot be created/assigned (the caller keeps its existing
+    cleanup path). Assignment after spawn has a small race, but a CLI's children normally
+    start after argument parsing; a failed assignment never leaves an open job behind.
+    """
+    if os.name != "nt" or not isinstance(pid, int) or pid <= 0:
+        return None
+    kernel = _kernel()
+    job, step, detail = _make_kill_on_close_job(kernel)
+    if not job:
+        return None
+    handle = kernel.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE | _PROCESS_QUERY_LIMITED_INFORMATION,
+                                False, pid)
+    if not handle:
+        kernel.CloseHandle(job)
+        return None
     try:
-        limits = ExtendedLimits()
-        limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE; no breakaway.
-        step, detail = None, 0
+        if not kernel.AssignProcessToJobObject(job, handle):
+            kernel.CloseHandle(job)
+            return None
+        return job
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def _watch(parent):
+    kernel = _kernel()
+    job, step, detail = _make_kill_on_close_job(kernel)
+    try:
         if not job:
-            step, detail = "CreateJobObjectW", ctypes.get_last_error()
-        elif not kernel.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
-            step, detail = "SetInformationJobObject", ctypes.get_last_error()
-        elif not kernel.AssignProcessToJobObject(job, parent):
-            step, detail = "AssignProcessToJobObject", ctypes.get_last_error()
-        if step:
             # Name the failing call: "check permissions" alone cannot be acted on.
             print(json.dumps({"ready": False, "step": step, "error": detail}), flush=True)
+            return 1
+        if not kernel.AssignProcessToJobObject(job, parent):
+            print(json.dumps({"ready": False, "step": "AssignProcessToJobObject",
+                              "error": ctypes.get_last_error()}), flush=True)
             return 1
         print(json.dumps({"ready": True}), flush=True)
         return 0 if kernel.WaitForSingleObject(parent, 0xFFFFFFFF) == 0 else 1

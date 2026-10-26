@@ -2240,6 +2240,11 @@ async function loadConfig() {
     if (typeof renderSettings === 'function') renderSettings(true);
   } catch (error) { /* keep the previous view */ }
 }
+Object.assign(TEST_TEXT, {
+  binary_unc_refused: 'UNC 경로 실행 파일은 허용하지 않습니다',
+  binary_symlink_refused: '심볼릭 링크 실행 파일은 허용하지 않습니다',
+  temp_failed: '임시 폴더를 만들 수 없습니다',
+});
 """)
 
 DASHBOARD_BODY = "\n  <div class=\"alerts\" id=\"alerts\"></div>\n\n  <div class=\"section-title\"><h2>\uc0c1\ud0dc</h2><span class=\"line\"></span></div>\n  <div class=\"grid\" id=\"grid\"></div>\n\n  <div class=\"section-title\"><h2>\ub3c4\uc6c0\ub9d0</h2><span class=\"line\"></span></div>\n  <div class=\"grid\" id=\"help\"></div>\n"

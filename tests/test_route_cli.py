@@ -270,6 +270,12 @@ class RunSafely(FakeCase):
         self.assertLessEqual(len(result["stdout"]), 1 << 20)
         self.assertLess(result["elapsed_ms"], 8000)
 
+    def test_a_detached_grandchild_is_cleaned_up_when_the_run_ends(self):
+        result = self.run_fake("spawn_child")
+        self.assertEqual(result["exit_code"], 0)
+        pid = int(side_file("gpid.txt").read_text())
+        self.assertTrue(wait_gone(pid, 2), "closing the diagnostic job must kill a detached grandchild")
+
     def test_inherited_handles_do_not_hang(self):
         made = []
         real = tempfile.mkdtemp
@@ -349,8 +355,11 @@ class ConnectionTest(FakeCase):
 
     def test_validation_reasons(self):
         for binary, code in ((r"relative\codex.exe", "binary_not_absolute"), (str(SHIM_DIR / "codex-evil.exe"), "binary_name_mismatch"),
-                             (str(SHIM_DIR / "gone" / "codex.exe"), "binary_not_found")):
+                             (str(SHIM_DIR / "gone" / "codex.exe"), "binary_not_found"),
+                             (r"\\server\share\codex.exe", "binary_unc_refused")):
             self.assertEqual(rc.connection_test("codex", binary=binary)["reason"], code)
+        with mock.patch.object(rc.os.path, "islink", return_value=True):
+            self.assertEqual(rc.connection_test("codex", binary=str(CMD))["reason"], "binary_symlink_refused")
         bad = SHIM_DIR.parent / "bad" / "codex.cmd"
         bad.parent.mkdir(exist_ok=True)
         bad.write_text("@echo hi\r\n")

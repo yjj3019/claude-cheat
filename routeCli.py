@@ -46,12 +46,18 @@ def validate_binary(kind, path):
         raise CliError("binary_name_mismatch")
     if not isinstance(path, str) or not path or "\0" in path or not os.path.isabs(path):
         raise CliError("binary_not_absolute")
+    if path.startswith(("\\\\", "//")):
+        # A pinned UNC target would run code from (and authenticate to) a remote share.
+        raise CliError("binary_unc_refused")
     path = os.path.normpath(path)
     stem, ext = os.path.splitext(os.path.basename(path))
     if stem.lower() != kind or ext.lower() not in (".exe", ".cmd", ""):
         raise CliError("binary_name_mismatch")
     if not os.path.isfile(path):
         raise CliError("binary_not_found")
+    if os.path.islink(path):
+        # The link name can match while the target is any executable; a hard link still can.
+        raise CliError("binary_symlink_refused")
     return path
 
 
@@ -164,6 +170,7 @@ def run_safely(argv, *, stdin_text=None, cwd, env, timeout, max_bytes=1048576):
     out_path, err_path = os.path.join(tmp, "out"), os.path.join(tmp, "err")
     started = time.monotonic()
     timed_out = truncated = False
+    job = None
     try:
         in_path = os.path.join(tmp, "in")
         Path(in_path).write_bytes((stdin_text or "").encode("utf-8"))
@@ -173,6 +180,9 @@ def run_safely(argv, *, stdin_text=None, cwd, env, timeout, max_bytes=1048576):
                                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             except (OSError, ValueError):
                 raise CliError("spawn_failed") from None
+        # Own the diagnostic's tree from here: closing this job kills children the CLI leaves
+        # behind even when its root exits first (taskkill /T cannot find the tree after that).
+        job = localProcessTree.create_job_for(process.pid)
         identity = localProcessTree.process_identity(process.pid)
         while process.poll() is None:
             if time.monotonic() - started > timeout:
@@ -197,6 +207,8 @@ def run_safely(argv, *, stdin_text=None, cwd, env, timeout, max_bytes=1048576):
                 "truncated": truncated or size > max_bytes, "elapsed_ms": int((time.monotonic() - started) * 1000),
                 "stdout": stdout, "stderr_len": os.path.getsize(err_path), "stderr_head": stderr_head}
     finally:
+        if job:
+            localProcessTree.close_job(job)
         _rmtree(tmp)
 
 
