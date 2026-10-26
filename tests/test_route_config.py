@@ -2,6 +2,8 @@
 import importlib.util
 import os
 import random
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -195,7 +197,9 @@ class StoreTests(unittest.TestCase):
         self.tmp = self.enterContext(tempfile.TemporaryDirectory())
 
     def names(self):
-        return sorted(p.name for p in Path(self.tmp).iterdir())
+        # The cross-process save lock is a sibling dot-file, not a settings artifact.
+        lock = "." + cfg.CONFIG_NAME + ".lock"
+        return sorted(p.name for p in Path(self.tmp).iterdir() if p.name != lock)
 
     def test_reads_environment_style_names(self):
         store = make_store(self.tmp, **{"openclaude.config.yaml": VALID})
@@ -315,7 +319,9 @@ class StoreTests(unittest.TestCase):
             store = make_store(tmp, **{".env.openrouter": "OPENROUTER_MODEL=vendor/old\n", ".env.local-llm": bad})
             with self.assertRaises(cfg.ConfigError):
                 store.write_provider("openrouter", {"OPENROUTER_MODEL": "vendor/new"})
-            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), [".env.local-llm", ".env.openrouter"])
+            # The save lock is a dot-file; no settings file may appear when migration refuses.
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir() if not p.name.endswith(".lock")),
+                             [".env.local-llm", ".env.openrouter"])
 
     def test_legacy_parsing_keeps_the_launchers_strict_meaning(self):
         store = make_store(self.tmp, **{".env.local-llm": "LOCAL_LLM_API_KEY=abc'\n"})
@@ -389,6 +395,38 @@ class StoreTests(unittest.TestCase):
         self.assertFalse([n for n in self.names() if n.endswith(".tmp")])
         # the untouched keys survived every write
         self.assertEqual(store.read_provider("openrouter")["ANTHROPIC_AUTH_TOKEN"], "sk-or-v1-abcdefghijkl")
+
+    def test_saves_from_two_processes_are_serialised(self):
+        # Two dashboards on different ports can save at once; the in-process lock cannot
+        # order them, so a lock file must (otherwise one update is lost or a replace fails).
+        make_store(self.tmp, **{"openclaude.config.yaml": VALID})
+        config = Path(self.tmp) / "openclaude.config.yaml"
+        root = Path(__file__).resolve().parents[1]
+        template = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            f"sys.path.insert(0, {str(root)!r})\n"
+            "import routeConfig\n"
+            f"store = routeConfig.Store(Path({str(config)!r}))\n"
+            "for index in range(25):\n"
+            "    store.write_provider(" + repr("{PROVIDER}") + ", {" + repr("{NAME}") +
+            ": 'value-%d' % index})\n")
+        workers = []
+        for provider, name in (("openrouter", "OPENROUTER_MODEL"), ("local", "LOCAL_LLM_MODEL")):
+            path = Path(self.tmp) / f"worker-{provider}.py"
+            path.write_text(template.replace("{PROVIDER}", provider).replace("{NAME}", name),
+                            encoding="utf-8")
+            workers.append(subprocess.Popen([sys.executable, str(path)], cwd=str(root),
+                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True))
+        results = [worker.communicate(timeout=120) for worker in workers]
+        for worker, (_out, error) in zip(workers, results):
+            self.assertEqual(worker.returncode, 0, error[-600:])
+        store = cfg.Store(config)
+        self.assertEqual(store.read_provider("openrouter")["OPENROUTER_MODEL"], "value-24")
+        self.assertEqual(store.read_provider("local")["LOCAL_LLM_MODEL"], "value-24")
+        self.assertEqual(store.read_provider("openrouter")["ANTHROPIC_AUTH_TOKEN"], "sk-or-v1-abcdefghijkl")
+        self.assertFalse([n for n in self.names() if n.endswith(".tmp")])
+        self.assertTrue((Path(self.tmp) / (".openclaude.config.yaml.lock")).is_file())
 
 
 try:

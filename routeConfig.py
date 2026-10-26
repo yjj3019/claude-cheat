@@ -19,6 +19,7 @@ Callers keep using the historical environment-style names (``OPENROUTER_MODEL`` 
 mapping to YAML keys lives in ``SECTIONS``. A service that has no section yet falls back,
 read-only, to its legacy dotenv file (``.env.openrouter`` / ``.env.local-llm``).
 """
+import contextlib
 import os
 import random
 import re
@@ -334,7 +335,7 @@ class Store:
             if name not in names:
                 raise ConfigError("unknown_key")
             yaml_updates[names[name]] = value
-        with _WRITE_LOCK:
+        with _WRITE_LOCK, self._cross_process_lock():
             # Re-read inside the lock so a concurrent save is never overwritten with stale text.
             original = self._read_text()
             if original is None:
@@ -346,6 +347,60 @@ class Store:
                 text = original
             text = update_text(text, provider, yaml_updates)
             self._atomic_write(text, original)
+
+    @contextlib.contextmanager
+    def _cross_process_lock(self, timeout=10.0):
+        """Serialise saves across dashboard processes, not only across threads.
+
+        Two dashboards on different ports (``--allow-port-fallback``) can save at the same
+        time. An in-process lock alone lets both read the same text and replace it, which
+        either loses one service's update or makes a replace fail with sharing contention.
+        The lock lives in a sibling dot-file so it never looks like a settings file; git
+        ignores it. If the lock file cannot be created at all, saving still proceeds (the
+        single-dashboard case is the normal one) rather than turning a permission problem
+        into a new failure mode.
+        """
+        lock_path = self.path.with_name("." + self.path.name + ".lock")
+        try:
+            handle = open(lock_path, "a+b")
+        except OSError:
+            yield
+            return
+        acquired = False
+        try:
+            if os.name == "nt":
+                import msvcrt
+                handle.seek(0, os.SEEK_END)
+                if handle.tell() == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                deadline = time.monotonic() + timeout
+                while True:
+                    try:
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                        acquired = True
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            raise ConfigError("config_busy") from None
+                        time.sleep(0.02)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                acquired = True
+            yield
+        finally:
+            if acquired:
+                try:
+                    if os.name == "nt":
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            handle.close()
 
     def _seed(self):
         """Text for a first save: the shipped example, plus every service's legacy values."""
