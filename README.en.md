@@ -327,12 +327,12 @@ Settings live on a **separate page** (`http://127.0.0.1:8787/settings`) reached 
 
 | Behaviour | Detail |
 | --- | --- |
-| Save | Only the managed keys change; comments and unrelated entries stay, and the previous file is kept as `openclaude.config.yaml.bak`. An unreadable file (encoding or syntax error) or a clashing save is never overwritten; you get an error code and line number instead |
+| Save | Only the managed keys change; other comments, sections, line endings (CRLF) and a byte-order mark stay, and the previous file is kept **byte-for-byte** as `openclaude.config.yaml.bak`. When a service has no section yet and its deprecated `.env` still holds values, the new section is seeded with them so a stored credential is not silently shadowed. Concurrent saves are serialised by a lock file; an unreadable file (encoding or syntax error) is never overwritten and reports a code and line number |
 | Secrets | Never sent back to the browser (`sk-or-…cd0` style). Leaving the field empty keeps the stored value; only a new value replaces it |
-| Server addresses | The Messages, HTTP-exception and model-list URLs are masked like keys (`http://12•••••.1:11434/v1/messages`: only the first and last two host characters, `user:pass@` and queries hidden). The original is never sent to the browser; empty keeps it |
+| Server addresses | The Messages, HTTP-exception and model-list URLs are masked like keys (`http://12•••••.1:11434/v1/messages`: only the first and last two host characters, `user:pass@` and queries hidden; a non-standard custom path becomes `/•••`). The original is never sent to the browser; empty keeps it |
 | Clear | Optional addresses (HTTP exception, model list) are erased with the **Clear** button (the `clear` list of `POST /api/config`). Required fields and keys cannot be cleared |
 | Validation | Model ID shape, key shape and Local URL rules (loopback, HTTPS, same origin) are checked before writing; a failure leaves the file untouched |
-| Protection | POST requires the session token embedded in the page and a same-origin request, so other sites cannot call it |
+| Protection | Both reading settings (`GET /api/config`) and saving them require the session token embedded in the page; POST also requires a same-origin request, so other sites cannot call it |
 | Tests | **Model check** reads the model list only; **inference test** sends one 16-token request (may cost a small amount) |
 | Model picker | **목록** opens a searchable list with context length and price and fills the field. `GET /api/models?provider=openrouter\|local` (session token required, 10 minute cache) |
 | When it applies | Saved settings take effect in the **next** session; restart a running one |
