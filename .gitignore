@@ -20,3 +20,6 @@ SESSION_LOG.md
 .usage-cache.json
 .usage-cache.json.tmp
 .bench/
+openclaude.config.yaml
+openclaude.config.yaml.*
+.openclaude.config.yaml.*
