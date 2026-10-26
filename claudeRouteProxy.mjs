@@ -181,6 +181,21 @@ if (routeLogPath) {
 export const DEEPSEEK = 'deepseek/deepseek-v4.1-flash-1017';
 const isPro = model => typeof model === 'string' && /^claude-(opus|haiku|fable)-[0-9][a-zA-Z0-9.-]*$/.test(model);
 const isSonnet = model => typeof model === 'string' && /^claude-sonnet-[0-9][a-zA-Z0-9.-]*$/.test(model);
+// Measurement only: coarse request shape (booleans/enums, never content or identifiers).
+const modelFamily = model => isSonnet(model) ? 'sonnet' : isPro(model) ? model.split('-')[1] : 'other';
+function requestShape(body) {
+  let tool_blocks = false, media = false;
+  for (const message of body.messages) {
+    if (!Array.isArray(message && message.content)) continue;
+    for (const block of message.content) {
+      const type = block && block.type;
+      if (type === 'tool_use' || type === 'tool_result') tool_blocks = true;
+      else if (type !== 'text' && type !== 'thinking' && type !== 'redacted_thinking') media = true;
+      if (tool_blocks && media) return { tool_blocks, media };
+    }
+  }
+  return { tool_blocks, media };
+}
 const validOpenRouterModel = model => typeof model === 'string' && /^[A-Za-z0-9~@][A-Za-z0-9._:/@+~-]{0,255}$/.test(model) && !/^(REPLACE_WITH_|YOUR_)/.test(model);
 const SEGMENT = String.raw`(?:[A-Za-z0-9_\-~:@+][A-Za-z0-9_\-.~:@+]{0,199}|\.[A-Za-z0-9_\-~:@+][A-Za-z0-9_\-.~:@+]{0,198}|\.\.[A-Za-z0-9_\-.~:@+]{1,198})`;
 const PATTERNS = new Map([
@@ -959,6 +974,13 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       try { body = JSON.parse(raw.toString('utf8')); } catch { return reject(400, 'Invalid JSON'); }
       if (!body || typeof body !== 'object' || Array.isArray(body)) return reject(403, 'Unsupported request fields');
       const model = body.model;
+      // Only sessions with a route log record the shape; it is a measurement, not routing input.
+      if (routeLogPath) {
+        try {
+          logEvent({ event: 'request_shape', family: modelFamily(model), tools: Array.isArray(body.tools) && body.tools.length > 0,
+            ...requestShape(body), stream: body.stream === true });
+        } catch {}
+      }
       // Everything from here to the response is a routed request; count it once.
       const startedAt = performance.now();
       let firstByteMs = null;

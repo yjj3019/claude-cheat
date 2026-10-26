@@ -247,3 +247,17 @@ test('fields marked for clearing are sent as an explicit clear list', async () =
   assert.match(html, /id="cfg-local-LOCAL_LLM_MODELS_URL"[^>]*disabled/);
   assert.match(html, /data-clear="local:LOCAL_LLM_MODELS_URL">취소</);
 });
+
+test('the request-shape card shows an empty state and then the text-only candidates', () => {
+  const empty = render(fixture()).get('grid').innerHTML;
+  assert.match(empty, /요청 구성/);
+  assert.match(empty, /데이터 없음/);
+  const base = fixture();
+  const shapes = { total: 10, by_family: { sonnet: { no_tools: 2, tools: 3 }, haiku: { no_tools: 5, tools: 0 } },
+    text_only: { sonnet: 2, haiku: 4 } };
+  const html = render(fixture({ routing: { ...base.routing, shapes } })).get('grid').innerHTML;
+  assert.match(html, /10건/);
+  assert.match(html, /텍스트만 Sonnet 2건, 텍스트만 Haiku 4건/);
+  assert.match(html, /<td>Sonnet<\/td><td class="num">2<\/td><td class="num">3<\/td>/);
+  assert.doesNotMatch(html, /데이터 없음. OpenRouter 세션/);
+});

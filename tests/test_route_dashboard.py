@@ -1559,6 +1559,74 @@ class SnapshotTests(unittest.TestCase):
         self.assertRegex(usage["current_hour"], r"^\d{4}-\d{2}-\d{2}T\d{2}$")
 
 
+class RequestShapeTests(unittest.TestCase):
+    """request_shape events say what a request looks like, never what it says."""
+
+    def event(self, now, minutes_ago=1, **fields):
+        stamp = (now - timedelta(minutes=minutes_ago)).isoformat()
+        return {"ts": stamp, "event": "request_shape", **fields}
+
+    def test_counts_by_family_with_text_only_candidates(self):
+        now = datetime.now(timezone.utc)
+        events = [
+            self.event(now, family="sonnet", tools=True, tool_blocks=False, media=False, stream=True),
+            self.event(now, family="sonnet", tools=False, tool_blocks=False, media=False, stream=True),
+            self.event(now, family="sonnet", tools=False, tool_blocks=True, media=False, stream=True),
+            self.event(now, family="haiku", tools=False, tool_blocks=False, media=False, stream=False),
+            self.event(now, family="haiku", tools=False, tool_blocks=False, media=True, stream=False),
+            self.event(now, family="opus", tools=True, tool_blocks=True, media=False, stream=True),
+        ]
+        shapes = dash.routing_state(events, now=now)["shapes"]
+        self.assertEqual(shapes["total"], 6)
+        self.assertEqual(shapes["by_family"]["sonnet"], {"no_tools": 2, "tools": 1})
+        self.assertEqual(shapes["by_family"]["haiku"], {"no_tools": 2, "tools": 0})
+        self.assertEqual(shapes["by_family"]["opus"], {"no_tools": 0, "tools": 1})
+        # a tool_result block or an image makes a request unfit for a text-only backend
+        self.assertEqual(shapes["text_only"], {"sonnet": 1, "haiku": 1})
+
+    def test_old_events_unknown_families_and_non_boolean_flags(self):
+        now = datetime.now(timezone.utc)
+        events = [
+            self.event(now, minutes_ago=dash.ROUTE_WINDOW + 5, family="sonnet", tools=False),
+            self.event(now, family="gemini", tools=False, tool_blocks=False, media=False),
+            self.event(now, family="sonnet", tools="true", tool_blocks="yes", media=1),
+            self.event(now),  # fields missing entirely
+        ]
+        shapes = dash.routing_state(events, now=now)["shapes"]
+        self.assertEqual(shapes["total"], 3)  # the old one is outside the window
+        self.assertEqual(shapes["by_family"]["other"], {"no_tools": 2, "tools": 0})
+        # only literal booleans count as true: the string and integer flags do not
+        self.assertEqual(shapes["by_family"]["sonnet"], {"no_tools": 1, "tools": 0})
+        self.assertEqual(shapes["text_only"], {"other": 2, "sonnet": 1})
+
+    def test_without_the_events_the_totals_are_zero_and_routing_is_unaffected(self):
+        now = datetime.now(timezone.utc)
+        selected = {"ts": (now - timedelta(seconds=5)).isoformat(), "event": "route_selected",
+                    "provider": "openrouter", "reason": "replacement", "model": "vendor/model"}
+        state = dash.routing_state([selected], now=now)
+        self.assertEqual(state["shapes"], {"total": 0, "by_family": {}, "text_only": {}})
+        self.assertEqual(state["state"], "external")
+        with_shape = dash.routing_state([selected, self.event(now, family="sonnet", tools=True)], now=now)
+        self.assertEqual(with_shape["state"], "external")
+        self.assertEqual(with_shape["counts"], state["counts"])
+
+    def test_they_do_not_flood_the_recent_event_list(self):
+        now = datetime.now(timezone.utc)
+        selected = {"ts": (now - timedelta(seconds=30)).isoformat(), "event": "route_selected",
+                    "provider": "plan", "reason": "native_feature"}
+        events = [selected] + [self.event(now, family="sonnet", tools=True) for _ in range(40)]
+        recent = dash.routing_state(events, now=now)["recent"]
+        self.assertEqual([row["event"] for row in recent], ["route_selected"])
+
+    def test_the_status_report_exposes_the_shapes(self):
+        now = datetime.now(timezone.utc)
+        events = [self.event(now, family="sonnet", tools=False, tool_blocks=False, media=False)]
+        with mock.patch.object(dash, "parse_route_log", return_value=events), \
+                mock.patch.object(dash, "read_settings", return_value={"OPENROUTER_MODEL": "vendor/model"}):
+            report = dash.status_report(offline=True)
+        self.assertEqual(report["request_shapes"]["text_only"], {"sonnet": 1})
+
+
 class UrlMaskingTests(unittest.TestCase):
     """Server addresses are masked like keys; optional ones can still be cleared on purpose."""
 
