@@ -126,3 +126,88 @@ test('idle routing renders without an insight list', () => {
   assert.match(nodes.get('grid').innerHTML, /조치할 항목 없음/);
   assert.equal(nodes.get('alerts').innerHTML, '');
 });
+
+// ---- settings page: one service form at a time, chosen from a select box ----
+
+function settingsBundle() {
+  const grab = name => {
+    const matches = [...SOURCE.matchAll(new RegExp(`^${name}\\s*(?:\\+=|=)\\s*(".*")$`, 'gm'))];
+    assert.ok(matches.length, `${name} not found in routeDashboard.py`);
+    return matches.map(match => JSON.parse(match[1])).join('\n');
+  };
+  return grab('JS_SHARED') + '\n' + grab('JS_SETTINGS');
+}
+
+const READY_OPENROUTER = { fields: {
+  OPENROUTER_MODEL: { value: 'vendor/model', set: true },
+  ANTHROPIC_AUTH_TOKEN: { secret: true, set: true, preview: 'sk-or-…abcd', value: '' } } };
+const READY_LOCAL = { fields: {
+  LOCAL_LLM_URL: { value: 'http://127.0.0.1:11434/v1/messages', set: true },
+  LOCAL_LLM_MODEL: { value: 'llama', set: true } } };
+
+async function settingsPage({ config, store = new Map(), blockedStorage = false } = {}) {
+  const context = buildContext();
+  const handlers = {};
+  const select = context.document.getElementById('provider-select');
+  select.addEventListener = (type, handler) => { handlers[type] = handler; };
+  context.fetch = async () => ({ json: async () => config });
+  context.localStorage = blockedStorage
+    ? { getItem() { throw new Error('blocked'); }, setItem() { throw new Error('blocked'); } }
+    : { getItem: key => (store.has(key) ? store.get(key) : null), setItem: (key, value) => store.set(key, value) };
+  const sandbox = { ...context, globalThis: null };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(settingsBundle(), sandbox, { filename: 'settings.js' });
+  await new Promise(resolve => setImmediate(resolve));
+  return { nodes: context.nodes, select, handlers, store };
+}
+
+const visible = nodes => ['openrouter', 'local'].filter(name => !nodes.get(`card-${name}`).hidden);
+
+test('settings show only the service that still needs configuration', async () => {
+  const page = await settingsPage({ config: { openrouter: READY_OPENROUTER, local: { fields: {} } } });
+  assert.deepEqual(visible(page.nodes), ['local']);
+  assert.match(page.select.innerHTML, /value="local" selected/);
+});
+
+test('settings default to OpenRouter when every service is configured', async () => {
+  const page = await settingsPage({ config: { openrouter: READY_OPENROUTER, local: READY_LOCAL } });
+  assert.deepEqual(visible(page.nodes), ['openrouter']);
+});
+
+test('the last selection survives a reload', async () => {
+  const store = new Map([['openclaude.provider', 'local']]);
+  const page = await settingsPage({ config: { openrouter: READY_OPENROUTER, local: READY_LOCAL }, store });
+  assert.deepEqual(visible(page.nodes), ['local']);
+});
+
+test('changing the select switches the visible form without re-rendering it', async () => {
+  const page = await settingsPage({ config: { openrouter: READY_OPENROUTER, local: READY_LOCAL } });
+  const before = page.nodes.get('settings').innerHTML;
+  page.select.value = 'local';
+  page.handlers.change();
+  assert.deepEqual(visible(page.nodes), ['local']);
+  assert.equal(page.store.get('openclaude.provider'), 'local');
+  assert.equal(page.nodes.get('settings').innerHTML, before);
+  // both forms stay in the DOM, so values typed into the hidden one are not lost
+  assert.match(before, /id="card-openrouter"/);
+  assert.match(before, /id="card-local"/);
+});
+
+test('an unknown select value is ignored', async () => {
+  const page = await settingsPage({ config: { openrouter: READY_OPENROUTER, local: READY_LOCAL } });
+  page.select.value = 'nope';
+  page.handlers.change();
+  assert.deepEqual(visible(page.nodes), ['openrouter']);
+});
+
+test('options show whether each service is configured, and blocked storage is tolerated', async () => {
+  const page = await settingsPage({
+    config: { openrouter: READY_OPENROUTER, local: { fields: {} } }, blockedStorage: true });
+  assert.match(page.select.innerHTML, /OpenRouter · 설정됨/);
+  assert.match(page.select.innerHTML, /Local LLM · 설정 필요/);
+  assert.deepEqual(visible(page.nodes), ['local']);
+  page.select.value = 'openrouter';
+  assert.doesNotThrow(() => page.handlers.change());
+  assert.deepEqual(visible(page.nodes), ['openrouter']);
+});

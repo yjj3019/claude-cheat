@@ -680,6 +680,14 @@ class PageTests(unittest.TestCase):
             self.assertIn('href="/"', page)
             self.assertIn('href="/settings"', page)
 
+    def test_settings_page_offers_one_service_select_and_dashboard_does_not(self):
+        self.assertIn('id="provider-select"', dash.SETTINGS_PAGE)
+        self.assertEqual(dash.SETTINGS_PAGE.count('id="provider-select"'), 1)
+        self.assertNotIn('id="provider-select"', dash.PAGE)
+        # one select, not a card per service side by side
+        self.assertNotIn('class="card col-6" id="card-', self.scripts()["settings"])
+        self.assertIn(".card[hidden]{display:none}", dash.SETTINGS_PAGE)
+
     def test_routes_serve_the_matching_page(self):
         import threading
         import urllib.error
