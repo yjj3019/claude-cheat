@@ -60,6 +60,36 @@ class OpenRouterConfigTests(unittest.TestCase):
         self.assertIn("OpenClaudeDashboard.ps1", message)
         self.assertIn("127.0.0.1:8787", message)
 
+    def write_yaml(self, text):
+        (self.root / "openclaude.config.yaml").write_text(text, encoding="utf-8")
+
+    def test_settings_are_read_from_the_unified_file(self):
+        self.write_yaml('openrouter:\n  model: "vendor/yaml-model"\n  api_key: "sk-or-synthetic-key"\n')
+        self.assertEqual(route.provider_config("openrouter"), {"SONNET_PROVIDER": "openrouter",
+            "OPENROUTER_API_KEY": "sk-or-synthetic-key", "OPENROUTER_MODEL": "vendor/yaml-model"})
+
+    def test_the_unified_file_wins_over_a_legacy_file_for_the_same_service(self):
+        self.write("vendor/legacy-model")
+        self.write_yaml('openrouter:\n  model: "vendor/yaml-model"\n  api_key: "sk-or-synthetic-key"\n')
+        self.assertEqual(route.provider_config("openrouter")["OPENROUTER_MODEL"], "vendor/yaml-model")
+
+    def test_a_file_with_only_another_service_still_reads_the_legacy_openrouter_file(self):
+        self.write("vendor/legacy-model")
+        self.write_yaml('local:\n  model: "m"\n')
+        self.assertEqual(route.provider_config("openrouter")["OPENROUTER_MODEL"], "vendor/legacy-model")
+
+    def test_a_broken_unified_file_is_a_sanitized_config_error(self):
+        self.write_yaml('openrouter:\n  model: "vendor/m"\n  api_key: sk-or-synthetic-key\n  extra: &anchor 1\n')
+        with self.assertRaises(route.OpenRouterConfigError) as caught:
+            route.provider_config("openrouter")
+        self.assertNotIn("sk-or-synthetic-key", str(caught.exception))
+        self.assertIn("openclaude.config.yaml", str(caught.exception))
+
+    def test_an_undecodable_unified_file_is_a_config_error_not_a_crash(self):
+        (self.root / "openclaude.config.yaml").write_bytes(b'openrouter:\n  model: "\xff"\n')
+        with self.assertRaises(route.OpenRouterConfigError):
+            route.provider_config("openrouter")
+
     def test_launcher_config_failure_prints_setup_guidance(self):
         with mock.patch.object(route, "launch", side_effect=route.OpenRouterConfigError()), \
              contextlib.redirect_stderr(io.StringIO()) as stderr:

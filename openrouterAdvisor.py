@@ -19,6 +19,7 @@ import threading
 import time
 import argparse
 import localProcessTree
+import routeConfig
 from urllib.parse import urlsplit, urlunsplit
 import urllib.request
 import urllib.error
@@ -31,7 +32,7 @@ LOCAL_STARTUP_MESSAGES = {
     "local_node_not_found": "Node.js executable not found. Install it or check PATH, then restart Local mode.",
     "local_cli_unsupported": "Local CLI mode requires Claude Code 2.1.304 or later. Check claude --version.",
     "local_cli_version_check_failed": "Could not check Claude Code version. Run claude --version and check executable permissions.",
-    "local_configuration_invalid": "Invalid Local configuration. Check .env.local-llm and process environment: Messages URL, HTTP approval, model, key format, and same-origin model-list URL. Values hidden.",
+    "local_configuration_invalid": "Invalid Local configuration. Check openclaude.config.yaml and process environment: Messages URL, HTTP approval, model, key format, and same-origin model-list URL. Values hidden.",
     "local_output_budget_invalid": "Local output budget must be a positive integer. Check CLAUDE_CODE_MAX_OUTPUT_TOKENS.",
     "local_proxy_start_failed": "Local routing proxy did not start. Check Node.js, proxy files, and loopback permissions, then restart Local mode.",
     "local_cli_start_failed": "Could not start Claude Code. Check executable permissions and restart Local mode.",
@@ -54,31 +55,26 @@ class OpenRouterStartupError(LocalStartupError):
 class OpenRouterConfigError(ValueError):
     def __init__(self):
         super().__init__(
-            "Set a valid ANTHROPIC_AUTH_TOKEN and OPENROUTER_MODEL in .env.openrouter beside openrouterAdvisor.py. "
+            "Set a valid ANTHROPIC_AUTH_TOKEN and OPENROUTER_MODEL in openclaude.config.yaml "
+            "(openrouter: api_key, model) beside openrouterAdvisor.py. "
             "No default model is selected. Values hidden. "
-            "Or run OpenClaudeDashboard.ps1, open http://127.0.0.1:8787/ and fill the OpenRouter settings there.")
+            "Or run OpenClaude.ps1 -Setup (OpenClaudeDashboard.ps1), open http://127.0.0.1:8787/ "
+            "and fill the OpenRouter settings there.")
 
 
 def read_env(path: Path) -> dict:
-    # shortcut: single-line KEY=VALUE only; add a dotenv library if multiline values are needed.
-    values = {}
-    for line in path.read_text(encoding="utf-8-sig").splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        match = re.fullmatch(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)", line)
-        if not match:
-            raise ValueError("Invalid provider environment entry; value hidden")
-        name, value = match.groups()
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        values[name] = value
-    return values
+    """Legacy single-line KEY=VALUE reader (strict); kept for the deprecated .env.* files."""
+    return routeConfig.read_legacy(path)
+
+
+def settings(provider: str) -> dict:
+    """One service's stored settings from openclaude.config.yaml, else its legacy .env file."""
+    return routeConfig.Store(ROOT / routeConfig.CONFIG_NAME).read_provider(provider)
 
 
 def read_key(values: dict | None = None) -> str:
     if values is None:
-        values = read_env(ROOT / ".env.openrouter")
+        values = settings("openrouter")
     token = values.get("ANTHROPIC_AUTH_TOKEN", "")
     if not re.fullmatch(r"sk-or-[A-Za-z0-9_-]+", token):
         raise ValueError("Invalid OpenRouter ANTHROPIC_AUTH_TOKEN; value hidden")
@@ -105,7 +101,7 @@ def local_endpoint(url: str, allow_remote: bool, http_url: str = "") -> tuple:
 def provider_config(provider: str, require_model: bool = True) -> dict:
     if provider == "openrouter":
         try:
-            values = read_env(ROOT / ".env.openrouter")
+            values = settings("openrouter")
             model = values.get("OPENROUTER_MODEL", "").strip()
             if not re.fullmatch(r"[A-Za-z0-9~@][A-Za-z0-9._:/@+~-]{0,255}", model) or model.startswith(("REPLACE_WITH_", "YOUR_")):
                 raise ValueError("Invalid OpenRouter model")
@@ -114,8 +110,7 @@ def provider_config(provider: str, require_model: bool = True) -> dict:
             raise OpenRouterConfigError() from None
     if provider != "local":
         raise ValueError("Unknown Sonnet provider")
-    path = ROOT / ".env.local-llm"
-    values = read_env(path) if path.is_file() else {}
+    values = settings("local")
     values = {**values, **{name: os.environ[name] for name in
               ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL") if name in os.environ}}
     url = values.get("LOCAL_LLM_URL", "http://127.0.0.1:11434/v1/messages")
@@ -126,7 +121,7 @@ def provider_config(provider: str, require_model: bool = True) -> dict:
     parsed, origin = local_endpoint(url, remote == "true", http_url)
     model = values.get("LOCAL_LLM_MODEL", "").strip()
     if (require_model and not model) or any(ord(char) < 32 for char in model):
-        raise ValueError("Set LOCAL_LLM_MODEL in .env.local-llm or the process environment")
+        raise ValueError("Set LOCAL_LLM_MODEL in openclaude.config.yaml (local: model) or the process environment")
     key = values.get("LOCAL_LLM_API_KEY", "")
     if any(ord(char) < 32 or ord(char) == 127 for char in key):
         raise ValueError("Invalid Local LLM key; value hidden")
@@ -854,7 +849,7 @@ def main(argv=None) -> int:
         if isinstance(exc, OpenRouterConfigError):
             payload.update({"action": "open_dashboard", "dashboard": "http://127.0.0.1:8787/",
                             "command": f"powershell -File \"{ROOT / 'OpenClaudeDashboard.ps1'}\""})
-            print("[setup required] .env.openrouter is missing or invalid", file=sys.stderr)
+            print("[setup required] openclaude.config.yaml (openrouter section) is missing or invalid", file=sys.stderr)
             print(f"  powershell -File \"{ROOT / 'OpenClaudeDashboard.ps1'}\"   ->  http://127.0.0.1:8787/",
                   file=sys.stderr)
             print("  or run: OpenClaude.ps1 -Setup   (opens the settings page in your browser)",

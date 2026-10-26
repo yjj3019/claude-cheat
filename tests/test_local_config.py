@@ -46,6 +46,24 @@ class LocalConfigTests(LocalTestCase):
         self.configure(LOCAL_LLM_API_KEY="process-key")
         self.assertEqual(route.provider_config("local")["LOCAL_LLM_API_KEY"], "process-key")
 
+    def test_unified_file_empty_values_fall_back_to_defaults_and_environment_still_wins(self):
+        (self.root / "openclaude.config.yaml").write_text(
+            'local:\n  url: ""\n  model: "yaml-model"\n  api_key: "yaml-key"\n  allow_remote: false\n'
+            '  models_url: ""\n  http_url: ""\n', encoding="utf-8")
+        config = route.provider_config("local")
+        self.assertEqual(config["LOCAL_LLM_URL"], "http://127.0.0.1:11434/v1/messages")
+        self.assertEqual(config["LOCAL_LLM_MODELS_URL"], "http://127.0.0.1:11434/v1/models")
+        self.assertEqual((config["LOCAL_LLM_MODEL"], config["LOCAL_LLM_API_KEY"]), ("yaml-model", "yaml-key"))
+        self.configure(LOCAL_LLM_API_KEY="process-key")
+        self.assertEqual(route.provider_config("local")["LOCAL_LLM_API_KEY"], "process-key")
+
+    def test_a_broken_unified_file_fails_local_closed_without_leaking_values(self):
+        (self.root / "openclaude.config.yaml").write_text(
+            'local:\n  model: "m"\n  api_key: "private-key-marker"\n  bogus: 1\n', encoding="utf-8")
+        with self.assertRaises(ValueError) as caught:
+            route.provider_config("local")
+        self.assertNotIn("private-key-marker", str(caught.exception))
+
     def test_remote_https_requires_explicit_opt_in(self):
         self.configure(LOCAL_LLM_URL="https://llm.invalid/v1/messages")
         with self.assertRaises(ValueError):
