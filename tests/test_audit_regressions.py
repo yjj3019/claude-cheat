@@ -18,40 +18,41 @@ class AuditRegressionTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
 
     # --- settings file safety -------------------------------------------------
+    def settings_files(self, path):
+        spec = {"path": path, "secret": {"ANTHROPIC_AUTH_TOKEN"},
+                "required": ("ANTHROPIC_AUTH_TOKEN", "OPENROUTER_MODEL"),
+                "fields": ("OPENROUTER_MODEL", "ANTHROPIC_AUTH_TOKEN")}
+        return mock.patch.object(dash, "CONFIG_FILES", {"openrouter": spec})
+
     def test_a_read_error_never_rewrites_the_settings_file(self):
-        path = self.root / ".env.openrouter"
-        original = "ANTHROPIC_AUTH_TOKEN=sk-or-v1-abcdefghijkl\nOPENROUTER_MODEL=v/a\n# comment\n"
+        path = self.root / "openclaude.config.yaml"
+        original = 'openrouter:\n  api_key: "sk-or-v1-abcdefghijkl"\n  model: "v/a"\n# comment\n'
         path.write_text(original, encoding="utf-8")
         with mock.patch.object(dash.Path, "read_text", side_effect=PermissionError("locked")):
             with self.assertRaises(OSError):
-                dash._write_env(path, {"OPENROUTER_MODEL": "v/b"})
+                dash.routeConfig.Store(path).write_provider("openrouter", {"OPENROUTER_MODEL": "v/b"})
         self.assertEqual(path.read_text(encoding="utf-8"), original)
-        self.assertFalse((self.root / ".env.openrouter.bak").exists())
+        self.assertFalse((self.root / "openclaude.config.yaml.bak").exists())
 
-    def test_a_non_utf8_settings_file_is_read_without_raising(self):
-        path = self.root / ".env.openrouter"
-        path.write_bytes(b"OPENROUTER_MODEL=v/a\n# \xff\xfe broken comment\n")
-        values = dash.read_env(path)
-        self.assertEqual(values.get("OPENROUTER_MODEL"), "v/a")
-        with mock.patch.object(dash, "CONFIG_FILES", {
-                "openrouter": {"path": path, "secret": {"ANTHROPIC_AUTH_TOKEN"},
-                               "required": ("ANTHROPIC_AUTH_TOKEN", "OPENROUTER_MODEL"),
-                               "fields": ("OPENROUTER_MODEL", "ANTHROPIC_AUTH_TOKEN")}}):
+    def test_a_non_utf8_settings_file_is_reported_without_raising_and_never_rewritten(self):
+        path = self.root / "openclaude.config.yaml"
+        broken = b'openrouter:\n  model: "v/a"\n# \xff\xfe broken comment\n'
+        path.write_bytes(broken)
+        with self.settings_files(path):
             snapshot = dash.config_snapshot()  # must not raise
-        self.assertEqual(snapshot["openrouter"]["fields"]["OPENROUTER_MODEL"]["value"], "v/a")
+            self.assertEqual(dash.read_settings("openrouter"), {})
+            with self.assertRaises(dash.routeConfig.ConfigError):
+                dash.save_config("openrouter", {"OPENROUTER_MODEL": "v/b", "ANTHROPIC_AUTH_TOKEN": "sk-or-v1-bbbbbbbbbbbb"})
+        self.assertEqual(snapshot["openrouter"]["error"]["code"], "config_not_utf8")
+        self.assertEqual(path.read_bytes(), broken)
 
     def test_saving_only_a_new_key_keeps_the_stored_model(self):
-        path = self.root / ".env.openrouter"
-        path.write_text("ANTHROPIC_AUTH_TOKEN=sk-or-v1-aaaaaaaaaaaa\nOPENROUTER_MODEL=v/a\n",
-                        encoding="utf-8")
-        with mock.patch.object(dash, "CONFIG_FILES", {
-                "openrouter": {"path": path, "secret": {"ANTHROPIC_AUTH_TOKEN"},
-                               "required": ("ANTHROPIC_AUTH_TOKEN", "OPENROUTER_MODEL"),
-                               "fields": ("OPENROUTER_MODEL", "ANTHROPIC_AUTH_TOKEN")}}):
+        path = self.root / "openclaude.config.yaml"
+        path.write_text('openrouter:\n  api_key: "sk-or-v1-aaaaaaaaaaaa"\n  model: "v/a"\n', encoding="utf-8")
+        with self.settings_files(path):
             saved = dash.save_config("openrouter", {"ANTHROPIC_AUTH_TOKEN": "sk-or-v1-bbbbbbbbbbbb"})
-        text = path.read_text(encoding="utf-8")
-        self.assertIn("sk-or-v1-bbbbbbbbbbbb", text)
-        self.assertIn("OPENROUTER_MODEL=v/a", text)
+            stored = dash.read_settings("openrouter")
+        self.assertEqual(stored, {"OPENROUTER_MODEL": "v/a", "ANTHROPIC_AUTH_TOKEN": "sk-or-v1-bbbbbbbbbbbb"})
         self.assertTrue(saved["openrouter"]["fields"]["ANTHROPIC_AUTH_TOKEN"]["set"])
 
     # --- transcript scanning --------------------------------------------------

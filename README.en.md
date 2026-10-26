@@ -15,23 +15,35 @@ Check the installed Claude Code, Node.js, and Python versions for compatibility.
 
 Install Node.js, Python, and Claude Code separately, and sign in to Claude Code with the existing Plan subscription. The current authentication gate specifically checks `subscriptionType="pro"`; Max and other plans are not guaranteed to pass. No npm or pip packages are required by the checked-in source.
 
-For OpenRouter, create `.env.openrouter` in this checkout's root:
+All settings live in one file, `openclaude.config.yaml`, in this checkout's root. Saving from the settings page creates it; to start by hand, copy the example (an existing file is never overwritten):
 
-```dotenv
-ANTHROPIC_AUTH_TOKEN=YOUR_OPENROUTER_API_KEY
-OPENROUTER_MODEL=REPLACE_WITH_OPENROUTER_MODEL_ID
+```powershell
+if (-not (Test-Path -LiteralPath 'openclaude.config.yaml')) {
+    Copy-Item -LiteralPath 'openclaude.config.example.yaml' -Destination 'openclaude.config.yaml'
+}
+notepad openclaude.config.yaml
 ```
 
-Replace the placeholder with a real OpenRouter key. This file is read next to `openrouterAdvisor.py`, not relative to the current working directory. Use one KEY=VALUE per line; blank lines, full-line comments and matching quotes are supported, but multiline values and shell expansion are not. Do not add inline comments after a key. This value is read only by the router. It does not replace the CLI's subscription login. `.env` and `.env.*` are ignored by Git; do not publish credentials.
+For OpenRouter, fill in this section:
 
-Set `OPENROUTER_MODEL` to a concrete ID from the [OpenRouter model list](https://openrouter.ai/models). Existing key-only files must add it. Missing, empty, malformed or placeholder models fail startup without default-model selection or Plan fallback. Both file settings are proxy-only; inherited OpenRouter environment values do not override this file.
+```yaml
+openrouter:
+  model: "REPLACE_WITH_OPENROUTER_MODEL_ID"
+  api_key: "YOUR_OPENROUTER_API_KEY"
+```
+
+Replace the placeholder with a real OpenRouter key. The file is read next to `openrouterAdvisor.py`, not relative to the current working directory. The format is a **strict YAML subset**: `section:` lines with two-space `key: "value"` lines and `#` comments only; quote your values. Tabs, anchors (`&` `*`), lists, `|` blocks and multi-line values are rejected with a line number, and an error never contains a value. A problem in one service's section does not block the other, and unknown top-level sections are preserved. No YAML library is needed. The key is read only by the router. It does not replace the CLI's subscription login. `openclaude.config.yaml` (and its `.bak`) is ignored by Git; do not publish credentials.
+
+The old `.env.openrouter` / `.env.local-llm` files are **deprecated**. They are read, read-only, only for a service that has no section in the new file; the first save from the settings page moves both services' values into the new file and leaves the old files untouched. When the new file has a section for a service, only the new file is used for it.
+
+Set `model` to a concrete ID from the [OpenRouter model list](https://openrouter.ai/models). Existing key-only files must add it. Missing, empty, malformed or placeholder models fail startup without default-model selection or Plan fallback. Both file settings are proxy-only; inherited OpenRouter environment values do not override this file.
 
 The selected model must support the [Messages API](https://openrouter.ai/docs/api/api-reference/anthropic-messages/create-messages?explorer=true) and the tools you need. Model selection does not guarantee every model or native feature is compatible. Response model identity remains strict; dynamic aliases or presets returning another ID can fail and are unverified. Endpoint and retry policy remain fixed as documented in the example.
 
 From the checkout root:
 
 ```powershell
-# Default provider: OpenRouter; model comes from .env.openrouter
+# Default provider: OpenRouter; model comes from openclaude.config.yaml
 .\OpenClaude.ps1
 # Local Messages API, after configuring a real local service
 .\OpenClaude.ps1 -Provider Local
@@ -54,9 +66,12 @@ Configure OpenRouter once in the web console — it runs without a routing sessi
 
 ```powershell
 .\OpenClaudeDashboard.ps1        # http://127.0.0.1:8787/ (fixed port)
+.\OpenClaude.ps1 -Setup           # starts the same dashboard and opens its settings page in the browser
 ```
 
-Fill the OpenRouter card with a **model ID** and **API key**, press **Model check**, then **Save**, and start the session. The check also runs on unsaved values, and saving without an existing `.env.openrouter` seeds the file from the shipped example so its comments stay. Starting the launcher with missing or invalid settings exits with the console address instead of opening a session. Editing the files by hand still works exactly as before.
+`-Setup` never creates or edits `openclaude.config.yaml` or any legacy `.env.*` file and does not start a session; you save the values on the web page yourself. The `[setup required]` hint printed by `OpenClaude.ps1` when settings are missing also mentions this command.
+
+Pick OpenRouter or Local LLM in the **service** select box at the top; only that service's fields are shown (each option is tagged `configured` / `setup needed`, and the last choice is remembered in the browser). For OpenRouter, fill in a **model ID** and **API key**, press **Model check**, then **Save**, and start the session. The check also runs on unsaved values, and saving without an existing `openclaude.config.yaml` seeds the file from `openclaude.config.example.yaml` so its comments stay. API keys and server addresses are shown only in part and the stored original is never sent back to the browser, so type the full value only when changing it (empty keeps it; the optional HTTP-exception and model-list addresses have a **Clear** button). Starting the launcher with missing or invalid settings exits with the console address instead of opening a session. Editing the files by hand still works exactly as before.
 
 A routed session starts Claude Code with experimental beta features disabled (`CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`, `CLAUDE_CODE_DISABLE_ADVISOR_TOOL`). The inline `tool_addition`, `context_management`, and advisor tool shape that Claude Code 2.1.310 sends by default is rejected by external Messages API providers with HTTP 400, so Plan requests in the same session also use the stable protocol. Advisor, inline tools, and server-side context editing are therefore unavailable in that session. Thinking and effort settings still travel per request, and ordinary mode still never asks the external provider for thinking.
 
@@ -178,28 +193,31 @@ Success requires `local_diagnostic`, `inference_checked`, `model_confirmed` and 
 
 Real Local inference requires a separately configured service and remains a separate validation step.
 
-Create `.env.local-llm` **next to the launcher**, or set the corresponding process environment variables. The configuration directory is not necessarily the working directory. Matching process environment variables override file values. Fill in the real server URL and model ID later. Only Anthropic-compatible `/v1/messages` is supported; no OpenAI-only `/v1/chat/completions` adapter is implemented.
+Configure the `local:` section of `openclaude.config.yaml` **next to the launcher**, or set the corresponding process environment variables. The configuration directory is not necessarily the working directory. Matching process environment variables override file values. Fill in the real server URL and model ID later. Only Anthropic-compatible `/v1/messages` is supported; no OpenAI-only `/v1/chat/completions` adapter is implemented.
 
 ```powershell
 # Run in the checkout root; preserve an existing configuration.
-if (-not (Test-Path -LiteralPath '.env.local-llm')) {
-    Copy-Item -LiteralPath '.env.local-llm.example' -Destination '.env.local-llm'
+if (-not (Test-Path -LiteralPath 'openclaude.config.yaml')) {
+    Copy-Item -LiteralPath 'openclaude.config.example.yaml' -Destination 'openclaude.config.yaml'
 }
-notepad .env.local-llm
+notepad openclaude.config.yaml
 # Model metadata only; no inference or Plan login is used.
 .\OpenClaude.ps1 -CheckLocal
 # Normal launch still checks the saved Plan authentication.
 .\OpenClaude.ps1 -Provider Local
 ```
 
-```dotenv
-LOCAL_LLM_URL=http://127.0.0.1:11434/v1/messages
-LOCAL_LLM_MODEL=YOUR_INSTALLED_MODEL_ID
-LOCAL_LLM_ALLOW_REMOTE=false
-# Set LOCAL_LLM_API_KEY separately only if the local server requires authentication.
-# Optional same-origin model-list URL; default: /v1/models.
-# LOCAL_LLM_MODELS_URL=http://127.0.0.1:11434/api/tags
+```yaml
+local:
+  url: "http://127.0.0.1:11434/v1/messages"
+  model: "YOUR_INSTALLED_MODEL_ID"
+  allow_remote: false
+  # Set api_key separately only if the local server requires authentication.
+  # Optional same-origin model-list URL; default: /v1/models.
+  # models_url: "http://127.0.0.1:11434/api/tags"
 ```
+
+The setting names below are the environment-variable names; in the file they are `url`, `model`, `api_key`, `allow_remote`, `http_url` and `models_url` under `local:`. An empty value (`""`) means "not set" and never hides a default.
 
 | Setting | Default / meaning |
 | --- | --- |
@@ -207,25 +225,26 @@ LOCAL_LLM_ALLOW_REMOTE=false
 | `LOCAL_LLM_MODEL` | Required at normal launch; exact server model ID |
 | `LOCAL_LLM_API_KEY` | Optional server-specific Bearer credential |
 | `LOCAL_LLM_ALLOW_REMOTE` | `false`; remote access needs explicit `true` and HTTPS |
-| `LOCAL_LLM_HTTP_URL` | Optional exact HTTP Messages URL pin; empty by default. Plaintext HTTP is allowed only when it exactly matches `LOCAL_LLM_URL`. Keep real values in ignored `.env.local-llm`; prefer HTTPS. |
+| `LOCAL_LLM_HTTP_URL` | Optional exact HTTP Messages URL pin; empty by default. Plaintext HTTP is allowed only when it exactly matches `LOCAL_LLM_URL`. Keep real values in the ignored `openclaude.config.yaml`; prefer HTTPS. |
 | `LOCAL_LLM_MODELS_URL` | Same-origin `/v1/models`; metadata only |
 
 For an existing remote service, for example:
 
-```dotenv
-LOCAL_LLM_URL=https://llm.example.com/v1/messages
-LOCAL_LLM_MODEL=YOUR_SERVER_MODEL_ID
-LOCAL_LLM_ALLOW_REMOTE=true
-# LOCAL_LLM_API_KEY=YOUR_SERVER_KEY
+```yaml
+local:
+  url: "https://llm.example.com/v1/messages"
+  model: "YOUR_SERVER_MODEL_ID"
+  allow_remote: true
+  # api_key: "YOUR_SERVER_KEY"
 ```
 
 Replace the example host and model before use. Use `127.0.0.1` rather than `localhost`; the latter is not a permitted loopback literal.
 
-By default, only literal loopback (`127.0.0.1` or `::1`) HTTP/HTTPS endpoints are allowed. To use an existing remote server, explicitly set `LOCAL_LLM_ALLOW_REMOTE=true` and an `https://server/v1/messages` URL. Remote HTTP without an explicit matching `LOCAL_LLM_HTTP_URL`, URL credentials/query/fragment, redirects, and invalid credential headers are rejected. Certificate verification is not disabled. Prefer HTTPS or a separately prepared loopback tunnel; an exact HTTP pin transmits prompts and server credentials without encryption. Opting in trusts the configured DNS name and its resolution.
+By default, only literal loopback (`127.0.0.1` or `::1`) HTTP/HTTPS endpoints are allowed. To use an existing remote server, explicitly set `LOCAL_LLM_ALLOW_REMOTE` (`allow_remote: true`) and an `https://server/v1/messages` URL. Remote HTTP without an explicit matching `LOCAL_LLM_HTTP_URL`, URL credentials/query/fragment, redirects, and invalid credential headers are rejected. Certificate verification is not disabled. Prefer HTTPS or a separately prepared loopback tunnel; an exact HTTP pin transmits prompts and server credentials without encryption. Opting in trusts the configured DNS name and its resolution.
 
 `-CheckLocal` sends only a GET to the same-origin model-list endpoint. It disables environment proxies and redirects, uses only the Local key in a fresh `Authorization: Bearer` header, and limits responses to 1 MiB with a five-second socket timeout. Output contains only model counts, configured-model presence, and fixed error categories. Model metadata success does not establish Messages inference or tool compatibility. If the server has no model-list API, skip that optional check and validate inference separately. A failed check never invokes Plan fallback.
 
-Local mode does not read the OpenRouter key. Real `.env*` settings are ignored by Git; only the credential-free `.env.local-llm.example` template is distributed. The server and model still need real validation later.
+Local mode does not read the OpenRouter key. Real `openclaude.config.yaml` / `.env*` settings are ignored by Git; only the credential-free `openclaude.config.example.yaml` template is distributed (the old `.env.*.example` files are deprecated). The server and model still need real validation later.
 
 Run real loopback HTTP integration tests with `node --test tests/*.test.mjs` and configuration/metadata tests with `python -m unittest discover -s tests -p 'test_*.py' -v`. Their servers and Plan responses are synthetic; they do not contact real LLM providers or accounts.
 
@@ -237,7 +256,7 @@ Independent validation after these Local additions passed Node tests, Python tes
 .\OpenClaude.ps1 -Provider OpenRouter -OpenRouterCompat
 ```
 
-Requires Claude Code 2.1.304 or newer and the same two `.env.openrouter` settings. All Claude model roles use the selected `OPENROUTER_MODEL`, without Plan login or fallback. The LocalCompat profile retains client plugins, skills, MCP, hooks, subagents, thinking and effort settings, ordinary configuration sources and default permissions. API-key helpers are disabled; the proxy route and temporary authentication are pinned in launch settings. Provider credentials stay in the proxy. Unknown native fields/betas and token counting are rejected. Ordinary routing and both Local modes remain available.
+Requires Claude Code 2.1.304 or newer and the same two `openclaude.config.yaml` OpenRouter settings. All Claude model roles use the selected `OPENROUTER_MODEL`, without Plan login or fallback. The LocalCompat profile retains client plugins, skills, MCP, hooks, subagents, thinking and effort settings, ordinary configuration sources and default permissions. API-key helpers are disabled; the proxy route and temporary authentication are pinned in launch settings. Provider credentials stay in the proxy. Unknown native fields/betas and token counting are rejected. Ordinary routing and both Local modes remain available.
 
 Responses are fully validated as JSON before conversion to client SSE. This mode uses one 120-second upstream attempt and a 30-second failure cooldown, with OpenRouter provider fallback disabled. Model identity, Messages/tool support and reasoning behavior still depend on the selected model; forwarding effort does not establish Sonnet-equivalent reasoning.
 
@@ -290,7 +309,7 @@ The **insights** card ranks *what changed, why, and what to do next* instead of 
 
 The aggregation cache (`.usage-cache.json`) carries the turn-ownership ledger and is about **0.5MB** for a real 7-day window (5.4MB for a synthetic 2,000-file/100k-turn fixture; above 200k claims the oldest files' claims are evicted whole). A cache version change forces one full rescan.
 
-The page shows no key, prompt or request body. It writes only `.env.openrouter` and `.env.local-llm` beside the launcher, and only when a save is requested. It is a separate process, so it can run beside the routing session.
+The page shows no key, prompt or request body. It writes only `openclaude.config.yaml` beside the launcher, and only when a save is requested. It is a separate process, so it can run beside the routing session.
 
 ### Editing settings and testing connections
 
@@ -298,13 +317,38 @@ Settings live on a **separate page** (`http://127.0.0.1:8787/settings`) reached 
 
 | Behaviour | Detail |
 | --- | --- |
-| Save | Only the managed keys change; comments and unrelated entries stay, and the previous file is kept as `.env.*.bak` |
+| Save | Only the managed keys change; comments and unrelated entries stay, and the previous file is kept as `openclaude.config.yaml.bak`. An unreadable file (encoding or syntax error) or a clashing save is never overwritten; you get an error code and line number instead |
 | Secrets | Never sent back to the browser (`sk-or-…cd0` style). Leaving the field empty keeps the stored value; only a new value replaces it |
+| Server addresses | The Messages, HTTP-exception and model-list URLs are masked like keys (`http://12•••••.1:11434/v1/messages`: only the first and last two host characters, `user:pass@` and queries hidden). The original is never sent to the browser; empty keeps it |
+| Clear | Optional addresses (HTTP exception, model list) are erased with the **Clear** button (the `clear` list of `POST /api/config`). Required fields and keys cannot be cleared |
 | Validation | Model ID shape, key shape and Local URL rules (loopback, HTTPS, same origin) are checked before writing; a failure leaves the file untouched |
 | Protection | POST requires the session token embedded in the page and a same-origin request, so other sites cannot call it |
 | Tests | **Model check** reads the model list only; **inference test** sends one 16-token request (may cost a small amount) |
 | Model picker | **목록** opens a searchable list with context length and price and fills the field. `GET /api/models?provider=openrouter\|local` (session token required, 10 minute cache) |
 | When it applies | Saved settings take effect in the **next** session; restart a running one |
+
+### CLI detection and connection test (diagnostics only)
+
+The **CLI (connection test only)** entry on the settings page finds the installed Codex, Grok and Claude Code CLIs, shows their versions and checks whether they can reach their service. It is a **diagnostic tool; routing requests to a CLI is not supported yet** (`OpenClaude.ps1 -Provider` has no CLI value).
+
+| Item | Behaviour |
+| --- | --- |
+| Detection | Looks in `PATH` and known install folders (`~\.grok\bin`, `%APPDATA%\npm`, `~\.local\bin`); if the running session's PATH is stale it re-reads the user and machine PATH from the registry. `GET /api/cli` (session token required) |
+| Detect check | Runs `--version` only (no network use) |
+| Connection test | Sends **one fixed line**, `Reply with exactly OK`, to the selected CLI. It **really calls that CLI's external service with its own login**, which may use a little quota or money |
+| How it runs | No shell. An npm `.cmd` wrapper is read and resolved to its real target (an unrecognised wrapper is refused). Each run uses a fresh empty temp folder and the prompt goes in a file or stdin, never in argv |
+| Environment | Only an allowlist reaches the child (PATH and system variables, proxy and certificate variables, that CLI's own login variables). `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_*`, `OPENROUTER_*` and the dashboard token are never passed, which prevents `claude -p` from calling this proxy again in a loop |
+| Result | Only a category, exit code and duration: `ready`, `timeout` (firewall or proxy suspected), `not_logged_in`, `unsupported_flag` (the CLI version rejected an option), `not_found`, and so on. CLI output and error text are neither shown nor logged |
+| Limits | One run at a time; time limit 10-120 s (default 60) |
+
+The tool-blocking flags (for example Codex `--disable shell_tool`) are **best effort and have not been verified to stop file reads.** The test prompt is a fixed string, but a CLI is an agent: do not use it to send untrusted input.
+
+### Request-shape measurement (sizing a CLI backend)
+
+The **request shape (CLI candidates)** card on the dashboard counts requests by **model family x tools**, to find out how many requests a text-only CLI could serve (no tools, tool results or images).
+- The proxy writes one content-free event per request (`request_shape`: family, tools, tool blocks, non-text media, stream) to the route log. It never records the model id, a prompt or a tool name.
+- It is recorded only in OpenRouter sessions (when a route log exists), and is also exposed as `request_shapes` in `/api/status`.
+- Note: Opus, Haiku and Fable requests always go to Plan today, so a CLI candidate must be a tool-less **Sonnet** request. If this number is small, CLI routing would have little effect.
 
 ### Status API for scripts and agents
 
@@ -364,7 +408,7 @@ A failed check exits with code 1 and never invokes Plan fallback. A successful m
 
 | Symptom | What to check |
 | --- | --- |
-| Missing `.env.openrouter` | Actual launcher directory, not current working directory |
+| Missing `openclaude.config.yaml` | Actual launcher directory, not current working directory |
 | OpenRouter 401 / missing authentication header | Router key file and key validity; successful HUD installation does not prove inference auth |
 | Old Local address remains active | Process environment overrides, global shim target, then restart |
 | Sonnet continues using Plan | Check `route_selected` with `-Debug`; `native_feature` can be legitimate (Plan-only model, token counting, native history). Repeated `unsupported_beta` means the CLI added a beta the router does not know yet, so update the launcher |
@@ -489,7 +533,8 @@ See the [connection and recovery checklist](docs/LIVE-VALIDATION.ko.md) for a ge
 | `tests/localLlmIntegration.test.mjs` | Real loopback HTTP tests with synthetic Messages servers and Plan responses |
 | `tests/test_local_config.py` | Configuration policy and model-metadata checks using synthetic HTTP servers |
 | `tests/test_local_lifecycle.py` | Windows synthetic CLI/launcher termination, proxy and connection cleanup |
-| `.env.local-llm.example` | Credential-free configuration template for an existing server |
+| `openclaude.config.example.yaml` | Credential-free unified configuration template (OpenRouter and Local) |
+| `.env.local-llm.example` | Credential-free Local template (deprecated; replaced by the file above) |
 | `docs/HISTORY.ko.md` | Historical investigation notes, separate from current policy |
 
 The private `tests/probeClaudeRoute.py` used during development is not distributed here.

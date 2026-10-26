@@ -9,7 +9,7 @@
 //
 // Exit codes: 0 pass, 1 fail, 2 the CLI or settings are missing.
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,18 +21,16 @@ const args = process.argv.slice(2);
 const promptIndex = args.indexOf('--prompt');
 const prompt = promptIndex >= 0 ? args[promptIndex + 1] : 'Reply with exactly OK';
 
-function readEnv(path) {
-  const values = {};
-  try {
-    for (const line of readFileSync(path, 'utf8').split(/\r?\n/)) {
-      const match = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$/.exec(line);
-      if (match && !line.trimStart().startsWith('#')) values[match[1]] = match[2].trim().replace(/^["']|["']$/g, '');
-    }
-  } catch { /* missing file */ }
-  return values;
+// The settings live in openclaude.config.yaml (or the deprecated .env.openrouter). Ask the one
+// Python reader instead of keeping a second parser here.
+function readSettings(provider) {
+  const run = spawnSync(process.platform === 'win32' ? 'python' : 'python3',
+    ['-c', 'import json, routeConfig; print(json.dumps(routeConfig.read_provider(__import__("sys").argv[1])))', provider],
+    { cwd: ROOT, encoding: 'utf8' });
+  try { return JSON.parse(run.stdout || '{}'); } catch { return {}; }
 }
 
-const config = readEnv(join(ROOT, '.env.openrouter'));
+const config = readSettings('openrouter');
 const key = config.ANTHROPIC_AUTH_TOKEN;
 const model = config.OPENROUTER_MODEL;
 if (!key || !model) {

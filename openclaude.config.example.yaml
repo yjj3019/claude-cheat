@@ -1,0 +1,48 @@
+# OpenClaude settings: one file for every service.
+#
+# Easiest: run  OpenClaude.ps1 -Setup  and fill the form in your browser. It creates and
+# updates openclaude.config.yaml for you and keeps these comments.
+# By hand: copy this file to openclaude.config.yaml (same folder) and edit it.
+#
+# Do not commit openclaude.config.yaml or share its contents: it holds keys.
+# Format: a strict YAML subset - "section:" lines with two-space "key: value" lines below,
+# and "#" comments. Quote values. Tabs, anchors, lists and multi-line values are rejected
+# with a line number. An empty value ("") means "not set".
+# The old .env.openrouter / .env.local-llm files are still read for a service that has no
+# section here, but they are deprecated and are never written to.
+
+openrouter:
+  # Required: the exact OpenRouter model ID (provider/model). There is no default model.
+  # Copy a concrete ID from https://openrouter.ai/models and confirm Messages/tool support.
+  model: ""
+  # Required: an OpenRouter API key (sk-or-...), not an Anthropic or Local server key.
+  api_key: ""
+
+local:
+  # Anthropic-compatible /v1/messages API (not /v1/chat/completions).
+  # Empty = the default http://127.0.0.1:11434/v1/messages.
+  url: ""
+  # Required: the model ID your server actually serves.
+  model: ""
+  # Local-only by default. Remote hosts require "true" and HTTPS.
+  allow_remote: false
+  # Optional; use a credential issued by this LLM server only.
+  api_key: ""
+  # Optional model-list endpoint, same scheme/host/port as url (Ollama can use /api/tags).
+  models_url: ""
+  # Optional exact HTTP Messages URL exception. HTTP sends prompts and credentials
+  # unencrypted; prefer HTTPS.
+  http_url: ""
+
+cli:
+  # Installed command-line clients (Codex, Grok, Claude Code). For now this section only drives the
+  # settings page's detection list and its connection test; requests are NOT routed to a CLI.
+  # The test sends one fixed line to the selected CLI's own service, using that CLI's own login.
+  # codex | grok | claude
+  kind: ""
+  # Optional model name passed to the CLI; empty = the CLI's own default.
+  model: ""
+  # Optional absolute path to pin the executable; empty = detect it. Its file name must match the kind.
+  binary: ""
+  # Connection-test time limit in seconds (10-120); empty = 60.
+  timeout_s: ""

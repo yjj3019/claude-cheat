@@ -1,9 +1,14 @@
-param([ValidateSet('OpenRouter', 'Local')][string]$Provider = 'OpenRouter', [switch]$CheckLocal, [switch]$DiagnoseLocal, [switch]$LocalMode, [switch]$LocalCompat, [switch]$OpenRouterCompat, [switch]$Debug, [switch]$Stream, [switch]$Takeover, [string]$Print)
+param([ValidateSet('OpenRouter', 'Local')][string]$Provider = 'OpenRouter', [switch]$CheckLocal, [switch]$DiagnoseLocal, [switch]$LocalMode, [switch]$LocalCompat, [switch]$OpenRouterCompat, [switch]$Debug, [switch]$Stream, [switch]$Takeover, [switch]$Setup, [string]$Print)
 # -Stream forwards provider frames as they validate (lower first-token latency) but a late
 # protocol error can no longer fall back to Plan; the default buffers and keeps fallback.
 $previousStream = $env:ROUTE_STREAM_PASSTHROUGH
 if ($Stream) { $env:ROUTE_STREAM_PASSTHROUGH = '1' }
 $ErrorActionPreference = 'Stop'
+# -Setup only opens the dashboard settings page; it never writes .env files or starts a session.
+if ($Setup) {
+    & (Join-Path $PSScriptRoot 'OpenClaudeDashboard.ps1') -Open
+    exit $LASTEXITCODE
+}
 $routeArgs = @('--provider', $Provider.ToLowerInvariant())
 if ($Takeover) { $routeArgs += '--takeover' }
 if ($Print) { $routeArgs += @('--print', $Print) }
