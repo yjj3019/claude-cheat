@@ -62,6 +62,15 @@ class OpenRouterConfigError(ValueError):
             "and fill the OpenRouter settings there.")
 
 
+class ProviderChoiceError(ValueError):
+    """Both providers are configured; a launch must not pick one silently."""
+
+    code = "provider_choice_required"
+
+    def __init__(self):
+        super().__init__("Both OpenRouter and Local settings are configured; choose one explicitly")
+
+
 def read_env(path: Path) -> dict:
     """Legacy single-line KEY=VALUE reader (strict); kept for the deprecated .env.* files."""
     return routeConfig.read_legacy(path)
@@ -138,6 +147,37 @@ def provider_config(provider: str, require_model: bool = True) -> dict:
         raise ValueError("Local model-list URL must have the same origin without credentials or query")
     return {"SONNET_PROVIDER": provider, "LOCAL_LLM_URL": url, "LOCAL_LLM_MODEL": model,
             "LOCAL_LLM_API_KEY": key, "LOCAL_LLM_ALLOW_REMOTE": remote, "LOCAL_LLM_HTTP_URL": http_url, "LOCAL_LLM_MODELS_URL": models_url}
+
+
+def configured_provider() -> str:
+    """Pick the one configured routing provider, or refuse to guess.
+
+    A bare launch used to default to OpenRouter and silently ignore a configured Local
+    service (or, with only Local configured, print OpenRouter setup guidance). Resolution
+    is explicit: exactly one usable provider is selected, both is a usage error, and none
+    keeps the setup guidance that points at the dashboard.
+    """
+    ready, failures = [], []
+    for name in ("openrouter", "local"):
+        try:
+            provider_config(name)
+        except (OSError, ValueError) as error:
+            failures.append((name, error))
+        else:
+            ready.append(name)
+    if len(ready) == 2:
+        raise ProviderChoiceError()
+    if len(ready) == 1:
+        return ready[0]
+    # Nothing is usable. Point a Local-only user at the Local section instead of telling
+    # them to fill OpenRouter; a first-run install still gets the OpenRouter setup help.
+    try:
+        local_source = routeConfig.Store(ROOT / routeConfig.CONFIG_NAME).source("local")
+    except (OSError, ValueError):
+        local_source = "none"
+    if local_source != "none":
+        raise LocalStartupError("local_configuration_invalid")
+    raise OpenRouterConfigError()
 
 
 class NoLocalRedirect(urllib.request.HTTPRedirectHandler):
@@ -604,7 +644,7 @@ def local_cli_command(claude: str, compat: bool = False) -> list:
             "--no-chrome", "--settings", json.dumps(settings), "--append-system-prompt", workspace_context]
 
 
-def takeover(provider: str = "openrouter", debug: bool = False) -> int:
+def takeover(provider: str = "auto", debug: bool = False) -> int:
     """Hand the live port to a fresh proxy so the running CLI keeps working across a restart."""
     record = read_handoff()
     if not record:
@@ -612,6 +652,10 @@ def takeover(provider: str = "openrouter", debug: bool = False) -> int:
     port, nonce = record["port"], record.get("nonce")
     if not isinstance(nonce, str) or not nonce:
         raise RuntimeError("The recorded session has no token; restart the session normally")
+    if provider == "auto":
+        # The replacement must serve the same provider as the session it takes over.
+        recorded = record.get("provider")
+        provider = recorded if recorded in ("openrouter", "local") else configured_provider()
     if not port_open(port):
         raise RuntimeError(f"Nothing is listening on the recorded port {port}; start a normal session")
     try:
@@ -637,8 +681,10 @@ def takeover(provider: str = "openrouter", debug: bool = False) -> int:
             return 0
 
 
-def launch(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False, openrouter_compat: bool = False, debug: bool = False,
+def launch(provider: str = "auto", local_only: bool = False, local_compat: bool = False, openrouter_compat: bool = False, debug: bool = False,
            print_prompt: str | None = None, print_json: bool = True) -> int:
+    if provider == "auto":
+        provider = configured_provider()
     if (local_only and provider != "local") or (local_compat and not local_only):
         raise ValueError("Local CLI mode requires the local provider")
     if openrouter_compat and (provider != "openrouter" or local_only or local_compat):
@@ -802,7 +848,8 @@ def main(argv=None) -> int:
             self_test()
             return 0
         parser = argparse.ArgumentParser(description="Sonnet replacement with Plan fallback")
-        parser.add_argument("--provider", choices=("openrouter", "local"), default="openrouter")
+        parser.add_argument("--provider", choices=("auto", "openrouter", "local"), default="auto",
+                            help="auto picks the only configured provider and refuses to guess when both are set")
         parser.add_argument("--check-local", action="store_true", help="Check local model metadata without inference or Plan login")
         parser.add_argument("--diagnose-local", action="store_true", help="One synthetic Local inference without CLI, native features or Plan fallback")
         parser.add_argument("--local-mode", action="store_true", help="Interactive Local-only CLI with native integrations disabled and no Plan fallback")
@@ -816,6 +863,9 @@ def main(argv=None) -> int:
         parser.add_argument("--print-text", action="store_true",
                             help="With --print, keep the CLI's human output instead of JSON")
         options = parser.parse_args(arguments)
+        if options.openrouter_compat and options.provider == "auto":
+            # The flag itself names the provider; keep the pre-Auto behavior for this mode.
+            options.provider = "openrouter"
         if options.openrouter_compat and (options.provider != "openrouter" or options.local_mode or options.local_compat or options.check_local or options.diagnose_local):
             parser.error("--openrouter-compat requires --provider openrouter and cannot be combined with Local modes or diagnostic checks")
         if options.local_compat and (options.provider != "local" or options.local_mode or options.check_local or options.diagnose_local):
@@ -842,6 +892,16 @@ def main(argv=None) -> int:
                       local_compat=options.local_compat, openrouter_compat=options.openrouter_compat,
                       debug=options.debug, print_prompt=options.print_prompt,
                       print_json=not options.print_text)
+    except ProviderChoiceError:
+        payload = {"event": "provider_choice_required", "providers": ["openrouter", "local"],
+                   "action": "choose_provider",
+                   "commands": ["OpenClaude.ps1 -Provider OpenRouter", "OpenClaude.ps1 -Provider Local"]}
+        print(json.dumps(payload), file=sys.stderr)
+        print("Both OpenRouter and Local settings are configured. Choose one explicitly:", file=sys.stderr)
+        print("  OpenClaude.ps1 -Provider OpenRouter", file=sys.stderr)
+        print("  OpenClaude.ps1 -Provider Local", file=sys.stderr)
+        print("  (or run OpenClaude.ps1 -Setup to review or remove one service's settings)", file=sys.stderr)
+        return 2
     except (LocalStartupError, OpenRouterConfigError) as exc:
         payload = {"event": "openrouter_start_failed", "kind": type(exc).__name__,
                    "code": exc.code if isinstance(exc, LocalStartupError) else "openrouter_configuration_invalid",

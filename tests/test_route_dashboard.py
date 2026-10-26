@@ -1532,9 +1532,9 @@ class SnapshotTests(unittest.TestCase):
              mock.patch.object(dash, "read_settings", return_value={"OPENROUTER_MODEL": "vendor/model"}):
             data = dash.snapshot()
         self.assertEqual(sorted(data),
-                         ["account", "alerts", "configured", "generated_at", "help", "insights", "model",
-                          "pricing", "proxy_metrics", "proxy_modified_at", "proxy_stale", "refresh_ms",
-                          "routing", "summary", "usage"])
+                         ["account", "active_session", "alerts", "configured", "generated_at", "help",
+                          "insights", "model", "pricing", "providers", "proxy_metrics",
+                          "proxy_modified_at", "proxy_stale", "refresh_ms", "routing", "summary", "usage"])
         self.assertEqual(data["model"], "vendor/model")
         self.assertEqual(data["routing"]["state"], "unknown")
         self.assertEqual(data["alerts"], [])
@@ -1894,6 +1894,59 @@ class OpenPageTests(unittest.TestCase):
             dash.main([])
         self.assertEqual(serve.call_args_list[0].kwargs["open_page"], "settings")
         self.assertIsNone(serve.call_args_list[1].kwargs["open_page"])
+
+
+class ProviderSelectionDisplayTests(unittest.TestCase):
+    """A dual install must be visible: configured services and the live session's provider."""
+
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.object(dash, "ROOT", self.root))
+        self.enterContext(mock.patch.object(dash, "SESSION_HANDOFF_FILE",
+                                            self.root / ".session-handoff.json"))
+
+    def handoff(self, payload):
+        (self.root / ".session-handoff.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_provider_states_reports_each_routing_service(self):
+        with mock.patch.object(dash, "provider_configured",
+                               side_effect=lambda name: name == "local"):
+            self.assertEqual(dash.provider_states(), {"openrouter": False, "local": True})
+
+    def test_active_session_exposes_only_provider_and_started(self):
+        self.handoff({"provider": "local", "started": "2026-10-26T00:00:00+00:00",
+                      "nonce": "private-token", "port": 48432, "proxy_pid": 1})
+        self.assertEqual(dash.active_session(),
+                         {"provider": "local", "started": "2026-10-26T00:00:00+00:00"})
+
+    def test_active_session_ignores_missing_malformed_or_foreign_records(self):
+        self.assertIsNone(dash.active_session())
+        (self.root / ".session-handoff.json").write_text("{not json", encoding="utf-8")
+        self.assertIsNone(dash.active_session())
+        self.handoff(["not", "an", "object"])
+        self.assertIsNone(dash.active_session())
+        self.handoff({"provider": "plan", "nonce": "private-token"})
+        self.assertIsNone(dash.active_session(), "only routing services count as a session")
+        self.handoff({"provider": "local", "nonce": "private-token"})
+        self.assertEqual(dash.active_session(), {"provider": "local", "started": None})
+
+    def test_status_and_snapshot_expose_the_dual_provider_state(self):
+        self.handoff({"provider": "openrouter", "started": "2026-10-26T00:00:00+00:00",
+                      "nonce": "private-token"})
+        with mock.patch.object(dash, "provider_configured", return_value=True), \
+             mock.patch.object(dash, "parse_route_log", return_value=[]), \
+             mock.patch.object(dash, "account_state", return_value={"ok": False, "error": "offline"}), \
+             mock.patch.object(dash, "usage_snapshot", return_value=dash._empty_usage()), \
+             mock.patch.object(dash, "model_pricing", return_value=None), \
+             mock.patch.object(dash, "proxy_metrics", return_value=None):
+            report = dash.status_report(offline=True)
+            data = dash.snapshot()
+        self.assertEqual(report["providers"], {"openrouter": True, "local": True})
+        self.assertEqual(report["active_session"]["provider"], "openrouter")
+        self.assertEqual(data["providers"], {"openrouter": True, "local": True})
+        self.assertEqual(data["active_session"]["provider"], "openrouter")
+        self.assertNotIn("private-token", json.dumps(report))
+        self.assertNotIn("private-token", json.dumps(data))
 
 
 if __name__ == "__main__":

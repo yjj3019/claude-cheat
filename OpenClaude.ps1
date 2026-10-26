@@ -1,4 +1,6 @@
-param([ValidateSet('OpenRouter', 'Local')][string]$Provider = 'OpenRouter', [switch]$CheckLocal, [switch]$DiagnoseLocal, [switch]$LocalMode, [switch]$LocalCompat, [switch]$OpenRouterCompat, [switch]$Debug, [switch]$Stream, [switch]$Takeover, [switch]$Setup, [string]$Print)
+param([ValidateSet('Auto', 'OpenRouter', 'Local')][string]$Provider = 'Auto', [switch]$CheckLocal, [switch]$DiagnoseLocal, [switch]$LocalMode, [switch]$LocalCompat, [switch]$OpenRouterCompat, [switch]$Debug, [switch]$Stream, [switch]$Takeover, [switch]$Setup, [string]$Print)
+# -Provider Auto (default) selects the only configured service and refuses to guess when both
+# OpenRouter and Local are configured; pass -Provider to choose explicitly.
 # -Stream forwards provider frames as they validate (lower first-token latency) but a late
 # protocol error can no longer fall back to Plan; the default buffers and keeps fallback.
 $previousStream = $env:ROUTE_STREAM_PASSTHROUGH

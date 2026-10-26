@@ -43,11 +43,21 @@ The selected model must support the [Messages API](https://openrouter.ai/docs/ap
 From the checkout root:
 
 ```powershell
-# Default provider: OpenRouter; model comes from openclaude.config.yaml
+# Default: -Provider Auto picks the only configured service
 .\OpenClaude.ps1
 # Local Messages API, after configuring a real local service
 .\OpenClaude.ps1 -Provider Local
 ```
+
+`-Provider` defaults to **Auto**: exactly one configured service is selected automatically, and when **both** are validly configured the launch refuses to guess and exits with code 2, asking for an explicit choice:
+
+```text
+Both OpenRouter and Local settings are configured. Choose one explicitly:
+  OpenClaude.ps1 -Provider OpenRouter
+  OpenClaude.ps1 -Provider Local
+```
+
+The settings page's service selector marks whether each service is configured and appends `현재 세션` (current session) to the service a live routed session is using; the same state is exposed as `providers` and `active_session` in `/api/status` and `/api/snapshot`. `-Takeover` without `-Provider` follows the provider recorded for the session it takes over.
 
 If you install a global launcher separately, configuration is read beside its target script. Cloning this repository neither installs a global command nor changes an existing launcher target. Run the script in the intended checkout explicitly.
 

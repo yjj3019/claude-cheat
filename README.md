@@ -254,6 +254,16 @@ URL 내 사용자명·비밀번호·쿼리·fragment, redirect, 잘못된 인증
 
 다시 OpenRouter를 쓰려면 세션을 종료하고 기본 명령으로 재실행합니다. 실행 중인 세션에서 `/model`은 Claude 모델을 선택하며 OpenRouter/Local 제공자를 바꾸는 메뉴가 아닙니다.
 
+`-Provider`의 기본값은 **`Auto`** 입니다. 설정된 서비스가 하나뿐이면 그 서비스를 자동으로 선택하고, **둘 다 유효하게 설정돼 있으면 조용히 한쪽을 고르지 않고** 실행을 거부하며 아래처럼 명시 선택을 요구합니다(종료 코드 2).
+
+```text
+Both OpenRouter and Local settings are configured. Choose one explicitly:
+  OpenClaude.ps1 -Provider OpenRouter
+  OpenClaude.ps1 -Provider Local
+```
+
+설정 화면의 **사용할 서비스** 선택 상자에는 설정 여부와 함께 현재 실행 중인 세션이 쓰는 서비스가 `현재 세션`으로 표시됩니다(`/api/status`·`/api/snapshot`의 `providers`, `active_session`). `-Takeover`는 `-Provider`를 생략하면 인수인계 대상 세션의 서비스를 그대로 따릅니다.
+
 ### Claude CLI Local 호환 모드
 
 ```powershell
