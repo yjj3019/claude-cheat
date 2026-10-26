@@ -428,6 +428,45 @@ class StoreTests(unittest.TestCase):
         self.assertFalse([n for n in self.names() if n.endswith(".tmp")])
         self.assertTrue((Path(self.tmp) / (".openclaude.config.yaml.lock")).is_file())
 
+    def test_a_new_section_migrates_that_services_legacy_values(self):
+        # An existing file for another service must not shadow (hide) a credential that is
+        # still being read from the deprecated .env file.
+        tmp = self.enterContext(tempfile.TemporaryDirectory())
+        config = Path(tmp) / "openclaude.config.yaml"
+        config.write_text('local:\n  model: "keep"\n', encoding="utf-8")
+        (Path(tmp) / ".env.openrouter").write_text(
+            "ANTHROPIC_AUTH_TOKEN=sk-or-legacy\nOPENROUTER_MODEL=vendor/old\n", encoding="utf-8")
+        store = cfg.Store(config)
+        store.write_provider("openrouter", {"OPENROUTER_MODEL": "vendor/new", "ANTHROPIC_AUTH_TOKEN": None})
+        values = store.read_provider("openrouter")
+        self.assertEqual(values["OPENROUTER_MODEL"], "vendor/new")
+        self.assertEqual(values["ANTHROPIC_AUTH_TOKEN"], "sk-or-legacy")
+        self.assertEqual(store.read_provider("local")["LOCAL_LLM_MODEL"], "keep")
+        self.assertEqual(store.source("openrouter"), "yaml")
+
+    def test_a_save_preserves_crlf_bom_comments_and_exact_backup_bytes(self):
+        tmp = self.enterContext(tempfile.TemporaryDirectory())
+        config = Path(tmp) / "openclaude.config.yaml"
+        raw = (b"\xef\xbb\xbfopenrouter:\r\n  model: \"vendor/old\"  # keep me\r\n"
+               b"  api_key: \"sk-or-old\"\r\nfuture:\r\n  x: \"y\"\r\n")
+        config.write_bytes(raw)
+        store = cfg.Store(config)
+        store.write_provider("openrouter", {"OPENROUTER_MODEL": "vendor/new"})
+        written = config.read_bytes()
+        self.assertTrue(written.startswith(b"\xef\xbb\xbf"), "the BOM survives")
+        self.assertIn(b"\r\n", written, "CRLF survives")
+        self.assertIn(b"# keep me", written, "an inline comment on a managed key survives")
+        self.assertIn(b"future:", written)
+        self.assertEqual((Path(tmp) / "openclaude.config.yaml.bak").read_bytes(), raw,
+                         "the backup is the exact previous bytes")
+        self.assertEqual(store.read_provider("openrouter")["OPENROUTER_MODEL"], "vendor/new")
+
+    def test_yaml_leading_indicator_characters_are_rejected(self):
+        for value in ("]x", "}x", ",x"):
+            with self.subTest(value=value):
+                doc = cfg.parse(f'openrouter:\n  model: {value}\n')
+                self.assertIsNotNone(doc.first_error("openrouter"), value)
+
 
 try:
     import yaml  # optional: only used to prove the subset is also valid YAML, never imported by the app

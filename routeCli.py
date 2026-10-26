@@ -313,7 +313,12 @@ def connection_test(kind, *, binary=None, model=None, timeout_s=60):
         timeout_s = 60.0
     if not _lock.acquire(blocking=False):
         return {**result, "reason": "busy"}
-    tmp = tempfile.mkdtemp(prefix="routecli-cwd-")
+    try:
+        tmp = tempfile.mkdtemp(prefix="routecli-cwd-")
+    except OSError:
+        # Without this the global lock would stay held and every later test would say "busy".
+        _lock.release()
+        return {**result, "reason": "temp_failed"}
     try:
         found = find_binary(kind, binary or None)
         if not found:

@@ -61,6 +61,8 @@ ROUTING_EVENTS_CAP = 2000
 SHORT_WINDOW = 10
 TIMELINE_HOURS = 24
 BYTES_CAP = 65536
+# Endpoints users configure by hand; any other model-list path is treated as opaque (masked).
+SAFE_URL_PATHS = {"/v1/messages", "/v1/models", "/api/tags"}
 SOURCE_LABELS = {"external": "OpenRouter", "plan": "Plan(Anthropic)"}
 # Writing settings is limited to the one settings file (openclaude.config.yaml) and these keys.
 CONFIG_FILES = {
@@ -1690,7 +1692,10 @@ def _mask_url(value):
     userinfo = "•••@" if parts.username is not None or parts.password is not None else ""
     suffix = f":{port}" if port is not None else ""
     query = "?•••" if parts.query or parts.fragment else ""
-    return f"{parts.scheme}://{userinfo}{shown}{suffix}{parts.path}{query}"
+    # A custom path can be a credential carrier (same-origin model lists allow any path),
+    # so only the documented endpoints stay readable; everything else is hidden.
+    path = parts.path if parts.path in SAFE_URL_PATHS else ("/•••" if parts.path else "")
+    return f"{parts.scheme}://{userinfo}{shown}{suffix}{path}{query}"
 
 
 def _settings_state(provider):
@@ -2225,6 +2230,18 @@ renderPicker = function () {
 };
 """)
 
+JS_SHARED += json.dumps("""
+// Settings are session-scoped (even masked), so the config request carries the page token.
+async function loadConfig() {
+  try {
+    const response = await fetch('/api/config', {cache: 'no-store', headers: {'x-dashboard-token': TOKEN}});
+    if (!response.ok) return;
+    CONFIG = await response.json();
+    if (typeof renderSettings === 'function') renderSettings(true);
+  } catch (error) { /* keep the previous view */ }
+}
+""")
+
 DASHBOARD_BODY = "\n  <div class=\"alerts\" id=\"alerts\"></div>\n\n  <div class=\"section-title\"><h2>\uc0c1\ud0dc</h2><span class=\"line\"></span></div>\n  <div class=\"grid\" id=\"grid\"></div>\n\n  <div class=\"section-title\"><h2>\ub3c4\uc6c0\ub9d0</h2><span class=\"line\"></span></div>\n  <div class=\"grid\" id=\"help\"></div>\n"
 
 SETTINGS_BODY = "\n  <div class=\"alerts\" id=\"alerts\"></div>\n\n  <div class=\"section-title\"><h2>\uc124\uc815</h2><span class=\"line\"></span></div>\n  <div class=\"provider-pick\"><label for=\"provider-select\">\uc0ac\uc6a9\ud560 \uc11c\ube44\uc2a4</label><select class=\"input\" id=\"provider-select\" aria-label=\"\uc0ac\uc6a9\ud560 \uc11c\ube44\uc2a4\"></select></div>\n  <div class=\"grid\" id=\"settings\"></div>\n\n  <div class=\"section-title\"><h2>\uc801\uc6a9 \ubc29\ubc95</h2><span class=\"line\"></span></div>\n  <div class=\"grid\" id=\"guide\"></div>\n"
@@ -2294,6 +2311,10 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/settings":
             self._send(200, "text/html; charset=utf-8", SETTINGS_PAGE.replace("__DASHBOARD_TOKEN__", TOKEN))
         elif path == "/api/config":
+            if not self._authorized():
+                # Settings (even masked) belong to the session, exactly like /api/cli.
+                return self._send(403, "application/json; charset=utf-8",
+                                  json.dumps({"error": "token_required"}))
             try:
                 # The settings page needs both services' state and which one a live session
                 # uses; the handoff token itself is never exposed.
@@ -2348,6 +2369,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _authorized(self):
         token = self.headers.get("x-dashboard-token") or ""
+        # compare_digest raises TypeError on non-ASCII str; a header is bytes-decoded latin-1,
+        # so refuse it rather than letting the handler die without a 403.
+        if not token.isascii():
+            return False
         return bool(token) and secrets.compare_digest(token, TOKEN)
 
     def _method_not_allowed(self):

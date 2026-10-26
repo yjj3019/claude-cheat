@@ -28,7 +28,7 @@ class AuditRegressionTests(unittest.TestCase):
         path = self.root / "openclaude.config.yaml"
         original = 'openrouter:\n  api_key: "sk-or-v1-abcdefghijkl"\n  model: "v/a"\n# comment\n'
         path.write_text(original, encoding="utf-8")
-        with mock.patch.object(dash.Path, "read_text", side_effect=PermissionError("locked")):
+        with mock.patch.object(dash.Path, "read_bytes", side_effect=PermissionError("locked")):
             with self.assertRaises(OSError):
                 dash.routeConfig.Store(path).write_provider("openrouter", {"OPENROUTER_MODEL": "v/b"})
         self.assertEqual(path.read_text(encoding="utf-8"), original)

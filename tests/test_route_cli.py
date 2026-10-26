@@ -339,6 +339,14 @@ class ConnectionTest(FakeCase):
             self.assertEqual((result["ok"], result["reason"], result["kind"]), (ok, reason, "codex"), mode)
             self.assertEqual(set(result), {"ok", "reason", "kind", "version", "exit_code", "elapsed_ms"})
 
+    def test_a_temp_failure_does_not_poison_the_lock(self):
+        with mock.patch.object(rc.tempfile, "mkdtemp", side_effect=OSError("denied")):
+            result = rc.connection_test("codex", binary=str(CMD))
+        self.assertEqual(result["reason"], "temp_failed")
+        self.assertFalse(rc._lock.locked(), "the busy flag must be released")
+        self.skip_probe()
+        self.assertEqual(self.codex("ok")["reason"], "ready")
+
     def test_validation_reasons(self):
         for binary, code in ((r"relative\codex.exe", "binary_not_absolute"), (str(SHIM_DIR / "codex-evil.exe"), "binary_name_mismatch"),
                              (str(SHIM_DIR / "gone" / "codex.exe"), "binary_not_found")):

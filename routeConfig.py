@@ -96,7 +96,7 @@ def _scalar(raw, line):
             out.append(char)
             index += 1
         raise ConfigError("unterminated_string", line)
-    if first in "&*!|>[{@`%" or raw.startswith(("- ", "? ")) or raw == "-":
+    if first in "&*!|>[{@`%]},," or raw.startswith(("- ", "? ")) or raw == "-":
         raise ConfigError("unsupported_syntax", line)
     comment = re.search(r"\s#", raw)
     value = (raw[:comment.start()] if comment else raw).rstrip()
@@ -186,6 +186,33 @@ def _dump(value):
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def _trailing_comment(line):
+    """The trailing ``# ...`` of a managed line, with its leading space, or "".
+
+    Only a ``#`` outside quotes and preceded by whitespace starts a comment, so a value
+    containing ``#`` (quoted or bare like ``v#1``) keeps it as part of the value.
+    """
+    quote = None
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote:
+            if quote == '"' and char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                if quote == "'" and line[index + 1:index + 2] == "'":
+                    index += 2
+                    continue
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char == "#" and index > 0 and line[index - 1] in " \t":
+            return line[index - 1:]
+        index += 1
+    return ""
+
+
 def update_text(text, section, updates):
     """Return ``text`` with ``updates`` ({yaml_key: str|None}) applied inside ``section``.
 
@@ -224,7 +251,8 @@ def update_text(text, section, updates):
                 continue  # collapse duplicates of a managed key
             written.add(key)
             value = updates[key]
-            body.append(line if value is None else f"  {key}: {_dump(value)}")
+            body.append(line if value is None else
+                        f"  {key}: {_dump(value)}{_trailing_comment(line)}")
             last_entry = start + len(body) - 1
             continue
         body.append(line)
@@ -289,12 +317,7 @@ class Store:
 
     def _read_text(self):
         """File text, or None when the file does not exist. Undecodable files are an error."""
-        try:
-            return self.path.read_text(encoding="utf-8-sig")
-        except FileNotFoundError:
-            return None
-        except UnicodeDecodeError:
-            raise ConfigError("config_not_utf8") from None
+        return self._decode(self._read_bytes())
 
     def source(self, provider):
         """Where a service's settings come from: 'yaml', 'legacy' or 'none'."""
@@ -337,7 +360,8 @@ class Store:
             yaml_updates[names[name]] = value
         with _WRITE_LOCK, self._cross_process_lock():
             # Re-read inside the lock so a concurrent save is never overwritten with stale text.
-            original = self._read_text()
+            raw = self._read_bytes()
+            original = self._decode(raw)
             if original is None:
                 text = self._seed()
             else:
@@ -345,8 +369,40 @@ class Store:
                 if doc.errors:
                     raise doc.errors[0]
                 text = original
+                # A service whose section does not exist yet is still being served from its
+                # deprecated .env file. Creating the section without those legacy values would
+                # silently shadow (hide) the stored credential, so the section starts from them;
+                # explicit posted values and None entries are left for update_text to decide.
+                if provider not in doc.sections:
+                    for key, value in self._legacy_values(provider).items():
+                        if key not in yaml_updates or yaml_updates[key] is None:
+                            yaml_updates[key] = value
             text = update_text(text, provider, yaml_updates)
-            self._atomic_write(text, original)
+            self._atomic_write(text, raw, original is not None and raw.startswith(b"\xef\xbb\xbf"))
+
+    def _legacy_values(self, provider):
+        """The legacy dotenv values for one service, as {yaml_key: value} (missing file = {})."""
+        spec = SECTIONS[provider]
+        legacy = self._legacy(provider)
+        if legacy is None or not legacy.is_file():
+            return {}
+        values = read_legacy(legacy)
+        return {key: values[name] for key, name in spec["keys"].items() if name in values}
+
+    def _read_bytes(self):
+        try:
+            return self.path.read_bytes()
+        except FileNotFoundError:
+            return None
+
+    @staticmethod
+    def _decode(raw):
+        if raw is None:
+            return None
+        try:
+            return raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            raise ConfigError("config_not_utf8") from None
 
     @contextlib.contextmanager
     def _cross_process_lock(self, timeout=10.0):
@@ -420,14 +476,23 @@ class Store:
                 base = update_text(base, provider, yaml_values)
         return base
 
-    def _atomic_write(self, text, original):
+    def _atomic_write(self, text, original_bytes, bom=False):
         descriptor, temporary = tempfile.mkstemp(prefix="." + CONFIG_NAME + ".", suffix=".tmp",
                                                  dir=str(self.path.parent))
         try:
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+            # newline="" keeps the line endings update_text detected from the original text;
+            # utf-8-sig only when the original file carried a byte-order mark.
+            with os.fdopen(descriptor, "w", encoding="utf-8-sig" if bom else "utf-8",
+                           newline="") as handle:
                 handle.write(text)
-            if original is not None:
-                self.path.with_name(self.path.name + ".bak").write_text(original, encoding="utf-8", newline="")
+            if original_bytes is not None:
+                backup = self.path.with_name(self.path.name + ".bak")
+                backup.write_bytes(original_bytes)
+                if os.name != "nt":
+                    try:
+                        os.chmod(backup, 0o600)  # the previous file may contain a key
+                    except OSError:
+                        pass
             if not _replace_with_retry(temporary, self.path):
                 raise OSError("could not replace the settings file")
         finally:

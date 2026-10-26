@@ -1793,6 +1793,9 @@ class UrlMaskingTests(unittest.TestCase):
         self.assertEqual(dash._mask_url("http://[::1]:8080/v1/messages"), "http://[:•••]:8080/v1/messages")
         hidden = dash._mask_url("https://user:pw@llm.example.com/v1/messages?token=abc#frag")
         self.assertEqual(hidden, "https://•••@ll•••••••••••om/v1/messages?•••")
+        custom = dash._mask_url("http://127.0.0.1:11434/v1/models/sk-live-SECRET")
+        self.assertNotIn("SECRET", custom, "a custom path can carry a credential")
+        self.assertTrue(custom.endswith("/•••"), custom)
         for leaked in ("user", "pw", "token", "abc", "frag", "example"):
             self.assertNotIn(leaked, hidden)
         for bad in ("not a url", "ftp://host/x", "http://host:99999/x", "http://"):
@@ -1894,6 +1897,73 @@ class OpenPageTests(unittest.TestCase):
             dash.main([])
         self.assertEqual(serve.call_args_list[0].kwargs["open_page"], "settings")
         self.assertIsNone(serve.call_args_list[1].kwargs["open_page"])
+
+
+class LegacyMigrationSaveTests(unittest.TestCase):
+    """Saving one service must not shadow another value still read from a legacy .env file."""
+
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.config = self.root / "openclaude.config.yaml"
+        self.enterContext(mock.patch.object(dash, "CONFIG_FILES", {
+            "openrouter": {"path": self.config,
+                           "secret": {"ANTHROPIC_AUTH_TOKEN"},
+                           "required": ("ANTHROPIC_AUTH_TOKEN", "OPENROUTER_MODEL"),
+                           "fields": ("OPENROUTER_MODEL", "ANTHROPIC_AUTH_TOKEN")}}))
+
+    def test_saving_a_model_keeps_the_legacy_key(self):
+        self.config.write_text('local:\n  model: "keep"\n', encoding="utf-8")
+        (self.root / ".env.openrouter").write_text(
+            "ANTHROPIC_AUTH_TOKEN=sk-or-legacy\nOPENROUTER_MODEL=vendor/old\n", encoding="utf-8")
+        dash.save_config("openrouter", {"OPENROUTER_MODEL": "vendor/new"})
+        values = dash.read_settings("openrouter")
+        self.assertEqual(values["OPENROUTER_MODEL"], "vendor/new")
+        self.assertEqual(values["ANTHROPIC_AUTH_TOKEN"], "sk-or-legacy")
+        self.assertEqual(dash.config_snapshot()["openrouter"]["fields"]["ANTHROPIC_AUTH_TOKEN"]["set"], True)
+
+
+class ConfigEndpointAuthTests(unittest.TestCase):
+    """Settings are session-scoped even when values are masked: no token, no config."""
+
+    def setUp(self):
+        import threading
+
+        self.server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self._shutdown)
+
+    def _shutdown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def get(self, headers):
+        import socket
+
+        request = ["GET /api/config HTTP/1.1", f"Host: 127.0.0.1:{self.port}", "Connection: close"]
+        request.extend(f"{name}: {value}" for name, value in headers)
+        with socket.create_connection(("127.0.0.1", self.port), timeout=10) as sock:
+            sock.sendall(("\r\n".join(request) + "\r\n\r\n").encode("latin-1"))
+            chunks = []
+            while True:
+                part = sock.recv(4096)
+                if not part:
+                    break
+                chunks.append(part)
+        return b"".join(chunks)
+
+    def test_config_needs_the_session_token(self):
+        denied = self.get([])
+        self.assertIn(b"403", denied.split(b"\r\n", 1)[0])
+        self.assertIn(b"token_required", denied)
+        allowed = self.get([("x-dashboard-token", dash.TOKEN)])
+        self.assertIn(b"200", allowed.split(b"\r\n", 1)[0])
+        self.assertIn(b"active_session", allowed)
+
+    def test_a_non_ascii_token_is_rejected_as_json(self):
+        response = self.get([("x-dashboard-token", "\xff")])
+        self.assertIn(b"403", response.split(b"\r\n", 1)[0])
+        self.assertIn(b"token_required", response)
 
 
 class ProviderSelectionDisplayTests(unittest.TestCase):
