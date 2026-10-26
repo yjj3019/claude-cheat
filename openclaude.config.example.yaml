@@ -33,3 +33,16 @@ local:
   # Optional exact HTTP Messages URL exception. HTTP sends prompts and credentials
   # unencrypted; prefer HTTPS.
   http_url: ""
+
+cli:
+  # Installed command-line clients (Codex, Grok, Claude Code). For now this section only drives the
+  # settings page's detection list and its connection test; requests are NOT routed to a CLI.
+  # The test sends one fixed line to the selected CLI's own service, using that CLI's own login.
+  # codex | grok | claude
+  kind: ""
+  # Optional model name passed to the CLI; empty = the CLI's own default.
+  model: ""
+  # Optional absolute path to pin the executable; empty = detect it. Its file name must match the kind.
+  binary: ""
+  # Connection-test time limit in seconds (10-120); empty = 60.
+  timeout_s: ""

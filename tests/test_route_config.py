@@ -102,13 +102,13 @@ class ParseTests(unittest.TestCase):
         self.assertIsNone(doc.first_error("local"))
 
     def test_unknown_sections_are_ignored_whatever_their_syntax(self):
-        text = ('openrouter:\n  model: "m"\ncli:\n  kind: codex\n  nested:\n    - a\n    - {b: [1]}\n'
+        text = ('openrouter:\n  model: "m"\nfuture:\n  kind: codex\n  nested:\n    - a\n    - {b: [1]}\n'
                 'local:\n  model: "l"\n')
         doc = cfg.parse(text)
         self.assertEqual(doc.errors, [])
         self.assertEqual(doc.sections["openrouter"]["values"], {"model": "m"})
         self.assertEqual(doc.sections["local"]["values"], {"model": "l"})
-        self.assertNotIn("cli", doc.sections)
+        self.assertNotIn("future", doc.sections)
 
     def test_unicode_line_separators_do_not_split_lines(self):
         # str.splitlines() would turn the text after U+2028 / U+0085 / U+000B into a phantom line
@@ -159,7 +159,7 @@ class UpdateTextTests(unittest.TestCase):
         self.assertEqual(out.count("model:"), 1)
 
     def test_unknown_sections_and_their_content_survive_byte_for_byte(self):
-        future = 'cli:\n  kind: codex\n  extra:\n    - {a: 1}\n'
+        future = 'future:\n  kind: codex\n  extra:\n    - {a: 1}\n'
         out = cfg.update_text('openrouter:\n  model: "m"\n' + future, "openrouter", {"model": "n"})
         self.assertIn(future, out)
 
@@ -245,6 +245,21 @@ class StoreTests(unittest.TestCase):
         store.write_provider("openrouter", {"OPENROUTER_MODEL": "vendor/m"})
         self.assertEqual(store.read_provider("local"), {"LOCAL_LLM_ALLOW_REMOTE": "false"})
         self.assertEqual(store.read_provider("openrouter"), {"OPENROUTER_MODEL": "vendor/m"})
+
+    def test_the_cli_section_has_no_legacy_file_and_round_trips(self):
+        store = make_store(self.tmp, **{".env.openrouter": "OPENROUTER_MODEL=vendor/old\n"})
+        self.assertEqual(store.source("cli"), "none")
+        self.assertEqual(store.read_provider("cli"), {})
+        store.write_provider("cli", {"CLI_KIND": "codex", "CLI_TIMEOUT_S": "45"})
+        self.assertEqual(store.read_provider("cli"), {"CLI_KIND": "codex", "CLI_TIMEOUT_S": "45"})
+        self.assertEqual(store.source("cli"), "yaml")
+        # migrating the other services' legacy files still happened, and the new section did not break it
+        self.assertEqual(store.read_provider("openrouter"), {"OPENROUTER_MODEL": "vendor/old"})
+        with self.assertRaises(cfg.ConfigError):
+            store.write_provider("cli", {"NOT_A_KEY": "x"})
+        broken = make_store(tempfile.mkdtemp(dir=self.tmp), **{"openclaude.config.yaml": 'cli:\n  kinds: "x"\n'})
+        with self.assertRaises(cfg.ConfigError):
+            broken.read_provider("cli")
 
     def test_error_scope_section_versus_document(self):
         store = make_store(self.tmp, **{"openclaude.config.yaml": 'openrouter:\n  modle: "x"\nlocal:\n  model: "m"\n'})

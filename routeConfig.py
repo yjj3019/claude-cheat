@@ -39,6 +39,9 @@ SECTIONS = {
               "keys": {"url": "LOCAL_LLM_URL", "model": "LOCAL_LLM_MODEL", "api_key": "LOCAL_LLM_API_KEY",
                        "allow_remote": "LOCAL_LLM_ALLOW_REMOTE", "http_url": "LOCAL_LLM_HTTP_URL",
                        "models_url": "LOCAL_LLM_MODELS_URL"}},
+    # Installed command-line clients (Codex, Grok, Claude Code). New in the unified file, so no legacy .env.
+    "cli": {"legacy": None,
+            "keys": {"kind": "CLI_KIND", "model": "CLI_MODEL", "binary": "CLI_BINARY", "timeout_s": "CLI_TIMEOUT_S"}},
 }
 
 # Renaming over a file a Windows reader or scanner holds open fails with these.
@@ -276,7 +279,9 @@ class Store:
         self.path = Path(path)
 
     def _legacy(self, provider):
-        return self.path.with_name(SECTIONS[provider]["legacy"])
+        """The deprecated dotenv file for a service, or None when it never had one."""
+        name = SECTIONS[provider]["legacy"]
+        return self.path.with_name(name) if name else None
 
     def _example(self):
         return self.path.with_name(EXAMPLE_NAME)
@@ -295,7 +300,8 @@ class Store:
         text = self._read_text()
         if text is not None and provider in parse(text).sections:
             return "yaml"
-        return "legacy" if self._legacy(provider).is_file() else "none"
+        legacy = self._legacy(provider)
+        return "legacy" if legacy is not None and legacy.is_file() else "none"
 
     def read_provider(self, provider):
         """Environment-style ``{NAME: value}`` for one service. Raises ConfigError/OSError."""
@@ -312,6 +318,8 @@ class Store:
                 return {spec["keys"][key]: value
                         for key, value in doc.sections[provider]["values"].items() if value != ""}
         legacy = self._legacy(provider)
+        if legacy is None:
+            return {}
         try:
             return read_legacy(legacy)
         except FileNotFoundError:
@@ -346,6 +354,8 @@ class Store:
         except (FileNotFoundError, UnicodeDecodeError):
             base = ""
         for provider, spec in SECTIONS.items():
+            if self._legacy(provider) is None:
+                continue
             try:
                 legacy = read_legacy(self._legacy(provider))
             except FileNotFoundError:

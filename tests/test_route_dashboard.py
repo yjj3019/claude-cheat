@@ -897,13 +897,13 @@ class ConfigTests(unittest.TestCase):
 
     def test_save_keeps_comments_other_sections_and_the_stored_secret(self):
         self.write('# keep me\nopenrouter:\n  api_key: "sk-or-v1-abcdefghijkl"\n  model: "vendor/old"\n'
-                   '# about local\nlocal:\n  model: "llama"\ncli:\n  kind: codex\n')
+                   '# about local\nlocal:\n  model: "llama"\nfuture:\n  kind: codex\n')
         dash.save_config("openrouter", {"OPENROUTER_MODEL": "vendor/new", "ANTHROPIC_AUTH_TOKEN": ""})
         text = self.path.read_text(encoding="utf-8")
         self.assertIn("# keep me", text)
         self.assertIn("# about local", text)
         self.assertIn('local:\n  model: "llama"', text.replace("\r\n", "\n"))
-        self.assertIn("cli:\n  kind: codex", text.replace("\r\n", "\n"))
+        self.assertIn("future:\n  kind: codex", text.replace("\r\n", "\n"))
         self.assertEqual(dash.read_settings("openrouter"),
                          {"OPENROUTER_MODEL": "vendor/new", "ANTHROPIC_AUTH_TOKEN": "sk-or-v1-abcdefghijkl"})
         self.assertTrue((self.root / "openclaude.config.yaml.bak").is_file())
