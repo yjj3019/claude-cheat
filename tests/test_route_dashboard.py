@@ -1483,6 +1483,105 @@ class SnapshotTests(unittest.TestCase):
         self.assertRegex(usage["current_hour"], r"^\d{4}-\d{2}-\d{2}T\d{2}$")
 
 
+class UrlMaskingTests(unittest.TestCase):
+    """Server addresses are masked like keys; optional ones can still be cleared on purpose."""
+
+    URL = "http://127.0.0.1:11434/v1/messages"
+    MODELS = "http://127.0.0.1:11434/v1/models"
+
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.path = self.root / ".env.local-llm"
+        self.enterContext(mock.patch.object(dash, "CONFIG_FILES", {"local": {
+            "path": self.path,
+            "secret": {"LOCAL_LLM_API_KEY", "LOCAL_LLM_URL", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL"},
+            "clearable": {"LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL"},
+            "required": ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL"),
+            "fields": ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY",
+                       "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL")}}))
+        self.path.write_text(f"LOCAL_LLM_URL={self.URL}\nLOCAL_LLM_MODEL=llama\n"
+                             f"LOCAL_LLM_MODELS_URL={self.MODELS}\n", encoding="utf-8")
+
+    def stored(self):
+        return dash.read_env(self.path)
+
+    def test_mask_url_hides_host_credentials_and_query(self):
+        self.assertEqual(dash._mask_url(""), "")
+        self.assertEqual(dash._mask_url(self.URL), "http://12•••••.1:11434/v1/messages")
+        self.assertEqual(dash._mask_url("http://gpu/v1/messages"), "http://g•••/v1/messages")
+        self.assertEqual(dash._mask_url("http://[::1]:8080/v1/messages"), "http://[:•••]:8080/v1/messages")
+        hidden = dash._mask_url("https://user:pw@llm.example.com/v1/messages?token=abc#frag")
+        self.assertEqual(hidden, "https://•••@ll•••••••••••om/v1/messages?•••")
+        for leaked in ("user", "pw", "token", "abc", "frag", "example"):
+            self.assertNotIn(leaked, hidden)
+        for bad in ("not a url", "ftp://host/x", "http://host:99999/x", "http://"):
+            self.assertEqual(dash._mask_url(bad), "•" * 8)
+
+    def test_snapshot_never_returns_a_stored_address(self):
+        snapshot = dash.config_snapshot()
+        fields = snapshot["local"]["fields"]
+        for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODELS_URL"):
+            self.assertTrue(fields[name]["secret"])
+            self.assertTrue(fields[name]["set"])
+            self.assertEqual(fields[name]["value"], "")
+        self.assertEqual(fields["LOCAL_LLM_URL"]["preview"], "http://12•••••.1:11434/v1/messages")
+        self.assertNotIn("127.0.0.1", json.dumps(snapshot))
+        self.assertFalse(fields["LOCAL_LLM_URL"]["clearable"])
+        self.assertTrue(fields["LOCAL_LLM_MODELS_URL"]["clearable"])
+        self.assertFalse(fields["LOCAL_LLM_HTTP_URL"]["set"])
+        self.assertEqual(fields["LOCAL_LLM_MODEL"]["value"], "llama")
+
+    def test_an_empty_address_keeps_the_stored_one(self):
+        dash.save_config("local", {"LOCAL_LLM_URL": "", "LOCAL_LLM_MODEL": "llama2",
+                                   "LOCAL_LLM_MODELS_URL": ""})
+        stored = self.stored()
+        self.assertEqual(stored["LOCAL_LLM_URL"], self.URL)
+        self.assertEqual(stored["LOCAL_LLM_MODELS_URL"], self.MODELS)
+        self.assertEqual(stored["LOCAL_LLM_MODEL"], "llama2")
+
+    def test_a_typed_address_replaces_the_stored_one(self):
+        other = "http://127.0.0.1:9000/v1/messages"
+        dash.save_config("local", {"LOCAL_LLM_URL": other, "LOCAL_LLM_MODEL": "llama",
+                                   "LOCAL_LLM_MODELS_URL": "http://127.0.0.1:9000/v1/models"})
+        self.assertEqual(self.stored()["LOCAL_LLM_URL"], other)
+
+    def test_clear_erases_an_optional_address(self):
+        dash.save_config("local", {"LOCAL_LLM_MODEL": "llama"}, clear=["LOCAL_LLM_MODELS_URL"])
+        self.assertEqual(self.stored().get("LOCAL_LLM_MODELS_URL", ""), "")
+        self.assertFalse(dash.config_snapshot()["local"]["fields"]["LOCAL_LLM_MODELS_URL"]["set"])
+        self.assertEqual(self.stored()["LOCAL_LLM_URL"], self.URL)
+
+    def test_clear_wins_over_a_posted_value(self):
+        dash.save_config("local", {"LOCAL_LLM_MODEL": "llama", "LOCAL_LLM_MODELS_URL": self.MODELS},
+                         clear=["LOCAL_LLM_MODELS_URL"])
+        self.assertEqual(self.stored().get("LOCAL_LLM_MODELS_URL", ""), "")
+
+    def test_clear_rejects_required_keys_and_unknown_names_without_writing(self):
+        before = self.path.read_text(encoding="utf-8")
+        for bad in (["LOCAL_LLM_URL"], ["LOCAL_LLM_API_KEY"], ["NOPE"], [1], "LOCAL_LLM_MODELS_URL", {"a": 1},
+                    ["LOCAL_LLM_MODELS_URL"] * 17):
+            with self.assertRaises(ValueError) as caught:
+                dash.save_config("local", {"LOCAL_LLM_MODEL": "llama"}, clear=bad)
+            self.assertEqual(str(caught.exception), "invalid_clear")
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+        self.assertFalse((self.root / ".env.local-llm.bak").exists())
+
+    def test_clearing_the_exception_a_url_depends_on_is_rejected(self):
+        internal = "http://llm.corp.example/v1/messages"
+        self.path.write_text(f"LOCAL_LLM_URL={internal}\nLOCAL_LLM_MODEL=llama\n"
+                             f"LOCAL_LLM_HTTP_URL={internal}\n", encoding="utf-8")
+        before = self.path.read_text(encoding="utf-8")
+        with self.assertRaises(ValueError):
+            dash.save_config("local", {"LOCAL_LLM_MODEL": "llama"}, clear=["LOCAL_LLM_HTTP_URL"])
+        self.assertEqual(self.path.read_text(encoding="utf-8"), before)
+
+    def test_connection_results_and_model_lists_do_not_echo_the_address(self):
+        with mock.patch.object(dash, "_http_json", side_effect=OSError("boom")):
+            result = dash.run_connection_test("local", "metadata")
+            catalog = dash.model_catalog("local", refresh=True)
+        self.assertNotIn("127.0.0.1", json.dumps(result) + json.dumps(catalog))
+
+
 class OpenPageTests(unittest.TestCase):
     """--open sends the browser to a dashboard page without touching any settings file."""
 

@@ -159,7 +159,7 @@ async function settingsPage({ config, store = new Map(), blockedStorage = false 
   vm.createContext(sandbox);
   vm.runInContext(settingsBundle(), sandbox, { filename: 'settings.js' });
   await new Promise(resolve => setImmediate(resolve));
-  return { nodes: context.nodes, select, handlers, store };
+  return { nodes: context.nodes, select, handlers, store, sandbox };
 }
 
 const visible = nodes => ['openrouter', 'local'].filter(name => !nodes.get(`card-${name}`).hidden);
@@ -210,4 +210,40 @@ test('options show whether each service is configured, and blocked storage is to
   page.select.value = 'openrouter';
   assert.doesNotThrow(() => page.handlers.change());
   assert.deepEqual(visible(page.nodes), ['openrouter']);
+});
+
+test('a stored server address is shown masked and can be cleared only when optional', async () => {
+  const masked = (preview, clearable) => ({ secret: true, set: true, preview, value: '', clearable });
+  const page = await settingsPage({ config: {
+    openrouter: READY_OPENROUTER,
+    local: { fields: {
+      LOCAL_LLM_URL: masked('http://12•••••.1:11434/v1/messages', false),
+      LOCAL_LLM_MODEL: { value: 'llama', set: true },
+      LOCAL_LLM_MODELS_URL: masked('http://12•••••.1:11434/v1/models', true),
+      LOCAL_LLM_HTTP_URL: { secret: true, set: false, preview: '', value: '', clearable: true } } } } });
+  const html = page.nodes.get('settings').innerHTML;
+  assert.doesNotMatch(html, /127\.0\.0\.1:11434\/v1\/messages/);
+  assert.match(html, /저장됨 \(http:\/\/12•••••\.1:11434\/v1\/messages\)/);
+  // a masked address is not a password field: no reveal toggle for it
+  assert.doesNotMatch(html, /data-reveal="cfg-local-LOCAL_LLM_URL"/);
+  // required address cannot be cleared; a stored optional one can; an unset optional one has nothing to clear
+  assert.doesNotMatch(html, /data-clear="local:LOCAL_LLM_URL"/);
+  assert.match(html, /data-clear="local:LOCAL_LLM_MODELS_URL"/);
+  assert.doesNotMatch(html, /data-clear="local:LOCAL_LLM_HTTP_URL"/);
+});
+
+test('fields marked for clearing are sent as an explicit clear list', async () => {
+  const page = await settingsPage({ config: { openrouter: READY_OPENROUTER, local: READY_LOCAL } });
+  const sandboxEval = code => vm.runInContext(code, page.sandbox);
+  // arrays built inside the vm have another realm's prototype, so compare them as JSON
+  const clearList = provider => JSON.parse(sandboxEval(`JSON.stringify(clearList("${provider}"))`));
+  assert.deepEqual(clearList('local'), []);
+  sandboxEval('CLEAR.add("local:LOCAL_LLM_MODELS_URL"); CLEAR.add("openrouter:OPENROUTER_MODEL")');
+  assert.deepEqual(clearList('local'), ['LOCAL_LLM_MODELS_URL']);
+  // a cleared field renders disabled with a cancel button so the pending erase is visible
+  sandboxEval('CONFIG.local = {fields:{LOCAL_LLM_URL:{secret:true,set:true,preview:"x",value:"",clearable:false},' +
+    'LOCAL_LLM_MODEL:{value:"m",set:true},LOCAL_LLM_MODELS_URL:{secret:true,set:true,preview:"y",value:"",clearable:true}}}; renderSettings(true)');
+  const html = page.nodes.get('settings').innerHTML;
+  assert.match(html, /id="cfg-local-LOCAL_LLM_MODELS_URL"[^>]*disabled/);
+  assert.match(html, /data-clear="local:LOCAL_LLM_MODELS_URL">취소</);
 });
