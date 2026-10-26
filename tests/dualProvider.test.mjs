@@ -77,15 +77,51 @@ test('without an alternate provider the same model id stays blocked', { timeout:
 });
 
 test('an alternate provider is refused outside ordinary mode and with invalid settings', () => {
-  const base = { key: 'sk-or-dual', nonce: NONCE, openrouterModel: PRIMARY_MODEL, provider: 'openrouter' };
-  assert.throws(() => createProxy({ ...base, localOnly: true, provider: 'local',
-    localUrl: LOCAL_URL, localModel: 'm', altProvider: 'openrouter', altModel: 'a/b', altKey: 'sk-or-x', altAlias: ALT_ALIAS }));
-  assert.throws(() => createProxy({ ...base, altProvider: 'openrouter', altModel: 'a/b', altKey: 'wrong-prefix', altAlias: ALT_ALIAS }));
-  assert.throws(() => createProxy({ ...base, altProvider: 'openrouter', altModel: 'bad model', altKey: 'sk-or-x', altAlias: ALT_ALIAS }));
-  assert.throws(() => createProxy({ ...base, altProvider: 'local', altModel: ALT_MODEL, altAlias: ALT_ALIAS }));
-  assert.throws(() => createProxy({ ...base, altProvider: 'openrouter', altModel: PRIMARY_MODEL, altKey: 'sk-or-x', altAlias: ALT_ALIAS }));
-  assert.throws(() => createProxy({ ...base, altProvider: 'openrouter', altModel: 'a/b', altKey: 'sk-or-x', altAlias: 'sonnet' }));
-  assert.throws(() => createProxy({ ...base, altProvider: 'openrouter', altModel: 'a/b', altKey: 'sk-or-x', altAlias: 'bad id' }));
+  // Local-primary fixtures: with an OpenRouter base the same-provider guard would fire
+  // before the key/model/alias validations, so each refusal below must be the specific one.
+  const localBase = { nonce: NONCE, provider: 'local', localUrl: LOCAL_URL,
+    localModel: 'primary-local-model', localKey: 'primary-local-key' };
+  const altOpenrouter = { altProvider: 'openrouter', altModel: 'alt/or-model',
+    altKey: 'sk-or-alt0000000000000000000000000000000000000', altAlias: ALT_ALIAS };
+  assert.throws(() => createProxy({ ...localBase, localOnly: true, ...altOpenrouter }), /ordinary session/);
+  assert.throws(() => createProxy({ ...localBase, ...altOpenrouter, altKey: 'wrong-prefix' }),
+    /Alternate OpenRouter configuration required/);
+  assert.throws(() => createProxy({ ...localBase, ...altOpenrouter, altModel: 'bad model' }),
+    /Alternate OpenRouter configuration required/);
+  assert.throws(() => createProxy({ ...localBase, ...altOpenrouter, altAlias: 'claude-sonnet-5' }), /collides/);
+  assert.throws(() => createProxy({ ...localBase, ...altOpenrouter, altAlias: 'bad id' }),
+    /Invalid alternate model alias/);
+  assert.throws(() => createProxy({ ...localBase, altProvider: 'local', altModel: ALT_MODEL, altAlias: ALT_ALIAS }),
+    /Invalid alternate provider/);
+  // The symmetric cases: an OpenRouter session cannot take itself as the alternate, and an
+  // alternate Local service still has to pass the endpoint policy.
+  assert.throws(() => createProxy({ key: 'sk-or-dual', nonce: NONCE, openrouterModel: PRIMARY_MODEL,
+    altProvider: 'openrouter', altModel: 'a/b', altKey: 'sk-or-x', altAlias: ALT_ALIAS }),
+    /Invalid alternate provider/);
+  assert.throws(() => createProxy({ key: 'sk-or-dual', nonce: NONCE, openrouterModel: PRIMARY_MODEL,
+    altProvider: 'local', altModel: 'm', altAlias: ALT_ALIAS }), /Invalid Local/);
+});
+
+test('a local-primary session dispatches the OpenRouter alias to OpenRouter', { timeout: 15000 }, async t => {
+  const calls = [];
+  const ALT_KEY = 'sk-or-alt0000000000000000000000000000000000000';
+  const proxy = await startProxy(t, { provider: 'local', localUrl: LOCAL_URL,
+    localModel: 'primary-local-model', localKey: 'primary-local-key',
+    altProvider: 'openrouter', altModel: 'alt/or-model', altKey: ALT_KEY, altAlias: 'claude-route-openrouter',
+    fetchImpl: async (url, init) => {
+      calls.push({ url, body: JSON.parse(init.body), auth: init.headers.authorization });
+      return Response.json(reply(url === EXTERNAL ? 'alt/or-model' : 'primary-local-model'));
+    } });
+  const alias = await proxy.sendOk('claude-route-openrouter');
+  assert.equal(alias.status, 200);
+  assert.equal(calls[0].url, EXTERNAL);
+  assert.equal(calls[0].body.model, 'alt/or-model');
+  assert.equal(calls[0].body.provider.allow_fallbacks, false);
+  assert.equal(calls[0].auth, `Bearer ${ALT_KEY}`);
+  const primary = await proxy.sendOk(MODEL);
+  assert.equal(primary.status, 200);
+  assert.equal(calls[1].url, LOCAL_URL);
+  assert.equal(calls[1].body.model, 'primary-local-model');
 });
 
 test('an alternate provider failure opens only its own breaker', { timeout: 20000 }, async t => {
@@ -111,4 +147,19 @@ test('an alternate provider failure opens only its own breaker', { timeout: 2000
   assert.equal(during.status, 200);
   assert.match(during.text, /plan-ok/);
   assert.equal(urls.filter(url => url === LOCAL_URL).length, 4, 'the open alternate breaker is not hammered');
+});
+
+test('an alternate answer naming the wrong model is validated and never passed through', { timeout: 20000 }, async t => {
+  const urls = [];
+  const proxy = await startProxy(t, { ...altConfig,
+    fetchImpl: async (url, init) => {
+      urls.push(url);
+      if (url === PLAN) return Response.json(planReply());
+      if (url === LOCAL_URL) return Response.json(reply('other/model'));
+      return Response.json(reply(PRIMARY_MODEL));
+    } });
+  const result = await proxy.sendOk(ALT_ALIAS);
+  assert.equal(result.status, 200);
+  assert.match(result.text, /plan-ok/, 'a mismatched alternate model falls back to Plan');
+  assert.equal(urls.filter(url => url === LOCAL_URL).length, 4, 'the mismatch is retried before the breaker opens');
 });

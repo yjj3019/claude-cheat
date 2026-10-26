@@ -4,6 +4,7 @@ guarantee that the alternate provider's credential reaches the proxy only, never
 import contextlib
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -40,16 +41,29 @@ class DualProviderTestCase(unittest.TestCase):
     def spawn(self):
         return contextlib.ExitStack()
 
-    def run_session(self, provider, **kwargs):
+    def run_session(self, provider, during=None, **kwargs):
         proxy = mock.Mock()
+        proxy.pid = 424242
         proxy.stdout.readline.return_value = '{"port":12345}'
         auth = {"loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "pro"}
-        with mock.patch.object(route, "run_owned", return_value=auth), \
+        seen = {}
+
+        def fake_run_owned(args, env, cwd, prompt="", timeout=120):
+            seen["probe_env"] = dict(env)
+            return auth
+
+        with mock.patch.object(route, "run_owned", side_effect=fake_run_owned), \
              mock.patch.object(route.shutil, "which", return_value="synthetic-cli"), \
              mock.patch.object(route.subprocess, "Popen", return_value=proxy) as spawn, \
+             mock.patch.object(route, "HANDOFF_FILE", self.root / ".session-handoff.json"), \
              mock.patch.object(route.Path, "home", return_value=self.root):
             with route.routed_session(provider, **kwargs) as env:
-                return env, spawn.call_args.kwargs["env"]
+                seen["env"] = env
+                seen["proxy_env"] = spawn.call_args.kwargs["env"]
+                if during:
+                    during(env, spawn.call_args.kwargs["env"])
+        self.last = seen
+        return seen["env"], seen["proxy_env"]
 
 
 class RoutingSectionTests(DualProviderTestCase):
@@ -134,6 +148,44 @@ class DualSessionTests(DualProviderTestCase):
         self.assertNotIn("ANTHROPIC_CUSTOM_MODEL_OPTION", env)
         self.assertNotIn("ROUTE_ALT_KEY", env)
         self.assertNotIn("ROUTE_ALT_KEY", proxy_env)
+
+    def test_the_auth_probe_never_inherits_stale_alternate_secrets(self):
+        write_config(self.root, BOTH + DUAL)
+        os.environ.update({"ROUTE_ALT_KEY": "stale-alt-secret", "ANTHROPIC_CUSTOM_MODEL_OPTION": "stale-alias"})
+        env, _ = self.run_session("openrouter")
+        probe = self.last["probe_env"]
+        self.assertNotIn("ROUTE_ALT_KEY", probe, "the probe runs a CLI child and must stay clean")
+        self.assertNotIn("ROUTE_ALT_KEY", env)
+        self.assertNotIn("ANTHROPIC_CUSTOM_MODEL_OPTION", probe)
+        self.assertEqual(env["ANTHROPIC_CUSTOM_MODEL_OPTION"], "claude-route-local",
+                         "the entry the launcher owns must replace the stale export")
+
+    def test_local_primary_dual_session_pins_the_stable_protocol_for_the_openrouter_entry(self):
+        write_config(self.root, BOTH + DUAL)
+        env, proxy_env = self.run_session("local")
+        self.assertEqual((env.get("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"),
+                          env.get("CLAUDE_CODE_DISABLE_ADVISOR_TOOL")), ("1", "1"))
+        self.assertEqual(proxy_env["ROUTE_ALT_PROVIDER"], "openrouter")
+        write_config(self.root, BOTH)
+        env, proxy_env = self.run_session("local")
+        self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", env)
+        self.assertNotIn("ROUTE_ALT_PROVIDER", proxy_env)
+
+    def test_the_handoff_record_keeps_the_alternate_topology_without_secrets(self):
+        write_config(self.root, BOTH + DUAL)
+        handoff = {}
+
+        def peek(_env, _proxy_env):
+            handoff.clear()
+            handoff.update(json.loads((self.root / ".session-handoff.json").read_text(encoding="utf-8")))
+
+        self.run_session("openrouter", during=peek)
+        self.assertEqual(handoff.get("dual"),
+                         {"provider": "local", "alias": "claude-route-local", "model": "local-model"})
+        self.assertNotIn("local-key", json.dumps(handoff))
+        write_config(self.root, BOTH)
+        self.run_session("openrouter", during=peek)
+        self.assertNotIn("dual", handoff)
 
 
 if __name__ == "__main__":

@@ -68,6 +68,7 @@ With `routing: dual_provider: true` in `openclaude.config.yaml` and **both servi
 - The other provider's credential reaches **only the proxy process**, never the CLI environment. The routing log's `route_selected`/`circuit_open` events carry a `provider` field saying where a request went.
 - Special modes (`-LocalMode`, `-LocalCompat`, `-OpenRouterCompat`) rewrite requests and disable Plan fallback, so they ignore this feature entirely (no extra entry is added).
 - The `/model` entry is injected at session start through `ANTHROPIC_CUSTOM_MODEL_OPTION*`, so changing the option requires restarting the session. Whether the picker shows the entry depends on the CLI version (the hook was confirmed in 2.1.310); the proxy's model-id-to-provider dispatch is covered by unit tests.
+- `-Takeover` stores this topology (provider, alias, model id — no credentials) in the handoff record and refuses to drain when the current settings could no longer serve the same alias (feature disabled, alternate changed, or the provider switched), because a picker entry that suddenly starts returning 403 mid-session is worse than an explicit restart. The alternate credential is always re-read from the current settings.
 
 If you install a global launcher separately, configuration is read beside its target script. Cloning this repository neither installs a global command nor changes an existing launcher target. Run the script in the intended checkout explicitly.
 

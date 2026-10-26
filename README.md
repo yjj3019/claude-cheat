@@ -273,6 +273,7 @@ Both OpenRouter and Local settings are configured. Choose one explicitly:
 - 다른 provider의 자격증명은 **프록시 프로세스에만** 전달되고 CLI 환경변수에는 절대 들어가지 않습니다. 라우팅 로그의 `route_selected`/`circuit_open`은 어느 provider로 갔는지 `provider` 필드로 알려 줍니다.
 - `-LocalMode`·`-LocalCompat`·`-OpenRouterCompat` 같은 특수 모드는 요청을 재작성하고 Plan fallback을 끄므로 이 기능을 무시합니다(항목도 만들지 않습니다).
 - `/model` 항목은 세션 시작 시 환경변수(`ANTHROPIC_CUSTOM_MODEL_OPTION*`)로 주입되므로, 옵션을 바꾸면 세션을 다시 시작해야 보입니다. 항목 표시는 CLI 버전에 좌우되고(2.1.310에서 훅 확인), 프록시의 모델 id → provider 디스패치는 단위 테스트로 검증됩니다.
+- `-Takeover`로 세션을 넘길 때는 인수인계 기록에 이 구성(provider·별칭·모델 id, 자격증명 없음)이 함께 저장되고, 새 프록시가 같은 별칭을 계속 받아들일 수 없는 설정(기능 해제·대체 서비스 변경·provider 전환)이라면 드레인 전에 실행을 거부합니다. 실행 중인 CLI의 항목이 갑자기 403이 되는 일을 막기 위함이며, 대체 서비스 자격증명은 항상 현재 설정에서 다시 읽습니다.
 
 ### Claude CLI Local 호환 모드
 

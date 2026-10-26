@@ -152,6 +152,58 @@ class TakeoverGuardTests(unittest.TestCase):
             advisor.takeover("openrouter")
         self.assertIn("Nothing is listening", str(caught.exception))
 
+    DUAL_RECORD = {"port": 48432, "nonce": "n", "provider": "openrouter",
+                   "dual": {"provider": "local", "alias": "claude-route-local", "model": "local-model"}}
+    DUAL_WANTED = {"ROUTE_ALT_PROVIDER": "local", "ROUTE_ALT_ALIAS": "claude-route-local",
+                   "ROUTE_ALT_MODEL": "local-model", "ROUTE_ALT_URL": "http://127.0.0.1:9/v1/messages",
+                   "ROUTE_ALT_KEY": "k", "ROUTE_ALT_ALLOW_REMOTE": "false", "ROUTE_ALT_HTTP_URL": ""}
+
+    def _guards(self, record, wanted):
+        self.enterContext(mock.patch.object(advisor, "read_handoff", return_value=record))
+        self.enterContext(mock.patch.object(advisor, "port_open", return_value=True))
+        self.enterContext(mock.patch.object(advisor, "dual_provider_setup", return_value=wanted))
+        return self.enterContext(mock.patch.object(advisor, "request_handover"))
+
+    def test_takeover_refuses_before_draining_when_the_recorded_dual_topology_is_gone(self):
+        handover = self._guards(dict(self.DUAL_RECORD), None)
+        with self.assertRaises(RuntimeError) as caught:
+            advisor.takeover("openrouter")
+        self.assertIn("dual_provider", str(caught.exception))
+        self.assertIn("restart", str(caught.exception))
+        handover.assert_not_called()
+
+    def test_takeover_refuses_a_malformed_dual_record(self):
+        handover = self._guards({**self.DUAL_RECORD, "dual": "claude-route-local"}, dict(self.DUAL_WANTED))
+        with self.assertRaises(RuntimeError):
+            advisor.takeover("openrouter")
+        handover.assert_not_called()
+
+    def test_takeover_refuses_when_the_alternate_service_changed(self):
+        wanted = {**self.DUAL_WANTED, "ROUTE_ALT_MODEL": "new-model"}
+        handover = self._guards(dict(self.DUAL_RECORD), wanted)
+        with self.assertRaises(RuntimeError) as caught:
+            advisor.takeover("openrouter")
+        self.assertIn("same alternate", str(caught.exception))
+        handover.assert_not_called()
+
+    def test_takeover_refuses_an_explicit_provider_flip_that_orphans_the_alias(self):
+        wanted = {**self.DUAL_WANTED, "ROUTE_ALT_PROVIDER": "openrouter", "ROUTE_ALT_ALIAS": "claude-route-openrouter"}
+        handover = self._guards(dict(self.DUAL_RECORD), wanted)
+        with self.assertRaises(RuntimeError):
+            advisor.takeover("local")
+        handover.assert_not_called()
+
+    def test_takeover_accepts_the_same_dual_topology(self):
+        handover = self._guards(dict(self.DUAL_RECORD), dict(self.DUAL_WANTED))
+        handover.return_value = {"drained": True, "waitedMs": 1}
+        self.enterContext(mock.patch.object(advisor, "wait_for_port_release", return_value=True))
+        marker = self.enterContext(mock.patch.object(advisor, "log_route_marker"))
+        self.enterContext(mock.patch.object(advisor, "routed_session"))
+        self.enterContext(mock.patch.object(advisor.time, "sleep", side_effect=KeyboardInterrupt))
+        self.assertEqual(advisor.takeover("openrouter"), 0)
+        handover.assert_called_once()
+        marker.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

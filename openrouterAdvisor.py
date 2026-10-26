@@ -222,6 +222,15 @@ def dual_cli_env(fragment: dict) -> dict:
             "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": f"Send this model's requests to {label}"}
 
 
+# Env names the CLI must never see: alternate-provider routing (proxy-only secrets) and the
+# /model picker hooks this launcher owns. Shared by the session environment and the auth
+# probe, which otherwise rebuilds the caller's environment and would inherit a stale export.
+_CLI_ENV_STRIP = ("ROUTE_ALT_PROVIDER", "ROUTE_ALT_MODEL", "ROUTE_ALT_URL", "ROUTE_ALT_KEY",
+                  "ROUTE_ALT_ALLOW_REMOTE", "ROUTE_ALT_HTTP_URL", "ROUTE_ALT_ALIAS",
+                  "ANTHROPIC_CUSTOM_MODEL_OPTION", "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME",
+                  "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION")
+
+
 class NoLocalRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -333,12 +342,20 @@ def write_json_state(path: Path, payload: dict) -> bool:
             pass
 
 
-def write_handoff(*, port, nonce, proxy_pid, provider, cli_pid):
-    """Record the live route so another terminal can take it over without changing the port."""
+def write_handoff(*, port, nonce, proxy_pid, provider, cli_pid, dual=None):
+    """Record the live route so another terminal can take it over without changing the port.
+
+    ``dual`` is the non-secret alternate topology ({provider, alias, model}) an ordinary
+    session exposed in the CLI's /model picker; a takeover must keep accepting the same
+    alias or the already-running CLI would start getting 403s for its own model entry.
+    """
     if not isinstance(port, int) or not isinstance(proxy_pid, int):
         return  # nothing usable to record (also keeps mocked sessions out of the file)
     payload = {"port": port, "nonce": nonce, "proxy_pid": proxy_pid, "launcher_pid": cli_pid,
                "provider": provider, "started": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    if dual:
+        payload["dual"] = {"provider": dual["ROUTE_ALT_PROVIDER"], "alias": dual["ROUTE_ALT_ALIAS"],
+                           "model": dual["ROUTE_ALT_MODEL"]}
     write_json_state(HANDOFF_FILE, payload)
 
 
@@ -475,7 +492,12 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
         env.update(ANTHROPIC_DEFAULT_SONNET_MODEL="claude-sonnet-5-5", ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-5-5",
                    ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-haiku-5-5", ANTHROPIC_DEFAULT_FABLE_MODEL="claude-fable-5-1",
                    ANTHROPIC_SMALL_FAST_MODEL="claude-haiku-5-5", CLAUDE_CODE_SUBAGENT_MODEL="claude-sonnet-5-5")
-    if provider == "openrouter":
+    # Dual provider is an ordinary-session convenience: local-only and compatibility modes
+    # rewrite requests and disable Plan fallback, so they never get a second provider.
+    # Resolved before the CLI env so a dual OpenRouter participant also pins the stable
+    # protocol below; the /model entry itself is applied after the env cleanup that follows.
+    dual = None if isolated or compat else dual_provider_setup(provider)
+    if provider == "openrouter" or (dual is not None and dual["ROUTE_ALT_PROVIDER"] == "openrouter"):
         # Claude Code 2.1.310 sends experimental betas whose request shape (inline tool_addition
         # blocks, context_management, advisor tool) the Messages API providers reject with HTTP 400.
         # Keep the routed session on the stable protocol; thinking and effort stay per request.
@@ -487,10 +509,7 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
     env.pop("OPENROUTER_ROUTE_COMPAT", None)
     for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER"):
         env.pop(name, None)
-    for name in ("ROUTE_ALT_PROVIDER", "ROUTE_ALT_MODEL", "ROUTE_ALT_URL", "ROUTE_ALT_KEY",
-                 "ROUTE_ALT_ALLOW_REMOTE", "ROUTE_ALT_HTTP_URL", "ROUTE_ALT_ALIAS",
-                 "ANTHROPIC_CUSTOM_MODEL_OPTION", "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME",
-                 "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION"):
+    for name in _CLI_ENV_STRIP:
         env.pop(name, None)
     # Remove only provider credentials/routing left by the former OpenRouter setup.
     for name in ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",
@@ -512,6 +531,8 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
         probe_env.pop("ANTHROPIC_BASE_URL", None)
         probe_env.pop("ANTHROPIC_AUTH_TOKEN", None)
         probe_env.pop("ANTHROPIC_API_KEY", None)
+        for name in _CLI_ENV_STRIP:
+            probe_env.pop(name, None)
         auth = run_owned(command + ["auth", "status", "--json"], probe_env, str(Path.home()), timeout=60)
         if not (auth.get("loggedIn") is True and auth.get("authMethod") == "claude.ai"
                 and auth.get("apiProvider") == "firstParty" and auth.get("subscriptionType") == "pro"):
@@ -537,9 +558,6 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
                      "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"):
             if env.get(name) == config["OPENROUTER_MODEL"]:
                 env.pop(name)
-    # Dual provider is an ordinary-session convenience: local-only and compatibility modes
-    # rewrite requests and disable Plan fallback, so they never get a second provider.
-    dual = None if isolated or compat else dual_provider_setup(provider)
     if dual:
         env.update(dual_cli_env(dual))
     if check_connection(provider, config=config) != 0:
@@ -607,7 +625,7 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
         log_route_marker(f"launcher start pid={os.getpid()} proxy={proxy.pid} port={port}")
         # Remember the live route so a second terminal can take it over without the CLI noticing.
         write_handoff(port=port, nonce=nonce, proxy_pid=proxy.pid, provider=provider,
-                      cli_pid=os.getpid())
+                      cli_pid=os.getpid(), dual=dual)
         yield env
     finally:
         log_route_marker(f"launcher exit pid={os.getpid()}")
@@ -713,6 +731,24 @@ def takeover(provider: str = "auto", debug: bool = False) -> int:
         provider = recorded if recorded in ("openrouter", "local") else configured_provider()
     if not port_open(port):
         raise RuntimeError(f"Nothing is listening on the recorded port {port}; start a normal session")
+    # The recorded session may expose the other provider in the CLI's /model picker
+    # (routing: dual_provider). The replacement must keep accepting the exact alias the
+    # running CLI already offers, so refuse before draining when the current settings
+    # would drop or change that topology: mid-session 403s on a picker entry are worse
+    # than an explicit "restart instead". Credentials are rebuilt from disk either way.
+    recorded_dual = record.get("dual")
+    if recorded_dual is not None:
+        wanted = dual_provider_setup(provider)
+        topology = (isinstance(recorded_dual, dict) and isinstance(wanted, dict)
+                    and wanted.get("ROUTE_ALT_PROVIDER") == recorded_dual.get("provider")
+                    and wanted.get("ROUTE_ALT_ALIAS") == recorded_dual.get("alias")
+                    and wanted.get("ROUTE_ALT_MODEL") == recorded_dual.get("model"))
+        if not topology:
+            alt = recorded_dual.get("provider") if isinstance(recorded_dual, dict) else None
+            raise RuntimeError(
+                f"The recorded session exposes the {alt or 'alternate'} service in /model"
+                " (routing: dual_provider), but the current settings no longer provide that"
+                " same alternate; restart the CLI session instead of taking over")
     try:
         report = request_handover(port, nonce)
     except (OSError, ValueError) as error:
