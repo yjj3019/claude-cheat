@@ -6,6 +6,7 @@ import io
 import http.client
 import json
 import os
+import sys
 import tempfile
 import time
 import unittest
@@ -1557,6 +1558,142 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(usage["timeline"], [])
         self.assertIsNone(usage["cost_usd"])
         self.assertRegex(usage["current_hour"], r"^\d{4}-\d{2}-\d{2}T\d{2}$")
+
+
+class CliSettingsTests(unittest.TestCase):
+    """The CLI card detects installed clients and runs one fixed connection test; it never routes."""
+
+    def setUp(self):
+        import types
+
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.path = self.root / "openclaude.config.yaml"
+        files = {name: {**spec, "path": self.path} for name, spec in dash.CONFIG_FILES.items()}
+        self.enterContext(mock.patch.object(dash, "CONFIG_FILES", files))
+
+        class CliError(ValueError):
+            def __init__(self, code):
+                self.code = code
+                super().__init__(code)
+
+        self.calls = []
+        fake = types.ModuleType("routeCli")
+        fake.KINDS = ("codex", "grok", "claude")
+        fake.CliError = CliError
+
+        def validate_binary(kind, path):
+            if not str(path).startswith("C:\\tools\\" + kind):
+                raise CliError("binary_name_mismatch")
+            return path
+
+        def detect_all(pinned=None):
+            self.calls.append(("detect_all", pinned))
+            return [{"kind": "codex", "found": True, "name": "codex.cmd", "dir": "C:\\npm", "via": "PATH",
+                     "version": "0.164.0", "reason": None},
+                    {"kind": "grok", "found": False, "name": None, "dir": None, "via": None,
+                     "version": None, "reason": "not_found"},
+                    {"kind": "claude", "found": True, "name": "claude.cmd", "dir": "C:\\npm", "via": "known-dir",
+                     "version": "2.1.310", "reason": None}]
+
+        def connection_test(kind, **options):
+            self.calls.append(("connection_test", kind, options))
+            return {"ok": True, "reason": "ready", "kind": kind, "version": "0.164.0", "exit_code": 0,
+                    "elapsed_ms": 1200, "stdout": "SHOULD NOT LEAK"}
+
+        fake.validate_binary, fake.detect_all, fake.connection_test = validate_binary, detect_all, connection_test
+        self.fake = fake
+        self.enterContext(mock.patch.dict(sys.modules, {"routeCli": fake}))
+
+    def valid(self, **extra):
+        return {"CLI_KIND": "codex", "CLI_MODEL": "gpt-x", "CLI_BINARY": "", "CLI_TIMEOUT_S": "45", **extra}
+
+    def test_the_cli_section_is_saved_validated_and_does_not_count_as_a_routing_service(self):
+        self.assertFalse(dash.any_provider_configured())
+        dash.save_config("cli", self.valid())
+        self.assertEqual(dash.read_settings("cli"),
+                         {"CLI_KIND": "codex", "CLI_MODEL": "gpt-x", "CLI_TIMEOUT_S": "45"})
+        snapshot = dash.config_snapshot()["cli"]
+        self.assertEqual(snapshot["fields"]["CLI_KIND"]["value"], "codex")
+        self.assertFalse(snapshot["fields"]["CLI_KIND"]["secret"])
+        self.assertFalse(dash.any_provider_configured(), "a CLI is a diagnosis target, not a configured provider")
+
+    def test_invalid_values_are_rejected_before_writing(self):
+        dash.save_config("cli", self.valid())
+        before = self.path.read_bytes()
+        cases = [({"CLI_KIND": "gemini"}, "invalid_cli_kind"), ({"CLI_KIND": ""}, "missing_cli_kind"),
+                 ({"CLI_MODEL": "bad model!"}, "invalid_cli_model"), ({"CLI_MODEL": "-x"}, "invalid_cli_model"),
+                 ({"CLI_BINARY": "C:\\evil\\codex.exe"}, "invalid_cli_binary"),
+                 ({"CLI_TIMEOUT_S": "5"}, "invalid_cli_timeout"), ({"CLI_TIMEOUT_S": "121"}, "invalid_cli_timeout"),
+                 ({"CLI_TIMEOUT_S": "abc"}, "invalid_cli_timeout"), ({"CLI_TIMEOUT_S": "\u0663\u0660"}, "invalid_cli_timeout")]
+        for override, reason in cases:
+            with self.subTest(reason=reason, override=override):
+                with self.assertRaises(ValueError) as caught:
+                    dash.save_config("cli", {**self.valid(), **override})
+                self.assertEqual(str(caught.exception), reason)
+        self.assertEqual(self.path.read_bytes(), before)
+        dash.save_config("cli", self.valid(CLI_BINARY="C:\\tools\\codex.exe"))  # a matching pin is accepted
+        self.assertEqual(dash.read_settings("cli")["CLI_BINARY"], "C:\\tools\\codex.exe")
+
+    def test_saving_the_cli_section_leaves_the_routing_services_alone(self):
+        self.path.write_text('openrouter:\n  model: "vendor/a"\n  api_key: "sk-or-v1-abcdefghijkl"\n', encoding="utf-8")
+        before = dash.read_settings("openrouter")
+        dash.save_config("cli", self.valid())
+        self.assertEqual(dash.read_settings("openrouter"), before)
+
+    def test_detection_test_returns_only_safe_fields(self):
+        result = dash.run_connection_test("cli", "metadata", self.valid(CLI_KIND="grok"))
+        self.assertEqual((result["ok"], result["reason"], result["kind"]), (False, "not_found", "grok"))
+        result = dash.run_connection_test("cli", "metadata", self.valid(CLI_KIND="codex"))
+        self.assertEqual((result["ok"], result["reason"], result["version"]), (True, "detected", "0.164.0"))
+        self.assertEqual(dash.run_connection_test("cli", "metadata", {"CLI_KIND": "nope"})["reason"],
+                         "invalid_configuration")
+
+    def test_the_connection_test_passes_the_saved_options_and_never_returns_cli_output(self):
+        result = dash.run_connection_test("cli", "inference", self.valid(CLI_MODEL="m-1"))
+        self.assertEqual(result["reason"], "ready")
+        self.assertNotIn("stdout", result)
+        self.assertNotIn("SHOULD NOT LEAK", json.dumps(result))
+        kind, options = self.calls[-1][1], self.calls[-1][2]
+        self.assertEqual(kind, "codex")
+        self.assertEqual((options["model"], options["timeout_s"], options["binary"]), ("m-1", 45, None))
+
+    def test_unsaved_values_are_validated_before_anything_runs(self):
+        result = dash.run_connection_test("cli", "inference", self.valid(CLI_TIMEOUT_S="999"))
+        self.assertEqual(result["reason"], "invalid_configuration")
+        self.assertFalse([call for call in self.calls if call[0] == "connection_test"])
+
+    def test_a_missing_helper_module_is_reported_instead_of_crashing(self):
+        with mock.patch.dict(sys.modules, {"routeCli": None}):
+            self.assertEqual(dash.run_connection_test("cli", "metadata", self.valid())["reason"], "cli_module_missing")
+            with self.assertRaises(ImportError):
+                dash._cli_detection({})
+
+    def test_a_cli_has_no_model_catalog(self):
+        catalog = dash.model_catalog("cli")
+        self.assertEqual((catalog["ok"], catalog["error"], catalog["models"]), (False, "not_supported", []))
+
+    def test_the_detection_endpoint_needs_the_session_token(self):
+        import threading
+        import urllib.error
+        import urllib.request
+
+        server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            url = f"http://127.0.0.1:{port}/api/cli"
+            with self.assertRaises(urllib.error.HTTPError) as denied:
+                opener.open(url, timeout=10)
+            denied.exception.close()
+            self.assertEqual(denied.exception.code, 403)
+            request = urllib.request.Request(url, headers={"x-dashboard-token": dash.TOKEN})
+            with opener.open(request, timeout=10) as response:
+                kinds = json.loads(response.read())["kinds"]
+            self.assertEqual([row["kind"] for row in kinds], ["codex", "grok", "claude"])
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 class RequestShapeTests(unittest.TestCase):

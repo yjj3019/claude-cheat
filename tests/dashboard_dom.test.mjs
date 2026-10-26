@@ -261,3 +261,43 @@ test('the request-shape card shows an empty state and then the text-only candida
   assert.match(html, /<td>Sonnet<\/td><td class="num">2<\/td><td class="num">3<\/td>/);
   assert.doesNotMatch(html, /데이터 없음. OpenRouter 세션/);
 });
+﻿
+test('the CLI card explains it is diagnosis only and lists the detected clients', async () => {
+  const kinds = [
+    { kind: 'codex', found: true, name: 'codex.cmd', dir: 'C:\\npm', version: '0.164.0' },
+    { kind: 'grok', found: false, reason: 'not_found' },
+  ];
+  const page = await settingsPage({ config: { openrouter: READY_OPENROUTER, local: READY_LOCAL } });
+  const sandboxEval = code => vm.runInContext(code, page.sandbox);
+  sandboxEval(`CLI_DETECT = ${JSON.stringify(kinds)}; renderSettings(true)`);
+  const html = page.nodes.get('settings').innerHTML;
+  assert.match(html, /id="card-cli"/);
+  assert.match(html, /요청 라우팅은 아직 지원하지 않습니다/);
+  assert.match(html, /Reply with exactly OK/);
+  assert.match(html, /<select class="input" id="cfg-cli-CLI_KIND"/);
+  assert.match(html, /<option value="codex">codex<\/option>/);
+  assert.match(html, /감지됨/);
+  assert.match(html, /0\.164\.0/);
+  assert.match(html, /설치된 CLI를 찾지 못했습니다/);
+  assert.match(html, />연결 테스트 \(외부 호출\)</);
+  assert.doesNotMatch(html, /data-picker="cli"/, 'a CLI has no model list');
+});
+
+test('an unconfigured CLI card is never preselected over the routing services', async () => {
+  const page = await settingsPage({ config: { openrouter: READY_OPENROUTER, local: READY_LOCAL } });
+  assert.deepEqual(visible(page.nodes), ['openrouter']);
+  assert.equal(page.nodes.get('card-cli').hidden, true);
+  assert.match(page.select.innerHTML, /CLI \(연결 테스트 전용\) · 설정 필요/);
+});
+
+test('a CLI test result shows the version, exit code and a firewall hint on timeout', async () => {
+  const page = await settingsPage({ config: { openrouter: READY_OPENROUTER, local: READY_LOCAL } });
+  const sandboxEval = code => vm.runInContext(code, page.sandbox);
+  sandboxEval(`RESULTS.cli = {provider:'cli', mode:'inference', ok:false, reason:'timeout', version:'0.164.0', exit_code:null, elapsed_ms:60000}; renderSettings(true)`);
+  const result = page.nodes.get('res-cli');
+  assert.match(result.innerHTML, /연결 테스트 · 시간 초과 — 방화벽/);
+  assert.match(result.innerHTML, /v0\.164\.0/);
+  assert.match(result.innerHTML, /60초/);
+  assert.doesNotMatch(result.innerHTML, /종료 코드/, 'a null exit code is not shown');
+});
+

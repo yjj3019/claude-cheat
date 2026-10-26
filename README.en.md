@@ -327,6 +327,29 @@ Settings live on a **separate page** (`http://127.0.0.1:8787/settings`) reached 
 | Model picker | **목록** opens a searchable list with context length and price and fills the field. `GET /api/models?provider=openrouter\|local` (session token required, 10 minute cache) |
 | When it applies | Saved settings take effect in the **next** session; restart a running one |
 
+### CLI detection and connection test (diagnostics only)
+
+The **CLI (connection test only)** entry on the settings page finds the installed Codex, Grok and Claude Code CLIs, shows their versions and checks whether they can reach their service. It is a **diagnostic tool; routing requests to a CLI is not supported yet** (`OpenClaude.ps1 -Provider` has no CLI value).
+
+| Item | Behaviour |
+| --- | --- |
+| Detection | Looks in `PATH` and known install folders (`~\.grok\bin`, `%APPDATA%\npm`, `~\.local\bin`); if the running session's PATH is stale it re-reads the user and machine PATH from the registry. `GET /api/cli` (session token required) |
+| Detect check | Runs `--version` only (no network use) |
+| Connection test | Sends **one fixed line**, `Reply with exactly OK`, to the selected CLI. It **really calls that CLI's external service with its own login**, which may use a little quota or money |
+| How it runs | No shell. An npm `.cmd` wrapper is read and resolved to its real target (an unrecognised wrapper is refused). Each run uses a fresh empty temp folder and the prompt goes in a file or stdin, never in argv |
+| Environment | Only an allowlist reaches the child (PATH and system variables, proxy and certificate variables, that CLI's own login variables). `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_*`, `OPENROUTER_*` and the dashboard token are never passed, which prevents `claude -p` from calling this proxy again in a loop |
+| Result | Only a category, exit code and duration: `ready`, `timeout` (firewall or proxy suspected), `not_logged_in`, `unsupported_flag` (the CLI version rejected an option), `not_found`, and so on. CLI output and error text are neither shown nor logged |
+| Limits | One run at a time; time limit 10-120 s (default 60) |
+
+The tool-blocking flags (for example Codex `--disable shell_tool`) are **best effort and have not been verified to stop file reads.** The test prompt is a fixed string, but a CLI is an agent: do not use it to send untrusted input.
+
+### Request-shape measurement (sizing a CLI backend)
+
+The **request shape (CLI candidates)** card on the dashboard counts requests by **model family x tools**, to find out how many requests a text-only CLI could serve (no tools, tool results or images).
+- The proxy writes one content-free event per request (`request_shape`: family, tools, tool blocks, non-text media, stream) to the route log. It never records the model id, a prompt or a tool name.
+- It is recorded only in OpenRouter sessions (when a route log exists), and is also exposed as `request_shapes` in `/api/status`.
+- Note: Opus, Haiku and Fable requests always go to Plan today, so a CLI candidate must be a tool-less **Sonnet** request. If this number is small, CLI routing would have little effect.
+
 ### Status API for scripts and agents
 
 Check the current state without opening the page:
