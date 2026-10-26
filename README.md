@@ -252,7 +252,7 @@ URL 내 사용자명·비밀번호·쿼리·fragment, redirect, 잘못된 인증
 # OpenClaude.ps1 -Provider Local
 ```
 
-다시 OpenRouter를 쓰려면 세션을 종료하고 기본 명령으로 재실행합니다. 실행 중인 세션에서 `/model`은 Claude 모델을 선택하며 OpenRouter/Local 제공자를 바꾸는 메뉴가 아닙니다.
+다시 OpenRouter를 쓰려면 세션을 종료하고 기본 명령으로 재실행합니다. 실행 중인 세션에서 `/model`은 기본적으로 Claude 모델을 선택하는 메뉴이고 OpenRouter/Local 제공자를 바꾸지 않습니다(아래 옵트인은 예외).
 
 `-Provider`의 기본값은 **`Auto`** 입니다. 설정된 서비스가 하나뿐이면 그 서비스를 자동으로 선택하고, **둘 다 유효하게 설정돼 있으면 조용히 한쪽을 고르지 않고** 실행을 거부하며 아래처럼 명시 선택을 요구합니다(종료 코드 2).
 
@@ -263,6 +263,16 @@ Both OpenRouter and Local settings are configured. Choose one explicitly:
 ```
 
 설정 화면의 **사용할 서비스** 선택 상자에는 설정 여부와 함께 현재 실행 중인 세션이 쓰는 서비스가 `현재 세션`으로 표시됩니다(`/api/status`·`/api/snapshot`의 `providers`, `active_session`). `-Takeover`는 `-Provider`를 생략하면 인수인계 대상 세션의 서비스를 그대로 따릅니다.
+
+### 한 세션에서 두 서비스 함께 쓰기 (옵트인)
+
+`openclaude.config.yaml`에 `routing: dual_provider: true`를 넣고 **두 서비스가 모두 설정돼 있으면**, 일반 세션이 Claude Code의 `/model` 목록에 다른 쪽 서비스를 항목 하나로 더 보여 줍니다(모델 id `claude-route-local` 또는 `claude-route-openrouter`, 예: `Local (qwen3-coder:latest)`).
+
+- 세션의 기본 provider(`-Provider`로 고른 쪽)는 그대로 기본값입니다. `/model`에서 다른 항목을 고른 **그 요청만** 다른 provider로 갑니다.
+- 네이티브 기능·Plan fallback은 이전과 같이 Plan(구독)으로 갑니다. 다른 provider의 실패는 **그 provider의 서킷 브레이커**만 열고, 한쪽이 죽어도 다른 쪽 요청에는 영향이 없습니다.
+- 다른 provider의 자격증명은 **프록시 프로세스에만** 전달되고 CLI 환경변수에는 절대 들어가지 않습니다. 라우팅 로그의 `route_selected`/`circuit_open`은 어느 provider로 갔는지 `provider` 필드로 알려 줍니다.
+- `-LocalMode`·`-LocalCompat`·`-OpenRouterCompat` 같은 특수 모드는 요청을 재작성하고 Plan fallback을 끄므로 이 기능을 무시합니다(항목도 만들지 않습니다).
+- `/model` 항목은 세션 시작 시 환경변수(`ANTHROPIC_CUSTOM_MODEL_OPTION*`)로 주입되므로, 옵션을 바꾸면 세션을 다시 시작해야 보입니다. 항목 표시는 CLI 버전에 좌우되고(2.1.310에서 훅 확인), 프록시의 모델 id → provider 디스패치는 단위 테스트로 검증됩니다.
 
 ### Claude CLI Local 호환 모드
 

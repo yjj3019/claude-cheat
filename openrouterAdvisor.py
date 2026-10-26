@@ -180,6 +180,48 @@ def configured_provider() -> str:
     raise OpenRouterConfigError()
 
 
+DUAL_ALIASES = {"openrouter": "claude-route-openrouter", "local": "claude-route-local"}
+
+
+def dual_provider_setup(provider: str) -> dict | None:
+    """Proxy env that exposes the other configured provider as one extra /model entry, or None.
+
+    Opt-in through ``routing: dual_provider``. A missing or broken other provider keeps the
+    session single-provider instead of failing startup: this is a convenience, not a need.
+    """
+    try:
+        enabled = (settings("routing").get("ROUTE_DUAL_PROVIDER") or "").strip().lower()
+    except (OSError, ValueError):
+        return None
+    if enabled not in {"true", "1", "yes"}:
+        return None
+    other = "local" if provider == "openrouter" else "openrouter"
+    try:
+        config = provider_config(other)
+    except (OSError, ValueError):
+        return None
+    fragment = {"ROUTE_ALT_PROVIDER": other, "ROUTE_ALT_ALIAS": DUAL_ALIASES[other]}
+    if other == "openrouter":
+        fragment.update(ROUTE_ALT_MODEL=config["OPENROUTER_MODEL"], ROUTE_ALT_KEY=config["OPENROUTER_API_KEY"])
+    else:
+        fragment.update(ROUTE_ALT_URL=config["LOCAL_LLM_URL"], ROUTE_ALT_MODEL=config["LOCAL_LLM_MODEL"],
+                        ROUTE_ALT_KEY=config.get("LOCAL_LLM_API_KEY", ""),
+                        ROUTE_ALT_ALLOW_REMOTE=config["LOCAL_LLM_ALLOW_REMOTE"],
+                        ROUTE_ALT_HTTP_URL=config.get("LOCAL_LLM_HTTP_URL", ""))
+    return fragment
+
+
+def dual_cli_env(fragment: dict) -> dict:
+    """Show the alternate provider in Claude Code's /model picker (one custom entry)."""
+    label = "OpenRouter" if fragment["ROUTE_ALT_PROVIDER"] == "openrouter" else "Local"
+    name = f"{label} ({fragment['ROUTE_ALT_MODEL']})"
+    if len(name) > 60:
+        name = name[:57] + "..."
+    return {"ANTHROPIC_CUSTOM_MODEL_OPTION": fragment["ROUTE_ALT_ALIAS"],
+            "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": name,
+            "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": f"Send this model's requests to {label}"}
+
+
 class NoLocalRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -445,6 +487,11 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
     env.pop("OPENROUTER_ROUTE_COMPAT", None)
     for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER"):
         env.pop(name, None)
+    for name in ("ROUTE_ALT_PROVIDER", "ROUTE_ALT_MODEL", "ROUTE_ALT_URL", "ROUTE_ALT_KEY",
+                 "ROUTE_ALT_ALLOW_REMOTE", "ROUTE_ALT_HTTP_URL", "ROUTE_ALT_ALIAS",
+                 "ANTHROPIC_CUSTOM_MODEL_OPTION", "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME",
+                 "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION"):
+        env.pop(name, None)
     # Remove only provider credentials/routing left by the former OpenRouter setup.
     for name in ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN",
                  "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "ANTHROPIC_BASE_URL", PRO_SESSION_GATE]:
@@ -476,7 +523,8 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
         raise FileNotFoundError("Node.js required for local routing")
     nonce = nonce or secrets.token_urlsafe(32)
     proxy_env = clean_env()
-    for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER"):
+    for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER",
+                 "ROUTE_ALT_PROVIDER", "ROUTE_ALT_MODEL", "ROUTE_ALT_URL", "ROUTE_ALT_KEY", "ROUTE_ALT_ALLOW_REMOTE", "ROUTE_ALT_HTTP_URL", "ROUTE_ALT_ALIAS"):
         proxy_env.pop(name, None)
     try:
         config = provider_config(provider)
@@ -489,10 +537,17 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
                      "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_FABLE_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"):
             if env.get(name) == config["OPENROUTER_MODEL"]:
                 env.pop(name)
+    # Dual provider is an ordinary-session convenience: local-only and compatibility modes
+    # rewrite requests and disable Plan fallback, so they never get a second provider.
+    dual = None if isolated or compat else dual_provider_setup(provider)
+    if dual:
+        env.update(dual_cli_env(dual))
     if check_connection(provider, config=config) != 0:
         print(json.dumps({"event": "provider_connection_unavailable", "provider": provider,
                           "action": "continue", "plan_fallback": not isolated}), flush=True)
     proxy_env.update(config, LOCAL_ROUTE_TOKEN=nonce, LOCAL_ROUTE_ONLY="1" if local_only else "0")
+    if dual:
+        proxy_env.update(dual)
     if provider == "openrouter":
         # Keep routing decisions for later diagnosis; -Debug only shows them live in the terminal.
         proxy_env["ROUTE_LOG_PATH"] = str(ROOT / ".route.log")

@@ -716,7 +716,10 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   // Opt-in: peel the CLI's trailing token-count footer from system text before the external
   // request so the provider's prefix cache survives between turns. Documented in the README.
   stabilizePromptCache = process.env.ROUTE_STABILIZE_PROMPT_CACHE === '1',
-  onHandover = null }) {
+  onHandover = null,
+  // Optional second provider for ordinary sessions: a request whose model equals altAlias
+  // goes to that provider instead of the session's primary one. Absent = single provider.
+  altProvider = null, altModel, altUrl, altKey, altAllowRemote = false, altHttpUrl = '', altAlias }) {
   if (typeof localOnly !== 'boolean' || (localOnly && provider !== 'local')) throw new Error('Local-only mode requires local provider');
   if (typeof localCompat !== 'boolean' || (localCompat && (!localOnly || provider !== 'local')))
     throw new Error('Local compatibility requires Local-only mode');
@@ -734,12 +737,37 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   if (localKey !== undefined && (typeof localKey !== 'string' || /[\x00-\x1f\x7f]/.test(localKey))) throw new Error('Invalid Local credential');
   const externalUrl = provider === 'local' ? localEndpoint(localUrl, localAllowRemote, localHttpUrl) : 'https://openrouter.ai/api/v1/messages';
   if (provider === 'local' && (typeof localModel !== 'string' || !localModel.trim())) throw new Error('Local model required');
+  // Dual provider is an ordinary-session feature only: local-only and compatibility modes
+  // rewrite requests and disable Plan fallback, so a second provider there would bypass
+  // those guarantees. The alias is the exact model id the CLI must send to select it.
+  let altExternalUrl = null;
+  if (altProvider !== null) {
+    if (localOnly || localCompat || openrouterCompat) throw new Error('Alternate provider requires an ordinary session');
+    if (!['openrouter', 'local'].includes(altProvider) || altProvider === provider) throw new Error('Invalid alternate provider');
+    if (typeof altAlias !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(altAlias)) throw new Error('Invalid alternate model alias');
+    if (altAlias === openrouterModel || altAlias === localModel || isPro(altAlias) || isSonnet(altAlias))
+      throw new Error('Alternate model alias collides with a routed model');
+    if (typeof altAllowRemote !== 'boolean') throw new Error('Remote Local setting must be boolean');
+    if (altProvider === 'openrouter') {
+      if (!validOpenRouterModel(altModel) || typeof altKey !== 'string' || !/^sk-or-[A-Za-z0-9_-]+$/.test(altKey))
+        throw new Error('Alternate OpenRouter configuration required');
+      altExternalUrl = 'https://openrouter.ai/api/v1/messages';
+    } else {
+      if (typeof altModel !== 'string' || !altModel.trim()) throw new Error('Alternate Local model required');
+      if (altKey !== undefined && (typeof altKey !== 'string' || /[\x00-\x1f\x7f]/.test(altKey)))
+        throw new Error('Invalid Local credential');
+      altExternalUrl = localEndpoint(altUrl, altAllowRemote, altHttpUrl);
+    }
+  }
   if (!isSonnet(fallbackModel)) throw new Error('Fallback must be a native Sonnet model');
   for (const value of [retryDelayMs, cooldownMs, attemptTimeoutMs, planHeaderMs, planIdleMs, attemptCeilingMs])
     if (!Number.isFinite(value) || value < 0) throw new Error('Invalid routing timeout');
   if (!Number.isFinite(requestIdleTimeoutMs) || requestIdleTimeoutMs < 0) throw new Error('Invalid request idle timeout');
   if (!Number.isFinite(retryMaxWaitMs) || retryMaxWaitMs < 0) throw new Error('Invalid retry wait');
-  let openUntil = 0, probing = false, generation = 0, lastLocalFailure = 'upstream_error';
+  // Breaker state is per provider: one failing provider must not make the other look down.
+  const newCircuit = () => ({ openUntil: 0, probing: false, generation: 0, lastLocalFailure: 'upstream_error' });
+  const circuits = { openrouter: newCircuit(), local: newCircuit() };
+  const primaryCircuit = circuits[provider];
   // The last rate-limit answer a provider gave; kept for exposure and the breaker decision.
   let lastRateLimit = null;
   // Breaker classification. Transport/timeout, 5xx and unusable 2xx answers mean the provider
@@ -756,7 +784,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   };
   // Diagnostics are redacted once, at the sink: the configured credentials are the most
   // specific secrets and the generic rules catch any provider text that echoed a token.
-  const secrets = [key, localKey].filter(secret => typeof secret === 'string' && secret.length >= 4);
+  const secrets = [key, localKey, altKey].filter(secret => typeof secret === 'string' && secret.length >= 4);
   const diagnostics = text => emitDiagnostic(text, secrets);
   // Counters stay in memory and are written to a small file at most once a second, so the
   // dashboard can read routing load without talking to this process.
@@ -988,6 +1016,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       metrics.requests += 1;
       metrics.bytesIn += raw.length;
       if (body.stream === true) metrics.streams += 1;
+      // Which provider this request is aimed at; the alias check below may switch it.
+      let circuitState = primaryCircuit;
       const originalWrite = res.write.bind(res), originalEnd = res.end.bind(res);
       res.write = chunk => {
         if (chunk) metrics.bytesOut += Buffer.byteLength(chunk);
@@ -1032,7 +1062,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       res.on('finish', () => recordRequest(false));
       const compatAlias = compatProfile && ['sonnet', 'opus', 'haiku', 'fable'].includes(model);
       const configuredAlias = provider === 'openrouter' && model === openrouterModel;
-      if (!compatAlias && !configuredAlias && !isPro(model) && !isSonnet(model) && model !== DEEPSEEK) return reject(403, 'Model blocked');
+      const altRequested = altExternalUrl !== null && model === altAlias;
+      if (!compatAlias && !configuredAlias && !altRequested && !isPro(model) && !isSonnet(model) && model !== DEEPSEEK) return reject(403, 'Model blocked');
       const oauthOK = /^Bearer\s+sk-ant-oat/.test(req.headers.authorization || '') && !req.headers['x-api-key'] &&
         (req.headers['anthropic-beta'] || '').includes('oauth-');
       const sendPro = async (reason = 'native_feature', detail) => {
@@ -1044,8 +1075,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           let message = `${label}-only mode cannot route this request; Plan fallback disabled`;
           let code, retryAfterSeconds, previousErrorCode;
           if (reason === 'fallback' || reason === 'circuit_open') {
-            const remaining = Math.max(0, Math.ceil((openUntil - now()) / 1000));
-            const recoveryInProgress = reason === 'circuit_open' && probing && remaining === 0;
+            const remaining = Math.max(0, Math.ceil((circuitState.openUntil - now()) / 1000));
+            const recoveryInProgress = reason === 'circuit_open' && circuitState.probing && remaining === 0;
             const descriptions = {
               timeout: [`${errorPrefix}_timeout`, `${label} request timed out.`],
               authentication_failed: [`${errorPrefix}_authentication_failed`, `${label} server authentication failed. Check the ${label} API key and access permissions; restart the ${label} session after changing credentials.`],
@@ -1056,8 +1087,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             let description;
             [code, description] = reason === 'fallback' ? descriptions[detail] || descriptions.upstream_error :
               recoveryInProgress ? [`${errorPrefix}_recovery_in_progress`, `${label} recovery check is in progress. Wait for it to finish before sending a new request.`] :
-                [`${errorPrefix}_cooldown`, `${label} retry cooldown is active. Previous failure: ${(descriptions[lastLocalFailure] || descriptions.upstream_error)[1]}`];
-            if (reason === 'circuit_open') previousErrorCode = (descriptions[lastLocalFailure] || descriptions.upstream_error)[0];
+                [`${errorPrefix}_cooldown`, `${label} retry cooldown is active. Previous failure: ${(descriptions[circuitState.lastLocalFailure] || descriptions.upstream_error)[1]}`];
+            if (reason === 'circuit_open') previousErrorCode = (descriptions[circuitState.lastLocalFailure] || descriptions.upstream_error)[0];
             if (!recoveryInProgress) retryAfterSeconds = remaining;
             const retryHint = recoveryInProgress ? '' : remaining > 0 ?
               ` Wait ${remaining} second${remaining === 1 ? '' : 's'} before a new request.` :
@@ -1079,7 +1110,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         if (normalizedIds.empty) return reject(400, 'Invalid tool call id');
         if (normalizedIds.changed) logEvent({ event: 'tool_ids_normalized', provider: 'plan', count: normalizedIds.count });
         // The model that actually serves a Plan request may differ from the client alias.
-        const planModel = model === DEEPSEEK || (configuredAlias && !isPro(model) && !isSonnet(model)) ? fallbackModel : model;
+        const planModel = model === DEEPSEEK || altRequested
+          || (configuredAlias && !isPro(model) && !isSonnet(model)) ? fallbackModel : model;
         noteRoute('plan', reason);
         logEvent({ event: 'route_selected', provider: 'plan', reason, ...(detail ? { detail } : {}),
           model: planModel,
@@ -1153,16 +1185,23 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       const nativeDetail = req.url.startsWith('/v1/messages/count_tokens') ? 'token_count' : compatProfile ?
         compatExclusion(body, req.headers['anthropic-beta']) : isPro(model) ? 'plan_model' : externalExclusion(body, req.headers['anthropic-beta'], localOnly);
       if (nativeDetail) return await sendPro('native_feature', nativeDetail);
+      // The alternate model id selects the second provider; anything else keeps the session's
+      // primary provider, so a single-provider session behaves exactly as before.
+      const target = altRequested
+        ? { name: altProvider, model: altModel, url: altExternalUrl, key: altKey, openrouter: altProvider === 'openrouter' }
+        : { name: provider, model: provider === 'local' ? localModel : openrouterModel, url: externalUrl,
+            key: provider === 'local' ? localKey : key, openrouter: provider === 'openrouter' };
+      circuitState = circuits[target.name];
       // An expired breaker admits exactly one half-open probe: the first request takes the
       // lease synchronously, everyone else falls back to Plan (or is told recovery is in
       // progress) until that probe settles. The generation snapshot fences late completions.
-      if (openUntil && (now() < openUntil || probing)) return await sendPro('circuit_open');
-      const probe = Boolean(openUntil);
-      if (probe) probing = true;
-      const claimedGeneration = generation;
+      if (circuitState.openUntil && (now() < circuitState.openUntil || circuitState.probing)) return await sendPro('circuit_open');
+      const probe = Boolean(circuitState.openUntil);
+      if (probe) circuitState.probing = true;
+      const claimedGeneration = circuitState.generation;
       let succeeded = false, localFailure = 'upstream_error', failureClass = null;
       try {
-        const externalModel = provider === 'local' ? localModel : openrouterModel;
+        const externalModel = target.model;
         const externalBody = { ...body, model: externalModel };
         if (Array.isArray(externalBody.messages) && hasNativeThinking(externalBody.messages)) {
           externalBody.messages = withoutNativeThinking(externalBody.messages);
@@ -1174,7 +1213,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         // Ordinary mode: external thinking blocks would pin the next turn to Plan (unsigned history), so never request them.
         if (!compatProfile) externalBody.thinking = { type: 'disabled' };
         if (body.tools) externalBody.tools = body.tools.map(tool => ({ ...tool, input_schema: compatibleSchema(tool.input_schema) }));
-        if (provider === 'openrouter') externalBody.provider = { allow_fallbacks: false };
+        if (target.openrouter) externalBody.provider = { allow_fallbacks: false };
         // Opt-in prefix-cache stabilization: only the very last system text block may lose a
         // trailing, unfenced token-count footer. User/assistant content is never touched.
         if (stabilizePromptCache && externalBody.system !== undefined) {
@@ -1187,12 +1226,12 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         const logReplacement = () => {
           if (routeLogged) return;
           routeLogged = true;
-          logEvent({ event: 'route_selected', provider, reason: 'replacement', model: externalModel });
+          logEvent({ event: 'route_selected', provider: target.name, reason: 'replacement', model: externalModel });
           noteRoute('external', 'replacement');
         };
         const headers = { 'content-type': 'application/json', 'anthropic-version': req.headers['anthropic-version'] || '2023-06-01' };
         if (compatProfile && req.headers['anthropic-beta']) headers['anthropic-beta'] = req.headers['anthropic-beta'];
-        const credential = provider === 'local' ? localKey : key;
+        const credential = target.key;
         if (credential) headers.authorization = `Bearer ${credential}`;
         const attempts = noPlan ? 1 : 4;
         // Permanent 4xx will not change on retry; request-level ones must not open the provider-wide circuit.
@@ -1214,7 +1253,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           let status, retryAfterMs = 0;
           try {
             const operation = (async () => {
-              const response = await fetchImpl(externalUrl, { method: 'POST', headers,
+              const response = await fetchImpl(target.url, { method: 'POST', headers,
                 body: externalPayload, redirect: 'error', signal: controller.signal });
               status = response.status;
               if (!response.ok) {
@@ -1228,7 +1267,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
                   if (hint !== null) retryAfterMs = hint;
                   // Fence the exposed observation: a stale request must not overwrite the
                   // rate-limit state a newer generation already established.
-                  if (claimedGeneration === generation) {
+                  if (claimedGeneration === circuitState.generation) {
                     lastRateLimit = { status, retryAfterMs: hint, at: new Date().toISOString() };
                   }
                 }
@@ -1253,7 +1292,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               });
               const streaming = streamPassthrough && !noPlan && body.stream === true;
               const validated = await bufferedResponse(response, externalModel, model, noPlan ? false : body.stream,
-                controller.signal, () => { noteFirstByte(); if (!noPlan) arm(); }, provider === 'openrouter',
+                controller.signal, () => { noteFirstByte(); if (!noPlan) arm(); }, target.openrouter,
                 streaming ? onFrame : null, !compatProfile && !localOnly, streaming ? onDrain : null);
               if (compatProfile) {
                 const content = JSON.parse(validated.text).content;
@@ -1292,9 +1331,9 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             const response = await abortable(operation, controller.signal);
             client.signal.throwIfAborted();
             succeeded = true;
-            if (claimedGeneration === generation) {
-              if (openUntil) logEvent({ event: 'circuit_recovered', provider });
-              openUntil = 0;
+            if (claimedGeneration === circuitState.generation) {
+              if (circuitState.openUntil) logEvent({ event: 'circuit_recovered', provider: target.name });
+              circuitState.openUntil = 0;
             }
             logReplacement();
             if (response.streamed) { res.end(); return; }
@@ -1308,7 +1347,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             if (error?.streamed || res.headersSent) {
               // Headers are already on the wire, so retrying or falling back would corrupt
               // the response; report the failure inside the stream and stop here.
-              logEvent({ event: 'stream_broken', provider, category: 'upstream' });
+              logEvent({ event: 'stream_broken', provider: target.name, category: 'upstream' });
               try {
                 res.write(`event: error\ndata: ${JSON.stringify({ type: 'error',
                   error: { type: 'api_error', message: 'upstream stream failed' } })}\n\n`);
@@ -1326,7 +1365,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               status === 401 || status === 403 ? 'authentication_failed' : status === 402 ? 'payment_required' : validation === 'empty_response' ? 'empty_response' : 'upstream_error';
             if (Number.isInteger(status)) failureStatus = status;
             failureClass = failureClassOf(status, controller.signal.reason === 'attempt_timeout');
-            logEvent({ event: 'external_attempt_failed', provider, attempt: attempt + 1,
+            logEvent({ event: 'external_attempt_failed', provider: target.name, attempt: attempt + 1,
               ...(Number.isInteger(status) ? { status } : {}), ...(validation ? { validation } : {}),
               ...(retryAfterMs ? { retry_after_ms: retryAfterMs } : {}),
               failure: failureClass,
@@ -1349,22 +1388,22 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             client.signal.addEventListener('abort', () => { clearTimeout(timeout); resolve(); }, { once: true });
           }), client.signal);
         }
-        if (!requestRejected && failureClass !== 'request' && claimedGeneration === generation) {
-          generation++;
-          if (noPlan) lastLocalFailure = localFailure;
+        if (!requestRejected && failureClass !== 'request' && claimedGeneration === circuitState.generation) {
+          circuitState.generation++;
+          if (noPlan) circuitState.lastLocalFailure = localFailure;
           // A 429 states its own recovery window: honor the parsed Retry-After (bounded)
           // instead of the generic cooldown, so the provider is not hammered while it asked
           // to be left alone. Without a hint, the operator's cooldown still applies.
           const cooldown = failureClass === 'rate_limit' && retryAfterHintMs !== null
             ? Math.min(RATE_LIMIT_COOLDOWN_MAX_MS, retryAfterHintMs)
             : cooldownMs;
-          openUntil = now() + cooldown;
+          circuitState.openUntil = now() + cooldown;
           metrics.circuitOpens += 1;
-          logEvent({ event: 'circuit_open', provider, failure: failureClass,
+          logEvent({ event: 'circuit_open', provider: target.name, failure: failureClass,
             ...(failureClass === 'rate_limit' ? { retry_after_ms: retryAfterHintMs, cooldown_ms: cooldown } : {}) });
         }
       } finally {
-        if (probe) probing = false;
+        if (probe) circuitState.probing = false;
       }
       if (!succeeded) await sendPro('fallback', noPlan ? localFailure : undefined);
     } catch {
@@ -1403,9 +1442,13 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     provider: process.env.SONNET_PROVIDER || 'openrouter', localUrl: process.env.LOCAL_LLM_URL,
     localModel: process.env.LOCAL_LLM_MODEL, localKey: process.env.LOCAL_LLM_API_KEY,
     localOnly: process.env.LOCAL_ROUTE_ONLY === '1', localCompat: process.env.LOCAL_ROUTE_COMPAT === '1', openrouterCompat: process.env.OPENROUTER_ROUTE_COMPAT === '1', localHttpUrl: process.env.LOCAL_LLM_HTTP_URL, localAllowRemote: process.env.LOCAL_LLM_ALLOW_REMOTE === 'true',
-    metricsPath: process.env.ROUTE_METRICS_PATH };
+    metricsPath: process.env.ROUTE_METRICS_PATH,
+    altProvider: process.env.ROUTE_ALT_PROVIDER || null, altModel: process.env.ROUTE_ALT_MODEL, altUrl: process.env.ROUTE_ALT_URL,
+    altKey: process.env.ROUTE_ALT_KEY, altAllowRemote: process.env.ROUTE_ALT_ALLOW_REMOTE === 'true', altHttpUrl: process.env.ROUTE_ALT_HTTP_URL,
+    altAlias: process.env.ROUTE_ALT_ALIAS };
   for (const name of ['OPENROUTER_API_KEY', 'OPENROUTER_MODEL', 'LOCAL_ROUTE_TOKEN', 'LOCAL_ROUTE_ONLY', 'LOCAL_ROUTE_COMPAT', 'OPENROUTER_ROUTE_COMPAT', 'SONNET_PROVIDER', 'LOCAL_LLM_URL',
-    'LOCAL_LLM_MODEL', 'LOCAL_LLM_API_KEY', 'LOCAL_LLM_ALLOW_REMOTE', 'LOCAL_LLM_HTTP_URL', 'LOCAL_LLM_MODELS_URL', 'ROUTE_METRICS_PATH']) delete process.env[name];
+    'LOCAL_LLM_MODEL', 'LOCAL_LLM_API_KEY', 'LOCAL_LLM_ALLOW_REMOTE', 'LOCAL_LLM_HTTP_URL', 'LOCAL_LLM_MODELS_URL', 'ROUTE_METRICS_PATH', 'ROUTE_ALT_PROVIDER', 'ROUTE_ALT_MODEL', 'ROUTE_ALT_URL',
+    'ROUTE_ALT_KEY', 'ROUTE_ALT_ALLOW_REMOTE', 'ROUTE_ALT_HTTP_URL', 'ROUTE_ALT_ALIAS']) delete process.env[name];
   if (process.argv.slice(2).includes('--check-connection')) {
     try {
       const result = await checkConnection(config);

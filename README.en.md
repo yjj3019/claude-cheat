@@ -59,6 +59,16 @@ Both OpenRouter and Local settings are configured. Choose one explicitly:
 
 The settings page's service selector marks whether each service is configured and appends `현재 세션` (current session) to the service a live routed session is using; the same state is exposed as `providers` and `active_session` in `/api/status` and `/api/snapshot`. `-Takeover` without `-Provider` follows the provider recorded for the session it takes over.
 
+### Using both services in one session (opt-in)
+
+With `routing: dual_provider: true` in `openclaude.config.yaml` and **both services configured**, an ordinary session lists the other service as one extra entry in Claude Code's `/model` picker (model id `claude-route-local` or `claude-route-openrouter`, for example `Local (qwen3-coder:latest)`).
+
+- The session's own provider (the one `-Provider` chose) stays the default. **Only requests** sent while the extra entry is selected go to the other provider.
+- Native features and Plan fallback still go to Plan (the subscription) as before. A failure opens **that provider's own circuit breaker**; one service going down does not affect requests to the other.
+- The other provider's credential reaches **only the proxy process**, never the CLI environment. The routing log's `route_selected`/`circuit_open` events carry a `provider` field saying where a request went.
+- Special modes (`-LocalMode`, `-LocalCompat`, `-OpenRouterCompat`) rewrite requests and disable Plan fallback, so they ignore this feature entirely (no extra entry is added).
+- The `/model` entry is injected at session start through `ANTHROPIC_CUSTOM_MODEL_OPTION*`, so changing the option requires restarting the session. Whether the picker shows the entry depends on the CLI version (the hook was confirmed in 2.1.310); the proxy's model-id-to-provider dispatch is covered by unit tests.
+
 If you install a global launcher separately, configuration is read beside its target script. Cloning this repository neither installs a global command nor changes an existing launcher target. Run the script in the intended checkout explicitly.
 
 > Scripts use the **product-name form**: `OpenClaude.ps1` (routing session) and `OpenClaudeDashboard.ps1` (dashboard). The previous names `startClaudeOpenRouter.ps1`, `startOpenClaude.ps1`, `startClaudeDashboard.ps1` and `startDashboard.ps1` remain as **compatibility shims**, so existing shortcuts and aliases keep working (they forward every argument and print a one-line notice).

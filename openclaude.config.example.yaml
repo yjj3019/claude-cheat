@@ -46,3 +46,11 @@ cli:
   binary: ""
   # Connection-test time limit in seconds (10-120); empty = 60.
   timeout_s: ""
+
+routing:
+  # "true": when BOTH openrouter and local are configured, an ordinary session also shows the
+  # other provider as one extra entry in Claude Code's /model picker (model ids
+  # claude-route-openrouter / claude-route-local). The session's own provider stays the
+  # default; local-only and compatibility modes ignore this. Default false.
+  dual_provider: false
+

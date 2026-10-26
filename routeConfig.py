@@ -43,6 +43,9 @@ SECTIONS = {
     # Installed command-line clients (Codex, Grok, Claude Code). New in the unified file, so no legacy .env.
     "cli": {"legacy": None,
             "keys": {"kind": "CLI_KIND", "model": "CLI_MODEL", "binary": "CLI_BINARY", "timeout_s": "CLI_TIMEOUT_S"}},
+    # Session routing behaviour. New in the unified file, so no legacy .env.
+    "routing": {"legacy": None,
+                "keys": {"dual_provider": "ROUTE_DUAL_PROVIDER"}},
 }
 
 # Renaming over a file a Windows reader or scanner holds open fails with these.
