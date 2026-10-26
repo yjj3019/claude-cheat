@@ -112,7 +112,7 @@ def main():
         dash._USAGE_SNAP.update({"signature": None, "at": 0.0, "data": None})
         dash._ROUTE_TAIL.update({"path": None, "events": [], "offset": 0, "digest": None})
         try:
-            with mock.patch.object(dash, "read_env", return_value={"OPENROUTER_MODEL": "vendor/model"}), \
+            with mock.patch.object(dash, "read_settings", return_value={"OPENROUTER_MODEL": "vendor/model"}), \
                  mock.patch.object(dash, "account_state", return_value={"ok": False, "error": "offline"}), \
                  mock.patch.object(dash, "model_pricing", return_value={"ok": False}):
                 timed("snapshot (first, cold caches)", lambda: dash.snapshot(), rounds=2)

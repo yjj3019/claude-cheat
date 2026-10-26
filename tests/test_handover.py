@@ -15,21 +15,17 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import routeConfig
+
 ROOT = Path(__file__).resolve().parents[1]
 NODE = os.environ.get("NODE") or "node"
-CONFIG = ROOT / ".env.openrouter"
 
 
 def read_config():
-    values = {}
     try:
-        for line in CONFIG.read_text(encoding="utf-8").splitlines():
-            if "=" in line and not line.lstrip().startswith("#"):
-                name, _, value = line.partition("=")
-                values[name.strip()] = value.strip().strip('"').strip("'")
-    except OSError:
+        return routeConfig.Store(ROOT / routeConfig.CONFIG_NAME).read_provider("openrouter")
+    except (OSError, routeConfig.ConfigError):
         return {}
-    return values
 
 
 def port_open(port, timeout=0.4):
@@ -53,7 +49,7 @@ CONFIG_VALUES = read_config()
 @unittest.skipUnless(os.environ.get("CLAUDE_CHEAT_SLOW") == "1",
                      "spawns a real proxy; set CLAUDE_CHEAT_SLOW=1")
 @unittest.skipUnless(CONFIG_VALUES.get("ANTHROPIC_AUTH_TOKEN") and CONFIG_VALUES.get("OPENROUTER_MODEL"),
-                     "needs a configured .env.openrouter")
+                     "needs a configured openclaude.config.yaml")
 class HandoverTests(unittest.TestCase):
     def setUp(self):
         self.handoff = Path(self.enterContext(tempfile.TemporaryDirectory())) / "handoff.json"

@@ -40,7 +40,7 @@ class DashboardFuzzTests(unittest.TestCase):
         self.enterContext(mock.patch.object(dash, "ROUTE_LOG", log))
         self.enterContext(mock.patch.object(dash, "_ROUTE_TAIL",
                                             {"path": None, "events": [], "offset": 0, "digest": None}))
-        self.enterContext(mock.patch.object(dash, "read_env", return_value={"OPENROUTER_MODEL": "vendor/model"}))
+        self.enterContext(mock.patch.object(dash, "read_settings", return_value={"OPENROUTER_MODEL": "vendor/model"}))
         self.enterContext(mock.patch.object(dash, "account_state", return_value={"ok": False}))
         self.enterContext(mock.patch.object(dash, "model_pricing", return_value={"ok": False}))
         self.enterContext(mock.patch.object(dash, "scan_sessions", return_value=dash._empty_usage()))
@@ -118,7 +118,7 @@ class DashboardFuzzTests(unittest.TestCase):
                     connection.recv(4096)  # any answer (or a clean close) is acceptable
                 except (socket.timeout, ConnectionResetError):
                     pass
-        with mock.patch.object(dash, "read_env", return_value={"OPENROUTER_MODEL": "vendor/model"}):
+        with mock.patch.object(dash, "read_settings", return_value={"OPENROUTER_MODEL": "vendor/model"}):
             status, payload = self.request("GET", "/api/status")
         self.assertEqual(status, 200, "the dashboard stopped serving after framing abuse")
         self.assertIn("state", json.loads(payload))

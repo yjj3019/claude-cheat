@@ -46,7 +46,7 @@ _RETRY_WINERRORS = {5, 32, 33}  # ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, 
 _RETRY_ATTEMPTS = 4
 _WRITE_LOCK = threading.Lock()
 # Characters that would break a line or are never meaningful in a setting; refused on write.
-_FORBIDDEN = re.compile("[\x00-\x1f\x7f\u0085  ]")
+FORBIDDEN = re.compile("[\x00-\x1f\x7f\u0085  ]")
 _BARE_BOOL = ("true", "false")
 
 
@@ -167,7 +167,7 @@ def parse(text):
         except ConfigError as error:
             errors.append(error)
             continue
-        if _FORBIDDEN.search(value):
+        if FORBIDDEN.search(value):
             errors.append(ConfigError("forbidden_character", number))
             continue
         doc.sections[current]["values"][key] = value
@@ -175,7 +175,7 @@ def parse(text):
 
 
 def _dump(value):
-    if not isinstance(value, str) or _FORBIDDEN.search(value):
+    if not isinstance(value, str) or FORBIDDEN.search(value):
         raise ConfigError("invalid_value")
     if value in _BARE_BOOL:
         return value

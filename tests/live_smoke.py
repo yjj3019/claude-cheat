@@ -25,8 +25,7 @@ import routeDashboard as dash  # noqa: E402  (local import: shares the config pa
 
 
 def load(provider):
-    spec = dash.CONFIG_FILES[provider]
-    return dash.read_env(Path(spec["path"]))
+    return dash.read_settings(provider)
 
 
 def call(url, key, payload=None, timeout=30):

@@ -480,7 +480,7 @@ class AlertTests(unittest.TestCase):
 
 class StatusReportTests(unittest.TestCase):
     def setUp(self):
-        self.enterContext(mock.patch.object(dash, "read_env", return_value={
+        self.enterContext(mock.patch.object(dash, "read_settings", return_value={
             "ANTHROPIC_AUTH_TOKEN": "sk-or-synthetic", "OPENROUTER_MODEL": "vendor/model"}))
 
     def event(self, provider="openrouter", reason="replacement", model="vendor/model", minutes=0):
@@ -858,22 +858,32 @@ class ServerTests(unittest.TestCase):
 class ConfigTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.path = self.root / "openclaude.config.yaml"
         self.files = {
-            "openrouter": {"path": self.root / ".env.openrouter", "secret": {"ANTHROPIC_AUTH_TOKEN"},
+            "openrouter": {"path": self.path, "secret": {"ANTHROPIC_AUTH_TOKEN"},
                            "required": ("ANTHROPIC_AUTH_TOKEN", "OPENROUTER_MODEL"),
                            "fields": ("OPENROUTER_MODEL", "ANTHROPIC_AUTH_TOKEN")},
-            "local": {"path": self.root / ".env.local-llm", "secret": {"LOCAL_LLM_API_KEY"},
+            "local": {"path": self.path, "secret": {"LOCAL_LLM_API_KEY"},
                       "required": ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL"),
                       "fields": ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY",
                                  "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL")},
         }
         self.enterContext(mock.patch.object(dash, "CONFIG_FILES", self.files))
 
-    def write(self, provider, text):
-        self.files[provider]["path"].write_text(text, encoding="utf-8")
+    def write(self, text):
+        self.path.write_text(text, encoding="utf-8")
+
+    def put(self, provider, **values):
+        """Store environment-style values for one service in the unified file."""
+        keys = {name: key for key, name in dash.routeConfig.SECTIONS[provider]["keys"].items()}
+        text = self.path.read_text(encoding="utf-8") if self.path.exists() else ""
+        self.write(dash.routeConfig.update_text(text, provider, {keys[name]: value for name, value in values.items()}))
+
+    def put_openrouter(self, model="vendor/a", key="sk-or-v1-abcdefghijkl"):
+        self.put("openrouter", OPENROUTER_MODEL=model, ANTHROPIC_AUTH_TOKEN=key)
 
     def test_snapshot_masks_secrets_and_reports_which_are_set(self):
-        self.write("openrouter", "# comment\nANTHROPIC_AUTH_TOKEN=sk-or-v1-abcdefghijkl\nOPENROUTER_MODEL=vendor/model\n")
+        self.put_openrouter("vendor/model")
         snapshot = dash.config_snapshot()
         entries = snapshot["openrouter"]["fields"]
         self.assertTrue(entries["ANTHROPIC_AUTH_TOKEN"]["secret"])
@@ -882,28 +892,40 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("…", entries["ANTHROPIC_AUTH_TOKEN"]["preview"])
         self.assertNotIn("abcdefghijkl", json.dumps(snapshot))
         self.assertEqual(entries["OPENROUTER_MODEL"]["value"], "vendor/model")
+        self.assertEqual((snapshot["openrouter"]["source"], snapshot["openrouter"]["error"]), ("yaml", None))
+        self.assertTrue(snapshot["openrouter"]["exists"])
 
-    def test_save_keeps_comments_unrelated_keys_and_the_stored_secret(self):
-        self.write("openrouter", "# keep me\nANTHROPIC_AUTH_TOKEN=sk-or-v1-abcdefghijkl\n"
-                                 "OPENROUTER_MODEL=vendor/old\nUNRELATED=1\n")
+    def test_save_keeps_comments_other_sections_and_the_stored_secret(self):
+        self.write('# keep me\nopenrouter:\n  api_key: "sk-or-v1-abcdefghijkl"\n  model: "vendor/old"\n'
+                   '# about local\nlocal:\n  model: "llama"\ncli:\n  kind: codex\n')
         dash.save_config("openrouter", {"OPENROUTER_MODEL": "vendor/new", "ANTHROPIC_AUTH_TOKEN": ""})
-        text = self.files["openrouter"]["path"].read_text(encoding="utf-8")
+        text = self.path.read_text(encoding="utf-8")
         self.assertIn("# keep me", text)
-        self.assertIn("UNRELATED=1", text)
-        self.assertIn("OPENROUTER_MODEL=vendor/new", text)
-        self.assertIn("ANTHROPIC_AUTH_TOKEN=sk-or-v1-abcdefghijkl", text)
-        self.assertTrue((self.root / ".env.openrouter.bak").is_file())
+        self.assertIn("# about local", text)
+        self.assertIn('local:\n  model: "llama"', text.replace("\r\n", "\n"))
+        self.assertIn("cli:\n  kind: codex", text.replace("\r\n", "\n"))
+        self.assertEqual(dash.read_settings("openrouter"),
+                         {"OPENROUTER_MODEL": "vendor/new", "ANTHROPIC_AUTH_TOKEN": "sk-or-v1-abcdefghijkl"})
+        self.assertTrue((self.root / "openclaude.config.yaml.bak").is_file())
 
     def test_save_writes_a_new_secret_when_provided(self):
-        self.write("openrouter", "ANTHROPIC_AUTH_TOKEN=sk-or-v1-abcdefghijkl\nOPENROUTER_MODEL=vendor/a\n")
+        self.put_openrouter("vendor/a")
         dash.save_config("openrouter", {"OPENROUTER_MODEL": "vendor/a", "ANTHROPIC_AUTH_TOKEN": "sk-or-v1-zzzzzzzzzzzz"})
-        text = self.files["openrouter"]["path"].read_text(encoding="utf-8")
-        self.assertIn("ANTHROPIC_AUTH_TOKEN=sk-or-v1-zzzzzzzzzzzz", text)
-        self.assertEqual(text.count("ANTHROPIC_AUTH_TOKEN="), 1)
+        text = self.path.read_text(encoding="utf-8")
+        self.assertEqual(dash.read_settings("openrouter")["ANTHROPIC_AUTH_TOKEN"], "sk-or-v1-zzzzzzzzzzzz")
+        self.assertEqual(text.count("api_key:"), 1)
+
+    def test_saving_one_service_leaves_the_other_untouched(self):
+        self.put("local", LOCAL_LLM_URL="http://127.0.0.1:11434/v1/messages", LOCAL_LLM_MODEL="llama")
+        self.put_openrouter()
+        before = dash.read_settings("local")
+        dash.save_config("openrouter", {"OPENROUTER_MODEL": "vendor/b"})
+        self.assertEqual(dash.read_settings("local"), before)
+        self.assertEqual(dash.read_settings("openrouter")["OPENROUTER_MODEL"], "vendor/b")
 
     def test_invalid_values_are_rejected_before_writing(self):
-        self.write("openrouter", "ANTHROPIC_AUTH_TOKEN=sk-or-v1-abcdefghijkl\nOPENROUTER_MODEL=vendor/a\n")
-        before = self.files["openrouter"]["path"].read_text(encoding="utf-8")
+        self.put_openrouter("vendor/a")
+        before = self.path.read_bytes()
         for values, reason in [
             ({"OPENROUTER_MODEL": "REPLACE_WITH_MODEL", "ANTHROPIC_AUTH_TOKEN": ""}, "invalid_model"),
             ({"OPENROUTER_MODEL": "vendor/a", "ANTHROPIC_AUTH_TOKEN": "nope"}, "invalid_key"),
@@ -913,7 +935,17 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaises(ValueError) as caught:
                     dash.save_config("openrouter", values)
                 self.assertEqual(str(caught.exception), reason)
-        self.assertEqual(self.files["openrouter"]["path"].read_text(encoding="utf-8"), before)
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_control_and_line_separator_characters_are_refused_before_writing(self):
+        self.put("local", LOCAL_LLM_URL="http://127.0.0.1:11434/v1/messages", LOCAL_LLM_MODEL="llama")
+        before = self.path.read_bytes()
+        for bad in ("a b", "a b", "a\u0085b", "a\x00b", "a\nb"):
+            with self.subTest(bad=repr(bad)):
+                with self.assertRaises(ValueError) as caught:
+                    dash.save_config("local", {"LOCAL_LLM_MODEL": bad})
+                self.assertEqual(str(caught.exception), "invalid_value")
+        self.assertEqual(self.path.read_bytes(), before)
 
     def test_local_validation_covers_url_mode_and_origin(self):
         base = {"LOCAL_LLM_URL": "http://127.0.0.1:11434/v1/messages", "LOCAL_LLM_MODEL": "fixture"}
@@ -926,7 +958,7 @@ class ConfigTests(unittest.TestCase):
                           {**base, "LOCAL_LLM_MODELS_URL": "https://other.example/v1/models"})
 
     def test_connection_test_reports_metadata_and_inference_safely(self):
-        self.write("openrouter", "ANTHROPIC_AUTH_TOKEN=sk-or-v1-abcdefghijkl\nOPENROUTER_MODEL=vendor/a\n")
+        self.put_openrouter("vendor/a")
         with mock.patch.object(dash, "_http_json", return_value=(200, {"data": [{"id": "vendor/a"}]})):
             metadata = dash.run_connection_test("openrouter", "metadata")
         self.assertTrue(metadata["ok"])
@@ -953,7 +985,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(result["reason"], "model_found")
         self.assertNotIn("unsavedkey", json.dumps(result))
         # A blank secret falls back to the stored value, so a saved key still works.
-        self.write("openrouter", "ANTHROPIC_AUTH_TOKEN=sk-or-v1-storedkey1234\nOPENROUTER_MODEL=vendor/old\n")
+        self.put_openrouter("vendor/old", "sk-or-v1-storedkey1234")
         with mock.patch.object(dash, "_http_json", return_value=(200, {"data": [{"id": "vendor/c"}]})):
             fallback = dash.run_connection_test("openrouter", "metadata",
                                                 {"OPENROUTER_MODEL": "vendor/c", "ANTHROPIC_AUTH_TOKEN": ""})
@@ -968,28 +1000,68 @@ class ConfigTests(unittest.TestCase):
         request.assert_not_called()
 
     def test_first_save_seeds_comments_from_the_example_file(self):
-        example = self.root / ".env.openrouter.example"
-        example.write_text("# shipped comment\nOPENROUTER_MODEL=REPLACE_WITH_OPENROUTER_MODEL_ID\n"
-                           "ANTHROPIC_AUTH_TOKEN=YOUR_OPENROUTER_API_KEY\n", encoding="utf-8")
-        self.assertFalse((self.root / ".env.openrouter").exists())
+        example = self.root / "openclaude.config.example.yaml"
+        example.write_text('# shipped comment\nopenrouter:\n  model: ""\n  api_key: ""\n', encoding="utf-8")
+        self.assertFalse(self.path.exists())
         dash.save_config("openrouter", {"OPENROUTER_MODEL": "vendor/a",
                                         "ANTHROPIC_AUTH_TOKEN": "sk-or-v1-abcdefghijkl"})
-        text = (self.root / ".env.openrouter").read_text(encoding="utf-8")
+        text = self.path.read_text(encoding="utf-8")
         self.assertIn("# shipped comment", text)
-        self.assertIn("OPENROUTER_MODEL=vendor/a", text)
-        self.assertIn("ANTHROPIC_AUTH_TOKEN=sk-or-v1-abcdefghijkl", text)
-        self.assertNotIn("REPLACE_WITH_OPENROUTER_MODEL_ID", text)
+        self.assertEqual(dash.read_settings("openrouter"),
+                         {"OPENROUTER_MODEL": "vendor/a", "ANTHROPIC_AUTH_TOKEN": "sk-or-v1-abcdefghijkl"})
 
     def test_connection_test_missing_configuration_and_http_errors(self):
-        self.write("openrouter", "OPENROUTER_MODEL=vendor/a\n")
+        self.put("openrouter", OPENROUTER_MODEL="vendor/a")
         self.assertEqual(dash.run_connection_test("openrouter")["reason"], "configuration_missing")
-        self.write("openrouter", "ANTHROPIC_AUTH_TOKEN=sk-or-v1-abcdefghijkl\nOPENROUTER_MODEL=vendor/a\n")
+        self.put_openrouter("vendor/a")
         import urllib.error
         with mock.patch.object(dash, "_http_json", side_effect=urllib.error.HTTPError(
                 "u", 401, "denied", {}, None)):
             self.assertEqual(dash.run_connection_test("openrouter")["status"], 401)
         with mock.patch.object(dash, "_http_json", side_effect=dash.urllib.error.URLError("down")):
             self.assertEqual(dash.run_connection_test("openrouter")["reason"], "connection_failed")
+
+    def test_legacy_env_files_are_shown_and_migrated_on_the_first_save(self):
+        legacy = self.root / ".env.openrouter"
+        legacy.write_text("ANTHROPIC_AUTH_TOKEN=sk-or-v1-legacykey123\nOPENROUTER_MODEL=vendor/legacy\n", encoding="utf-8")
+        (self.root / ".env.local-llm").write_text("LOCAL_LLM_MODEL=llama\n", encoding="utf-8")
+        before = legacy.read_bytes()
+        snapshot = dash.config_snapshot()
+        self.assertEqual(snapshot["openrouter"]["source"], "legacy")
+        self.assertEqual(snapshot["openrouter"]["fields"]["OPENROUTER_MODEL"]["value"], "vendor/legacy")
+        self.assertNotIn("legacykey", json.dumps(snapshot))
+        self.assertFalse(self.path.exists())
+        dash.save_config("openrouter", {"OPENROUTER_MODEL": "vendor/migrated"})
+        self.assertEqual(dash.config_snapshot()["openrouter"]["source"], "yaml")
+        self.assertEqual(dash.read_settings("openrouter"),
+                         {"OPENROUTER_MODEL": "vendor/migrated", "ANTHROPIC_AUTH_TOKEN": "sk-or-v1-legacykey123"})
+        self.assertEqual(dash.read_settings("local")["LOCAL_LLM_MODEL"], "llama")  # moved over too
+        self.assertEqual(legacy.read_bytes(), before)  # the deprecated file is never touched
+
+    def test_a_broken_settings_file_is_reported_and_never_overwritten(self):
+        broken = 'openrouter:\n  model: "vendor/a"\n  bogus: 1\nlocal:\n  model: "llama"\n'
+        self.write(broken)
+        snapshot = dash.config_snapshot()  # must not raise
+        self.assertEqual(snapshot["openrouter"]["error"], {"code": "unknown_key", "line": 3})
+        self.assertIsNone(snapshot["local"]["error"])
+        self.assertNotIn("vendor/a", json.dumps(snapshot["openrouter"]["error"]))
+        with self.assertRaises(dash.routeConfig.ConfigError) as caught:
+            dash.save_config("openrouter", {"OPENROUTER_MODEL": "vendor/b", "ANTHROPIC_AUTH_TOKEN": "sk-or-v1-abcdefghijkl"})
+        self.assertEqual(caught.exception.code, "unknown_key")
+        self.assertEqual(self.path.read_text(encoding="utf-8"), broken)
+        # the other service is not blocked by it
+        dash.save_config("local", {"LOCAL_LLM_URL": "http://127.0.0.1:11434/v1/messages", "LOCAL_LLM_MODEL": "llama2"})
+        self.assertEqual(dash.read_settings("local")["LOCAL_LLM_MODEL"], "llama2")
+
+    def test_an_undecodable_settings_file_is_reported_not_rewritten(self):
+        self.path.write_bytes(b'openrouter:\n  model: "\xff"\n')
+        before = self.path.read_bytes()
+        snapshot = dash.config_snapshot()
+        self.assertEqual(snapshot["openrouter"]["error"]["code"], "config_not_utf8")
+        with self.assertRaises(dash.routeConfig.ConfigError):
+            dash.save_config("openrouter", {"OPENROUTER_MODEL": "vendor/b", "ANTHROPIC_AUTH_TOKEN": "sk-or-v1-abcdefghijkl"})
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertFalse((self.root / "openclaude.config.yaml.bak").exists())
 
 
 class RouteTailTests(unittest.TestCase):
@@ -1144,18 +1216,18 @@ class ModelCatalogTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.files = {
-            "openrouter": {"path": self.root / ".env.openrouter", "secret": {"ANTHROPIC_AUTH_TOKEN"},
+            "openrouter": {"path": self.root / "openclaude.config.yaml", "secret": {"ANTHROPIC_AUTH_TOKEN"},
                            "required": ("ANTHROPIC_AUTH_TOKEN", "OPENROUTER_MODEL"),
                            "fields": ("OPENROUTER_MODEL", "ANTHROPIC_AUTH_TOKEN")},
-            "local": {"path": self.root / ".env.local-llm", "secret": {"LOCAL_LLM_API_KEY"},
+            "local": {"path": self.root / "openclaude.config.yaml", "secret": {"LOCAL_LLM_API_KEY"},
                       "required": ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL"),
                       "fields": ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY",
                                  "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL")},
         }
         self.enterContext(mock.patch.object(dash, "CONFIG_FILES", self.files))
         self.enterContext(mock.patch.object(dash, "_MODELS_CACHE", {}))
-        (self.root / ".env.openrouter").write_text(
-            "ANTHROPIC_AUTH_TOKEN=sk-or-v1-abcdefghijkl\nOPENROUTER_MODEL=vendor/a\n", encoding="utf-8")
+        (self.root / "openclaude.config.yaml").write_text(
+            'openrouter:\n  api_key: "sk-or-v1-abcdefghijkl"\n  model: "vendor/a"\n', encoding="utf-8")
 
     def test_openrouter_list_is_parsed_with_pricing_and_context(self):
         payload = {"data": [
@@ -1183,8 +1255,10 @@ class ModelCatalogTests(unittest.TestCase):
             dash._models_endpoint("local", {"LOCAL_LLM_URL": "not a url"})
 
     def test_ollama_style_list_is_accepted(self):
-        (self.root / ".env.local-llm").write_text(
-            "LOCAL_LLM_URL=http://127.0.0.1:11434/v1/messages\nLOCAL_LLM_MODEL=llama3:8b\n", encoding="utf-8")
+        settings = self.root / "openclaude.config.yaml"
+        settings.write_text(settings.read_text(encoding="utf-8")
+                            + 'local:\n  url: "http://127.0.0.1:11434/v1/messages"\n  model: "llama3:8b"\n',
+                            encoding="utf-8")
         with mock.patch.object(dash, "_http_json", return_value=(200, {"models": [{"name": "llama3:8b"}]})):
             catalog = dash.model_catalog("local")
         self.assertEqual(catalog["models"][0]["id"], "llama3:8b")
@@ -1270,7 +1344,9 @@ class ModelCatalogTests(unittest.TestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            with opener.open(f"http://127.0.0.1:{port}/api/status", timeout=15) as response:
+            # This class stores a fake key; the status report must not call out to OpenRouter with it.
+            with mock.patch.object(dash, "account_state", return_value={"ok": False, "error": "offline"}), \
+                    opener.open(f"http://127.0.0.1:{port}/api/status", timeout=15) as response:
                 self.assertEqual(response.status, 200)
                 self.assertEqual(response.headers.get("x-content-type-options"), "nosniff")
                 self.assertEqual(response.headers.get("referrer-policy"), "no-referrer")
@@ -1452,7 +1528,7 @@ class SnapshotTests(unittest.TestCase):
              mock.patch.object(dash, "parse_route_log", return_value=[]), \
              mock.patch.object(dash, "account_state", return_value={"ok": False, "error": "configuration_missing"}), \
              mock.patch.object(dash, "model_pricing", return_value={"ok": False, "error": "configuration_missing"}), \
-             mock.patch.object(dash, "read_env", return_value={"OPENROUTER_MODEL": "vendor/model"}):
+             mock.patch.object(dash, "read_settings", return_value={"OPENROUTER_MODEL": "vendor/model"}):
             data = dash.snapshot()
         self.assertEqual(sorted(data),
                          ["account", "alerts", "configured", "generated_at", "help", "insights", "model",
@@ -1491,7 +1567,7 @@ class UrlMaskingTests(unittest.TestCase):
 
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.path = self.root / ".env.local-llm"
+        self.path = self.root / "openclaude.config.yaml"
         self.enterContext(mock.patch.object(dash, "CONFIG_FILES", {"local": {
             "path": self.path,
             "secret": {"LOCAL_LLM_API_KEY", "LOCAL_LLM_URL", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL"},
@@ -1499,11 +1575,11 @@ class UrlMaskingTests(unittest.TestCase):
             "required": ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL"),
             "fields": ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY",
                        "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL")}}))
-        self.path.write_text(f"LOCAL_LLM_URL={self.URL}\nLOCAL_LLM_MODEL=llama\n"
-                             f"LOCAL_LLM_MODELS_URL={self.MODELS}\n", encoding="utf-8")
+        self.path.write_text(f'local:\n  url: "{self.URL}"\n  model: "llama"\n  models_url: "{self.MODELS}"\n',
+                             encoding="utf-8")
 
     def stored(self):
-        return dash.read_env(self.path)
+        return dash.read_settings("local")
 
     def test_mask_url_hides_host_credentials_and_query(self):
         self.assertEqual(dash._mask_url(""), "")
@@ -1564,12 +1640,12 @@ class UrlMaskingTests(unittest.TestCase):
                 dash.save_config("local", {"LOCAL_LLM_MODEL": "llama"}, clear=bad)
             self.assertEqual(str(caught.exception), "invalid_clear")
         self.assertEqual(self.path.read_text(encoding="utf-8"), before)
-        self.assertFalse((self.root / ".env.local-llm.bak").exists())
+        self.assertFalse((self.root / "openclaude.config.yaml.bak").exists())
 
     def test_clearing_the_exception_a_url_depends_on_is_rejected(self):
         internal = "http://llm.corp.example/v1/messages"
-        self.path.write_text(f"LOCAL_LLM_URL={internal}\nLOCAL_LLM_MODEL=llama\n"
-                             f"LOCAL_LLM_HTTP_URL={internal}\n", encoding="utf-8")
+        self.path.write_text(f'local:\n  url: "{internal}"\n  model: "llama"\n  http_url: "{internal}"\n',
+                             encoding="utf-8")
         before = self.path.read_text(encoding="utf-8")
         with self.assertRaises(ValueError):
             dash.save_config("local", {"LOCAL_LLM_MODEL": "llama"}, clear=["LOCAL_LLM_HTTP_URL"])
