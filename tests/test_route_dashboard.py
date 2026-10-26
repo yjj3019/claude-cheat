@@ -1475,5 +1475,38 @@ class SnapshotTests(unittest.TestCase):
         self.assertRegex(usage["current_hour"], r"^\d{4}-\d{2}-\d{2}T\d{2}$")
 
 
+class OpenPageTests(unittest.TestCase):
+    """--open sends the browser to a dashboard page without touching any settings file."""
+
+    def run_serve(self, **kwargs):
+        class Stub:
+            server_address = ("127.0.0.1", 8787)
+
+            def serve_forever(self):
+                raise KeyboardInterrupt
+
+            def server_close(self):
+                pass
+
+        with mock.patch.object(dash, "DashboardServer", return_value=Stub()),                 mock.patch.object(dash, "_refresh_loop"), mock.patch.object(dash, "_stop_previous"),                 mock.patch.object(dash, "_write_pid_record"), mock.patch.object(dash, "_read_pid_record",
+                                                                                 return_value=None),                 mock.patch.object(dash.webbrowser, "open") as opener,                 contextlib.redirect_stdout(io.StringIO()):
+            dash.serve(**kwargs)
+        return opener
+
+    def test_open_page_launches_the_browser_on_that_page(self):
+        opener = self.run_serve(open_page="settings")
+        opener.assert_called_once_with("http://127.0.0.1:8787/settings")
+
+    def test_default_serve_does_not_open_a_browser(self):
+        self.run_serve().assert_not_called()
+
+    def test_open_flag_defaults_to_the_settings_page(self):
+        with mock.patch.object(dash, "serve") as serve:
+            dash.main(["--open"])
+            dash.main([])
+        self.assertEqual(serve.call_args_list[0].kwargs["open_page"], "settings")
+        self.assertIsNone(serve.call_args_list[1].kwargs["open_page"])
+
+
 if __name__ == "__main__":
     unittest.main()

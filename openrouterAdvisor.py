@@ -857,6 +857,8 @@ def main(argv=None) -> int:
             print("[setup required] .env.openrouter is missing or invalid", file=sys.stderr)
             print(f"  powershell -File \"{ROOT / 'OpenClaudeDashboard.ps1'}\"   ->  http://127.0.0.1:8787/",
                   file=sys.stderr)
+            print("  or run: OpenClaude.ps1 -Setup   (opens the settings page in your browser)",
+                  file=sys.stderr)
             print("  fill the OpenRouter settings there, save, then run OpenClaude.ps1 again",
                   file=sys.stderr)
         print(json.dumps(payload), file=sys.stderr)

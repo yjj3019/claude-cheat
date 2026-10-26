@@ -26,6 +26,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import webbrowser
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -2406,7 +2407,7 @@ def _stop_previous(port, path=None, timeout=5.0):
     return not _port_open(port)
 
 
-def serve(host="127.0.0.1", port=DEFAULT_PORT, refresh=3, allow_fallback=False):
+def serve(host="127.0.0.1", port=DEFAULT_PORT, refresh=3, allow_fallback=False, open_page=None):
     threading.Thread(target=_refresh_loop, args=(max(1, refresh),), daemon=True).start()
     # A previous dashboard keeps its port between restarts; take it over instead of moving.
     _stop_previous(port)
@@ -2424,6 +2425,12 @@ def serve(host="127.0.0.1", port=DEFAULT_PORT, refresh=3, allow_fallback=False):
     url = f"http://{_display_host(host)}:{server.server_address[1]}/"
     print(json.dumps({"dashboard": url, "route_log": str(ROUTE_LOG), "read_only": True,
                       **({"port_fallback": fallback} if fallback else {})}), flush=True)
+    if open_page:
+        # The socket is already listening, so the browser request waits for serve_forever().
+        try:
+            webbrowser.open(url + open_page.lstrip("/"))
+        except webbrowser.Error:
+            pass
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -2520,6 +2527,8 @@ def main(argv=None):
                         help="Pick a free port instead of failing when the requested port is busy")
     parser.add_argument("--stop", action="store_true",
                         help="Stop only the dashboard recorded in .dashboard.pid")
+    parser.add_argument("--open", dest="open_page", nargs="?", const="settings", default=None,
+                        metavar="PAGE", help="Open this dashboard page in the browser (default: settings)")
     args = parser.parse_args(argv)
     if args.stop:
         record = _read_pid_record()
@@ -2554,7 +2563,8 @@ def main(argv=None):
         return status_exit_code(report)
     if args.host not in ("127.0.0.1", "::1", "localhost"):
         raise SystemExit("Bind a loopback address only")
-    serve(args.host, args.port, args.refresh, allow_fallback=args.allow_port_fallback)
+    serve(args.host, args.port, args.refresh, allow_fallback=args.allow_port_fallback,
+          open_page=args.open_page)
     return 0
 
 

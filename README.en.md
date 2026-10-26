@@ -54,7 +54,10 @@ Configure OpenRouter once in the web console — it runs without a routing sessi
 
 ```powershell
 .\OpenClaudeDashboard.ps1        # http://127.0.0.1:8787/ (fixed port)
+.\OpenClaude.ps1 -Setup           # starts the same dashboard and opens its settings page in the browser
 ```
+
+`-Setup` never creates or edits a `.env.*` file and does not start a session; you save the values on the web page yourself. The `[setup required]` hint printed by `OpenClaude.ps1` when settings are missing also mentions this command.
 
 Fill the OpenRouter card with a **model ID** and **API key**, press **Model check**, then **Save**, and start the session. The check also runs on unsaved values, and saving without an existing `.env.openrouter` seeds the file from the shipped example so its comments stay. Starting the launcher with missing or invalid settings exits with the console address instead of opening a session. Editing the files by hand still works exactly as before.
 
