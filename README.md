@@ -64,7 +64,7 @@ claude auth status
 
 | 실행 방식 | 읽는 설정 위치 |
 | --- | --- |
-| 내려받은 저장소에서 `.\OpenClaude.ps1` 실행 | 해당 저장소의 `.env.openrouter` / `.env.local-llm` |
+| 내려받은 저장소에서 `.\OpenClaude.ps1` 실행 | 해당 저장소의 `openclaude.config.yaml` (예전 `.env.openrouter` / `.env.local-llm`은 읽기 전용 폴백) |
 | 기존 PC의 전역 `OpenClaude.ps1` 실행 | 전역 실행기가 가리키는 원본 실행기 폴더 |
 
 전역 실행기를 따로 설치했다면 그 대상 폴더에서 설정을 읽습니다. 저장소를 clone해도 전역 명령이 자동 설치되거나 기존 실행기의 대상이 바뀌지 않습니다. 새 checkout은 해당 폴더의 실행기를 명시적으로 실행하세요.
@@ -91,30 +91,38 @@ claude auth status
 .\OpenClaude.ps1 -Setup           # 같은 대시보드를 띄우고 설정 페이지를 브라우저로 엽니다
 ```
 
-`-Setup`은 설정 파일(`.env.*`)을 만들거나 고치지 않고 세션도 시작하지 않습니다. 값은 웹 페이지에서 직접 저장합니다. 설정이 없을 때 `OpenClaude.ps1`이 출력하는 `[setup required]` 안내에도 이 명령이 포함됩니다.
+`-Setup`은 설정 파일(`openclaude.config.yaml`과 예전 `.env.*`)을 만들거나 고치지 않고 세션도 시작하지 않습니다. 값은 웹 페이지에서 직접 저장합니다. 설정이 없을 때 `OpenClaude.ps1`이 출력하는 `[setup required]` 안내에도 이 명령이 포함됩니다.
 
-상단의 **사용할 서비스** 선택 상자에서 OpenRouter 또는 Local LLM을 고르면 해당 서비스의 입력란만 표시됩니다(옵션에 `설정됨`/`설정 필요`가 함께 표시되고, 마지막 선택은 브라우저에 기억됩니다). OpenRouter라면 **모델 ID**와 **API 키**를 입력하고 **모델 확인** → **저장**을 누른 뒤 세션을 시작하세요. 모델 확인은 저장 전 값으로도 실행되며, `.env.openrouter`가 없으면 저장 시 예제 파일의 주석을 그대로 가져와 값만 채웁니다. 설정이 없거나 잘못된 상태로 실행기를 시작하면 세션을 열지 않고 콘솔 주소를 안내합니다.
+상단의 **사용할 서비스** 선택 상자에서 OpenRouter 또는 Local LLM을 고르면 해당 서비스의 입력란만 표시됩니다(옵션에 `설정됨`/`설정 필요`가 함께 표시되고, 마지막 선택은 브라우저에 기억됩니다). OpenRouter라면 **모델 ID**와 **API 키**를 입력하고 **모델 확인** → **저장**을 누른 뒤 세션을 시작하세요. 모델 확인은 저장 전 값으로도 실행되며, `openclaude.config.yaml`이 없으면 저장 시 `openclaude.config.example.yaml`의 주석을 그대로 가져와 값만 채웁니다. API 키와 서버 주소는 화면에 일부만 표시되고 저장된 원문은 브라우저로 전송되지 않으므로, 바꿀 때만 전체를 입력합니다(비워 두면 유지, 선택 항목인 HTTP 예외·모델 목록 주소는 **지우기**로 삭제). 설정이 없거나 잘못된 상태로 실행기를 시작하면 세션을 열지 않고 콘솔 주소를 안내합니다.
 
-아래 파일을 직접 편집하는 방식도 그대로 지원합니다.
+설정 파일을 직접 편집하는 방식도 지원합니다.
 
-### ① 라우터 전용 키 파일 만들기
+### ① 설정 파일 만들기
 
-실행기 폴더에서 다음 파일을 열고 저장합니다. 이미 파일이 있으면 기존 내용을 먼저 확인하세요.
+모든 서비스의 설정은 실행기 폴더의 `openclaude.config.yaml` **한 파일**에 둡니다. 설정 화면에서 저장해도 같은 파일이 만들어집니다. 직접 만들려면 예제를 복사해 편집하세요. 이미 파일이 있으면 덮어쓰지 않습니다.
 
 ```powershell
-notepad .env.openrouter
+if (-not (Test-Path -LiteralPath 'openclaude.config.yaml')) {
+    Copy-Item -LiteralPath 'openclaude.config.example.yaml' -Destination 'openclaude.config.yaml'
+}
+notepad openclaude.config.yaml
 ```
 
-파일 내용:
+OpenRouter 섹션 내용:
 
-```dotenv
-ANTHROPIC_AUTH_TOKEN=YOUR_OPENROUTER_API_KEY
-OPENROUTER_MODEL=REPLACE_WITH_OPENROUTER_MODEL_ID
+```yaml
+openrouter:
+  model: "REPLACE_WITH_OPENROUTER_MODEL_ID"
+  api_key: "YOUR_OPENROUTER_API_KEY"
 ```
 
-`YOUR_OPENROUTER_API_KEY`를 본인의 실제 OpenRouter 키로 바꿉니다. 이 변수명은 **라우터가 파일에서 읽는 항목**입니다. Claude Code의 전역 환경변수에 OpenRouter 키를 넣거나 Plan 로그인을 API 키 로그인으로 바꾸라는 뜻이 아닙니다. 키를 화면·로그·커밋에 공유하지 마세요.
+파일 형식은 **YAML의 제한된 부분집합**입니다. `섹션:` 아래에 두 칸 들여쓴 `키: "값"` 줄과 `#` 주석만 쓸 수 있고, 값은 따옴표로 감싸는 것을 권장합니다. 탭·앵커(`&` `*`)·목록·`|` 블록·여러 줄 값은 줄 번호와 함께 거부하며 오류 문구에는 값을 싣지 않습니다. 한 서비스 섹션의 오류는 다른 서비스를 막지 않고, 알 수 없는 최상위 섹션은 그대로 보존합니다. 외부 YAML 라이브러리는 필요 없습니다.
 
-`OPENROUTER_MODEL`에는 [OpenRouter 모델 목록](https://openrouter.ai/models)의 구체적인 모델 ID를 입력합니다. 기존에 키만 설정했다면 이 항목을 추가해야 합니다. 누락·빈 값·예제 플레이스홀더는 시작 오류로 종료하며 다른 모델이나 Plan으로 자동 대체하지 않습니다. 이 파일의 두 항목만 읽고, 값은 프록시에만 전달합니다.
+예전 `.env.openrouter` / `.env.local-llm`은 **폐기 예정**입니다. 해당 서비스의 섹션이 새 파일에 없을 때만 읽는 읽기 전용 폴백이며, 설정 화면에서 처음 저장하면 두 서비스의 값이 새 파일로 옮겨집니다(예전 파일은 수정·삭제하지 않습니다). 새 파일에 섹션이 있으면 그 서비스는 새 파일만 사용합니다.
+
+`YOUR_OPENROUTER_API_KEY`를 본인의 실제 OpenRouter 키로 바꿉니다. `api_key`는 **라우터가 파일에서 읽는 항목**입니다. Claude Code의 전역 환경변수에 OpenRouter 키를 넣거나 Plan 로그인을 API 키 로그인으로 바꾸라는 뜻이 아닙니다. 키를 화면·로그·커밋에 공유하지 마세요.
+
+`model`에는 [OpenRouter 모델 목록](https://openrouter.ai/models)의 구체적인 모델 ID를 입력합니다. 기존에 키만 설정했다면 이 항목을 추가해야 합니다. 누락·빈 값·예제 플레이스홀더는 시작 오류로 종료하며 다른 모델이나 Plan으로 자동 대체하지 않습니다. 이 섹션의 두 항목만 읽고, 값은 프록시에만 전달합니다.
 
 모델 선택이 가능해도 모든 모델의 도구 호출과 네이티브 기능을 보장하지 않습니다. 선택 모델이 [Messages API](https://openrouter.ai/docs/api/api-reference/anthropic-messages/create-messages?explorer=true)와 필요한 도구 호출을 지원하는지 확인하세요. 응답의 모델 ID를 설정값과 정확히 비교하므로, 다른 ID로 응답하는 동적 별칭·프리셋은 실패할 수 있으며 미검증입니다. API 주소와 재시도 정책은 예제 파일에 고정값으로 구분했습니다.
 
@@ -125,7 +133,7 @@ OPENROUTER_MODEL=REPLACE_WITH_OPENROUTER_MODEL_ID
 .\OpenClaude.ps1
 ```
 
-Claude Code에서 `/model`로 **Sonnet**을 선택합니다. 호환되는 요청은 OpenRouter의 `https://openrouter.ai/api/v1/messages`로 보내며, 대체 모델은 `.env.openrouter`의 `OPENROUTER_MODEL`로 지정합니다. 특정 모델을 기본값으로 선택하지 않습니다.
+Claude Code에서 `/model`로 **Sonnet**을 선택합니다. 호환되는 요청은 OpenRouter의 `https://openrouter.ai/api/v1/messages`로 보내며, 대체 모델은 `openclaude.config.yaml`의 `openrouter.model`로 지정합니다. 특정 모델을 기본값으로 선택하지 않습니다.
 
 기존 전역 실행기가 설치된 PC에서는 다른 작업 폴더에서도 다음처럼 실행할 수 있습니다.
 
@@ -143,7 +151,7 @@ OpenClaude.ps1
 .\OpenClaude.ps1 -Provider OpenRouter -OpenRouterCompat
 ```
 
-Claude Code 2.1.304 이상에서 `.env.openrouter`의 같은 키와 `OPENROUTER_MODEL`을 사용합니다. 주 모델·빠른 모델·하위 에이전트의 Claude 모델 선택을 모두 지정한 같은 OpenRouter 모델로 전달하며, Plan 로그인과 Plan fallback은 사용하지 않습니다. 기존 일반 실행과 Local 모드는 유지합니다.
+Claude Code 2.1.304 이상에서 `openclaude.config.yaml`의 같은 OpenRouter 키와 `openrouter.model`을 사용합니다. 주 모델·빠른 모델·하위 에이전트의 Claude 모델 선택을 모두 지정한 같은 OpenRouter 모델로 전달하며, Plan 로그인과 Plan fallback은 사용하지 않습니다. 기존 일반 실행과 Local 모드는 유지합니다.
 
 LocalCompat과 같은 호환 처리로 플러그인·스킬·MCP·hooks·하위 에이전트 및 thinking·추론 강도 설정을 허용합니다. 사용자·프로젝트 설정과 기본 승인·거절 규칙을 유지하고, API 키 helper는 끕니다. 실행 설정으로 프록시 주소와 임시 인증을 고정하며 제공자 키는 프록시에만 전달합니다. 알려진 CLI 제어 필드만 변환하고, 지원하지 않는 beta·필드·토큰 계산 API는 명시적으로 거절합니다.
 
@@ -169,30 +177,34 @@ LocalCompat과 같은 호환 처리로 플러그인·스킬·MCP·hooks·하위 
 
 ```powershell
 # 기존 설정은 덮어쓰지 않음
-if (-not (Test-Path -LiteralPath '.env.local-llm')) {
-    Copy-Item -LiteralPath '.env.local-llm.example' -Destination '.env.local-llm'
+if (-not (Test-Path -LiteralPath 'openclaude.config.yaml')) {
+    Copy-Item -LiteralPath 'openclaude.config.example.yaml' -Destination 'openclaude.config.yaml'
 }
-notepad .env.local-llm
+notepad openclaude.config.yaml
 ```
 
 같은 PC의 서버 예시입니다. 모델 ID는 서버에 실제로 설치·제공된 값으로 바꾸세요.
 
-```dotenv
-LOCAL_LLM_URL=http://127.0.0.1:11434/v1/messages
-LOCAL_LLM_MODEL=YOUR_INSTALLED_MODEL_ID
-LOCAL_LLM_ALLOW_REMOTE=false
-# 인증이 필요할 때만 서버 전용 키 설정
-# LOCAL_LLM_API_KEY=YOUR_LOCAL_SERVER_KEY
+```yaml
+local:
+  url: "http://127.0.0.1:11434/v1/messages"
+  model: "YOUR_INSTALLED_MODEL_ID"
+  allow_remote: false
+  # 인증이 필요할 때만 서버 전용 키 설정
+  # api_key: "YOUR_LOCAL_SERVER_KEY"
 ```
 
 다른 PC의 기존 서버를 사용할 때의 예시입니다. 아래 호스트는 실제 주소로 바꿔야 합니다.
 
-```dotenv
-LOCAL_LLM_URL=https://llm.example.com/v1/messages
-LOCAL_LLM_MODEL=YOUR_SERVER_MODEL_ID
-LOCAL_LLM_ALLOW_REMOTE=true
-# LOCAL_LLM_API_KEY=YOUR_SERVER_KEY
+```yaml
+local:
+  url: "https://llm.example.com/v1/messages"
+  model: "YOUR_SERVER_MODEL_ID"
+  allow_remote: true
+  # api_key: "YOUR_SERVER_KEY"
 ```
+
+아래 표의 이름은 환경변수 이름입니다. 파일에서는 `local:` 아래에 `url`, `model`, `api_key`, `allow_remote`, `http_url`, `models_url`로 씁니다. 빈 값(`""`)은 "설정 안 함"으로 읽어 기본값을 가리지 않습니다.
 
 | 항목 | 기본값 / 동작 |
 | --- | --- |
@@ -200,7 +212,7 @@ LOCAL_LLM_ALLOW_REMOTE=true
 | `LOCAL_LLM_MODEL` | 실행 시 필수; 서버의 정확한 모델 ID |
 | `LOCAL_LLM_API_KEY` | 선택; 해당 서버 전용 `Authorization: Bearer`로 전달 |
 | `LOCAL_LLM_ALLOW_REMOTE` | `false`; 원격 서버는 명시적 `true`와 HTTPS 필요 |
-| `LOCAL_LLM_HTTP_URL` | Optional exact HTTP Messages URL pin; empty by default. Plaintext HTTP is allowed only when it exactly matches `LOCAL_LLM_URL`. Keep real values in ignored `.env.local-llm`; prefer HTTPS. |
+| `LOCAL_LLM_HTTP_URL` | Optional exact HTTP Messages URL pin; empty by default. Plaintext HTTP is allowed only when it exactly matches `LOCAL_LLM_URL`. Keep real values in the ignored `openclaude.config.yaml`; prefer HTTPS. |
 | `LOCAL_LLM_MODELS_URL` | 같은 origin의 `/v1/models`; 모델 목록 점검에만 사용 |
 
 같은 이름의 **프로세스 환경변수가 파일보다 우선**합니다. `localhost` 대신 허용되는 주소 리터럴 `127.0.0.1` 또는 `[::1]`을 사용하세요. 원격 HTTP는 `LOCAL_LLM_HTTP_URL`이 `LOCAL_LLM_URL`과 정확히 일치할 때만 허용하며, 이 경우 프롬프트와 `LOCAL_LLM_API_KEY` Bearer 키가 암호화 없이 전송됩니다. 그 외에는 HTTPS 또는 별도로 준비한 loopback 터널이 필요합니다.
@@ -289,7 +301,7 @@ CLI의 후속 요청 때문에 최초 오류 대신 대기 안내가 마지막�
 |---|---|
 | `local_cli_not_found` / `local_node_not_found` | Claude Code·Node.js 설치와 PATH |
 | `local_cli_unsupported` / `local_cli_version_check_failed` | `claude --version`, 최소 2.1.304, 실행 권한 |
-| `local_configuration_invalid` | `.env.local-llm`과 환경변수의 URL·HTTP 허용·모델·키 형식·모델 목록 origin |
+| `local_configuration_invalid` | `openclaude.config.yaml`(또는 예전 `.env.local-llm`)과 환경변수의 URL·HTTP 허용·모델·키 형식·모델 목록 origin |
 | `local_output_budget_invalid` | `CLAUDE_CODE_MAX_OUTPUT_TOKENS`가 양의 정수인지 확인 |
 | `local_proxy_start_failed` | Node.js·프록시 파일·루프백 접근 권한. 준비 제한 시간은 기존 15초 유지 |
 | `local_cli_start_failed` | Claude Code 실행 권한과 설치 상태 |
@@ -438,7 +450,7 @@ Sonnet 선택과 HUD의 모델·비용 표시는 실제 외부 라우팅이나 �
 
 집계 캐시(`.usage-cache.json`)는 턴 소유권 원장을 포함해 실사용 7일 창에서 약 **0.5MB**입니다(합성 2,000파일·10만 턴 기준 5.4MB, 상한 20만 클레임에서 오래된 파일 단위로 축출). 캐시 버전이 바뀌면 한 번 전체 재스캔합니다.
 
-키·프롬프트·요청 본문은 표시하지 않습니다. 설정 저장을 요청했을 때만 실행기 폴더의 `.env.openrouter`·`.env.local-llm`을 수정하고, 그 외에는 아무것도 기록하지 않습니다. 대시보드는 세션과 별개 프로세스이므로 라우팅 세션과 함께 띄워 두면 됩니다.
+키·프롬프트·요청 본문은 표시하지 않습니다. 설정 저장을 요청했을 때만 실행기 폴더의 `openclaude.config.yaml` 하나를 수정하고, 그 외에는 아무것도 기록하지 않습니다. 대시보드는 세션과 별개 프로세스이므로 라우팅 세션과 함께 띄워 두면 됩니다.
 
 ### 설정 편집과 연결 테스트
 
@@ -446,8 +458,10 @@ Sonnet 선택과 HUD의 모델·비용 표시는 실제 외부 라우팅이나 �
 
 | 항목 | 동작 |
 | --- | --- |
-| 저장 | 지정된 키만 수정하고 주석·다른 항목은 유지합니다. 이전 내용은 `.env.*.bak`에 남깁니다 |
+| 저장 | 지정된 키만 수정하고 주석·다른 항목은 유지합니다. 이전 내용은 `openclaude.config.yaml.bak`에 남깁니다. 같은 파일을 읽을 수 없거나(인코딩·문법 오류) 다른 저장과 겹치면 덮어쓰지 않고 오류와 줄 번호만 알려 줍니다 |
 | 비밀값 | 브라우저로 다시 전송하지 않습니다(`sk-or-…cd0`처럼 마스킹). 입력을 비우면 저장된 값을 유지하고, 새 값을 넣을 때만 교체합니다 |
+| 서버 주소 | Messages·HTTP 예외·모델 목록 주소도 키처럼 일부만 보입니다(`http://12•••••.1:11434/v1/messages`: 호스트는 앞뒤 2자만, `user:pass@`와 쿼리는 가림). 원문은 브라우저로 전송하지 않고, 비우면 유지합니다 |
+| 지우기 | 선택 항목(HTTP 예외·모델 목록 주소)은 **지우기** 버튼으로 삭제합니다(`POST /api/config`의 `clear` 목록). 필수 항목과 키는 지울 수 없습니다 |
 | 검증 | 모델 ID 형식, 키 형식, Local URL 규칙(루프백·HTTPS·동일 출처)을 저장 전에 확인하며 실패하면 파일을 건드리지 않습니다 |
 | 보호 | POST 요청은 페이지에 내장된 세션 토큰과 동일 출처일 때만 허용합니다(다른 사이트에서 호출 불가) |
 | 연결 테스트 | **모델 확인**은 모델 목록만 조회하고, **추론 테스트**는 16토큰으로 1회 호출합니다(소액 과금 가능) |
@@ -480,7 +494,7 @@ python routeDashboard.py --status --offline  # OpenRouter 호출 생략
 
 | 증상 | 먼저 확인할 내용 |
 | --- | --- |
-| `.env.openrouter`를 찾지 못함 | 현재 작업 폴더가 아닌 실제 실행기 폴더에 저장했는지 확인 |
+| `openclaude.config.yaml`을 찾지 못함 | 현재 작업 폴더가 아닌 실제 실행기 폴더에 저장했는지 확인 |
 | OpenRouter 401 / `Missing Authentication header` | 전용 파일의 실제 키·유효성을 확인; HUD 플러그인 설치 성공은 API 인증 성공과 별개 |
 | Local 설정을 바꿔도 이전 서버 사용 | 프로세스 환경변수 우선순위와 전역 실행기 대상 확인 후 세션 재시작 |
 | Local 모델 목록 성공인데 추론 실패 | Messages API·모델 ID·도구/응답 형식 호환성을 별도 확인 |
@@ -628,7 +642,8 @@ python tests/bench_dashboard.py            # 10MB 로그 · 2,000개 세션 파�
 | [openrouterAdvisor.py](openrouterAdvisor.py) | Plan 인증 검사·환경 격리·프록시 수명 관리·Local 목록 점검 |
 | [localProcessTree.py](localProcessTree.py) | Windows Local 전용 진입점의 Job 소유권·프로세스 트리 종료 감시 |
 | [claudeRouteProxy.mjs](claudeRouteProxy.mjs) | 모델별 라우팅·응답 검증·재시도·fallback·복구 |
-| [.env.local-llm.example](.env.local-llm.example) | 키가 없는 Local 설정 예제 |
+| [openclaude.config.example.yaml](openclaude.config.example.yaml) | 키가 없는 통합 설정 예제 (OpenRouter·Local) |
+| [.env.local-llm.example](.env.local-llm.example) | 키가 없는 Local 설정 예제 (폐기 예정, 위 파일로 대체) |
 | [tests/claudeRouteProxy.test.mjs](tests/claudeRouteProxy.test.mjs) | 프록시 합성 회귀 검사 |
 | [tests/localLlmIntegration.test.mjs](tests/localLlmIntegration.test.mjs) | loopback HTTP 서버를 사용하는 합성 통합 검사 |
 | [tests/test_local_config.py](tests/test_local_config.py) | Local 설정과 메타데이터 점검 검사 |

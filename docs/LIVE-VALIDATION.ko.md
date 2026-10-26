@@ -26,7 +26,7 @@
 
 ## OpenRouter 호환 모드와 시작 점검 검증 (2026-10-24)
 
-`-Provider OpenRouter -OpenRouterCompat`은 `.env.openrouter`의 선택 모델을 모든 Claude 모델 역할에 사용하며 Plan 로그인·전환을 차단합니다. 기존 일반 실행과 Local 모드는 유지합니다. 대화형 시작 시 제공자별 최소 추론을 1회 수행하고, 점검 실패도 CLI 진입을 계속합니다. 일반 모드의 Plan fallback과 별도 모드의 Plan 차단 정책을 각각 유지합니다.
+`-Provider OpenRouter -OpenRouterCompat`은 `openclaude.config.yaml`의 `openrouter.model`을 모든 Claude 모델 역할에 사용하며 Plan 로그인·전환을 차단합니다. 기존 일반 실행과 Local 모드는 유지합니다. 대화형 시작 시 제공자별 최소 추론을 1회 수행하고, 점검 실패도 CLI 진입을 계속합니다. 일반 모드의 Plan fallback과 별도 모드의 Plan 차단 정책을 각각 유지합니다.
 
 공개 Node 회귀 테스트 342개와 Python 테스트 64개, 실행기 자체 점검이 통과했습니다. 역할별 모델 매핑, 제공자 인증 분리, thinking·추론 강도·도구 참조·메타데이터 보존, 미지원 기능 거절, 인증·빈 응답·모델 불일치·타임아웃·cooldown 후 복구와 클라이언트 취소를 확인했습니다. OpenRouter 호환 모드의 모든 모의 upstream 호출은 OpenRouter 고정 주소만 사용했으며 Plan 호출은 없었습니다. 모든 대화형 모드에서 실패한 점검 뒤 프록시·CLI 시작 순서와 기존 Plan 허용 여부를 검사했습니다.
 
