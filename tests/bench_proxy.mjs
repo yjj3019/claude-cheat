@@ -236,10 +236,11 @@ export function validateHttpResponse(observed, expected) {
     if (observed.text !== expected.text)
       failures.push(`body differs (expected ${expected.text.length} chars, received ${String(observed.text ?? '').length})`);
   } else if (expected.body !== undefined) {
-    let parsed = null;
-    try { parsed = JSON.parse(observed.text); } catch (error) { failures.push(`body is not JSON: ${error.message}`); }
-    if (parsed !== null && !isDeepStrictEqual(parsed, expected.body))
-      failures.push('body differs from expected validated payload');
+    try {
+      const parsed = JSON.parse(observed.text);
+      if (!isDeepStrictEqual(parsed, expected.body))
+        failures.push('body differs from expected validated payload');
+    } catch (error) { failures.push(`body is not JSON: ${error.message}`); }
   }
   return { ok: failures.length === 0, failures };
 }

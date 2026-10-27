@@ -245,6 +245,16 @@ test('validateHttpResponse deep-compares JSON bodies and exact streaming text', 
     { status: 200, body: expectedBody });
   assert.match(invalidJson.failures.join(' '), /not JSON/);
 
+  const nullInsteadOfObject = validateHttpResponse({ status: 200, text: 'null' },
+    { status: 200, body: expectedBody });
+  assert.equal(nullInsteadOfObject.ok, false, 'JSON null must not match an expected object');
+  assert.match(nullInsteadOfObject.failures.join(' '), /body differs/);
+  assert.deepEqual(validateHttpResponse({ status: 200, text: 'null' }, { status: 200, body: null }),
+    { ok: true, failures: [] });
+  assert.equal(validateHttpResponse({ status: 200, text: '{}' }, { status: 200, body: null }).ok, false);
+  assert.match(validateHttpResponse({ status: 200, text: 'not json' },
+    { status: 200, body: null }).failures.join(' '), /not JSON/);
+
   const sse = fixtureSse(CLIENT_MODEL);
   assert.equal(validateHttpResponse({ status: 200, contentType: 'text/event-stream', text: sse },
     { status: 200, contentTypeIncludes: 'text/event-stream', text: sse }).ok, true);
