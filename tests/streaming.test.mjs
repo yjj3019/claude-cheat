@@ -27,7 +27,7 @@ function frames(model, { text = 'hello', extraFrames = [] } = {}) {
   ];
 }
 
-async function start({ passthrough = false, chunks = null, planCalls = [] } = {}) {
+async function start({ passthrough = false, chunks = null, planCalls = [], beforeFinal = null } = {}) {
   const server = createProxy({
     key: 'sk-or-stream', nonce: NONCE, openrouterModel: 'stream/model', retryDelayMs: 0,
     attemptTimeoutMs: 8000, streamPassthrough: passthrough,
@@ -39,9 +39,10 @@ async function start({ passthrough = false, chunks = null, planCalls = [] } = {}
       const stream = new ReadableStream({
         async start(controller) {
           const encoder = new TextEncoder();
-          for (const piece of pieces) {
+          for (let i = 0; i < pieces.length; i++) {
+            if (beforeFinal && i === pieces.length - 1) await beforeFinal;
             await new Promise(resolve => setTimeout(resolve, FRAME_DELAY_MS));
-            controller.enqueue(encoder.encode(piece));
+            controller.enqueue(encoder.encode(pieces[i]));
           }
           controller.close();
         },
@@ -90,14 +91,30 @@ test('by default the proxy buffers the whole stream before answering', async () 
   }
 });
 
-test('passthrough delivers the first token while the provider is still generating', async () => {
-  const { server, base } = await start({ passthrough: true });
+test('passthrough delivers the first token while the provider is still generating', { timeout: 10000 }, async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const { server, base } = await start({ passthrough: true, beforeFinal: gate });
   try {
-    const result = await request(base);
-    assert.equal(result.status, 200);
-    assert.ok(result.ttfb < result.total * 0.6, `ttfb ${result.ttfb} of ${result.total}`);
-    assert.match(result.body, /message_stop/);
+    const response = await fetch(base, { method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-local-route-token': NONCE,
+        authorization: 'Bearer sk-ant-oat-stream', 'anthropic-beta': BETA },
+      body: JSON.stringify({ model: MODEL, max_tokens: 64, stream: true,
+        messages: [{ role: 'user', content: 'hello' }] }) });
+    assert.equal(response.status, 200);
+    const reader = response.body.getReader();
+    const first = await reader.read();
+    assert.match(new TextDecoder().decode(first.value), /hello/);
+    release();
+    let tail = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      tail += new TextDecoder().decode(value);
+    }
+    assert.match(tail, /message_stop/);
   } finally {
+    release();
     server.closeAllConnections();
     server.close();
   }
@@ -119,6 +136,53 @@ test('passthrough keeps a recoverable failure recoverable before any token', asy
     server.close();
   }
 });
+
+test('ordinary passthrough rejects reasoning before publishing any external content', async () => {
+  const planCalls = [];
+  const chunks = [frame('message_start', { message: { ...META, model: 'stream/model' } }),
+    frame('content_block_start', { index: 1, content_block: { type: 'thinking', thinking: '' } }),
+    frame('content_block_delta', { index: 1, delta: { type: 'thinking_delta', thinking: 'PRIVATE_REASONING' } }),
+    frame('content_block_stop', { index: 1 }), ...frames('stream/model').slice(1)];
+  const { server, base } = await start({ passthrough: true, chunks, planCalls });
+  try {
+    const result = await request(base);
+    assert.doesNotMatch(result.body, /PRIVATE_REASONING|thinking_delta/);
+    assert.match(result.body, /plan ok/);
+    assert.equal(planCalls.length, 1);
+  } finally { server.closeAllConnections(); server.close(); }
+});
+
+test('passthrough stops on late forbidden thinking without forwarding it or replaying', async () => {
+  const planCalls = [];
+  const valid = frames('stream/model');
+  const chunks = [...valid.slice(0, 4),
+    frame('content_block_start', { index: 1, content_block: { type: 'redacted_thinking', data: 'SECRET_LATE' } }),
+    ...valid.slice(4)];
+  const { server, base } = await start({ passthrough: true, chunks, planCalls });
+  try {
+    const result = await request(base);
+    assert.match(result.body, /hello/);
+    assert.match(result.body, /upstream stream failed/);
+    assert.doesNotMatch(result.body, /SECRET_LATE|redacted_thinking/);
+    assert.equal(planCalls.length, 0);
+  } finally { server.closeAllConnections(); server.close(); }
+});
+
+for (const passthrough of [false, true]) {
+  test(`nonempty message_start content cannot bypass validation (passthrough ${passthrough})`, async () => {
+    const planCalls = [];
+    const chunks = frames('stream/model');
+    chunks[0] = frame('message_start', { message: { ...META, model: 'stream/model',
+      content: [{ type: 'server_tool_use', id: 'unvalidated', name: 'web_search', input: {} }] } });
+    const { server, base } = await start({ passthrough, chunks, planCalls });
+    try {
+      const result = await request(base);
+      assert.doesNotMatch(result.body, /server_tool_use|unvalidated/);
+      assert.match(result.body, /plan ok/);
+      assert.equal(planCalls.length, 1);
+    } finally { server.closeAllConnections(); server.close(); }
+  });
+}
 
 test('a slow client is respected instead of buffering the whole reply in the proxy', async () => {
   // 300 frames of 4 KiB force the socket buffer full while the client is not reading, so

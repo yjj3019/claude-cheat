@@ -545,7 +545,7 @@ for (const [label, content] of [
   ['whitespace tool name', [{ type: 'tool_use', id: 'fixture-tool', name: ' ', input: {} }]],
 ]) {
   for (const format of ['json', 'sse']) {
-    test(`external ${format} ${label} retries three times then forwards Pro unchanged`, async t => {
+    test(`external ${format} ${label} rejects invalid output then forwards Pro unchanged`, async t => {
       const { calls, request } = await fixture(t, url => url === proURL
         ? new Response('native result', { status: 429, headers: { 'retry-after': '60' } })
         : format === 'json'
@@ -556,8 +556,11 @@ for (const [label, content] of [
       assert.equal(response.status, 429);
       assert.equal(response.headers.get('retry-after'), '60');
       assert.equal(await response.text(), 'native result');
-      assert.equal(calls.length, 5);
-      assert.ok(calls.slice(0, 4).every(call => call.url === externalURL));
+      // Ordinary SSE reasoning is now rejected at the first forbidden frame;
+      // the existing request-rejection policy avoids repeating that unsupported response.
+      const attempts = format === 'sse' && label.includes('thinking only') ? 1 : 4;
+      assert.equal(calls.length, attempts + 1);
+      assert.ok(calls.slice(0, attempts).every(call => call.url === externalURL));
       assert.equal(calls.at(-1).url, proURL);
       assert.deepEqual(calls.at(-1).parsedBody, original);
       assert.equal(calls.at(-1).headers.authorization, OAUTH);
@@ -1549,6 +1552,30 @@ test('stalled Plan stream is cut after the idle timeout', async t => {
   const body = await response.text();
   assert.match(body, /event: error/);
   assert.match(body, /upstream stream failed/);
+});
+
+test('stalled Plan error body honors timeout and cancels its reader', { timeout: 3000 }, async t => {
+  let cancelled = false;
+  let source;
+  const stalled = new Response(new ReadableStream({ start(controller) { source = controller; }, cancel() { cancelled = true; } }), { status: 503 });
+  // Cleanup also releases the intentionally stalled source if the regression fails.
+  const release = setTimeout(() => { try { source.close(); } catch {} }, 1500);
+  t.after(() => clearTimeout(release));
+  const { request } = await fixture(t, () => stalled, { planIdleMs: 40, planHeaderMs: 80 });
+  const response = await request(requestBody(OPUS), { headers: proHeaders });
+  assert.equal(response.status, 502);
+  await response.text();
+  assert.equal(cancelled, true);
+});
+
+test('Plan error timeout does not await a stuck source cancellation', { timeout: 2500 }, async t => {
+  let cancelCalled = false;
+  const stalled = new Response(new ReadableStream({ cancel() { cancelCalled = true; return new Promise(() => {}); } }), { status: 503 });
+  const { request } = await fixture(t, () => stalled, { planIdleMs: 40, planHeaderMs: 80 });
+  const response = await request(requestBody(OPUS), { headers: proHeaders });
+  assert.equal(response.status, 502);
+  await response.text();
+  assert.equal(cancelCalled, true);
 });
 
 test('request body up to 32 MiB reaches routing instead of being rejected at 16 MiB', async t => {

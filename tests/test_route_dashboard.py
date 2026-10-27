@@ -82,6 +82,22 @@ class RouteLogTests(unittest.TestCase):
         state = dash.routing_state(events)
         self.assertEqual(state["proxy_code"], "2026-10-25T02:30:00.000Z")
 
+    def test_restart_does_not_reuse_previous_route_as_current_evidence(self):
+        now = datetime(2026, 10, 25, 3, 0, 0, tzinfo=timezone.utc)
+        old = {"event": "route_selected", "provider": "openrouter", "model": "vendor/old",
+               "ts": (now - timedelta(seconds=2)).isoformat()}
+        start = {"event": "proxy_start", "ts": now.isoformat()}
+        state = dash.routing_state([old, start], now=now)
+        self.assertEqual(state["state"], "unknown")
+        self.assertIsNone(state["last"])
+        self.assertEqual(state["proxy_started_at"], start["ts"])
+        self.assertEqual(state["counts"]["external"], 1)  # Historical window remains intact.
+        current = {"event": "route_selected", "provider": "local", "model": "new-local",
+                   "ts": now.isoformat()}
+        state = dash.routing_state([old, start, current], now=now)
+        self.assertEqual(state["last"]["provider"], "local")
+        self.assertEqual(state["last"]["model"], "new-local")
+
     def test_missing_log_reports_unknown_state(self):
         self.assertEqual(dash.parse_route_log(), [])
         state = dash.routing_state([])
@@ -883,6 +899,36 @@ class ConfigTests(unittest.TestCase):
     def put_openrouter(self, model="vendor/a", key="sk-or-v1-abcdefghijkl"):
         self.put("openrouter", OPENROUTER_MODEL=model, ANTHROPIC_AUTH_TOKEN=key)
 
+    def test_save_validates_latest_candidate_inside_store_transaction(self):
+        self.put("local", LOCAL_LLM_URL="http://127.0.0.1:1111/v1/messages",
+                 LOCAL_LLM_MODEL="fixture", LOCAL_LLM_API_KEY="fixture-secret")
+        original_write = dash.routeConfig.Store.write_provider
+        interleaved = False
+        committed = {}
+
+        def concurrent_write(store, provider, updates, **kwargs):
+            nonlocal interleaved
+            if not interleaved:
+                interleaved = True
+                # Another valid save commits after A's preflight but before A's transaction.
+                original_write(store, "local", {"LOCAL_LLM_MODELS_URL": "http://127.0.0.1:1111/v1/models"})
+                committed["file"] = self.path.read_bytes()
+                committed["backup"] = self.path.with_name(self.path.name + ".bak").read_bytes()
+            return original_write(store, provider, updates, **kwargs)
+
+        with mock.patch.object(dash.routeConfig.Store, "write_provider", concurrent_write):
+            with self.assertRaisesRegex(ValueError, "invalid_models_url"):
+                dash.save_config("local", {"LOCAL_LLM_URL": "http://127.0.0.1:2222/v1/messages",
+                                           "LOCAL_LLM_API_KEY": ""})
+        stored = dash._store("local").read_provider("local")
+        self.assertEqual(stored["LOCAL_LLM_URL"], "http://127.0.0.1:1111/v1/messages")
+        self.assertEqual(stored["LOCAL_LLM_API_KEY"], "fixture-secret")
+        dash._validate_local(stored)
+        backup = self.path.with_name(self.path.name + ".bak")
+        # Rejected validation changes neither the latest config nor its existing backup.
+        self.assertEqual(self.path.read_bytes(), committed["file"])
+        self.assertEqual(backup.read_bytes(), committed["backup"])
+
     def test_snapshot_masks_secrets_and_reports_which_are_set(self):
         self.put_openrouter("vendor/model")
         snapshot = dash.config_snapshot()
@@ -1213,6 +1259,37 @@ class ProxyMetricsTests(unittest.TestCase):
         self.assertEqual(data["proxy_metrics"]["latencyMs"]["external"]["p50"], 3.5)
 
 
+class HttpRedirectTests(unittest.TestCase):
+    def test_authenticated_requests_never_follow_redirects(self):
+        import urllib.error
+        import urllib.request
+
+        for status, method in ((302, "GET"), (303, "POST"), (307, "POST"), (308, "GET")):
+            with self.subTest(status=status, method=method):
+                build_opener = urllib.request.build_opener
+                seen = []
+
+                class RedirectSource(urllib.request.BaseHandler):
+                    handler_order = 100
+
+                    def https_open(self, request):
+                        seen.append(request.full_url)
+                        if len(seen) > 1:
+                            raise AssertionError("redirect target received credentials")
+                        headers = {"location": "https://other.invalid/collect"}
+                        return self.parent.error("https", request, io.BytesIO(b""),
+                                                 status, "redirect", headers)
+
+                with mock.patch.object(urllib.request, "build_opener",
+                                       side_effect=lambda *handlers: build_opener(*handlers, RedirectSource())):
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        dash._http_json("https://provider.invalid/v1/models",
+                                        {"authorization": "Bearer fixture-secret"},
+                                        body={} if method == "POST" else None)
+                    self.assertEqual(raised.exception.code, status)
+                    raised.exception.close()
+                self.assertEqual(seen, ["https://provider.invalid/v1/models"])
+
 class ModelCatalogTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -1284,6 +1361,27 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual(catalog["error"], "authentication_failed")
         self.assertEqual(catalog["status"], 401)
         self.assertNotIn("sk-or", json.dumps(catalog))
+
+    def test_connection_check_closes_redirect_response(self):
+        import urllib.error
+        body = io.BytesIO(b"credential must not be returned")
+        error = urllib.error.HTTPError("https://provider.invalid", 303, "redirect", {}, body)
+        values = {"ANTHROPIC_AUTH_TOKEN": "sk-or-fixture", "OPENROUTER_MODEL": "vendor/a"}
+        with mock.patch.object(dash, "_http_json", side_effect=error):
+            result = dash.run_connection_test("openrouter", mode="inference", values=values)
+        self.assertTrue(body.closed)
+        self.assertEqual((result["reason"], result["status"]), ("http_error", 303))
+        self.assertNotIn("credential", json.dumps(result))
+
+    def test_catalog_closes_redirect_response_and_returns_sanitized_error(self):
+        import urllib.error
+        body = io.BytesIO(b"credential must not be returned")
+        error = urllib.error.HTTPError("https://provider.invalid", 302, "redirect", {}, body)
+        with mock.patch.object(dash, "_http_json", side_effect=error):
+            catalog = dash.model_catalog("openrouter")
+        self.assertTrue(body.closed)
+        self.assertEqual((catalog["error"], catalog["status"]), ("http_error", 302))
+        self.assertNotIn("credential", json.dumps(catalog))
 
     def test_empty_catalog_is_reported(self):
         with mock.patch.object(dash, "_http_json", return_value=(200, {"data": []})):

@@ -33,14 +33,15 @@ function emitDiagnostic(text, secrets = []) {
 }
 // Reads at most `limit` bytes from a web stream and cancels the rest, so an oversized
 // provider error body is never fully buffered. One extra byte is read to detect truncation.
-async function readBoundedBody(body, limit) {
+async function readBoundedBody(body, limit, signal, onProgress) {
   const reader = body.getReader();
   const chunks = [];
   let total = 0, truncated = false;
   try {
     while (total <= limit) {
-      const { done, value } = await reader.read();
+      const { done, value } = await abortable(reader.read(), signal);
       if (done) break;
+      onProgress?.();
       const allowed = limit + 1 - total;
       if (value.byteLength >= allowed) {
         if (allowed > 0) chunks.push(value.subarray(0, allowed));
@@ -52,7 +53,8 @@ async function readBoundedBody(body, limit) {
       total += value.byteLength;
     }
   } finally {
-    await reader.cancel().catch(() => {});
+    // The source may never settle cancellation; do not let cleanup defeat the deadline.
+    reader.cancel().catch(() => {});
     reader.releaseLock();
   }
   return { text: Buffer.concat(chunks).subarray(0, limit).toString('utf8'), truncated };
@@ -422,6 +424,8 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false)
       if (event.type === 'message_start') {
         if (started || event.message?.model !== model) throw new Error('Wrong response model');
         if (strictMeta && !validMessageMeta(event.message)) throw new Error('Invalid stream metadata');
+        if (event.message.content !== undefined && (!Array.isArray(event.message.content) || event.message.content.length))
+          throw new Error('Nonempty stream start content');
         started = true;
         event.message.model = clientModel;
       } else if (event.type !== 'ping' && !started) throw new Error('Missing start');
@@ -430,7 +434,10 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false)
             !validContentBlock(event.content_block)) throw new Error('Invalid content block');
         // Ordinary mode never accepts reasoning blocks from the external provider; the
         // buffered path caught these with a text scan, which a stream cannot rely on.
-        if (thinking(event.content_block)) sawThinking = true;
+        if (thinking(event.content_block)) {
+          if (rejectThinking) throw new Error('Thinking response in ordinary mode');
+          sawThinking = true;
+        }
         indices.add(event.index);
         usable ||= usableContent(event.content_block);
         usable ||= usableContent(event.content_block);
@@ -439,7 +446,10 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false)
       if (event.type === 'content_block_delta') {
         const block = blocks.get(event.index);
         if (!block || !event.delta) throw new Error('Unknown content block');
-        if (['thinking_delta', 'signature_delta'].includes(event.delta.type)) sawThinking = true;
+        if (['thinking_delta', 'signature_delta'].includes(event.delta.type)) {
+          if (rejectThinking) throw new Error('Thinking response in ordinary mode');
+          sawThinking = true;
+        }
         if (event.delta.type === 'input_json_delta' && block.type === 'tool_use' && typeof event.delta.partial_json === 'string') {
           block.hasJson = true;
           block.json += event.delta.partial_json;
@@ -931,7 +941,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     }
     if (req.method !== 'POST' || !/^\/v1\/messages(?:\/count_tokens)?(?:\?beta=true)?$/.test(req.url)) return reject(403, 'Endpoint blocked');
     const client = new AbortController();
-    let recordRequest = () => {};
+    let recordRequest = () => {}, responseFailed = false;
     // A request owns one inflight slot until it is released. An early rejection (bad JSON,
     // oversized body) never reaches recordRequest, and a client that vanishes mid-body never
     // finishes its response, so release on 'close' too: a leaked slot makes every later
@@ -1041,7 +1051,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         releaseTurn();
         const elapsed = Number((performance.now() - startedAt).toFixed(2));
         if (aborted) { metrics.aborted += 1; metrics.failed += 1; }
-        else if (res.statusCode < 400) metrics.ok += 1;
+        else if (!responseFailed && res.statusCode < 400) metrics.ok += 1;
         else metrics.failed += 1;
         if (routeKind) {
           const bucket = metrics.latency[routeKind];
@@ -1054,6 +1064,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         }
         metrics.last = { ts: new Date().toISOString(), traceId, route: routeKind || 'none', reason: routeReason,
           status: aborted ? 499 : res.statusCode, ms: elapsed,
+          outcome: aborted ? 'aborted' : responseFailed || res.statusCode >= 400 ? 'failed' : 'ok',
           // Exposed so a rate-limit answer stays visible to the dashboard (and to the circuit
           // work that will consume it); null means no usable Retry-After was seen.
           retryAfterMs: retryAfterHintMs };
@@ -1143,7 +1154,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         if (upstream.status >= 400 && upstream.body) {
           // The body is read with a hard cap: an error page cannot be buffered in full just
           // to relay a diagnostic excerpt, and the remainder is cancelled.
-          const { text: errorBody, truncated } = await readBoundedBody(upstream.body, MAX_ERROR_BODY);
+          arm(planIdleMs);
+          const { text: errorBody, truncated } = await readBoundedBody(upstream.body, MAX_ERROR_BODY, plan.signal, () => arm(planIdleMs));
           const scrubbed = redactDiagnostic(errorBody, secrets);
           const redacted = scrubbed !== errorBody;
           if (truncated || redacted) {
@@ -1347,6 +1359,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             if (error?.streamed || res.headersSent) {
               // Headers are already on the wire, so retrying or falling back would corrupt
               // the response; report the failure inside the stream and stop here.
+              responseFailed = true;
               logEvent({ event: 'stream_broken', provider: target.name, category: 'upstream' });
               try {
                 res.write(`event: error\ndata: ${JSON.stringify({ type: 'error',
@@ -1408,6 +1421,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       if (!succeeded) await sendPro('fallback', noPlan ? localFailure : undefined);
     } catch {
       if (!client.signal.aborted) {
+        responseFailed = true;
         logEvent({ event: 'route_failed', category: 'upstream' });
         if (res.headersSent) {
           // Part of the answer is already on the wire: report the failure inside the stream.

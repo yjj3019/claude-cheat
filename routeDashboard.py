@@ -333,7 +333,10 @@ def routing_state(events, now=None, idle_after=300):
     if len(events) > ROUTING_EVENTS_CAP:
         events = events[-ROUTING_EVENTS_CAP:]
     now = now or datetime.now(timezone.utc)
-    selected = [e for e in events if e.get("event") == "route_selected"]
+    # Log append order is the session boundary; wall clocks can move backwards.
+    start_index = next((i for i in range(len(events) - 1, -1, -1)
+                        if events[i].get("event") == "proxy_start"), -1)
+    selected = [e for e in events[start_index + 1:] if e.get("event") == "route_selected"]
     last = selected[-1] if selected else None
     age = _age_seconds(last["ts"], now) if last else None
     if last is None:
@@ -1904,8 +1907,15 @@ def save_config(provider, values, clear=()):
             updates[name] = clean.get(name) or None
         elif name in clean:
             updates[name] = clean[name]
-    # The store starts a first save from the shipped example (comments stay) and migrates legacy files.
-    _store(provider).write_provider(provider, updates)
+    def validate_candidate(candidate):
+        for name in spec["required"]:
+            if not candidate.get(name):
+                raise ValueError(f"missing_{name.lower()}")
+        _validate_config(provider, candidate)
+
+    # Revalidate the exact candidate under the store lock: another save may have
+    # changed complementary fields since preflight. Failure must precede backup/write.
+    _store(provider).write_provider(provider, updates, validate=validate_candidate)
     return config_snapshot()
 
 
@@ -2000,6 +2010,7 @@ def model_catalog(provider="openrouter", values=None, refresh=False, now=None):
         if isinstance(error, urllib.error.HTTPError):
             code = error.code
             reason = "authentication_failed" if code in (401, 403) else "http_error"
+            error.close()
         data = {"provider": provider, "ok": False, "error": reason, "status": code, "models": []}
         return data
     models = _parse_models(payload)
@@ -2014,7 +2025,12 @@ def _http_json(url, headers, body=None, timeout=12):
     import urllib.error
     import urllib.request
 
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            # Only the configured endpoint is authorized to receive provider credentials.
+            return None
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     data = json.dumps(body).encode("utf-8") if body is not None else None
     request = urllib.request.Request(url, data=data, headers=headers,
                                      method="POST" if body is not None else "GET")

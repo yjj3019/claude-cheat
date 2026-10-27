@@ -170,6 +170,12 @@ test('a broken passthrough stream keeps one traceId across its lines', { timeout
   assert.equal(broken.length, 1);
   assert.equal(selected[0].traceId, broken[0].traceId, 'a failed stream is reconstructable from one traceId');
   assert.match(selected[0].traceId, TRACE_ID);
+  const metrics = await proxy.metrics();
+  assert.equal(metrics.requests, 1);
+  assert.equal(metrics.ok, 0);
+  assert.equal(metrics.failed, 1);
+  assert.equal(metrics.last.status, 200); // HTTP is committed, semantic completion still failed.
+  assert.equal(metrics.last.outcome, 'failed');
 });
 
 test('a credential in an upstream error body is redacted in the client body and the logs',

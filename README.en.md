@@ -464,7 +464,6 @@ python -m unittest discover -s tests -p 'test_*.py' -v
 python openrouterAdvisor.py --self-test
 node --check claudeRouteProxy.mjs
 node tests/simulate.mjs --soak 3000        # synthetic traffic, long session, memory
-python openrouterAdvisor.py --print "Reply with exactly OK"   # one real CLI turn (automation)
 node tests/fuzz.mjs --iterations 2000      # proxy fuzzing (deterministic seed)
 python -m unittest tests.test_fuzz_dashboard   # dashboard fuzzing
 python tests/live_smoke.py --dry-run       # report which settings exist, no billing
@@ -474,7 +473,8 @@ python tests/live_smoke.py --dry-run       # report which settings exist, no bil
 - The process-tree suite needs **Git Bash**. `C:\Windows\System32\bash.exe` is WSL and cannot run the Windows python path the harness passes, so it skips itself.
 - The dashboard enforces a **Host allowlist** (127.0.0.1, localhost, ::1) against DNS rebinding and sends `nosniff`, `no-referrer` and `X-Frame-Options: DENY`. Write endpoints require the session token and a same-origin request.
 - Real provider calls stay out of the suite. After a configuration change, confirm once with `python tests/live_smoke.py` (16 tokens, well under a cent per run).
-- The launcher has a **non-interactive `--print "prompt"`** mode (JSON by default, `--print-text` for people). For a real end-to-end turn: `$env:CLAUDE_CHEAT_LIVE = '1'; python -m unittest tests.test_cli_integration`.
+- The launcher has a **non-interactive `--print "prompt"`** mode (JSON by default, `--print-text` for people). `python openrouterAdvisor.py --print "Reply with exactly OK"` and `$env:CLAUDE_CHEAT_LIVE = '1'; python -m unittest tests.test_cli_integration` invoke a real CLI and provider and may incur charges.
+- `node --test tests/cli_smoke.test.mjs` tests the experimental smoke harness with a synthetic CLI and mocked provider. Separately, `node tests/cli_smoke.mjs` uses user settings and a real CLI and provider, **may incur charges**, and remains unverified against real CLI versions. Windows `.cmd` shell wrappers are not supported. A timeout terminates only the direct child; descendant process cleanup is not guaranteed.
 
 The tests cover payload preservation, authentication isolation, tool-result round trips, the initial request plus three retries, Plan fallback, recovery, cancellation, timeouts, and empty responses. Synthetic success does not establish live-provider or full native-feature parity.
 

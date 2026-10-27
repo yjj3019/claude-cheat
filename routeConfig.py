@@ -352,8 +352,8 @@ class Store:
         except FileNotFoundError:
             return {}
 
-    def write_provider(self, provider, updates):
-        """Apply ``{NAME: str|None}`` to one service. Serialised, atomic, with a ``.bak`` copy."""
+    def write_provider(self, provider, updates, validate=None):
+        """Apply updates atomically; optional validation sees the exact locked candidate before I/O."""
         spec = SECTIONS[provider]
         names = {name: key for key, name in spec["keys"].items()}
         yaml_updates = {}
@@ -381,6 +381,13 @@ class Store:
                         if key not in yaml_updates or yaml_updates[key] is None:
                             yaml_updates[key] = value
             text = update_text(text, provider, yaml_updates)
+            if validate is not None:
+                candidate = parse(text)
+                error = candidate.first_error(provider)
+                if error:
+                    raise error
+                validate({spec["keys"][key]: value
+                          for key, value in candidate.sections[provider]["values"].items() if value != ""})
             self._atomic_write(text, raw, original is not None and raw.startswith(b"\xef\xbb\xbf"))
 
     def _legacy_values(self, provider):
