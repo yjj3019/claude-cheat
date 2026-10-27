@@ -877,7 +877,7 @@ def self_test() -> None:
     assert dict(os.environ) == original_env
     proxy = Mock()
     proxy.stdout.readline.return_value = '{"port": 12345}\n'
-    with patch(__name__ + ".run_owned", return_value=auth), patch("shutil.which", return_value="executable"), patch(__name__ + ".read_env", return_value={"ANTHROPIC_AUTH_TOKEN": "sk-or-test-placeholder", "OPENROUTER_MODEL": "fixture/model"}), patch(__name__ + ".check_connection", return_value=0), patch("subprocess.Popen", return_value=proxy) as start:
+    with patch(__name__ + ".run_owned", return_value=auth), patch("shutil.which", return_value="executable"), patch(__name__ + ".read_env", return_value={"ANTHROPIC_AUTH_TOKEN": "sk-or-test-placeholder", "OPENROUTER_MODEL": "fixture/model"}), patch(__name__ + ".provider_config", return_value={"SONNET_PROVIDER": "openrouter", "OPENROUTER_API_KEY": "sk-or-test-placeholder", "OPENROUTER_MODEL": "fixture/model"}), patch(__name__ + ".check_connection", return_value=0), patch("subprocess.Popen", return_value=proxy) as start:
         with routed_session() as env:
             assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
             assert env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "1"
@@ -893,7 +893,7 @@ def self_test() -> None:
             assert start.call_args.kwargs["stderr"] == subprocess.DEVNULL
         proxy.terminate.assert_called_once()
     assert dict(os.environ) == original_env
-    with patch(__name__ + ".run_owned", return_value=auth), patch("shutil.which", return_value="executable"), patch(__name__ + ".read_env", return_value={"ANTHROPIC_AUTH_TOKEN": "sk-or-test-placeholder", "OPENROUTER_MODEL": "fixture/model"}), patch(__name__ + ".check_connection", return_value=0), patch("subprocess.Popen", return_value=proxy) as start:
+    with patch(__name__ + ".run_owned", return_value=auth), patch("shutil.which", return_value="executable"), patch(__name__ + ".read_env", return_value={"ANTHROPIC_AUTH_TOKEN": "sk-or-test-placeholder", "OPENROUTER_MODEL": "fixture/model"}), patch(__name__ + ".provider_config", return_value={"SONNET_PROVIDER": "openrouter", "OPENROUTER_API_KEY": "sk-or-test-placeholder", "OPENROUTER_MODEL": "fixture/model"}), patch(__name__ + ".check_connection", return_value=0), patch("subprocess.Popen", return_value=proxy) as start:
         with routed_session(debug=True):
             assert start.call_args.kwargs["stderr"] is None
     proxy = Mock()
