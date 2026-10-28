@@ -24,6 +24,47 @@ def route_line(stamp, payload):
     return f"{stamp} {json.dumps(payload)}\n"
 
 
+class ResponseDisconnectTests(unittest.TestCase):
+    def handler(self):
+        handler = object.__new__(dash.Handler)
+        handler.headers = {"host": "127.0.0.1:8787"}
+        handler.path = "/api/snapshot"
+        handler.close_connection = False
+        handler.send_response = mock.Mock()
+        handler.send_header = mock.Mock()
+        handler.end_headers = mock.Mock()
+        handler.wfile = mock.Mock()
+        return handler
+
+    def test_snapshot_disconnect_does_not_attempt_a_second_response(self):
+        for error in (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            for stage in ("headers", "body"):
+                with self.subTest(error=error.__name__, stage=stage):
+                    handler = self.handler()
+                    target = handler.end_headers if stage == "headers" else handler.wfile.write
+                    target.side_effect = error("client disconnected")
+                    with mock.patch.object(dash, "cached_snapshot", return_value={}):
+                        handler.do_GET()
+                    handler.send_response.assert_called_once_with(200)
+                    self.assertTrue(handler.close_connection)
+                    if stage == "headers":
+                        handler.wfile.write.assert_not_called()
+
+    def test_snapshot_failure_still_returns_500(self):
+        handler = self.handler()
+        with mock.patch.object(dash, "cached_snapshot", side_effect=ValueError("invalid snapshot")):
+            handler.do_GET()
+        handler.send_response.assert_called_once_with(500)
+        self.assertEqual(json.loads(handler.wfile.write.call_args.args[0]),
+                         {"error": "snapshot_failed"})
+
+    def test_unrelated_io_error_is_not_suppressed(self):
+        handler = self.handler()
+        handler.wfile.write.side_effect = OSError("unexpected I/O failure")
+        with self.assertRaises(OSError):
+            handler._send(200, "application/json", "{}")
+
+
 class RouteLogTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -360,6 +401,16 @@ class CostProvenanceTests(unittest.TestCase):
         # A split above the cache-write total is clamped to it, never exceeding it.
         self.assertEqual(usage["cache_write_1h"]["external"], 10)
 
+    def test_same_rates_do_not_reuse_another_models_pricing_metadata(self):
+        self.append([self.assistant()])
+        first = {**self.RATES, "normalized_model": "vendor/first", "pricing_version": "version-1",
+                 "fetched_at": "2026-10-25T01:00:00Z"}
+        self.assertEqual(self.scan(pricing=first)["cost"]["normalized_model"], "vendor/first")
+        second = {**first, "normalized_model": "vendor/second"}
+        self.assertEqual(self.scan(pricing=second)["cost"]["normalized_model"], "vendor/second")
+        refreshed = {**second, "fetched_at": "2026-10-25T02:00:00Z"}
+        self.assertEqual(self.scan(pricing=refreshed)["cost"]["fetched_at"], refreshed["fetched_at"])
+
     def test_existing_payload_fields_are_unchanged_for_normal_data(self):
         self.append([self.assistant(message_id="msg_other",
                                     tokens=(1_000_000, 1_000_000, 1_000_000, 0)),
@@ -650,9 +701,9 @@ class TransitionTests(unittest.TestCase):
         joined = " ".join(row[0] for row in commands)
         for flag in ("--status", "--pretty", "--usage", "--offline"):
             self.assertIn(flag, joined)
-        self.assertEqual(len(dash.HELP_SECTION["endpoints"]), 4)
         names = " ".join(endpoint for endpoint, _ in dash.HELP_SECTION["endpoints"])
         self.assertIn("/api/config", names)
+        self.assertIn("/api/default-provider", names)
         self.assertIn("/api/metrics", names)
 
 
@@ -898,6 +949,205 @@ class ConfigTests(unittest.TestCase):
 
     def put_openrouter(self, model="vendor/a", key="sk-or-v1-abcdefghijkl"):
         self.put("openrouter", OPENROUTER_MODEL=model, ANTHROPIC_AUTH_TOKEN=key)
+
+    def test_default_selection_is_saved_without_changing_service_settings(self):
+        self.put_openrouter()
+        values = dash._store("openrouter").read_provider("openrouter")
+        self.assertEqual(dash.save_default_provider("openrouter"), "openrouter")
+        self.assertEqual(dash.config_snapshot()["default_provider"], "openrouter")
+        self.assertEqual(dash._store("openrouter").read_provider("openrouter"), values)
+        before = self.path.read_bytes()
+        self.assertEqual(dash.save_default_provider("openrouter"), "openrouter")
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(dash._store("openrouter").read_provider("openrouter"), values)
+
+    def test_dashboard_saved_default_is_used_by_the_launcher(self):
+        import openrouterAdvisor as route
+
+        self.put_openrouter()
+        self.put("local", LOCAL_LLM_URL="http://127.0.0.1:11434/v1/messages", LOCAL_LLM_MODEL="fixture")
+        dash.save_default_provider("local")
+        with mock.patch.object(route, "ROOT", self.root), mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(route.configured_provider(), "local")
+
+    def test_local_snapshots_skip_openrouter_and_do_not_reuse_its_priced_cache(self):
+        self.put_openrouter()
+        self.put("local", LOCAL_LLM_URL="http://127.0.0.1:11434/v1/messages", LOCAL_LLM_MODEL="fixture-local")
+        with mock.patch.object(dash, "_live_session", return_value=(None, None)), \
+             mock.patch.object(dash, "parse_route_log", return_value=[]), \
+             mock.patch.object(dash, "proxy_metrics", return_value={"requests": 4, "failed": 4, "stale": False}), \
+             mock.patch.object(dash, "scan_sessions", return_value=dash._empty_usage()) as scan, \
+             mock.patch.object(dash, "_USAGE_SNAP", {"at": 0, "data": None, "signature": None}), \
+             mock.patch.object(dash, "model_pricing", return_value={"ok": True, "pricing_version": "fixture"}) as pricing, \
+             mock.patch.object(dash, "account_state", return_value={"ok": True}) as account:
+            dash.save_default_provider("openrouter")
+            dash.snapshot()
+            account.reset_mock()
+            pricing.reset_mock()
+            dash.save_default_provider("local")
+            data = dash.snapshot()
+            self.assertEqual(scan.call_count, 2, "changing services invalidates priced usage")
+            self.assertIsNone(scan.call_args.kwargs["pricing"])
+            self.assertEqual(data["model"], "fixture-local")
+            self.assertEqual(data["account"]["error"], "not_applicable")
+            self.assertTrue(data["proxy_metrics"]["stale"], "orphaned counters are historical even if recently written")
+            self.assertNotIn("실패 응답 누적", [item["title"] for item in data["insights"]])
+            self.assertNotIn("account_error", [item.get("code") for item in data["alerts"]])
+            account.assert_not_called()
+            pricing.assert_not_called()
+
+    def test_real_proxy_handoff_settings_and_dashboard_follow_the_same_service(self):
+        import queue
+        import shutil
+        import subprocess
+        import threading
+        import openrouterAdvisor as route
+
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not available")
+        module = Path(dash.__file__).with_name("claudeRouteProxy.mjs").as_uri()
+        script = ("import {createProxy} from " + json.dumps(module) + ";"
+                  "const proxy=createProxy({provider:'local',localUrl:'http://127.0.0.1:1/v1/messages',"
+                  "localModel:'fixture-local',nonce:'fixture-session',metricsPath:null,"
+                  "fetchImpl:async()=>{throw new Error('Unexpected upstream request')}});"
+                  "proxy.listen(0,'127.0.0.1',()=>console.log(JSON.stringify({port:proxy.address().port})));"
+                  "process.stdin.resume();")
+        env = {key: value for key, value in os.environ.items()
+               if key.upper() in {"PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP", "COMSPEC"}}
+        proxy = subprocess.Popen([node, "--input-type=module", "-e", script], env=env,
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True, encoding="utf-8")
+        def stop_proxy():
+            if proxy.poll() is None:
+                proxy.terminate()
+                try:
+                    proxy.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proxy.kill()
+                    proxy.wait(timeout=5)
+            for stream in (proxy.stdin, proxy.stdout, proxy.stderr):
+                stream.close()
+        self.addCleanup(stop_proxy)
+        ready = queue.Queue()
+        threading.Thread(target=lambda: ready.put(proxy.stdout.readline()), daemon=True).start()
+        port = json.loads(ready.get(timeout=10))["port"]
+        self.enterContext(mock.patch.dict(os.environ, {}, clear=True))
+        handoff = self.root / ".session-handoff.json"
+        log = self.root / ".route.log"
+        log.write_text(route_line(datetime.now(timezone.utc).isoformat(),
+                                  {"event": "route_selected", "provider": "local", "reason": "replacement",
+                                   "model": "fixture-local"}), encoding="utf-8")
+        self.put_openrouter()
+        self.enterContext(mock.patch.object(route, "ROOT", self.root))
+        self.enterContext(mock.patch.object(route, "HANDOFF_FILE", handoff))
+        self.enterContext(mock.patch.object(dash, "SESSION_HANDOFF_FILE", handoff))
+        self.enterContext(mock.patch.object(dash, "ROUTE_LOG", log))
+        self.enterContext(mock.patch.object(dash, "usage_snapshot", return_value=dash._empty_usage()))
+        self.enterContext(mock.patch.object(dash, "account_state", side_effect=AssertionError("Local must not call OpenRouter")))
+        self.enterContext(mock.patch.object(dash, "model_pricing", side_effect=AssertionError("Local must not use OpenRouter pricing")))
+        route.write_handoff(port=port, nonce="fixture-session", proxy_pid=proxy.pid,
+                            provider="local", cli_pid=os.getpid())
+        server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        def request(method, path, payload=None):
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+            try:
+                connection.request(method, path, None if payload is None else json.dumps(payload),
+                                   {"x-dashboard-token": dash.TOKEN, "content-type": "application/json"})
+                response = connection.getresponse()
+                data = json.loads(response.read())
+                self.assertEqual(response.status, 200, data)
+                return data
+            finally:
+                connection.close()
+        request("POST", "/api/config", {"provider": "local", "values": {
+            "LOCAL_LLM_URL": "http://127.0.0.1:1/v1/messages", "LOCAL_LLM_MODEL": "fixture-local"}})
+        request("POST", "/api/default-provider", {"provider": "local"})
+        self.assertEqual(route.configured_provider(), "local")
+        saved = request("GET", "/api/config")
+        self.assertEqual(saved["default_provider"], "local")
+        self.assertEqual(saved["active_session"]["provider"], "local")
+        snapshot = dash.snapshot()
+        self.assertEqual(snapshot["model"], "fixture-local")
+        self.assertEqual(snapshot["proxy_metrics"]["requests"], 0)
+        self.assertFalse(snapshot["proxy_metrics"]["stale"])
+        self.assertIn("Local LLM", snapshot["summary"])
+        request("POST", "/api/default-provider", {"provider": "openrouter"})
+        self.assertEqual(route.configured_provider(), "openrouter")
+        report = request("GET", "/api/status")
+        self.assertEqual(report["active_session"]["provider"], "local")
+        self.assertEqual(report["config"]["model"], "fixture-local", "changing the next launch keeps the live session's context")
+        self.assertNotIn("fixture-session", json.dumps(report))
+        stop_proxy()
+        self.assertIsNone(dash.active_session(), "a leftover handoff file does not prove liveness")
+
+    def test_rejected_default_does_not_change_the_file_or_backup(self):
+        self.put_openrouter()
+        dash.save_default_provider("openrouter")
+        before = self.path.read_bytes()
+        backup = self.path.with_name(self.path.name + ".bak").read_bytes()
+        for provider in (None, [], {}, "cli", "unknown", "local"):
+            with self.subTest(provider=provider), self.assertRaises(ValueError):
+                dash.save_default_provider(provider)
+            self.assertEqual(self.path.read_bytes(), before)
+            self.assertEqual(self.path.with_name(self.path.name + ".bak").read_bytes(), backup)
+
+    def test_default_requires_the_selected_services_key(self):
+        self.put("openrouter", OPENROUTER_MODEL="vendor/a")
+        with self.assertRaisesRegex(ValueError, "default_provider_not_configured"):
+            dash.save_default_provider("openrouter")
+
+    def test_auto_can_recover_an_invalid_preference_without_a_ready_service(self):
+        self.write('routing:\n  default_provider: "invalid"\n')
+        snapshot = dash.config_snapshot()
+        self.assertIsNone(snapshot["default_provider"])
+        self.assertEqual(snapshot["default_provider_error"], "invalid_default_provider")
+        dash.save_default_provider("auto")
+        self.assertEqual(dash.config_snapshot()["default_provider"], "auto")
+        self.assertIsNone(dash.config_snapshot()["default_provider_error"])
+
+    def test_default_write_failure_keeps_the_current_file(self):
+        self.put_openrouter()
+        before = self.path.read_bytes()
+        with mock.patch.object(dash.routeConfig.Store, "_atomic_write", side_effect=OSError("write failed")):
+            with self.assertRaises(OSError):
+                dash.save_default_provider("openrouter")
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_default_endpoint_checks_authorization_origin_and_payload_before_saving(self):
+        import threading
+
+        self.put_openrouter()
+        server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            cases = [
+                ({}, {"provider": "openrouter"}, 403, "token_required"),
+                ({"x-dashboard-token": dash.TOKEN, "origin": "https://foreign.invalid"},
+                 {"provider": "openrouter"}, 403, "origin_rejected"),
+                ({"x-dashboard-token": dash.TOKEN}, {"provider": []}, 400, "invalid_default_provider"),
+                ({"x-dashboard-token": dash.TOKEN}, {"provider": "cli"}, 400, "invalid_default_provider"),
+                ({"x-dashboard-token": dash.TOKEN}, {"provider": "openrouter"}, 200, None),
+            ]
+            for headers, payload, status, error in cases:
+                with self.subTest(payload=payload, status=status):
+                    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                    try:
+                        connection.request("POST", "/api/default-provider", json.dumps(payload), headers)
+                        response = connection.getresponse()
+                        data = json.loads(response.read())
+                        self.assertEqual(response.status, status)
+                        self.assertEqual(data.get("error"), error)
+                    finally:
+                        connection.close()
+            self.assertEqual(dash.config_snapshot()["default_provider"], "openrouter")
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_save_validates_latest_candidate_inside_store_transaction(self):
         self.put("local", LOCAL_LLM_URL="http://127.0.0.1:1111/v1/messages",
@@ -2084,8 +2334,16 @@ class ProviderSelectionDisplayTests(unittest.TestCase):
     def test_active_session_exposes_only_provider_and_started(self):
         self.handoff({"provider": "local", "started": "2026-10-26T00:00:00+00:00",
                       "nonce": "private-token", "port": 48432, "proxy_pid": 1})
-        self.assertEqual(dash.active_session(),
-                         {"provider": "local", "started": "2026-10-26T00:00:00+00:00"})
+        connection = mock.Mock()
+        connection.getresponse.return_value.status = 200
+        connection.getresponse.return_value.read.return_value = b'{"startedAt":"2026-10-26T00:00:00Z","requests":4}'
+        with mock.patch.object(dash.http.client, "HTTPConnection", return_value=connection) as connect:
+            self.assertEqual(dash.active_session(),
+                             {"provider": "local", "started": "2026-10-26T00:00:00+00:00"})
+        connect.assert_called_once_with("127.0.0.1", 48432, timeout=0.5)
+        connection.request.assert_called_once_with("GET", "/api/metrics",
+                                                   headers={"x-local-route-token": "private-token"})
+        connection.close.assert_called_once()
 
     def test_active_session_ignores_missing_malformed_or_foreign_records(self):
         self.assertIsNone(dash.active_session())
@@ -2096,7 +2354,29 @@ class ProviderSelectionDisplayTests(unittest.TestCase):
         self.handoff({"provider": "plan", "nonce": "private-token"})
         self.assertIsNone(dash.active_session(), "only routing services count as a session")
         self.handoff({"provider": "local", "nonce": "private-token"})
-        self.assertEqual(dash.active_session(), {"provider": "local", "started": None})
+        self.assertIsNone(dash.active_session(), "a record without a listening authenticated proxy is not live")
+
+    def test_live_session_refuses_redirects_and_unauthorized_proxies(self):
+        self.handoff({"provider": "local", "nonce": "private-token", "port": 48432})
+        for status in (301, 403, 500):
+            with self.subTest(status=status):
+                connection = mock.Mock()
+                connection.getresponse.return_value.status = status
+                with mock.patch.object(dash.http.client, "HTTPConnection", return_value=connection):
+                    self.assertIsNone(dash.active_session())
+                connection.getresponse.return_value.read.assert_not_called()
+                connection.close.assert_called_once()
+
+    def test_offline_and_malformed_session_records_never_connect(self):
+        with mock.patch.object(dash.http.client, "HTTPConnection") as connect:
+            self.handoff({"provider": "local", "nonce": "private-token", "port": 48432})
+            self.assertEqual(dash._live_session(offline=True), (None, None))
+            for port in (True, 0, 65536, "48432", None):
+                self.handoff({"provider": "local", "nonce": "private-token", "port": port})
+                self.assertIsNone(dash.active_session())
+            self.handoff({"provider": "local", "nonce": "invalid\nheader", "port": 48432})
+            self.assertIsNone(dash.active_session())
+        connect.assert_not_called()
 
     def test_status_and_snapshot_expose_the_dual_provider_state(self):
         self.handoff({"provider": "openrouter", "started": "2026-10-26T00:00:00+00:00",
@@ -2106,11 +2386,13 @@ class ProviderSelectionDisplayTests(unittest.TestCase):
              mock.patch.object(dash, "account_state", return_value={"ok": False, "error": "offline"}), \
              mock.patch.object(dash, "usage_snapshot", return_value=dash._empty_usage()), \
              mock.patch.object(dash, "model_pricing", return_value=None), \
+             mock.patch.object(dash, "_live_session", side_effect=lambda offline=False:
+                               (None, None) if offline else ({"provider": "openrouter", "started": None}, None)), \
              mock.patch.object(dash, "proxy_metrics", return_value=None):
             report = dash.status_report(offline=True)
             data = dash.snapshot()
         self.assertEqual(report["providers"], {"openrouter": True, "local": True})
-        self.assertEqual(report["active_session"]["provider"], "openrouter")
+        self.assertIsNone(report["active_session"], "offline mode does not authenticate a live proxy")
         self.assertEqual(data["providers"], {"openrouter": True, "local": True})
         self.assertEqual(data["active_session"]["provider"], "openrouter")
         self.assertNotIn("private-token", json.dumps(report))

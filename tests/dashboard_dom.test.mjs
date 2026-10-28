@@ -1,21 +1,17 @@
 // Runs the dashboard page script against a minimal DOM stub so the rendering layer is
 // covered without a browser: cards, alert de-duplication, summary and copy buttons.
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { test } from 'node:test';
 import vm from 'node:vm';
 
-const SOURCE = readFileSync(new URL('../routeDashboard.py', import.meta.url), 'utf-8');
+// Run the exact scripts embedded in the served pages, including computed Python appends.
+const ASSETS = JSON.parse(execFileSync(process.env.PYTHON || 'python', ['-c',
+  'import json,re,routeDashboard as d; print(json.dumps({name:re.search(r"<script>(.*)</script>",page,re.S).group(1) for name,page in (("dashboard",d.PAGE),("settings",d.SETTINGS_PAGE))}))'],
+{ cwd: new URL('..', import.meta.url), encoding: 'utf-8' }));
 
 function scriptBundle() {
-  const grab = name => {
-    // A shared bundle may be assembled from a base assignment plus later `+=` appends
-    // (cost provenance labels are appended), so collect every assignment in order.
-    const matches = [...SOURCE.matchAll(new RegExp(`^${name}\\s*(?:\\+=|=)\\s*(".*")$`, 'gm'))];
-    assert.ok(matches.length, `${name} not found in routeDashboard.py`);
-    return matches.map(match => JSON.parse(match[1])).join('\n');
-  };
-  return grab('JS_SHARED') + grab('JS_DASHBOARD');
+  return ASSETS.dashboard;
 }
 
 function fakeElement(id = '') {
@@ -47,7 +43,7 @@ function buildContext() {
   };
   return {
     nodes, document, window: { addEventListener() {} },
-    fetch: async () => ({ json: async () => ({}) }),
+    fetch: async () => ({ ok: true, json: async () => ({}) }),
     setInterval: () => 0, clearInterval() {}, setTimeout: () => 0, clearTimeout() {},
     console, navigator: { clipboard: { writeText: async () => {} } }, Event: class {},
   };
@@ -130,12 +126,7 @@ test('idle routing renders without an insight list', () => {
 // ---- settings page: one service form at a time, chosen from a select box ----
 
 function settingsBundle() {
-  const grab = name => {
-    const matches = [...SOURCE.matchAll(new RegExp(`^${name}\\s*(?:\\+=|=)\\s*(".*")$`, 'gm'))];
-    assert.ok(matches.length, `${name} not found in routeDashboard.py`);
-    return matches.map(match => JSON.parse(match[1])).join('\n');
-  };
-  return grab('JS_SHARED') + '\n' + grab('JS_SETTINGS');
+  return ASSETS.settings;
 }
 
 const READY_OPENROUTER = { fields: {
@@ -145,12 +136,16 @@ const READY_LOCAL = { fields: {
   LOCAL_LLM_URL: { value: 'http://127.0.0.1:11434/v1/messages', set: true },
   LOCAL_LLM_MODEL: { value: 'llama', set: true } } };
 
-async function settingsPage({ config, store = new Map(), blockedStorage = false } = {}) {
+async function settingsPage({ config, store = new Map(), blockedStorage = false, configStatus = 200 } = {}) {
   const context = buildContext();
   const handlers = {};
   const select = context.document.getElementById('provider-select');
   select.addEventListener = (type, handler) => { handlers[type] = handler; };
-  context.fetch = async () => ({ json: async () => config });
+  const requests = [];
+  context.fetch = async (url, options) => {
+    requests.push({ url, options });
+    return { ok: configStatus === 200, status: configStatus, json: async () => config };
+  };
   context.localStorage = blockedStorage
     ? { getItem() { throw new Error('blocked'); }, setItem() { throw new Error('blocked'); } }
     : { getItem: key => (store.has(key) ? store.get(key) : null), setItem: (key, value) => store.set(key, value) };
@@ -159,7 +154,7 @@ async function settingsPage({ config, store = new Map(), blockedStorage = false 
   vm.createContext(sandbox);
   vm.runInContext(settingsBundle(), sandbox, { filename: 'settings.js' });
   await new Promise(resolve => setImmediate(resolve));
-  return { nodes: context.nodes, select, handlers, store, sandbox };
+  return { nodes: context.nodes, select, handlers, store, sandbox, requests };
 }
 
 const visible = nodes => ['openrouter', 'local'].filter(name => !nodes.get(`card-${name}`).hidden);
@@ -192,6 +187,94 @@ test('changing the select switches the visible form without re-rendering it', as
   // both forms stay in the DOM, so values typed into the hidden one are not lost
   assert.match(before, /id="card-openrouter"/);
   assert.match(before, /id="card-local"/);
+});
+
+test('the served settings script authenticates every config read', async () => {
+  const page = await settingsPage({ config: { openrouter: READY_OPENROUTER, local: READY_LOCAL } });
+  const requests = page.requests.filter(request => request.url === '/api/config');
+  assert.ok(requests.length > 0);
+  for (const { options } of requests) assert.ok(options.headers['x-dashboard-token']);
+});
+
+test('a rejected config read is not treated as empty settings', async () => {
+  const page = await settingsPage({ config: { error: 'token_required' }, configStatus: 403 });
+  assert.equal(vm.runInContext('CONFIG', page.sandbox), null);
+  await vm.runInContext('saveDefaultProvider()', page.sandbox);
+  assert.equal(page.requests.filter(request => request.url === '/api/default-provider').length, 0);
+  assert.match(page.nodes.get('default-provider-status').textContent, /먼저 읽어야/);
+});
+
+test('saving service settings keeps the current session and launch default', async () => {
+  const config = { openrouter: READY_OPENROUTER, local: READY_LOCAL, default_provider: 'local',
+    active_session: { provider: 'local', started: '2026-10-28T00:00:00Z' } };
+  const page = await settingsPage({ config });
+  page.sandbox.fetch = async () => ({ json: async () => ({ saved: true,
+    config: { openrouter: READY_OPENROUTER, local: READY_LOCAL, default_provider: 'local' } }) });
+  await vm.runInContext("saveSettings('openrouter')", page.sandbox);
+  assert.equal(vm.runInContext('CONFIG.active_session.provider', page.sandbox), 'local');
+  assert.equal(page.nodes.get('default-provider').value, 'local');
+  assert.match(page.nodes.get('default-provider-status').textContent, /현재 세션: Local LLM/);
+});
+
+test('Local routing is labeled correctly and does not show OpenRouter account failures', () => {
+  const base = fixture();
+  const nodes = render(fixture({ routing: { ...base.routing, last: { ...base.routing.last, provider: 'local' } },
+    account: { ok: false, error: 'not_applicable' }, summary: 'Local LLM으로 정상 처리 중' }));
+  assert.equal(nodes.get('live-text').textContent, 'Local LLM 사용 중');
+  assert.match(nodes.get('grid').innerHTML, /조회 대상이 아닙니다/);
+  assert.doesNotMatch(nodes.get('grid').innerHTML, /not_applicable/);
+});
+
+test('historical proxy counters are labeled as a previous run', () => {
+  const nodes = render(fixture({ proxy_metrics: { requests: 4, stale: true, age_seconds: 120 } }));
+  assert.match(nodes.get('grid').innerHTML, /지난 실행 기록/);
+});
+
+test('the saved launch default is separate from the settings editor selection', async () => {
+  const page = await settingsPage({ config: {
+    openrouter: READY_OPENROUTER, local: READY_LOCAL, default_provider: 'local' } });
+  assert.equal(page.nodes.get('default-provider').value, 'local');
+  assert.match(page.nodes.get('default-provider-status').textContent, /저장된 기본값: Local LLM/);
+  page.select.value = 'openrouter';
+  page.handlers.change();
+  assert.equal(page.nodes.get('default-provider').value, 'local');
+});
+
+test('an unreadable default is shown as an error rather than automatic selection', async () => {
+  const page = await settingsPage({ config: {
+    openrouter: READY_OPENROUTER, local: READY_LOCAL,
+    default_provider: null, default_provider_error: 'invalid_default_provider' } });
+  assert.equal(page.nodes.get('default-provider').value, '');
+  assert.match(page.nodes.get('default-provider-status').textContent, /읽지 못했습니다/);
+});
+
+test('saving a default persists the choice and explains when it applies', async () => {
+  const page = await settingsPage({ config: {
+    openrouter: READY_OPENROUTER, local: READY_LOCAL, default_provider: 'auto' } });
+  const calls = [];
+  page.sandbox.fetch = async (url, options) => {
+    calls.push({ url, payload: JSON.parse(options.body), headers: options.headers });
+    return { json: async () => ({ saved: true, default_provider: 'local' }) };
+  };
+  page.nodes.get('default-provider').value = 'local';
+  await vm.runInContext('saveDefaultProvider()', page.sandbox);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, '/api/default-provider');
+  assert.deepEqual(calls[0].payload, { provider: 'local' });
+  assert.ok(calls[0].headers['x-dashboard-token']);
+  assert.match(page.nodes.get('default-provider-status').textContent, /다음 새 세션/);
+  assert.equal(page.nodes.get('save-default-provider').disabled, false);
+});
+
+test('a failed default save preserves the saved choice and shows a useful action', async () => {
+  const page = await settingsPage({ config: {
+    openrouter: READY_OPENROUTER, local: READY_LOCAL, default_provider: 'openrouter' } });
+  page.sandbox.fetch = async () => ({ json: async () => ({ error: 'default_provider_not_configured' }) });
+  page.nodes.get('default-provider').value = 'local';
+  await vm.runInContext('saveDefaultProvider()', page.sandbox);
+  assert.equal(vm.runInContext('CONFIG.default_provider', page.sandbox), 'openrouter');
+  assert.match(page.nodes.get('default-provider-status').textContent, /필수 설정을 먼저 저장/);
+  assert.equal(page.nodes.get('save-default-provider').disabled, false);
 });
 
 test('an unknown select value is ignored', async () => {

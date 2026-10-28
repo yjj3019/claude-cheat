@@ -150,13 +150,12 @@ def provider_config(provider: str, require_model: bool = True) -> dict:
 
 
 def configured_provider() -> str:
-    """Pick the one configured routing provider, or refuse to guess.
-
-    A bare launch used to default to OpenRouter and silently ignore a configured Local
-    service (or, with only Local configured, print OpenRouter setup guidance). Resolution
-    is explicit: exactly one usable provider is selected, both is a usage error, and none
-    keeps the setup guidance that points at the dashboard.
-    """
+    """Use the saved default, otherwise select the only usable service without guessing."""
+    preferred = routeConfig.Store(ROOT / routeConfig.CONFIG_NAME).default_provider()
+    if preferred != "auto":
+        # A broken preference must not silently route to a different service.
+        provider_config(preferred)
+        return preferred
     ready, failures = [], []
     for name in ("openrouter", "local"):
         try:
@@ -938,9 +937,23 @@ def main(argv=None) -> int:
         if arguments == ["--self-test"]:
             self_test()
             return 0
-        parser = argparse.ArgumentParser(description="Sonnet replacement with Plan fallback")
+        parser = argparse.ArgumentParser(
+            description="Claude-Cheat: Sonnet replacement with Plan fallback",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog=r"""Examples:
+  python openrouterAdvisor.py                         Use the saved default service
+  python openrouterAdvisor.py --provider openrouter   Override it for this session
+  python openrouterAdvisor.py --provider local        Use Local LLM for this session
+  python openrouterAdvisor.py --check-local           Check Local model metadata only
+  python openrouterAdvisor.py --takeover              Keep the live session's service
+
+Setup: .\OpenClaude.ps1 -Setup
+Save a default service in the dashboard to launch without --provider.
+CLI settings are for connection tests, not request routing.
+Exit codes: 0 = success, 2 = usage/service choice required, others = failure.
+""")
         parser.add_argument("--provider", choices=("auto", "openrouter", "local"), default="auto",
-                            help="auto picks the only configured provider and refuses to guess when both are set")
+                            help="auto uses the saved default, then the only configured service; explicit values override the default")
         parser.add_argument("--check-local", action="store_true", help="Check local model metadata without inference or Plan login")
         parser.add_argument("--diagnose-local", action="store_true", help="One synthetic Local inference without CLI, native features or Plan fallback")
         parser.add_argument("--local-mode", action="store_true", help="Interactive Local-only CLI with native integrations disabled and no Plan fallback")
@@ -991,7 +1004,20 @@ def main(argv=None) -> int:
         print("Both OpenRouter and Local settings are configured. Choose one explicitly:", file=sys.stderr)
         print("  OpenClaude.ps1 -Provider OpenRouter", file=sys.stderr)
         print("  OpenClaude.ps1 -Provider Local", file=sys.stderr)
-        print("  (or run OpenClaude.ps1 -Setup to review or remove one service's settings)", file=sys.stderr)
+        print("  (or run OpenClaude.ps1 -Setup to save a default service)", file=sys.stderr)
+        print("\n[Claude-Cheat] OpenRouter와 Local LLM 설정이 모두 있어 실행할 서비스를 선택해야 합니다.", file=sys.stderr)
+        print("  OpenRouter 사용: .\\OpenClaude.ps1 -Provider OpenRouter", file=sys.stderr)
+        print("  Local LLM 사용:  .\\OpenClaude.ps1 -Provider Local", file=sys.stderr)
+        print("  설정 확인:      .\\OpenClaude.ps1 -Setup", file=sys.stderr)
+        print("  대시보드에서 서비스 설정을 저장한 뒤 '기본 실행 서비스'를 지정하면 옵션 없이 실행할 수 있습니다.", file=sys.stderr)
+        print("  CLI 항목은 연결 테스트 전용입니다. CLI를 라우팅 서비스로 실행할 수는 없습니다.", file=sys.stderr)
+        print("  설정은 유지되며 세션은 시작하지 않았습니다. 원하는 서비스의 명령을 실행하세요.", file=sys.stderr)
+        return 2
+    except routeConfig.ConfigError as exc:
+        print(json.dumps({"event": "routing_configuration_invalid", "code": exc.code,
+                          "line": exc.line, "action": "review_default_provider",
+                          "command": ".\\OpenClaude.ps1 -Setup"}), file=sys.stderr)
+        print("[Claude-Cheat] 기본 실행 서비스 설정을 확인하세요. 설정 화면에서 자동 선택 또는 사용할 서비스를 저장하세요.", file=sys.stderr)
         return 2
     except (LocalStartupError, OpenRouterConfigError) as exc:
         payload = {"event": "openrouter_start_failed", "kind": type(exc).__name__,

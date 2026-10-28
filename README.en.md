@@ -1,4 +1,4 @@
-# Claude Code · Sonnet replacement with Plan fallback
+# Claude-Cheat · Claude Code Sonnet replacement with Plan fallback
 
 [한국어](README.md) | **English**
 
@@ -43,13 +43,13 @@ The selected model must support the [Messages API](https://openrouter.ai/docs/ap
 From the checkout root:
 
 ```powershell
-# Default: -Provider Auto picks the only configured service
+# Use the default service saved in the dashboard
 .\OpenClaude.ps1
 # Local Messages API, after configuring a real local service
 .\OpenClaude.ps1 -Provider Local
 ```
 
-`-Provider` defaults to **Auto**: exactly one configured service is selected automatically, and when **both** are validly configured the launch refuses to guess and exits with code 2, asking for an explicit choice:
+`-Provider` defaults to **Auto**: it first uses `routing.default_provider` from `openclaude.config.yaml`. If the preference is absent or `auto`, exactly one configured service is selected automatically. With both configured and no explicit preference, it exits with code 2 and actionable guidance:
 
 ```text
 Both OpenRouter and Local settings are configured. Choose one explicitly:
@@ -57,7 +57,31 @@ Both OpenRouter and Local settings are configured. Choose one explicitly:
   OpenClaude.ps1 -Provider Local
 ```
 
-The settings page's service selector marks whether each service is configured and appends `현재 세션` (current session) to the service a live routed session is using; the same state is exposed as `providers` and `active_session` in `/api/status` and `/api/snapshot`. `-Takeover` without `-Provider` follows the provider recorded for the session it takes over.
+The settings editor selector marks whether each service is configured. The default launch section displays the saved preference and the service a live session is using; runtime state is also exposed as `providers` and `active_session` in `/api/status` and `/api/snapshot`. `-Takeover` without `-Provider` follows the provider recorded for the session it takes over.
+
+### Save a default service and launch without flags
+
+1. Run `.\OpenClaude.ps1 -Setup`.
+2. Under **설정할 서비스** (service to edit), choose OpenRouter or Local LLM, enter its settings and save them.
+3. Under **기본 실행 서비스** (default launch service), choose the service and press **기본값 저장** (save default).
+4. Run `.\OpenClaude.ps1` to start a new session. Repeating `-Provider` is no longer necessary.
+
+The settings editor selection is remembered in the browser; the launch default is saved in the shared settings file, so other browsers and terminals using this checkout read the same default. Editing another service does not change the default. Neither save action starts a session or changes a running one.
+
+```yaml
+routing:
+  default_provider: "local"  # auto | openrouter | local
+```
+
+An explicit `-Provider OpenRouter` or `-Provider Local` overrides the saved choice for that invocation without changing the file. `-Takeover` keeps the live session's service. An invalid preference or a broken selected service fails explicitly instead of silently selecting another service. The dashboard can reset an invalid preference to `auto` without requiring a configured service. The isolated modes (`-LocalMode`, `-LocalCompat`, `-OpenRouterCompat`) still require an explicit `-Provider`.
+
+The CLI section remains **detection and connection tests only**; it is not a routing service and cannot be selected as the default. Keep both OpenRouter and Local settings if needed; choosing a default does not require deleting either.
+
+Run `.\OpenClaude.ps1 -Help` or `python openrouterAdvisor.py --help` for options, runnable examples and exit codes without starting a session. The old `startOpenClaude.ps1` command remains a forwarding shim. A provider-choice usage error retains exit code 2 and no longer produces a redundant PowerShell error stack.
+
+The authenticated `POST /api/default-provider` endpoint accepts `{"provider":"local"}` (also `auto` and `openrouter`). `GET /api/config` reports `default_provider` and `default_provider_error`. Existing Host, token, Origin, request-size and rate checks protect writes. Provider settings and the default have separate save actions; a failed default save leaves the previous preference intact.
+
+This workflow follows the relevant [CLI design guidance](https://github.com/cursor/plugins/blob/main/cli-for-agent/skills/cli-for-agents/SKILL.md) and [documentation reliability guidance](https://github.com/cursor/plugins/blob/main/agent-compatibility/agents/docs-reliability-review.md): explicit flags, practical examples, actionable errors and docs matching actual behavior. Claude-Cheat is not a Cursor plugin or a port of the entire repository, and this work does not implement CLI-backed request routing.
 
 ### Using both services in one session (opt-in)
 
@@ -391,7 +415,27 @@ python routeDashboard.py --status --offline  # skip OpenRouter calls
 
 The report includes `state`, `provider`, `reason`, `detail`, **`model`**, `last_event_age_seconds`, `window_counts`, `plan_reasons`, `failures`, `alerts` and `account`. A running dashboard serves the same document at `GET /api/status`. Neither path includes the key, prompts or request bodies.
 
-A running proxy exposes its own counters at `GET /api/metrics` (same session token required, loopback only): request count, external/Plan split, p50/p95 latency, retries, streams, circuit opens and bytes in/out. The same snapshot is written to `.proxy-metrics.json` beside the launcher once a second and shown as the dashboard's **proxy throughput** card.
+A running proxy exposes its own counters at `GET /api/metrics` (same session token required, loopback only): request count, external/Plan split, p50/p95 latency, retries, streams, circuit opens and bytes in/out. The dashboard authenticates this response with the handoff token before identifying a **current session**, and uses the counters from that verified proxy. The token, port and PID are not returned in the settings response.
+
+Counters retained in `.proxy-metrics.json` are shown as **previous run history** when no live proxy is verified; they do not generate current-session failure or latency insights. `proxy_stale` compares the last recorded proxy code with the current source. It does not prove that an old proxy is currently running.
+
+### How the components stay aligned
+
+- Account and model context follows the verified live session, then the saved default, recent routing history, and configured services. Changing the default affects the next launch while preserving the current session.
+- The last-request label follows the actual routing record, independently of the session's default provider. This also applies to dual-provider sessions.
+- Local context skips OpenRouter account and pricing calls and shows them as not applicable. Shared token totals are labeled as external-service usage; OpenRouter rates are not applied in Local context.
+- Changing the service, model or pricing version invalidates the usage view cache. A cold page response does not wait for OpenRouter.
+- Saving service settings preserves default and current-session metadata. Failed config reads are not interpreted as empty settings and cannot overwrite the default.
+- `--offline` skips both external calls and local proxy checks. Its `active_session` is `null`; routing state and exit codes describe saved history rather than verified liveness.
+
+These targeted checks use temporary configuration and a real loopback Node proxy, without launching Claude Code or calling external inference:
+
+```powershell
+python -m unittest discover -s tests -p test_route_dashboard.py -k test_real_proxy
+node --test tests/dashboard_dom.test.mjs
+```
+
+The UI tests execute the JavaScript embedded in the actual Python-generated pages, including computed appends. They do not validate visual browser layout or real model response quality.
 
 ## Lowering the first-token delay (optional)
 

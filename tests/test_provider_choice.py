@@ -39,6 +39,59 @@ class ProviderChoiceTests(unittest.TestCase):
         with self.assertRaises(route.ProviderChoiceError):
             route.configured_provider()
 
+    def set_default(self, provider):
+        route.routeConfig.Store(self.root / "openclaude.config.yaml").write_provider(
+            "routing", {"ROUTE_DEFAULT_PROVIDER": provider})
+
+    def test_saved_default_resolves_a_dual_install(self):
+        self.write_openrouter()
+        self.write_local()
+        for provider in ("openrouter", "local"):
+            self.set_default(provider)
+            self.assertEqual(route.configured_provider(), provider)
+
+    def test_auto_preference_retains_the_existing_choice_requirement(self):
+        self.write_openrouter()
+        self.write_local()
+        self.set_default("auto")
+        with self.assertRaises(route.ProviderChoiceError):
+            route.configured_provider()
+
+    def test_invalid_preference_is_rejected_without_echoing_its_value(self):
+        self.write_openrouter()
+        self.set_default("private-invalid-value")
+        with self.assertRaisesRegex(route.routeConfig.ConfigError, "invalid_default_provider") as caught:
+            route.configured_provider()
+        self.assertNotIn("private-invalid-value", str(caught.exception))
+
+    def test_invalid_default_reports_a_recovery_command_and_exits_two(self):
+        self.set_default("private-invalid-value")
+        with mock.patch.object(route, "read_handoff", return_value=None), \
+             contextlib.redirect_stderr(io.StringIO()) as stderr:
+            code = route.main([])
+        self.assertEqual(code, 2)
+        text = stderr.getvalue()
+        self.assertNotIn("private-invalid-value", text)
+        payload = json.loads(text.splitlines()[0])
+        self.assertEqual(payload["event"], "routing_configuration_invalid")
+        self.assertEqual(payload["command"], ".\\OpenClaude.ps1 -Setup")
+
+    def test_missing_preferred_service_does_not_use_the_other_service(self):
+        self.write_openrouter()
+        self.set_default("local")
+        with self.assertRaises(ValueError):
+            route.configured_provider()
+
+    def test_explicit_provider_bypasses_an_invalid_saved_default(self):
+        self.set_default("invalid")
+        session = mock.MagicMock()
+        session.__enter__ = mock.Mock(return_value={})
+        with mock.patch.object(route.shutil, "which", return_value="claude"), \
+             mock.patch.object(route, "routed_session", return_value=session) as routed, \
+             mock.patch.object(route.subprocess, "call", return_value=0):
+            self.assertEqual(route.launch("local"), 0)
+        self.assertEqual(routed.call_args.args[0], "local")
+
     def test_nothing_configured_keeps_the_openrouter_setup_guidance(self):
         with self.assertRaises(route.OpenRouterConfigError):
             route.configured_provider()
@@ -83,8 +136,12 @@ class ProviderChoiceTests(unittest.TestCase):
         self.assertEqual(payload["providers"], ["openrouter", "local"])
         self.assertEqual(payload["action"], "choose_provider")
         self.assertIn("OpenClaude.ps1 -Provider Local", payload["commands"])
+        self.assertIn("옵션 없이 실행할 수 있습니다", text)
+        self.assertIn("연결 테스트 전용", text)
+        self.assertIn("세션은 시작하지 않았습니다", text)
 
     def test_takeover_auto_follows_the_live_sessions_provider(self):
+        self.set_default("openrouter")
         record = {"port": 48432, "nonce": "nonce", "provider": "local", "proxy_pid": 1}
         session = mock.MagicMock()
         session.__enter__ = mock.Mock(return_value={})

@@ -45,7 +45,7 @@ SECTIONS = {
             "keys": {"kind": "CLI_KIND", "model": "CLI_MODEL", "binary": "CLI_BINARY", "timeout_s": "CLI_TIMEOUT_S"}},
     # Session routing behaviour. New in the unified file, so no legacy .env.
     "routing": {"legacy": None,
-                "keys": {"dual_provider": "ROUTE_DUAL_PROVIDER"}},
+                "keys": {"dual_provider": "ROUTE_DUAL_PROVIDER", "default_provider": "ROUTE_DEFAULT_PROVIDER"}},
 }
 
 # Renaming over a file a Windows reader or scanner holds open fails with these.
@@ -389,6 +389,13 @@ class Store:
                 validate({spec["keys"][key]: value
                           for key, value in candidate.sections[provider]["values"].items() if value != ""})
             self._atomic_write(text, raw, original is not None and raw.startswith(b"\xef\xbb\xbf"))
+
+    def default_provider(self):
+        """An explicit preference for new sessions; old files retain automatic selection."""
+        provider = self.read_provider("routing").get("ROUTE_DEFAULT_PROVIDER", "auto")
+        if provider not in ("auto", "openrouter", "local"):
+            raise ConfigError("invalid_default_provider")
+        return provider
 
     def _legacy_values(self, provider):
         """The legacy dotenv values for one service, as {yaml_key: value} (missing file = {})."""

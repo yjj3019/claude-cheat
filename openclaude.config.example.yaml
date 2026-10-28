@@ -48,6 +48,10 @@ cli:
   timeout_s: ""
 
 routing:
+  # New sessions use this service without -Provider. auto = use the only configured
+  # service; when both are configured, ask the user to select a default in the dashboard.
+  # auto | openrouter | local. CLI is for diagnostics only.
+  default_provider: "auto"
   # "true": when BOTH openrouter and local are configured, an ordinary session also shows the
   # other provider as one extra entry in Claude Code's /model picker (model ids
   # claude-route-openrouter / claude-route-local). The session's own provider stays the

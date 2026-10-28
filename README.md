@@ -1,4 +1,4 @@
-# Claude Code: Sonnet을 OpenRouter 또는 Local LLM으로 사용하기
+# Claude-Cheat: Claude Code의 Sonnet을 OpenRouter 또는 Local LLM으로 사용하기
 
 **한국어** | [English](README.en.md) · [MIT License](LICENSE)
 
@@ -93,7 +93,7 @@ claude auth status
 
 `-Setup`은 설정 파일(`openclaude.config.yaml`과 예전 `.env.*`)을 만들거나 고치지 않고 세션도 시작하지 않습니다. 값은 웹 페이지에서 직접 저장합니다. 설정이 없을 때 `OpenClaude.ps1`이 출력하는 `[setup required]` 안내에도 이 명령이 포함됩니다.
 
-상단의 **사용할 서비스** 선택 상자에서 OpenRouter 또는 Local LLM을 고르면 해당 서비스의 입력란만 표시됩니다(옵션에 `설정됨`/`설정 필요`가 함께 표시되고, 마지막 선택은 브라우저에 기억됩니다). OpenRouter라면 **모델 ID**와 **API 키**를 입력하고 **모델 확인** → **저장**을 누른 뒤 세션을 시작하세요. 모델 확인은 저장 전 값으로도 실행되며, `openclaude.config.yaml`이 없으면 저장 시 `openclaude.config.example.yaml`의 주석을 그대로 가져와 값만 채웁니다. API 키와 서버 주소는 화면에 일부만 표시되고 저장된 원문은 브라우저로 전송되지 않으므로, 바꿀 때만 전체를 입력합니다(비워 두면 유지, 선택 항목인 HTTP 예외·모델 목록 주소는 **지우기**로 삭제). 설정이 없거나 잘못된 상태로 실행기를 시작하면 세션을 열지 않고 콘솔 주소를 안내합니다.
+상단의 **설정할 서비스** 선택 상자에서 OpenRouter 또는 Local LLM을 고르면 해당 서비스의 입력란만 표시됩니다(옵션에 `설정됨`/`설정 필요`가 함께 표시되고, 마지막 선택은 브라우저에 기억됩니다). OpenRouter라면 **모델 ID**와 **API 키**를 입력하고 **모델 확인** → **저장**을 누른 뒤 세션을 시작하세요. 모델 확인은 저장 전 값으로도 실행되며, `openclaude.config.yaml`이 없으면 저장 시 `openclaude.config.example.yaml`의 주석을 그대로 가져와 값만 채웁니다. API 키와 서버 주소는 화면에 일부만 표시되고 저장된 원문은 브라우저로 전송되지 않으므로, 바꿀 때만 전체를 입력합니다(비워 두면 유지, 선택 항목인 HTTP 예외·모델 목록 주소는 **지우기**로 삭제). 설정이 없거나 잘못된 상태로 실행기를 시작하면 세션을 열지 않고 콘솔 주소를 안내합니다.
 
 설정 파일을 직접 편집하는 방식도 지원합니다.
 
@@ -129,8 +129,8 @@ openrouter:
 ### ② 실행하고 Sonnet 선택하기
 
 ```powershell
-# 실행기 폴더에서 실행: 기본 제공자는 OpenRouter
-.\OpenClaude.ps1
+# 실행기 폴더에서 OpenRouter를 명시적으로 선택
+.\OpenClaude.ps1 -Provider OpenRouter
 ```
 
 Claude Code에서 `/model`로 **Sonnet**을 선택합니다. 호환되는 요청은 OpenRouter의 `https://openrouter.ai/api/v1/messages`로 보내며, 대체 모델은 `openclaude.config.yaml`의 `openrouter.model`로 지정합니다. 특정 모델을 기본값으로 선택하지 않습니다.
@@ -138,10 +138,64 @@ Claude Code에서 `/model`로 **Sonnet**을 선택합니다. 호환되는 요청
 기존 전역 실행기가 설치된 PC에서는 다른 작업 폴더에서도 다음처럼 실행할 수 있습니다.
 
 ```powershell
-OpenClaude.ps1
+OpenClaude.ps1 -Provider OpenRouter
 ```
 
 실행기는 해당 Claude 프로세스의 연결 주소만 로컬 라우터로 설정하고 기존 Plan 인증을 검사합니다. 저장된 로그인·사용자 설정을 API용 설정으로 덮어쓰지 않습니다. `/status`의 Plan 로그인 표시는 인증 상태이며 **현재 응답을 OpenRouter 모델이 만들었다는 증거는 아닙니다.**
+
+### 기본 서비스를 저장하고 옵션 없이 실행하기
+
+Claude-Cheat는 프로젝트 이름이며, OpenRouter와 Local LLM은 연결할 서비스입니다. 대시보드에는 **설정할 서비스**와 **기본 실행 서비스**가 구분되어 있습니다. 다른 서비스의 키나 모델을 편집하는 것만으로 기본 실행 대상이 바뀌지는 않습니다.
+
+1. `.\OpenClaude.ps1 -Setup`으로 설정 화면을 엽니다.
+2. **설정할 서비스**에서 OpenRouter 또는 Local LLM을 골라 모델·접속 설정을 입력하고 **저장**합니다.
+3. **기본 실행 서비스**에서 사용할 서비스를 고르고 **기본값 저장**을 누릅니다.
+4. 새 PowerShell 터미널에서 `.\OpenClaude.ps1`을 실행합니다. 이후에는 `-Provider`를 매번 입력할 필요가 없습니다.
+
+기본값은 브라우저가 아니라 실행기 폴더의 `openclaude.config.yaml`에 저장됩니다. 다른 브라우저·터미널에서도 같은 실행기와 설정 파일을 사용하면 같은 기본값을 읽습니다. 저장만으로 Claude 세션을 시작하거나 실행 중인 세션을 전환하지는 않습니다.
+
+| 실행 상황 | 현재 동작 |
+| --- | --- |
+| `.\OpenClaude.ps1` 실행, 기본 서비스 저장됨 | 저장된 서비스 사용 |
+| 기본값이 `auto`이거나 없는 기존 파일, 사용 가능한 서비스가 하나 | 해당 서비스 자동 선택 |
+| 기본값이 `auto`이거나 없는 기존 파일, 두 서비스 모두 사용 가능 | `provider_choice_required` 안내 후 종료 코드 `2`; 기본값 저장 또는 일회성 옵션 필요 |
+| `-Provider OpenRouter` 또는 `-Provider Local` 지정 | 저장된 기본값보다 우선; 해당 실행에만 적용 |
+| `.\OpenClaude.ps1 -Takeover` | 기본값을 바꿨어도 기존 세션의 서비스를 유지하며 프록시 교체 |
+| 대시보드에서 CLI 선택·저장 | 설치된 CLI의 감지·연결 테스트 설정 저장; 라우팅 대상으로 선택되지 않음 |
+
+두 서비스의 설정은 함께 보관할 수 있습니다. 기본값을 저장하기 위해 다른 서비스 설정을 지울 필요는 없습니다. 서비스 설정을 먼저 저장해야 기본값으로 지정할 수 있으며, CLI는 기본 실행 서비스 목록에 포함되지 않습니다.
+
+```powershell
+# 저장된 기본 서비스로 새 세션 시작
+.\OpenClaude.ps1
+
+# 이번 실행만 OpenRouter 사용
+.\OpenClaude.ps1 -Provider OpenRouter
+
+# 이번 실행만 Local LLM 사용
+.\OpenClaude.ps1 -Provider Local
+
+# 설정 화면 열기 (세션을 시작하지 않음)
+.\OpenClaude.ps1 -Setup
+
+# 옵션·실행 예제·종료 코드 확인 (세션을 시작하지 않음)
+.\OpenClaude.ps1 -Help
+```
+
+직접 설정할 때는 다음 항목을 사용합니다. 허용값은 `auto`, `openrouter`, `local`입니다.
+
+```yaml
+routing:
+  default_provider: "local"
+```
+
+저장된 서비스의 설정이 잘못되면 다른 서비스로 자동 변경하지 않고 오류를 안내합니다. 기본값 자체가 잘못된 경우 설정 화면에서 올바른 값을 다시 저장하거나 **자동 선택**으로 돌릴 수 있습니다. `-LocalMode`·`-LocalCompat`·`-OpenRouterCompat`은 기존대로 명시적인 `-Provider`가 필요합니다.
+
+`startOpenClaude.ps1 is now OpenClaude.ps1` 경고는 예전 명령을 새 명령으로 연결했다는 뜻입니다. 새 명령을 사용하면 이 경고는 나오지 않습니다. `provider_choice_required`는 서비스 선택이 필요하다는 안내이며, 연결 실패나 API 키 오류를 뜻하지 않습니다. `-Provider`는 새로 실행할 세션에 적용되며 이미 실행 중인 세션을 전환하지 않습니다.
+
+서비스 선택 API는 `POST /api/default-provider`에 `{"provider":"local"}` 형태로 요청합니다. `GET /api/config`의 `default_provider`와 `default_provider_error`로 저장 상태를 확인할 수 있습니다. 읽기·저장에는 페이지의 세션 토큰이 필요하며, 저장에는 기존 Origin·Host·요청 크기·횟수 제한도 적용됩니다.
+
+이번 실행 흐름과 문서 개선은 Cursor의 [CLI 설계 지침](https://github.com/cursor/plugins/blob/main/cli-for-agent/skills/cli-for-agents/SKILL.md)과 [문서 신뢰성 검토 지침](https://github.com/cursor/plugins/blob/main/agent-compatibility/agents/docs-reliability-review.md)을 참고했습니다. 명시적 옵션·실행 예제·조치 가능한 오류·문서와 동작의 일치를 적용 대상으로 삼았습니다. Claude-Cheat는 Cursor 플러그인이나 해당 저장소 전체의 이식판이 아니며, CLI를 모델 제공자로 연결하는 기능도 포함하지 않습니다.
 
 라우팅 세션은 Claude Code의 실험 beta를 끄고 시작합니다(`CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`, `CLAUDE_CODE_DISABLE_ADVISOR_TOOL`). Claude Code 2.1.310이 기본으로 보내는 `tool_addition`·`context_management`·advisor 도구 요청은 외부 Messages API가 HTTP 400으로 거절하므로, 같은 세션의 Plan 요청도 안정 프로토콜로 전송됩니다. 그 결과 이 세션에서는 advisor·inline 도구·서버 문맥 편집이 사용되지 않습니다. thinking·effort 설정은 요청마다 따로 전달되며, 일반 모드에서는 아래 5절대로 외부 요청에 thinking을 요구하지 않습니다.
 
@@ -252,9 +306,9 @@ URL 내 사용자명·비밀번호·쿼리·fragment, redirect, 잘못된 인증
 # OpenClaude.ps1 -Provider Local
 ```
 
-다시 OpenRouter를 쓰려면 세션을 종료하고 기본 명령으로 재실행합니다. 실행 중인 세션에서 `/model`은 기본적으로 Claude 모델을 선택하는 메뉴이고 OpenRouter/Local 제공자를 바꾸지 않습니다(아래 옵트인은 예외).
+다시 OpenRouter를 쓰려면 세션을 종료하고 `.\OpenClaude.ps1 -Provider OpenRouter`로 재실행합니다. 실행 중인 세션에서 `/model`은 기본적으로 Claude 모델을 선택하는 메뉴이고 OpenRouter/Local 제공자를 바꾸지 않습니다(아래 옵트인은 예외).
 
-`-Provider`의 기본값은 **`Auto`** 입니다. 설정된 서비스가 하나뿐이면 그 서비스를 자동으로 선택하고, **둘 다 유효하게 설정돼 있으면 조용히 한쪽을 고르지 않고** 실행을 거부하며 아래처럼 명시 선택을 요구합니다(종료 코드 2).
+`-Provider`의 기본값은 **`Auto`** 입니다. 먼저 저장된 기본 실행 서비스를 사용합니다. 기본값이 없거나 `auto`이면 설정된 서비스가 하나일 때 자동 선택하며, 둘 다 유효하면 아래처럼 선택을 안내하고 종료합니다(종료 코드 2). 매번 옵션을 입력하는 대신 [기본 실행 서비스를 저장](#기본-서비스를-저장하고-옵션-없이-실행하기)할 수 있습니다.
 
 ```text
 Both OpenRouter and Local settings are configured. Choose one explicitly:
@@ -262,7 +316,7 @@ Both OpenRouter and Local settings are configured. Choose one explicitly:
   OpenClaude.ps1 -Provider Local
 ```
 
-설정 화면의 **사용할 서비스** 선택 상자에는 설정 여부와 함께 현재 실행 중인 세션이 쓰는 서비스가 `현재 세션`으로 표시됩니다(`/api/status`·`/api/snapshot`의 `providers`, `active_session`). `-Takeover`는 `-Provider`를 생략하면 인수인계 대상 세션의 서비스를 그대로 따릅니다.
+설정 화면의 **설정할 서비스** 선택 상자에는 서비스별 설정 여부가 표시됩니다. **기본 실행 서비스** 영역에는 저장된 기본값과 현재 세션의 서비스가 표시됩니다(`/api/status`·`/api/snapshot`의 `providers`, `active_session`). `-Takeover`는 `-Provider`를 생략하면 저장된 기본값 대신 인수인계 대상 세션의 서비스를 그대로 따릅니다.
 
 ### 한 세션에서 두 서비스 함께 쓰기 (옵트인)
 
@@ -532,7 +586,27 @@ python routeDashboard.py --status --offline  # OpenRouter 호출 생략
 
 출력에는 `state`, `provider`, `reason`, `detail`, **`model`**, `last_event_age_seconds`, `window_counts`, `plan_reasons`, `failures`, `alerts`, `account`가 포함됩니다. 대시보드를 띄워 둔 경우 `GET /api/status`로 같은 내용을 받습니다. 두 경로 모두 키·프롬프트·요청 본문을 포함하지 않습니다.
 
-실행 중인 프록시는 자체 카운터를 `GET /api/metrics`로 제공합니다(같은 세션 토큰 필요, 127.0.0.1 전용). 요청 수, 외부·Plan 경로 분포, p50/p95 지연, 재시도·스트림·회로 횟수, 송수신 바이트를 담고 있으며, 같은 값이 실행기 폴더의 `.proxy-metrics.json`에 1초 간격으로 기록되어 대시보드의 **프록시 처리량** 카드에 표시됩니다.
+실행 중인 프록시는 자체 카운터를 `GET /api/metrics`로 제공합니다(같은 세션 토큰 필요, 127.0.0.1 전용). 요청 수, 외부·Plan 경로 분포, p50/p95 지연, 재시도·스트림·회로 횟수, 송수신 바이트를 담습니다. 대시보드는 인수인계 파일의 토큰으로 이 응답을 확인한 경우에만 **현재 세션**으로 표시하며, 인증된 응답의 카운터를 사용합니다. 토큰·포트·PID는 설정 응답에 포함하지 않습니다.
+
+`.proxy-metrics.json`에 남은 카운터도 볼 수 있지만, 현재 프록시가 확인되지 않으면 **지난 실행 기록**으로 표시하고 현재 세션의 실패·지연 인사이트에 사용하지 않습니다. `proxy_stale`은 마지막 프록시 시작 로그의 코드와 현재 소스가 다른지를 뜻합니다. 이 값만으로 구버전 프록시가 지금 실행 중이라고 판단하지 않습니다.
+
+### 설정·실행기·프록시·대시보드의 연결 기준
+
+- 모델·크레딧 카드의 서비스는 **인증된 현재 세션 → 저장된 기본값 → 최근 라우팅 기록 → 설정된 서비스** 순서로 정합니다. 기본값을 바꿔도 현재 세션의 서비스는 바뀌지 않습니다.
+- 최근 요청의 처리 라벨은 실제 라우팅 기록을 따릅니다. 한 세션에서 두 서비스를 함께 쓰는 경우, 기본 서비스와 마지막 요청의 제공자가 달라도 구분합니다.
+- Local을 표시할 때는 OpenRouter 크레딧·단가를 조회하지 않고 **적용 대상 아님**으로 안내합니다. 공통 토큰 집계는 **외부 서비스**로 표시하며, Local에 OpenRouter 단가를 적용하지 않습니다.
+- 서비스·모델·단가 버전이 바뀌면 토큰·비용 화면 캐시를 다시 계산합니다. 최초 페이지 응답은 OpenRouter 조회를 기다리지 않습니다.
+- 설정을 저장한 뒤에도 기본값과 현재 세션 표시를 유지합니다. 설정 읽기가 실패하면 이를 빈 설정으로 취급하거나 기본값을 덮어쓰지 않습니다.
+- `--offline`은 외부 API와 로컬 프록시 확인을 모두 생략합니다. 따라서 오프라인 응답의 `active_session`은 `null`이며, 라우팅 상태·종료 코드는 저장된 기록을 기준으로 해석해야 합니다.
+
+연결 흐름만 다시 확인하려면 다음 검사를 사용하세요. 임시 설정과 로컬 Node 프록시를 사용하며 실제 Claude CLI·외부 추론 호출은 실행하지 않습니다.
+
+```powershell
+python -m unittest discover -s tests -p test_route_dashboard.py -k test_real_proxy
+node --test tests/dashboard_dom.test.mjs
+```
+
+화면 검사는 Python이 실제 HTML에 넣는 JavaScript를 실행합니다. 소스 문자열 일부만 추출하는 방식으로는 인증 처리나 동적으로 추가된 코드의 누락을 놓칠 수 있기 때문입니다. 이 검사는 브라우저의 시각적 배치나 실제 외부 모델의 응답 품질까지 보증하지는 않습니다.
 
 ## 7. 문제 해결과 일반 Claude로 돌아가기
 
