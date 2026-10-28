@@ -125,6 +125,7 @@ HELP_SECTION = {
     ],
     "endpoints": [
         ["GET /api/status", "위와 같은 요약 JSON"],
+        ["GET /api/diagnostics", "AI용 읽기 전용 진단 JSON; 외부 API·추론 호출 없음"],
         ["GET /api/snapshot", "이 페이지가 쓰는 전체 데이터"],
         ["POST /api/default-provider", "기본 실행 서비스 저장 (auto/openrouter/local); 세션 토큰 필요"],
         ["GET /api/config", "두 제공자 설정(비밀값은 마스킹)"],
@@ -2043,17 +2044,21 @@ def _parse_models(payload):
                 rows = payload[key]
                 break
     rows = rows if isinstance(rows, list) else []
-    models = []
+    models, seen = [], set()
     for row in rows:
         if not isinstance(row, dict):
             continue
         identifier = row.get("id") or row.get("name") or row.get("model")
         if not isinstance(identifier, str) or not identifier.strip():
             continue
+        identifier = identifier.strip()
+        if identifier in seen:
+            continue
+        seen.add(identifier)
         pricing = row.get("pricing") if isinstance(row.get("pricing"), dict) else {}
         models.append({
-            "id": identifier.strip(),
-            "name": row.get("name") if isinstance(row.get("name"), str) else identifier.strip(),
+            "id": identifier,
+            "name": row.get("name") if isinstance(row.get("name"), str) else identifier,
             "context_length": row.get("context_length") if isinstance(row.get("context_length"), int) else None,
             "prompt_usd_per_m": _price_per_million(pricing.get("prompt")),
             "completion_usd_per_m": _price_per_million(pricing.get("completion")),
@@ -2482,6 +2487,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 self._send(500, "application/json; charset=utf-8",
                            json.dumps({"error": "snapshot_failed"}))
+        elif path == "/api/diagnostics":
+            try:
+                self._send(200, "application/json; charset=utf-8",
+                           json.dumps(diagnostics_report(), ensure_ascii=False))
+            except Exception:
+                self._send(500, "application/json; charset=utf-8", json.dumps({"error": "diagnostics_failed"}))
         elif self.path.split("?")[0] == "/api/status":
             try:
                 self._send(200, "application/json; charset=utf-8",
@@ -2770,6 +2781,143 @@ def serve(host="127.0.0.1", port=DEFAULT_PORT, refresh=3, allow_fallback=False, 
                 PID_FILE.unlink()
             except OSError:
                 pass
+
+
+def _diagnostic_model(value, sensitive):
+    if value is None:
+        return None, "unreported"
+    if (not isinstance(value, str)
+            or not re.fullmatch(r"[A-Za-z0-9~@][A-Za-z0-9._:/@+~-]{0,255}", value)
+            or re.search(r"^[A-Za-z]:|://|\\", value)
+            or value.startswith(("sk-", "ghp_", "github_pat_"))
+            or any(secret and secret in value for secret in sensitive)):
+        return None, "redacted"
+    return value, "reported"
+
+
+def _diagnostic_stamp(value):
+    if isinstance(value, str) and len(value) <= 40:
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return value
+        except ValueError:
+            pass
+    return None
+
+
+def diagnostics_report():
+    """Versioned, redacted diagnostics; never call provider APIs, infer, scan transcripts or write settings."""
+    checks, values, providers = [], {}, {}
+
+    def check(component, status, code, action=None):
+        checks.append({"component": component, "status": status, "code": code, "action": action})
+
+    check("dashboard", "ok", "dashboard_responding")
+    preferred, dual, routing_error = None, False, False
+    try:
+        routing_values = _store().read_provider("routing")
+        preferred = routing_values.get("ROUTE_DEFAULT_PROVIDER", "auto")
+        if preferred not in ("auto", *ROUTING_PROVIDERS):
+            raise ValueError("invalid_default_provider")
+        dual = (routing_values.get("ROUTE_DUAL_PROVIDER") or "").strip().lower() in ("true", "1", "yes")
+    except (OSError, ValueError):
+        preferred, routing_error = None, True
+        check("configuration", "error", "routing_configuration_invalid", "review_settings")
+    for name in ROUTING_PROVIDERS:
+        try:
+            stored = _store(name).read_provider(name)
+            values[name] = stored
+            candidate = dict(stored)
+            if name == "local" and not candidate.get("LOCAL_LLM_URL"):
+                candidate["LOCAL_LLM_URL"] = "http://127.0.0.1:11434/v1/messages"
+            complete = all(candidate.get(key) for key in CONFIG_FILES[name]["required"])
+            if complete:
+                _validate_config(name, candidate)
+            providers[name] = bool(complete)
+        except (OSError, ValueError):
+            providers[name] = False
+    ready = [name for name in ROUTING_PROVIDERS if providers[name]]
+    next_provider = preferred if preferred in ROUTING_PROVIDERS else ready[0] if len(ready) == 1 and not routing_error else None
+    if not routing_error:
+        if next_provider and providers[next_provider]:
+            check("configuration", "ok", "configuration_valid")
+        elif next_provider or not ready:
+            check("configuration", "error", "configuration_incomplete", "review_settings")
+        else:
+            check("configuration", "warning", "provider_choice_required", "save_default_provider")
+    sensitive = [value for name, stored in values.items() for key, value in stored.items()
+                 if key in CONFIG_FILES[name]["secret"]]
+    model_key = lambda name: "LOCAL_LLM_MODEL" if name == "local" else "OPENROUTER_MODEL"
+    configured_model, configured_status = _diagnostic_model(values.get(next_provider, {}).get(model_key(next_provider)), sensitive)
+    session, metrics = _live_session()
+    proxy_config = metrics.get("configuration") if metrics else None
+    proxy_config = proxy_config if isinstance(proxy_config, dict) else {}
+    loaded_model, loaded_status = _diagnostic_model(proxy_config.get("model"), sensitive)
+    if proxy_config.get("modelRedacted") is True:
+        loaded_model, loaded_status = None, "redacted"
+    alternate = proxy_config.get("alternate")
+    alternate_report = None
+    if isinstance(alternate, dict) and alternate.get("provider") in ROUTING_PROVIDERS:
+        alt_model, alt_status = _diagnostic_model(alternate.get("model"), sensitive)
+        if alternate.get("modelRedacted") is True:
+            alt_model, alt_status = None, "redacted"
+        alternate_report = {"provider": alternate["provider"], "model": alt_model, "model_status": alt_status}
+    if not session:
+        loaded_model, loaded_status, alternate_report = None, "unreported", None
+        check("proxy", "warning", "session_not_running", "start_session")
+    else:
+        check("proxy", "ok", "proxy_authenticated")
+        if proxy_config.get("provider") not in (None, session["provider"]):
+            loaded_model, loaded_status = None, "unreported"
+            check("model", "error", "proxy_provider_mismatch", "restart_session_with_current_mode")
+        elif loaded_status != "reported":
+            check("model", "unknown", "proxy_model_" + loaded_status, "restart_session_with_current_mode")
+        else:
+            current_model, _ = _diagnostic_model(values.get(session["provider"], {}).get(model_key(session["provider"])), sensitive)
+            if current_model != loaded_model:
+                check("model", "warning", "model_settings_changed", "restart_session_with_current_mode")
+            else:
+                check("model", "ok", "proxy_model_matches_settings")
+    check("upstream", "unknown", "upstream_not_checked", "check_provider_metadata")
+    routing = routing_state(parse_route_log())
+    last = routing.get("last") or {}
+    last_model, last_status = _diagnostic_model(last.get("model"), sensitive)
+    last_stamp, started = _diagnostic_stamp(last.get("ts")), _diagnostic_stamp((session or {}).get("started"))
+    elapsed = _seconds_between(started, last_stamp) if started and last_stamp else None
+    available = _SNAPSHOT.get("data") is not None
+    age = max(0, round(time.monotonic() - _SNAPSHOT["at"], 1)) if available and _SNAPSHOT.get("at") else None
+    refresh_failed = bool(_SNAPSHOT.get("error"))
+    if refresh_failed:
+        check("snapshot", "warning", "snapshot_refresh_failed", "restart_dashboard")
+    elif not available:
+        check("snapshot", "unknown", "snapshot_building", "retry_later")
+    elif age is not None and age > 30:
+        check("snapshot", "warning", "snapshot_stale", "retry_later")
+    else:
+        check("snapshot", "ok", "snapshot_available")
+    counters = {key: metrics.get(key) if metrics and type(metrics.get(key)) is int and metrics[key] >= 0 else None
+                for key in ("requests", "failed", "retries", "circuitOpens")}
+    if counters["failed"]:
+        check("requests", "warning", "request_failures_recorded", "inspect_last_route")
+    status = "error" if any(item["status"] == "error" for item in checks) else "degraded" if any(item["status"] == "warning" for item in checks) else "ok"
+    return {
+        "schema_version": 1, "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "status": status, "read_only": True, "inference_performed": False, "checks": checks,
+        "configuration": {"default_provider": preferred, "next_provider": next_provider,
+                          "configured_model": configured_model, "model_status": configured_status,
+                          "dual_provider": dual, "providers": providers},
+        "session": {"active": session is not None, "provider": (session or {}).get("provider"),
+                    "started": started, "loaded_model": loaded_model, "model_status": loaded_status,
+                    "alternate": alternate_report,
+                    "plan_fallback": proxy_config.get("planFallback") if type(proxy_config.get("planFallback")) is bool else None},
+        "last_route": {"provider": last.get("provider") if last.get("provider") in (*ROUTING_PROVIDERS, "plan") else None,
+                       "model": last_model, "model_status": last_status, "timestamp": last_stamp,
+                       "age_seconds": last.get("age_seconds"), "current_session": elapsed is not None and elapsed >= 0},
+        "metrics": {"source": "live_proxy" if metrics else "unavailable", **counters},
+        "snapshot": {"available": available, "age_seconds": age, "refresh_failed": refresh_failed},
+        "next_check": {"method": "POST", "path": "/api/test", "provider": (session or {}).get("provider") or next_provider,
+                       "mode": "metadata", "requires_token": True},
+    }
 
 
 def status_report(include_usage=False, offline=False):

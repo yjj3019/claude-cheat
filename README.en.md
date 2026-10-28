@@ -337,7 +337,7 @@ The **insights** card ranks *what changed, why, and what to do next* instead of 
 
 | Panel | Content |
 | --- | --- |
-| Now | **OpenRouter serving / Plan bypass / idle**, the **model that actually answered**, age, reason |
+| Now | **OpenRouter or Local LLM serving / Plan bypass / idle**, the **last request's actual routing model**, age, reason |
 | Alerts | Shown when Plan bypass reaches 50% within ten minutes, a circuit opens, a 400/413/422 rejection repeats, or the balance drops below 10% |
 | Last 60 minutes | Replacement versus Plan counts, circuit opens |
 | Bypass reasons | Counts per `native_feature` `detail` with **meaning and action**, external failure statuses and validation classes |
@@ -371,6 +371,14 @@ Settings live on a **separate page** (`http://127.0.0.1:8787/settings`) reached 
 | Tests | **Model check** reads the model list only; **inference test** sends one 16-token request (may cost a small amount) |
 | Model picker | **목록** opens a searchable list with context length and price and fills the field. `GET /api/models?provider=openrouter\|local` (session token required, 10 minute cache) |
 | When it applies | Saved settings take effect in the **next** session; restart a running one |
+
+### Current model checks and duplicate selection
+
+Distinguish the configured model (settings for the next session), the connection-test model (the response model ID is checked against the requested ID), and the last routed model (recorded after response validation). An ordinary session can still start after a failed connection check, with a warning and Plan fallback available. Model-list metadata checks do not prove inference works.
+
+The dashboard does not read Claude Code's current `/model` selection in real time. With no live session or no requests yet, settings and historical records are not proof of a current model connection.
+
+The picker lists an exact model ID only once per service, trimming surrounding whitespace and retaining the first row's metadata. IDs differing in case or a suffix such as `:latest` remain distinct. Selecting an item fills the input; saving is a separate action. Per-request provider selection and alternate-alias collision checks also apply. This does not prohibit different servers using the same model name or multiple independent sessions.
 
 ### CLI detection and connection test (diagnostics only)
 
@@ -418,6 +426,36 @@ The report includes `state`, `provider`, `reason`, `detail`, **`model`**, `last_
 A running proxy exposes its own counters at `GET /api/metrics` (same session token required, loopback only): request count, external/Plan split, p50/p95 latency, retries, streams, circuit opens and bytes in/out. The dashboard authenticates this response with the handoff token before identifying a **current session**, and uses the counters from that verified proxy. The token, port and PID are not returned in the settings response.
 
 Counters retained in `.proxy-metrics.json` are shown as **previous run history** when no live proxy is verified; they do not generate current-session failure or latency insights. `proxy_stale` compares the last recorded proxy code with the current source. It does not prove that an old proxy is currently running.
+
+### Read-only diagnostics API for AI debugging
+
+`GET http://127.0.0.1:8787/api/diagnostics` returns versioned JSON for agents and scripts while the dashboard is running. Loopback and Host checks apply. No session token is required for this redacted, read-only report.
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8787/api/diagnostics | ConvertTo-Json -Depth 8
+# or
+curl.exe --fail --silent http://127.0.0.1:8787/api/diagnostics
+```
+
+This request never edits settings, calls provider APIs, performs inference or scans transcripts. It authenticates the recorded loopback proxy once and reads configuration, routing history and existing snapshot cache state. Keys, tokens, server addresses, filesystem paths, PIDs, prompts, bodies and raw exceptions are excluded. A model containing a URL, absolute path or sensitive value is returned as `null` with `model_status: "redacted"`.
+
+| Field | Meaning |
+| --- | --- |
+| `schema_version` | Currently `1` |
+| `status` | Component summary: `ok`, `degraded` or `error` |
+| `checks[]` | Component, status, stable machine-readable code and recommended action code |
+| `configuration` | Saved default, next provider, configured model and provider configuration validity |
+| `session` | Authenticated proxy presence, its loaded primary model, alternate and Plan fallback policy |
+| `last_route` | Last routed model, timestamp, age and whether it belongs to the current session |
+| `metrics` | Current proxy request/failure/retry/circuit counters; historical files are not treated as current |
+| `snapshot` | Availability, age since last successful refresh and refresh-error presence |
+| `next_check` | A separate authenticated metadata-check request; not executed automatically |
+
+Useful check codes include `configuration_incomplete`, `routing_configuration_invalid`, `provider_choice_required`, `session_not_running`, `proxy_model_matches_settings`, `model_settings_changed`, `proxy_provider_mismatch`, `proxy_model_unreported`, `proxy_model_redacted`, `upstream_not_checked`, `snapshot_refresh_failed`, `snapshot_stale` (over 30 seconds) and `request_failures_recorded`.
+
+A successfully generated report returns **HTTP 200 even when a component has an error**; inspect its body rather than assuming HTTP 200 means inference works. An invalid Host returns 403. A report-generation failure returns 500 with the fixed code `diagnostics_failed`, without the exception text. No live session is a degraded/waiting state rather than proof that the dashboard is broken. Older proxies may not report a loaded model: `session.loaded_model` remains `null` instead of being inferred from settings. `session.plan_fallback` describes routing policy, not a guarantee after streaming output has already started.
+
+The existing `POST /api/test` accepts `{"provider":"local","mode":"metadata"}` for a model-list-only check and requires the page's `x-dashboard-token`. Actual inference is a separate `mode:"inference"` request and may cost money. A healthy local proxy and matching model metadata do not prove upstream inference succeeds.
 
 ### How the components stay aligned
 

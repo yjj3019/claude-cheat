@@ -90,6 +90,54 @@ test('metrics endpoint requires the session token', async () => {
   }
 });
 
+test('metrics identify the loaded routing configuration without credentials', async () => {
+  const { server, metrics } = await start();
+  try {
+    const response = await fetch(metrics, { headers: { 'x-local-route-token': NONCE } });
+    const payload = await response.json();
+    assert.deepEqual(payload.configuration, { provider: 'openrouter', model: 'metrics/model',
+      modelRedacted: false, alternate: null, planFallback: true });
+    assert.equal(payload.requests, 0, 'reading diagnostics must not perform inference');
+    assert.doesNotMatch(JSON.stringify(payload), /metrics-nonce|sk-or-metrics|sk-ant-oat/);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test('metrics redact paths and URLs even when they were configured as model ids', async () => {
+  const { server, metrics } = await start({ provider: 'local', localModel: 'C:/private/model.gguf',
+    localUrl: 'http://127.0.0.1:11434/v1/messages', localKey: 'local-private-key',
+    altProvider: 'openrouter', altModel: 'https://private.example/model', altKey: 'sk-or-alt-private',
+    altAlias: 'claude-route-openrouter' });
+  try {
+    const response = await fetch(metrics, { headers: { 'x-local-route-token': NONCE } });
+    const payload = await response.json();
+    assert.equal(payload.configuration.model, null);
+    assert.equal(payload.configuration.modelRedacted, true);
+    assert.deepEqual(payload.configuration.alternate, { provider: 'openrouter', model: null, modelRedacted: true });
+    assert.doesNotMatch(JSON.stringify(payload), /private|127\.0\.0\.1|11434|https:|sk-or-|metrics-nonce/);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test('a session token accidentally used as a model is not exposed in metrics', async () => {
+  const { server, metrics } = await start({ provider: 'local', localModel: NONCE,
+    localUrl: 'http://127.0.0.1:11434/v1/messages' });
+  try {
+    const response = await fetch(metrics, { headers: { 'x-local-route-token': NONCE } });
+    const payload = await response.json();
+    assert.equal(payload.configuration.model, null);
+    assert.equal(payload.configuration.modelRedacted, true);
+    assert.ok(!JSON.stringify(payload).includes(NONCE));
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
 test('counters follow the routes the proxy takes', async () => {
   const { server, base, metrics } = await start({ failOnce: true });
   try {

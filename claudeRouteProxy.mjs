@@ -809,7 +809,19 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     const at = fraction => Number(sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * fraction))].toFixed(2));
     return { count: sorted.length, p50: at(0.5), p95: at(0.95), max: at(1) };
   };
+  const publicMetricModel = value => validOpenRouterModel(value) &&
+    !/^[A-Za-z]:|:\/\/|\\/.test(value) &&
+    ![nonce, key, localKey, altKey].some(secret => typeof secret === 'string' && secret.length > 0 && value.includes(secret)) ? value : null;
   const metricsSnapshot = () => ({
+    configuration: {
+      provider,
+      model: publicMetricModel(provider === 'local' ? localModel : openrouterModel),
+      modelRedacted: publicMetricModel(provider === 'local' ? localModel : openrouterModel) === null,
+      alternate: altExternalUrl === null ? null : {
+        provider: altProvider, model: publicMetricModel(altModel), modelRedacted: publicMetricModel(altModel) === null,
+      },
+      planFallback: !noPlan,
+    },
     startedAt: new Date(metrics.startedAt).toISOString(),
     uptimeMs: Date.now() - metrics.startedAt,
     requests: metrics.requests, ok: metrics.ok, failed: metrics.failed,

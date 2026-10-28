@@ -546,6 +546,139 @@ class AlertTests(unittest.TestCase):
         self.assertIn("단가 조회 실패", titles)
 
 
+class DiagnosticsTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.path = self.root / "openclaude.config.yaml"
+        self.store = dash.routeConfig.Store(self.path)
+        self.store.write_provider("local", {"LOCAL_LLM_URL": "http://127.0.0.1:11434/v1/messages",
+                                            "LOCAL_LLM_MODEL": "fixture-local", "LOCAL_LLM_API_KEY": "private-api-key-fixture"})
+        self.store.write_provider("routing", {"ROUTE_DEFAULT_PROVIDER": "local"})
+        files = {name: {**spec, "path": self.path} for name, spec in dash.CONFIG_FILES.items()}
+        self.enterContext(mock.patch.object(dash, "CONFIG_FILES", files))
+        self.live = self.enterContext(mock.patch.object(dash, "_live_session", return_value=(None, None)))
+        self.enterContext(mock.patch.object(dash, "parse_route_log", return_value=[]))
+        self.cache = {"at": time.monotonic(), "data": {}, "error": None}
+        self.enterContext(mock.patch.object(dash, "_SNAPSHOT", self.cache))
+        for name in ("_http_json", "account_state", "model_pricing", "scan_sessions", "snapshot", "status_report",
+                     "save_config", "save_default_provider"):
+            self.enterContext(mock.patch.object(dash, name, side_effect=AssertionError("diagnostics must not call " + name)))
+
+    def live_proxy(self, model="fixture-local", configuration=True):
+        metrics = {"startedAt": "2026-10-28T00:00:00Z", "requests": 3, "failed": 0,
+                   "retries": 0, "circuitOpens": 0}
+        if configuration:
+            metrics["configuration"] = {"provider": "local", "model": model, "planFallback": True}
+        self.live.return_value = ({"provider": "local", "started": "2026-10-28T00:00:00Z"}, metrics)
+        return metrics
+
+    def test_read_only_report_distinguishes_settings_from_a_missing_session(self):
+        before = self.path.read_bytes()
+        report = dash.diagnostics_report()
+        self.assertEqual(report["schema_version"], 1)
+        self.assertEqual(report["status"], "degraded")
+        self.assertTrue(report["read_only"])
+        self.assertFalse(report["inference_performed"])
+        self.assertEqual(report["configuration"]["next_provider"], "local")
+        self.assertEqual(report["configuration"]["configured_model"], "fixture-local")
+        self.assertFalse(report["session"]["active"])
+        self.assertIsNone(report["session"]["loaded_model"])
+        self.assertIn("session_not_running", [item["code"] for item in report["checks"]])
+        self.assertIn("upstream_not_checked", [item["code"] for item in report["checks"]])
+        self.assertEqual(self.path.read_bytes(), before)
+        self.live.assert_called_once()
+        public = json.dumps(report)
+        self.assertNotIn("private-api-key-fixture", public)
+        self.assertNotIn("127.0.0.1:11434", public)
+        self.assertNotIn(str(self.root), public)
+
+    def test_authenticated_loaded_model_and_unchecked_upstream_are_separate(self):
+        self.live_proxy()
+        report = dash.diagnostics_report()
+        self.assertEqual(report["status"], "ok")
+        self.assertEqual(report["session"]["loaded_model"], "fixture-local")
+        self.assertEqual(report["session"]["model_status"], "reported")
+        self.assertTrue(report["session"]["plan_fallback"])
+        upstream = next(item for item in report["checks"] if item["component"] == "upstream")
+        self.assertEqual(upstream["status"], "unknown")
+        self.assertFalse(report["inference_performed"])
+        self.live.assert_called_once()
+
+    def test_changed_settings_do_not_overwrite_the_loaded_model(self):
+        self.live_proxy(model="previous-local-model")
+        report = dash.diagnostics_report()
+        self.assertEqual(report["configuration"]["configured_model"], "fixture-local")
+        self.assertEqual(report["session"]["loaded_model"], "previous-local-model")
+        self.assertEqual(report["status"], "degraded")
+        self.assertIn("model_settings_changed", [item["code"] for item in report["checks"]])
+
+    def test_old_proxy_metadata_is_unreported_instead_of_inferred_from_settings(self):
+        self.live_proxy(configuration=False)
+        report = dash.diagnostics_report()
+        self.assertIsNone(report["session"]["loaded_model"])
+        self.assertIsNone(report["session"]["plan_fallback"])
+        self.assertEqual(report["session"]["model_status"], "unreported")
+        self.assertIn("proxy_model_unreported", [item["code"] for item in report["checks"]])
+
+    def test_model_paths_urls_tokens_and_unexpected_nested_fields_are_redacted(self):
+        for value in ("https://user:pw@private.example/model", "C:/private/model.gguf", "/private/model",
+                      "\\\\host\\models", "private-api-key-fixture", "sk-or-private", "bad\nmodel", "m" * 257):
+            with self.subTest(value=value):
+                model, state = dash._diagnostic_model(value, ["private-api-key-fixture"])
+                self.assertIsNone(model)
+                self.assertEqual(state, "redacted")
+        metrics = self.live_proxy(model="C:/private/model.gguf")
+        metrics["configuration"]["alternate"] = {"provider": "openrouter", "model": "https://private.example/model",
+                                                   "key": "private-nested-token", "url": "https://private.example"}
+        metrics["secret"] = "private-metrics-token"
+        self.cache["error"] = {"message": "private-refresh-token C:/private/config.yaml"}
+        report = dash.diagnostics_report()
+        self.assertIsNone(report["session"]["loaded_model"])
+        self.assertEqual(report["session"]["model_status"], "redacted")
+        self.assertIsNone(report["session"]["alternate"]["model"])
+        self.assertNotIn("private", json.dumps(report))
+        self.assertTrue(report["snapshot"]["refresh_failed"])
+
+    def test_invalid_config_returns_a_code_without_source_values(self):
+        self.path.write_text('routing:\n  default_provider: "private-invalid-value"\n', encoding="utf-8")
+        report = dash.diagnostics_report()
+        self.assertEqual(report["status"], "error")
+        self.assertIsNone(report["configuration"]["default_provider"])
+        self.assertIn("routing_configuration_invalid", [item["code"] for item in report["checks"]])
+        self.assertNotIn("private-invalid-value", json.dumps(report))
+
+    def test_stale_snapshot_is_distinct_from_proxy_health(self):
+        self.live_proxy()
+        self.cache["at"] = time.monotonic() - 90
+        report = dash.diagnostics_report()
+        self.assertGreaterEqual(report["snapshot"]["age_seconds"], 90)
+        self.assertIn("snapshot_stale", [item["code"] for item in report["checks"]])
+        self.assertTrue(report["session"]["active"])
+
+    def test_http_contract_is_read_only_redacted_and_rejects_foreign_hosts(self):
+        import threading
+
+        server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        def request(method="GET", headers=None):
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+            try:
+                connection.request(method, "/api/diagnostics", headers=headers or {})
+                response = connection.getresponse()
+                return response.status, json.loads(response.read())
+            finally:
+                connection.close()
+        status, report = request()
+        self.assertEqual(status, 200)
+        self.assertEqual(report["schema_version"], 1)
+        self.assertEqual(request(headers={"host": "foreign.invalid"}), (403, {"error": "host_rejected"}))
+        self.assertEqual(request(method="POST"), (404, {"error": "not_found"}))
+        with mock.patch.object(dash, "diagnostics_report", side_effect=ValueError("private-handler-error")):
+            self.assertEqual(request(), (500, {"error": "diagnostics_failed"}))
+
+
 class StatusReportTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(mock.patch.object(dash, "read_settings", return_value={
@@ -1075,12 +1208,23 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(snapshot["proxy_metrics"]["requests"], 0)
         self.assertFalse(snapshot["proxy_metrics"]["stale"])
         self.assertIn("Local LLM", snapshot["summary"])
+        diagnostics = request("GET", "/api/diagnostics")
+        self.assertEqual(diagnostics["schema_version"], 1)
+        self.assertEqual(diagnostics["session"]["loaded_model"], "fixture-local")
+        self.assertEqual(diagnostics["configuration"]["next_provider"], "local")
+        self.assertFalse(diagnostics["inference_performed"])
+        self.assertEqual(diagnostics["metrics"]["requests"], 0)
         request("POST", "/api/default-provider", {"provider": "openrouter"})
         self.assertEqual(route.configured_provider(), "openrouter")
         report = request("GET", "/api/status")
         self.assertEqual(report["active_session"]["provider"], "local")
         self.assertEqual(report["config"]["model"], "fixture-local", "changing the next launch keeps the live session's context")
         self.assertNotIn("fixture-session", json.dumps(report))
+        diagnostics = request("GET", "/api/diagnostics")
+        self.assertEqual(diagnostics["configuration"]["next_provider"], "openrouter")
+        self.assertEqual(diagnostics["session"]["provider"], "local")
+        self.assertEqual(diagnostics["session"]["loaded_model"], "fixture-local")
+        self.assertNotIn("fixture-session", json.dumps(diagnostics))
         stop_proxy()
         self.assertIsNone(dash.active_session(), "a leftover handoff file does not prove liveness")
 
@@ -1541,6 +1685,23 @@ class HttpRedirectTests(unittest.TestCase):
                 self.assertEqual(seen, ["https://provider.invalid/v1/models"])
 
 class ModelCatalogTests(unittest.TestCase):
+    def test_same_model_id_is_listed_once_with_the_first_rows_metadata(self):
+        rows = dash._parse_models({"data": [
+            {"id": " vendor/model-a ", "name": "First model", "context_length": 1000},
+            {"id": "vendor/model-a", "name": "Repeated model", "context_length": 2000},
+            {"id": "vendor/model-b", "name": "Other model"},
+        ]})
+        self.assertEqual([row["id"] for row in rows], ["vendor/model-a", "vendor/model-b"])
+        self.assertEqual(rows[0]["name"], "First model")
+        self.assertEqual(rows[0]["context_length"], 1000)
+
+    def test_local_model_name_duplicates_are_removed_without_merging_different_ids(self):
+        rows = dash._parse_models({"models": [
+            {"name": "local-model"}, {"model": " local-model "},
+            {"name": "Local-Model"}, {"name": "local-model:latest"},
+        ]})
+        self.assertEqual([row["id"] for row in rows], ["Local-Model", "local-model", "local-model:latest"])
+
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.files = {

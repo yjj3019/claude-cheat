@@ -2,11 +2,39 @@
 
 **한국어** | [English](README.en.md) · [MIT License](LICENSE)
 
-기존 Claude Code의 **Plan 로그인과 사용자 설정을 사용하면서**, 호환되는 Sonnet 요청만 OpenRouter에서 지정한 모델 또는 지정한 Local LLM으로 보내는 로컬 라우터입니다. 외부 모델 요청이 실패하면 기존 Plan Sonnet으로 fallback하고, 연결이 복구되면 다시 외부 모델을 시도합니다.
+기존 Claude Code의 **Plan 로그인과 사용자 설정을 사용하면서**, 호환되는 Sonnet 요청을 지정한 OpenRouter 모델 또는 Local LLM으로 보내는 로컬 라우터입니다. 일반 모드는 외부 모델 요청이 재시도 정책에 따라 실패하면 기존 Plan Sonnet으로 fallback하고, 연결이 복구되면 다시 외부 모델을 시도합니다. Plan을 사용하지 않는 전용·호환 모드는 별도로 제공합니다.
 
-**현재 상태:** 라우팅·재시도·fallback·복구·Local 설정은 구현했습니다. 다만 **모든 Claude 고유 기능을 유지하면서 모든 Sonnet 요청을 외부 모델로 대체하는 것은 아직 달성하지 못했습니다.** 지원되지 않는 기능이나 대화 이력이 포함된 요청은 원본 Plan 경로를 사용합니다. [검증 범위와 한계](#8-검증-방법과-남은-한계)를 먼저 확인하세요.
+**현재 상태:** OpenRouter·Local 라우팅, 기본 실행 서비스 저장, 응답 모델 ID 검증, 모델 목록 중복 제거, AI용 진단 API를 제공합니다. CLI 항목은 감지·연결 테스트 전용입니다. 다만 **모든 Claude 고유 기능을 유지하면서 모든 Sonnet 요청을 외부 모델로 대체하는 것은 아직 달성하지 못했습니다.** 일반 모드의 미지원 기능이나 대화 이력은 원본 Plan 경로를 사용합니다. [검증 범위와 한계](#9-검증-방법과-남은-한계)를 먼저 확인하세요.
+
+## 빠른 시작
+
+먼저 [준비 사항](#2-준비와-설정-파일-위치)을 확인하고, 사용할 Local LLM 서버 또는 OpenRouter 계정을 준비합니다. **Local LLM만 사용할 경우 OpenRouter 설정은 필요하지 않습니다.**
+
+1. 저장소 폴더에서 설정 화면을 엽니다. 이 터미널은 대시보드 서버 실행용으로 유지합니다.
+
+   ```powershell
+   .\OpenClaude.ps1 -Setup
+   ```
+
+2. 브라우저의 **설정할 서비스**에서 `Local LLM` 또는 `OpenRouter`를 선택해 모델·접속 정보를 저장합니다. **모델 확인**은 목록 조회이며 추론 성공을 뜻하지 않습니다.
+3. **기본 실행 서비스**에서 같은 서비스를 골라 **기본값 저장**을 누릅니다. Local을 쓰려면 이 값을 `Local LLM`으로 저장하세요. 다른 서비스 설정을 삭제할 필요는 없습니다.
+4. **새 터미널**의 저장소 폴더에서 실행합니다. 이후에는 `-Provider`를 매번 입력하지 않아도 됩니다.
+
+   ```powershell
+   .\OpenClaude.ps1
+   ```
+
+5. AI나 별도 터미널에서 상태를 확인합니다. CLI가 실행 중이지 않으면 `session_not_running`, 외부 연결을 아직 검사하지 않았으면 `upstream_not_checked`가 정상적으로 표시될 수 있습니다.
+
+   ```powershell
+   Invoke-RestMethod http://127.0.0.1:8787/api/diagnostics | ConvertTo-Json -Depth 8
+   ```
+
+일반 Local 모드도 네이티브 기능과 Plan fallback을 유지합니다. Plan 경로를 사용하지 않는 동작은 [Local 전용 모드](#claude-cli-local-전용-모드)와 [Local 호환 모드](#claude-cli-local-호환-모드)를 확인하세요.
 
 ## 목차
+
+바로가기: [빠른 시작](#빠른-시작) · [기본 서비스 저장](#기본-서비스를-저장하고-옵션-없이-실행하기) · [AI 진단 API](#ai-디버깅용-상태-점검-api)
 
 1. [어떤 요청이 어디로 가나요?](#1-어떤-요청이-어디로-가나요)
 2. [준비와 설정 파일 위치](#2-준비와-설정-파일-위치)
@@ -15,8 +43,9 @@
 5. [재시도·fallback·복구 원리](#5-재시도fallback복구-원리)
 6. [실제로 사용한 모델 확인하기](#6-실제로-사용한-모델-확인하기)
 7. [문제 해결과 일반 Claude로 돌아가기](#7-문제-해결과-일반-claude로-돌아가기)
-8. [검증 방법과 남은 한계](#8-검증-방법과-남은-한계)
-9. [파일 구성과 라이선스](#9-파일-구성과-라이선스)
+8. [무중단 재시작](#8-무중단-재시작-프록시-교체)
+9. [검증 방법과 남은 한계](#9-검증-방법과-남은-한계)
+10. [파일 구성과 라이선스](#10-파일-구성과-라이선스)
 
 ## 1. 어떤 요청이 어디로 가나요?
 
@@ -24,7 +53,7 @@
 Claude Code — 기존 Plan 로그인·사용자 설정
   └─ 이 PC의 로컬 라우터
        ├─ 호환되는 Sonnet 요청 → 선택한 OpenRouter 모델 또는 Local LLM
-       ├─ 외부 요청이 총 4회 실패 → 기존 Plan Sonnet
+       ├─ 외부 요청이 재시도 정책에 따라 실패 → 기존 Plan Sonnet
        └─ Opus·Haiku·Fable / 외부 미지원 기능 → 기존 Plan 경로
 ```
 
@@ -44,7 +73,7 @@ Claude Code — 기존 Plan 로그인·사용자 설정
 
 ## 2. 준비와 설정 파일 위치
 
-별도로 설치한 **Claude Code, Node.js, Python**과 기존 **Claude Plan 로그인**이 필요합니다. 현재 인증 검사는 `subscriptionType="pro"`인 계정을 대상으로 하며 Max 등 다른 플랜의 지원을 보장하지 않습니다. 이 소스에 필요한 추가 npm·pip 패키지는 없습니다.
+별도로 설치한 **Claude Code, Node.js, Python**이 필요합니다. 일반 라우팅 모드는 기존 **Claude Plan 로그인**도 확인하며, 현재 인증 검사는 `subscriptionType="pro"`인 계정을 대상으로 합니다. Max 등 다른 플랜의 지원을 보장하지 않습니다. Plan을 사용하지 않는 Local 전용·호환 모드와 OpenRouter 호환 모드는 각 절의 조건을 따릅니다. 이 소스에 필요한 추가 npm·pip 패키지는 없습니다.
 
 Claude Code·Node.js·Python을 설치하고 각 버전과 호환성을 직접 확인하세요. 특정 개인 PC 구성이나 최소 지원 버전을 보장하지 않습니다.
 
@@ -78,9 +107,9 @@ claude auth status
 .\installLauncher.ps1 -Remove   # 설치한 포워더 전부 삭제
 ```
 
-설치 후에는 `D:\AI-Codding\Claude\ShowBox>` 같은 다른 폴더에서 `OpenClaude`(또는 `OpenClaudeDashboard`)만 입력하면 됩니다. 포워더는 이 체크아웃의 경로를 담으므로, 저장소를 옮기면 다시 설치하세요. `.local\bin`이 PATH에 없으면 설치 스크립트가 추가 명령을 안내합니다.
+설치 폴더가 PATH에 등록되어 있으면 다른 작업 폴더에서도 `OpenClaude` 또는 `OpenClaudeDashboard`만 입력하면 됩니다. 포워더는 이 체크아웃의 경로를 담으므로, 저장소를 옮기면 다시 설치하세요. `.local\bin`이 PATH에 없으면 설치 스크립트가 추가 명령을 안내합니다.
 
-`.env`는 한 줄에 `KEY=VALUE` 하나를 사용합니다. 빈 줄·`#`으로 시작하는 주석·값 전체를 감싼 따옴표는 허용하며, 여러 줄 값·셸 변수 확장은 지원하지 않습니다. 키 뒤에 같은 줄 주석을 붙이지 마세요. 실제 `.env*`는 Git에서 제외합니다. 예제에는 실제 인증값을 넣지 마세요.
+예전 `.env.*` 파일을 계속 읽는 경우 형식은 한 줄에 `KEY=VALUE` 하나입니다. 빈 줄·`#`으로 시작하는 주석·값 전체를 감싼 따옴표는 허용하며, 여러 줄 값·셸 변수 확장은 지원하지 않습니다. 키 뒤에 같은 줄 주석을 붙이지 마세요. 새 설정은 `openclaude.config.yaml`을 사용합니다. 실제 설정 파일은 Git에서 제외하며 예제에는 실제 인증값을 넣지 마세요.
 
 ## 3. OpenRouter 모델 시작하기
 
@@ -266,7 +295,7 @@ local:
 | `LOCAL_LLM_MODEL` | 실행 시 필수; 서버의 정확한 모델 ID |
 | `LOCAL_LLM_API_KEY` | 선택; 해당 서버 전용 `Authorization: Bearer`로 전달 |
 | `LOCAL_LLM_ALLOW_REMOTE` | `false`; 원격 서버는 명시적 `true`와 HTTPS 필요 |
-| `LOCAL_LLM_HTTP_URL` | Optional exact HTTP Messages URL pin; empty by default. Plaintext HTTP is allowed only when it exactly matches `LOCAL_LLM_URL`. Keep real values in the ignored `openclaude.config.yaml`; prefer HTTPS. |
+| `LOCAL_LLM_HTTP_URL` | 선택 항목이며 기본값은 비어 있음. `LOCAL_LLM_URL`과 정확히 같은 HTTP Messages 주소를 지정한 경우에만 평문 HTTP 예외 허용. 실제 주소는 Git에서 제외되는 설정 파일에 두고 HTTPS 사용을 우선 |
 | `LOCAL_LLM_MODELS_URL` | 같은 origin의 `/v1/models`; 모델 목록 점검에만 사용 |
 
 같은 이름의 **프로세스 환경변수가 파일보다 우선**합니다. `localhost` 대신 허용되는 주소 리터럴 `127.0.0.1` 또는 `[::1]`을 사용하세요. 원격 HTTP는 `LOCAL_LLM_HTTP_URL`이 `LOCAL_LLM_URL`과 정확히 일치할 때만 허용하며, 이 경우 프롬프트와 `LOCAL_LLM_API_KEY` Bearer 키가 암호화 없이 전송됩니다. 그 외에는 HTTPS 또는 별도로 준비한 loopback 터널이 필요합니다.
@@ -486,7 +515,7 @@ Sonnet 선택과 HUD의 모델·비용 표시는 실제 외부 라우팅이나 �
 .\OpenClaudeDashboard.ps1
 ```
 
-`127.0.0.1`에만 열리는 **읽기 전용** 페이지입니다. 포트는 **8787로 고정**되며, 이전에 띄운 대시보드가 남아 있으면 자동으로 종료하고 같은 포트를 다시 사용합니다. 다른 프로그램이 그 포트를 쓰고 있으면 임의 포트로 옮기지 않고 오류로 알립니다. 빈 포트로 대체하려면 `--allow-port-fallback`을 지정하세요.
+기본 주소는 **`http://127.0.0.1:8787/`**입니다. 상태 조회는 읽기 전용이고, 별도의 설정 화면에서 저장을 요청할 때만 서비스 설정·기본값을 변경합니다. 이전 대시보드는 아래 신원 검증을 통과한 경우에만 종료하고 같은 포트를 다시 사용합니다. 다른 프로그램이 그 포트를 쓰고 있으면 임의 포트로 옮기지 않고 오류로 알립니다. 빈 포트로 대체하려면 `python routeDashboard.py --allow-port-fallback`을 사용하세요.
 
 이전 인스턴스 종료는 `.dashboard.pid`에 기록한 **pid와 프로세스 생성시각이 모두 일치할 때만** 수행합니다(`python routeDashboard.py --stop` 포함). Windows에서 pid가 재사용된 경우·자기/상위 프로세스·구버전(신원 없는) 기록은 종료하지 않고 `identity_mismatch`/`own_tree_pid`/`identity_unverifiable` 한 줄로 보고하며, 그 기록은 다음 시작 때 덮어씁니다. 업그레이드 직후 이전 버전 대시보드가 남아 있다면 그 인스턴스를 한 번 직접 종료(`Ctrl+C`)한 뒤 시작하세요. 비Windows에는 생성시각 조회 수단이 없어 이 검증이 불가능하므로, 안전을 위해 종료를 거부합니다.
 
@@ -508,24 +537,26 @@ Sonnet 선택과 HUD의 모델·비용 표시는 실제 외부 라우팅이나 �
 
 | 항목 | 내용 |
 | --- | --- |
-| 지금 상태 | 마지막 `route_selected` 기준 **OpenRouter 사용 중 / Plan 우회 중 / 유휴**, **실제 사용 모델**, 경과 시간, 사유 |
+| 지금 상태 | 마지막 `route_selected` 기준 **OpenRouter 또는 Local LLM 사용 중 / Plan 우회 중 / 유휴**, **최근 요청의 실제 라우팅 모델**, 경과 시간, 사유 |
 | 경고 배너 | 최근 10분에 Plan 우회 50% 이상, 회로 차단, 400·413·422 거부, 잔액 10% 이하일 때 표시 |
-| 최근 60분 | OpenRouter 대 Plan 비율, 회로 차단 횟수 |
+| 최근 60분 | 외부 서비스 대 Plan 비율, 회로 차단 횟수; 저장된 라우팅 기록 기준 |
 | 우회 사유 | `native_feature`의 `detail`별 건수와 **의미·조치 설명**, 외부 실패 상태·검증 실패 분류 |
-| 크레딧 | 키 한도·이번 달 사용액·잔액·리셋일 (OpenRouter `/api/v1/key`) |
-| 오늘 토큰 | OpenRouter·Plan 토큰, 입력/출력, 캐시(5분·**1시간 TTL 분리**), **비용(상태 표기)** |
-| 시간대별 토큰 | 최근 24시간을 OpenRouter·Plan 막대로 표시 |
+| 크레딧 | OpenRouter 문맥에서 키 한도·사용액·잔액·리셋일 조회; Local에서는 적용 대상 아님 |
+| 오늘 토큰 | 외부 서비스·Plan 토큰, 입력/출력, 캐시(5분·**1시간 TTL 분리**), **비용(상태 표기)** |
+| 시간대별 토큰 | 최근 24시간을 외부 서비스·Plan 막대로 표시 |
 | 라우팅 전환 기록 | 경로가 바뀐 시점·사유·모델·건수·지속 시간 (최근 12회) |
 | 세션별 사용 | **고유 턴 수**(중복 제거), 외부/Plan 턴 수, 외부 토큰, **비용과 상태**, 사용 모델 |
 | 도움말 | CLI 명령어(`--status` 계열), HTTP API, 사유 코드표(의미·조치), 상태 배지, 종료 코드, 데이터 출처 |
 
 **턴은 정확히 한 번만 셉니다.** Claude Code는 같은 응답을 스트리밍 중 여러 번 기록하고 `/resume`·포크는 히스토리를 복사하므로, 파일별 합산은 같은 턴을 여러 번 셉니다(이 PC의 7일 창에서 assistant 행의 42%가 중복). 대시보드는 `message.id`+`requestId`(없으면 `msg:`/`uuid:` 폴백)로 턴을 식별하고, 중복 행은 턴 수를 늘리지 않으며 더 커진 토큰 차액만 반영합니다. 따라서 이전 버전보다 턴 수가 낮게 보이는 것이 정상입니다.
 
-**비용에는 상태가 붙습니다.** OpenRouter 경유분은 카탈로그 단가 기반 **추정(estimated)**, Plan 경유분은 구독 포함 **included(귀속용 $0)**, 단가를 확인할 수 없는 모델은 **unknown(비용 null)** 입니다. 캐시 생성 토큰은 5분·1시간 TTL을 분리해 1시간 단가가 있으면 그 값으로, 없으면 표준 단가로 계산하며 어느 쪽을 썼는지 함께 표시합니다. 실제 청구는 제공자 기록을 기준으로 확인하세요. **실제 사용 모델**은 프록시가 응답을 전달하기 직전에 기록합니다. CLI가 보여주는 모델 이름은 요청 별칭(`claude-sonnet-5-5` 등)이므로, 실제 제공자 모델은 이 값으로 확인하세요.
+**비용에는 상태가 붙습니다.** OpenRouter 문맥에서 단가를 조회하면 **추정(estimated)**, Plan 경유분은 구독 포함 **included(귀속용 $0)**, Local 또는 단가를 확인하지 못한 외부 토큰은 **unknown(비용 null)** 으로 표시합니다. 현재 추정은 조회한 한 모델의 단가를 집계된 외부 토큰에 적용하므로, 보관 기간에 여러 모델·서비스의 기록이 섞이면 모델별 실제 청구를 재현하지 못합니다. 캐시 생성 토큰은 5분·1시간 TTL을 분리해 1시간 단가가 있으면 그 값으로, 없으면 표준 단가로 계산합니다. 실제 청구는 제공자 기록을 기준으로 확인하세요.
+
+**최근 요청의 모델**은 경로 로그가 있을 때 프록시가 응답을 전달하기 직전에 남긴 값입니다. CLI에 표시되는 모델 이름은 요청 별칭(`claude-sonnet-5-5` 등)일 수 있습니다. 현재 프록시에 로드된 기본 모델과 최근 요청의 처리 모델은 [모델 확인 기준](#현재-모델-확인과-중복-선택의-범위)에 따라 구분합니다.
 
 집계 캐시(`.usage-cache.json`)는 턴 소유권 원장을 포함해 실사용 7일 창에서 약 **0.5MB**입니다(합성 2,000파일·10만 턴 기준 5.4MB, 상한 20만 클레임에서 오래된 파일 단위로 축출). 캐시 버전이 바뀌면 한 번 전체 재스캔합니다.
 
-키·프롬프트·요청 본문은 표시하지 않습니다. 설정 저장을 요청했을 때만 실행기 폴더의 `openclaude.config.yaml` 하나를 수정하고, 그 외에는 아무것도 기록하지 않습니다. 대시보드는 세션과 별개 프로세스이므로 라우팅 세션과 함께 띄워 두면 됩니다.
+키·프롬프트·요청 본문은 표시하지 않고, 경로 로그와 대화 원문을 수정하지 않습니다. 설정 저장은 실행기 폴더의 `openclaude.config.yaml`과 백업에 반영하며, 실행 중에는 PID 기록·집계 캐시 같은 운영 파일도 관리합니다. 대시보드는 CLI 세션과 별개 프로세스이므로 함께 띄워 두면 됩니다.
 
 ### 설정 편집과 연결 테스트
 
@@ -542,6 +573,23 @@ Sonnet 선택과 HUD의 모델·비용 표시는 실제 외부 라우팅이나 �
 | 연결 테스트 | **모델 확인**은 모델 목록만 조회하고, **추론 테스트**는 16토큰으로 1회 호출합니다(소액 과금 가능) |
 | 모델 선택 | **목록** 버튼으로 제공자 모델을 검색해 고릅니다(컨텍스트 길이·가격 표시). `GET /api/models?provider=openrouter\|local` (세션 토큰 필요, 10분 캐시) |
 | 적용 시점 | 저장한 설정은 **새 세션부터** 적용됩니다. 실행 중인 세션은 재시작하세요 |
+
+### 현재 모델 확인과 중복 선택의 범위
+
+모델 정보는 다음 네 가지를 구분해서 확인합니다.
+
+| 정보 | 확인 방법과 의미 |
+| --- | --- |
+| 설정된 모델 | 서비스 설정의 모델 ID입니다. 저장한 변경은 다음 세션에 적용됩니다 |
+| 프록시에 로드된 모델 | `/api/diagnostics`의 `session.loaded_model`입니다. 인증된 프록시가 시작 시 읽은 기본 모델이며, 다음 실행용 설정과 다를 수 있습니다 |
+| 연결 검사 모델 | 세션 시작 전 최소 추론에서 응답 모델 ID가 지정값과 일치하는지 검증합니다. 일반 모드는 실패해도 경고 후 세션을 시작할 수 있습니다 |
+| 최근 요청의 모델 | 프록시가 응답을 검증한 뒤 남긴 라우팅 기록입니다. 대시보드의 실제 사용 모델은 이 기록을 기준으로 합니다 |
+
+실행 중인 Claude Code의 `/model` 선택값을 대시보드가 실시간으로 읽지는 않습니다. 세션이 없거나 아직 요청을 보내지 않았다면 설정값·과거 기록만으로 현재 모델에 연결됐다고 판단하면 안 됩니다. **모델 확인**은 목록 조회이고 **추론 테스트**와는 다릅니다.
+
+실행기는 기본적으로 OpenRouter 세션에 경로 로그·메트릭 파일 경로를 설정합니다. Local 세션에서는 과거 OpenRouter 라우팅 기록이 남아 보일 수 있으므로, 현재 로드 모델은 `session.loaded_model`, 최근 기록의 소속은 `last_route.current_session`으로 구분하세요. 구버전 프록시가 모델을 보고하지 않거나 민감값이라 생략된 경우에는 로드 모델이 `null`입니다.
+
+모델 선택 목록에서는 같은 서비스의 **동일한 모델 ID를 한 번만** 표시합니다. 앞뒤 공백을 제거한 ID가 같으면 첫 항목의 메타데이터를 유지하며, 대소문자나 `:latest` 같은 접미사가 다른 ID는 임의로 합치지 않습니다. 항목 선택은 입력칸만 채우고, 저장 버튼을 눌러야 설정이 바뀝니다. 요청별 기본·대체 제공자 선택과 별칭 충돌 검사도 적용됩니다. 같은 모델 이름을 가진 서로 다른 서버나 여러 세션의 실행 자체를 금지하는 기능은 아닙니다.
 
 ### CLI 감지와 연결 테스트 (진단 전용)
 
@@ -574,7 +622,7 @@ Sonnet 선택과 HUD의 모델·비용 표시는 실제 외부 라우팅이나 �
 python routeDashboard.py --status           # 한 줄 JSON + 종료 코드
 python routeDashboard.py --status --pretty  # 읽기 좋게
 python routeDashboard.py --status --usage    # 토큰·비용까지 집계(느림)
-python routeDashboard.py --status --offline  # OpenRouter 호출 생략
+python routeDashboard.py --status --offline  # 외부 호출·현재 프록시 확인 생략, 저장된 기록만 조회
 ```
 
 | 종료 코드 | 의미 |
@@ -589,6 +637,50 @@ python routeDashboard.py --status --offline  # OpenRouter 호출 생략
 실행 중인 프록시는 자체 카운터를 `GET /api/metrics`로 제공합니다(같은 세션 토큰 필요, 127.0.0.1 전용). 요청 수, 외부·Plan 경로 분포, p50/p95 지연, 재시도·스트림·회로 횟수, 송수신 바이트를 담습니다. 대시보드는 인수인계 파일의 토큰으로 이 응답을 확인한 경우에만 **현재 세션**으로 표시하며, 인증된 응답의 카운터를 사용합니다. 토큰·포트·PID는 설정 응답에 포함하지 않습니다.
 
 `.proxy-metrics.json`에 남은 카운터도 볼 수 있지만, 현재 프록시가 확인되지 않으면 **지난 실행 기록**으로 표시하고 현재 세션의 실패·지연 인사이트에 사용하지 않습니다. `proxy_stale`은 마지막 프록시 시작 로그의 코드와 현재 소스가 다른지를 뜻합니다. 이 값만으로 구버전 프록시가 지금 실행 중이라고 판단하지 않습니다.
+
+### AI 디버깅용 상태 점검 API
+
+**`GET http://127.0.0.1:8787/api/diagnostics`**는 AI와 스크립트가 읽을 수 있는 버전 지정 JSON을 반환합니다. 대시보드가 실행 중이어야 합니다. 루프백·Host 검사를 적용하며, 비밀값을 제외한 진단 조회에는 세션 토큰이 필요하지 않습니다.
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8787/api/diagnostics | ConvertTo-Json -Depth 8
+# 또는
+curl.exe --fail --silent http://127.0.0.1:8787/api/diagnostics
+```
+
+이 조회는 설정을 수정하거나 외부 API·추론을 호출하지 않습니다. 현재 프록시가 있으면 인수인계 토큰으로 로컬 `/api/metrics`를 한 번 확인하고, 그 응답과 설정·라우팅 기록·기존 화면 캐시의 상태를 조합합니다. 토큰·키·서버 주소·파일 경로·PID·프롬프트·본문·원문 예외는 반환하지 않습니다. 모델 값에 URL·절대 경로·민감값이 포함되면 모델도 `null`, 상태는 `redacted`로 표시합니다.
+
+| 필드 | AI가 확인할 내용 |
+| --- | --- |
+| `schema_version` | 현재 `1`; 응답 형식을 식별하는 버전 |
+| `status` | `ok`, `degraded`, `error`; 진단 요청 성공 여부와 별개인 구성요소 상태 |
+| `checks[]` | `component`, `status`, 기계 판독용 `code`, 권장 조치 코드 `action` |
+| `configuration` | 저장된 기본값, 다음 실행 서비스, 설정된 모델, 서비스별 설정 완성 여부 |
+| `session` | 인증된 프록시의 존재와 실제 로드된 기본 모델, 대체 제공자, Plan fallback 정책 |
+| `last_route` | 최근 요청의 모델·시각·경과 시간과 현재 세션에 속하는지 여부 |
+| `metrics` | 현재 프록시의 요청·실패·재시도·회로 개방 누적 수; 과거 파일을 현재 수치로 사용하지 않음 |
+| `snapshot` | 화면 캐시의 존재, 마지막 성공 갱신 후 경과 초, 갱신 오류 유무 |
+| `next_check` | 별도 인증이 필요한 모델 목록 점검 요청 정보; 자동 실행하지 않음 |
+
+AI는 다음 코드로 원인과 조치를 구분할 수 있습니다.
+
+| 코드 | 의미 / 조치 |
+| --- | --- |
+| `configuration_incomplete` / `routing_configuration_invalid` | 설정이 없거나 잘못됨; 설정 화면 확인 |
+| `provider_choice_required` | 기본값 없이 두 서비스가 설정됨; 기본 서비스 저장 |
+| `session_not_running` | 현재 프록시가 확인되지 않음; 세션 실행. 대시보드 자체의 장애를 뜻하지 않음 |
+| `proxy_model_matches_settings` | 프록시가 보고한 로드 모델과 현재 설정이 같음; 외부 추론 성공 증거는 아님 |
+| `model_settings_changed` | 설정 모델과 로드된 모델이 다름; 같은 실행 모드를 유지하며 세션 재시작 |
+| `proxy_model_unreported` / `proxy_model_redacted` | 구버전 프록시가 모델을 보고하지 않거나 민감값이라 생략됨; 설정값으로 추정하지 않음 |
+| `proxy_provider_mismatch` | 인수인계 기록과 프록시가 보고한 제공자가 다름; 세션 상태 확인 후 같은 모드로 재시작 |
+| `upstream_not_checked` | 이 요청에서는 외부 모델 연결을 검사하지 않음; 오류와 구분 |
+| `snapshot_building` | 최초 화면 집계가 아직 완료되지 않음; 잠시 후 다시 조회 |
+| `snapshot_refresh_failed` / `snapshot_stale` | 화면 갱신 실패 또는 마지막 성공 후 30초 초과; 프록시 상태와 따로 확인 |
+| `request_failures_recorded` | 현재 프록시에 실패 요청이 누적됨; 최근 라우팅과 별도 연결 검사 확인 |
+
+진단 JSON 생성에 성공하면 구성요소에 오류가 있어도 **HTTP 200**을 반환하므로 AI는 본문의 `status`와 `checks`를 확인해야 합니다. 잘못된 Host는 403, 진단 처리 자체의 실패는 500과 고정 오류 코드 `diagnostics_failed`를 반환합니다. 구버전 프록시에는 로드 모델이 없을 수 있으며, 이 경우 `session.loaded_model`은 `null`입니다. `session.plan_fallback`은 라우팅 정책으로, 스트리밍 전달이 시작된 뒤에도 fallback을 보장한다는 뜻은 아닙니다.
+
+연결 검사가 필요하면 기존 **`POST /api/test`**에 `{"provider":"local","mode":"metadata"}`를 보내 모델 목록만 조회할 수 있습니다. 이 요청은 페이지의 `x-dashboard-token` 인증이 필요합니다. 실제 추론은 별도의 `mode:"inference"` 요청이며 호출 비용이 발생할 수 있습니다. 진단 API의 `ok`와 로컬 프록시 응답만으로 외부 추론까지 성공했다고 판단하지 마세요.
 
 ### 설정·실행기·프록시·대시보드의 연결 기준
 
@@ -660,21 +752,22 @@ CLI는 포트를 바꾸지 않으므로 재연결만 하면 계속 동작합니�
 공개 저장소에는 개인 PC 구성, 계정 사용량, 청구 내역, 실제 세션 로그를 보관하지 않습니다. 아래 명령은 합성 데이터와 로컬 모의 서버로 검사하며 외부 모델을 호출하지 않습니다.
 
 ```powershell
+$env:CLAUDE_CHEAT_LIVE = '0'               # 기본 검증에서는 실제 CLI·제공자 추론을 비활성화
 node --test tests/*.test.mjs
 python -m unittest discover -s tests -p 'test_*.py' -v
 python openrouterAdvisor.py --self-test
 node --check claudeRouteProxy.mjs
 node tests/simulate.mjs --soak 3000        # 합성 트래픽·장기 세션·메모리
 node tests/fuzz.mjs --iterations 2000      # 프록시 퍼징(결정적 시드)
-python -m unittest tests.test_fuzz_dashboard   # 대시보드 퍼징
+python -m unittest discover -s tests -p test_fuzz_dashboard.py  # 대시보드 퍼징
 python tests/live_smoke.py --dry-run       # 설정 존재 여부만 확인(무과금)
 ```
 
 - Windows 프로세스 트리 테스트(`test_local_lifecycle`)와 동시성 스트레스(`test_dashboard_concurrency`)는 **기본 스위트에서 건너뜁니다**. 실제 프로세스 트리를 띄우거나 서버에 12스레드를 걸기 때문에 느리고 부하에 민감합니다. 필요할 때만 `$env:CLAUDE_CHEAT_SLOW = '1'`로 켜세요.
 - 프로세스 트리 테스트는 **Git Bash**가 필요합니다. `C:\Windows\System32\bash.exe`(WSL)는 Windows 파이썬 경로를 실행하지 못해 자동으로 건너뜁니다.
 - 대시보드는 **Host 허용목록**(127.0.0.1·localhost·::1)으로 DNS 리바인딩을 막고, `nosniff`·`no-referrer`·`frame-ancestors DENY`(X-Frame-Options) 헤더를 보냅니다. 쓰기 API는 세션 토큰 + 동일 출처를 함께 요구합니다.
-- 실제 제공자 호출은 기본 스위트에서 제외되어 있습니다. 설정 변경 후 한 번 확인하려면 `python tests/live_smoke.py`(16토큰, 약 1회 0.01센트 미만)를 사용하세요.
-- 실행기에는 **비대화형 `--print "프롬프트"`** 모드가 있습니다(기본 JSON 출력, `--print-text`로 사람용). `python openrouterAdvisor.py --print "Reply with exactly OK"` 또는 `$env:CLAUDE_CHEAT_LIVE = '1'; python -m unittest tests.test_cli_integration`은 실제 CLI·제공자를 호출하며 비용이 발생할 수 있습니다.
+- 실제 제공자 추론은 기본 스위트에서 제외되어 있습니다. 설정 변경 후 한 번 확인하려면 `python tests/live_smoke.py`를 사용할 수 있으며, 실제 호출과 모델 요금 정책에 따라 비용이 발생합니다.
+- 실행기에는 **비대화형 `--print "프롬프트"`** 모드가 있습니다(기본 JSON 출력, `--print-text`로 사람용). `python openrouterAdvisor.py --print "Reply with exactly OK"` 또는 `$env:CLAUDE_CHEAT_LIVE = '1'; python -m unittest discover -s tests -p test_cli_integration.py`는 실제 CLI·제공자를 호출하며 비용이 발생할 수 있습니다.
 - `node --test tests/cli_smoke.test.mjs`는 합성 CLI·모의 제공자로 실험용 스모크 하네스만 검증합니다. 별도 `node tests/cli_smoke.mjs`는 사용자 설정과 실제 CLI·제공자를 사용하는 **실험용 유료 가능 검사**이며 실제 호환성은 미검증입니다. Windows의 `.cmd` 셸 래퍼 실행은 지원하지 않으며, 시간 초과 시 직접 자식 프로세스만 종료하므로 손자 프로세스 정리는 보장하지 않습니다.
 
 검사 대상은 요청·응답 보존, 인증 격리, 도구 결과 왕복, 최초 요청과 재시도 3회, Plan fallback, 회로 복구, 취소·타임아웃·빈 응답 처리입니다. 합성 테스트 통과를 실제 서비스나 모든 Claude Code 기능의 통과로 해석하면 안 됩니다.
@@ -743,21 +836,25 @@ python tests/bench_dashboard.py            # 10MB 로그 · 2,000개 세션 파�
 - 미지원 네이티브 기능이나 서명된 이력이 있으면 Plan 경로를 사용합니다. 따라서 외부 모델 사용률이 0%일 수 있고, 같은 대화에서 외부 경로로 돌아오지 못할 수도 있습니다.
 - 외부 추론의 네이티브 advisor만 별도로 구독 경로에서 실행하는 기능은 구현하지 않았습니다. custom `ANTHROPIC_BASE_URL`에서 원격 managed settings·organization policy를 포함한 모든 네이티브 기능의 동등성을 보장하지 않습니다.
 - 요청 본문은 32MiB로 제한하며 초과 시 fallback 전에 HTTP 413을 반환합니다. 버전이 숫자로 시작하는 `claude-sonnet-*`, `claude-opus-*`, `claude-haiku-*`, `claude-fable-*`, 설정한 OpenRouter 모델 ID와 과거 클라이언트 모델 별칭을 허용하며, 미등록 모델은 HTTP 403으로 거부합니다.
-- 경로는 POST `/v1/messages`, `/v1/messages/count_tokens`(선택적 `?beta=true`)와 로컬 확인 HEAD `/api/hello`만 허용합니다. 다른 경로는 구독으로 우회하지 않고 거부합니다.
+- 프록시의 추론 경로는 POST `/v1/messages`, `/v1/messages/count_tokens`(선택적 `?beta=true`)입니다. 같은 세션 토큰이 필요한 HEAD `/api/hello`, GET `/api/metrics`, POST `/api/handover`도 제공합니다. 그 밖의 프록시 경로는 구독으로 우회하지 않고 거부합니다. 대시보드의 `/api/diagnostics` 등은 별도 대시보드 포트에서 제공합니다.
 - 사용자 지정 `CLAUDE_CONFIG_DIR`는 유지하되, 미설정 또는 과거 전용 `~/.claude-openrouter`이면 자식에서 `~/.claude`를 사용합니다. 과거 폴더의 MCP·플러그인을 자동 이전하거나 폴더를 복사·삭제하지 않습니다.
 - Local·compat 격리 세션의 임의 토큰(nonce)은 Claude Code 프로세스의 `--settings` 인자와 환경변수에 들어갑니다. 같은 사용자 권한의 프로세스(명령줄을 수집하는 EDR·감사 도구 포함)가 읽을 수 있고, 유출되면 해당 세션 동안 로컬 프록시를 통해 OpenRouter/Local 사용량을 소비할 수 있습니다. 세션마다 새로 생성하며 `127.0.0.1`에만 바인드합니다. Plan 접근 권한은 주지 않습니다.
-- OpenRouter 응답은 `id`·`role=assistant`·토큰 `usage`가 없거나 SSE `event:` 이름이 JSON `type`과 다르면 거부(재시도 후 Plan)합니다. 기본 모델에서 2026-10-24 실호출로 이 형태를 확인했고(스트림·비스트림 각 1회), 다른 모델은 확인하지 못했습니다. Local 응답에는 메타데이터 형태를 강제하지 않으며 `event:` 이름 일치만 확인합니다.
+- 두 제공자 모두 응답 모델 ID·콘텐츠·종료 사유를 검증합니다. OpenRouter에는 `id`·`role=assistant`·토큰 `usage`도 요구하며, SSE `event:` 이름과 JSON `type`이 다르면 거부합니다. 일반 Local과 Local 호환 모드는 OpenRouter 전용 메타데이터 요구를 적용하지 않지만 공통 검증은 유지합니다. Local 전용 모드에서 JSON을 CLI용 스트림으로 변환할 때는 메타데이터도 요구합니다. 2026-10-24 실호출 결과는 당시 검증한 모델의 기록이며 다른 모델의 호환성을 보장하지 않습니다.
 - `claude`가 npm 설치의 `.cmd`/`.bat` shim으로 해석되면 격리 모드(Local·OpenRouter compat)는 경고를 출력합니다. cmd.exe가 shim을 거치는 인자의 따옴표·`&`·`%`를 잘못 해석할 가능성이 있으나 실제 재현은 하지 못했습니다. 네이티브 `claude.exe` 설치를 권장합니다.
 - HTTP 429가 발생하면 해당 계정의 Usage 화면과 응답을 직접 확인해야 합니다. 특정 계정의 한도·초기화 일정은 저장소에서 관리하지 않습니다.
 
 일반적인 검증 절차는 [연결·장애 복구 점검](docs/LIVE-VALIDATION.ko.md)을 참고하세요.
 
-## 9. 파일 구성과 라이선스
+## 10. 파일 구성과 라이선스
 
 | 파일 | 역할 |
 | --- | --- |
 | [OpenClaude.ps1](OpenClaude.ps1) | 제공자 선택과 Python 실행기 호출 |
+| [OpenClaudeDashboard.ps1](OpenClaudeDashboard.ps1) | 대시보드·설정 화면 실행 |
+| [installLauncher.ps1](installLauncher.ps1) | 다른 폴더에서 사용할 전역 실행기 설치·갱신 |
 | [openrouterAdvisor.py](openrouterAdvisor.py) | Plan 인증 검사·환경 격리·프록시 수명 관리·Local 목록 점검 |
+| [routeConfig.py](routeConfig.py) | 통합 설정 읽기·검증·원자적 저장·백업 |
+| [routeDashboard.py](routeDashboard.py) | 상태 화면·설정·모델 목록·AI 진단 API |
 | [localProcessTree.py](localProcessTree.py) | Windows Local 전용 진입점의 Job 소유권·프로세스 트리 종료 감시 |
 | [claudeRouteProxy.mjs](claudeRouteProxy.mjs) | 모델별 라우팅·응답 검증·재시도·fallback·복구 |
 | [openclaude.config.example.yaml](openclaude.config.example.yaml) | 키가 없는 통합 설정 예제 (OpenRouter·Local) |
@@ -765,6 +862,9 @@ python tests/bench_dashboard.py            # 10MB 로그 · 2,000개 세션 파�
 | [tests/claudeRouteProxy.test.mjs](tests/claudeRouteProxy.test.mjs) | 프록시 합성 회귀 검사 |
 | [tests/localLlmIntegration.test.mjs](tests/localLlmIntegration.test.mjs) | loopback HTTP 서버를 사용하는 합성 통합 검사 |
 | [tests/test_local_config.py](tests/test_local_config.py) | Local 설정과 메타데이터 점검 검사 |
+| [tests/test_route_dashboard.py](tests/test_route_dashboard.py) | 설정·진단 API·모델 중복 제거·실제 로컬 프록시 연동 검사 |
+| [tests/dashboard_dom.test.mjs](tests/dashboard_dom.test.mjs) | 실제 생성 페이지의 JavaScript 동작 검사 |
+| [tests/metrics.test.mjs](tests/metrics.test.mjs) | 프록시의 로드 모델·메트릭·민감값 제외 검사 |
 | [tests/test_local_lifecycle.py](tests/test_local_lifecycle.py) | Windows 합성 CLI·실행기 강제 종료 후 프록시·연결 정리 검사 |
 | [docs/HISTORY.ko.md](docs/HISTORY.ko.md) | 이전 구현·진단 기록; 현재 정책과 구분 |
 
