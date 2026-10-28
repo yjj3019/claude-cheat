@@ -40,8 +40,6 @@ if ($Help) {
     & python (Join-Path $PSScriptRoot 'openrouterAdvisor.py') --help
     exit $LASTEXITCODE
 }
-$previousStream = $env:ROUTE_STREAM_PASSTHROUGH
-if ($Stream) { $env:ROUTE_STREAM_PASSTHROUGH = '1' }
 $ErrorActionPreference = 'Stop'
 # -Setup only opens the dashboard settings page; it never writes .env files or starts a session.
 if ($Setup) {
@@ -63,7 +61,9 @@ if ($CliArgs.Count -gt 0) {
     $nativeArgsEncoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($nativeArgsJson))
     $routeArgs += @('--cli-args-b64', $nativeArgsEncoded)
 }
+$previousStream = $env:ROUTE_STREAM_PASSTHROUGH
 try {
+    if ($Stream) { $env:ROUTE_STREAM_PASSTHROUGH = '1' }
     & python (Join-Path $PSScriptRoot 'openrouterAdvisor.py') @routeArgs
     $routeExit = $LASTEXITCODE
 } finally {

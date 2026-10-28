@@ -25,6 +25,23 @@ function sse(frames, { delayMs = 0 } = {}) {
   }), { headers: { 'content-type': 'text/event-stream' } });
 }
 
+for (const config of [
+  { provider: 'local', localOnly: true, localUrl: 'http://127.0.0.1:9/v1/messages', localModel: 'fixture' },
+  { provider: 'openrouter', openrouterCompat: true, key: 'fixture', openrouterModel: MODEL },
+]) {
+  test(`isolated ${config.provider} proxy refuses old clients' takeover before draining`, async t => {
+    const server = createProxy({ ...config, nonce: NONCE });
+    await listenSafe(server);
+    t.after(() => { server.closeAllConnections(); server.close(); });
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const headers = { 'x-local-route-token': NONCE };
+    const result = await fetch(base + '/api/handover', { method: 'POST', headers });
+    assert.equal(result.status, 409);
+    const metrics = await fetch(base + '/api/metrics', { headers });
+    assert.equal(metrics.status, 200);
+  });
+}
+
 test('a drain that hits the cap reverts and keeps serving instead of cutting the turn', async t => {
   // Cleanup runs even when an assertion fails: a leaked interval would pin the event loop.
   const disposables = [];

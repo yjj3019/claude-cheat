@@ -246,6 +246,15 @@ class ChildEnv(unittest.TestCase):
 
 
 class RunSafely(FakeCase):
+    @unittest.skipUnless(os.name == "nt", "Windows job assignment required")
+    def test_tracking_failure_rejects_diagnostic_and_terminates_root(self):
+        with mock.patch.object(rc.localProcessTree, "create_job_for", return_value=None), \
+                mock.patch.object(rc.localProcessTree, "kill_owned_tree", wraps=rc.localProcessTree.kill_owned_tree) as kill:
+            with self.assertRaises(rc.CliError) as caught:
+                self.run_fake("tree_slow", timeout=5)
+        self.assertEqual(caught.exception.code, "process_tracking_unavailable")
+        kill.assert_called_once()
+
     def test_success(self):
         result = self.run_fake("ok")
         self.assertEqual((result["exit_code"], result["timed_out"], result["truncated"]), (0, False, False))

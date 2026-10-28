@@ -200,25 +200,29 @@ def _parse_route_log_unlocked(path=None, limit=5000, incremental=True):
     state = _ROUTE_TAIL
     try:
         with path.open("rb") as handle:
+            info = os.fstat(handle.fileno())
+            identity = (info.st_dev, info.st_ino) if info.st_ino else None
             prefix = handle.read(256)
             digest = hashlib.sha256(prefix).hexdigest()
             # A rewritten or rotated file keeps its byte length often enough that size
             # alone cannot tell it apart from an append; the leading bytes can.
             if (incremental and state["path"] == path_key and state["digest"] == digest
+                    and (identity is None or state.get("identity") is None or state["identity"] == identity)
                     and state["offset"] <= info.st_size):
                 start = state["offset"]
+                skip_partial = False
             else:
                 # A cold read only needs the tail: a log that grew for weeks must not be
                 # parsed in full on every dashboard start.
                 start = max(0, info.st_size - ROUTE_TAIL_BYTES) if info.st_size > ROUTE_TAIL_BYTES else 0
                 skip_partial = start > 0
+                if skip_partial:
+                    handle.seek(start - 1)
+                    skip_partial = handle.read(1) != b"\n"
                 state["events"] = []
-            skip_partial = start > len(prefix)
-            if skip_partial:
-                handle.seek(start)
-                chunk = handle.read()
-            else:
-                chunk = prefix[start:] + handle.read()
+                state["offset"] = start
+            handle.seek(start)
+            chunk = handle.read()
             if skip_partial and chunk:
                 # The tail almost certainly starts mid-line; drop that fragment but keep the
                 # offset absolute so the next refresh stays incremental.
@@ -233,7 +237,7 @@ def _parse_route_log_unlocked(path=None, limit=5000, incremental=True):
     if chunk:
         end = chunk.rfind(b"\n")
         if end < 0:
-            state.update({"path": path_key, "digest": digest})
+            state.update({"path": path_key, "digest": digest, "identity": identity})
             return list(state["events"])
         complete = chunk[: end + 1]
         for raw in complete.splitlines():
@@ -242,7 +246,7 @@ def _parse_route_log_unlocked(path=None, limit=5000, incremental=True):
                 state["events"].append(parsed)
         state["events"] = state["events"][-limit:]
         start += len(complete)
-    state.update({"path": path_key, "digest": digest, "offset": start})
+    state.update({"path": path_key, "digest": digest, "identity": identity, "offset": start})
     return list(state["events"])
 
 
@@ -2404,12 +2408,12 @@ def _refresh_loop(interval):
             _SNAPSHOT["at"] = time.monotonic()
             _SNAPSHOT["error"] = None
         except Exception as error:  # a broken snapshot must never freeze the page silently
-            _SNAPSHOT["error"] = {"message": f"{type(error).__name__}: {error}",
+            # Exception text can contain credentials, paths or provider response bodies.
+            _SNAPSHOT["error"] = {"message": "Snapshot refresh failed",
                                   "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-            if _SNAPSHOT.get("reported") != str(error):
-                _SNAPSHOT["reported"] = str(error)
-                import traceback
-                traceback.print_exc()
+            if _SNAPSHOT.get("reported") != type(error).__name__:
+                _SNAPSHOT["reported"] = type(error).__name__
+                print("Snapshot refresh failed (" + type(error).__name__ + ")", file=sys.stderr)
         time.sleep(interval)
 
 

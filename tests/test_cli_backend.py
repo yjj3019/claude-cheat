@@ -213,6 +213,201 @@ class BackendTest(unittest.TestCase):
             connection.close()
             self.assertTrue(stopped.wait(3))
 
+    def test_shutdown_closes_incomplete_request_headers(self):
+        instance = self.construct()
+        manager = backend.serve({})
+        self.enterContext(patch.object(backend, "HEADER_TIMEOUT_SECONDS", .5))
+        accepted = threading.Event()
+        original_setup = backend.BaseHTTPRequestHandler.setup
+        def mark_setup(handler):
+            original_setup(handler)
+            accepted.set()
+        self.enterContext(patch.object(backend.BaseHTTPRequestHandler, "setup", mark_setup))
+        with patch.object(backend, "Backend", return_value=instance):
+            _, url, _ = manager.__enter__()
+        parsed = urlsplit(url)
+        client = socket.create_connection((parsed.hostname, parsed.port), timeout=3)
+        client.sendall(b"POST /v1/messages HTTP/1.1\r\nHost: localhost\r\n")
+        # Ensure the handler has accepted the connection before measuring shutdown.
+        self.assertTrue(accepted.wait(3))
+        done = threading.Event()
+        errors = []
+        def close():
+            try:
+                manager.__exit__(None, None, None)
+            except Exception as error:
+                errors.append(error)
+            finally:
+                done.set()
+        thread = threading.Thread(target=close, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(done.wait(3), "incomplete headers prevented server shutdown")
+        finally:
+            client.close()
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_shutdown_cancels_slow_drip_headers_and_body(self):
+        for phase in ("headers", "body"):
+            with self.subTest(phase=phase):
+                instance = self.construct()
+                manager = backend.serve({})
+                with patch.object(backend, "Backend", return_value=instance):
+                    _, url, token = manager.__enter__()
+                parsed = urlsplit(url)
+                client = socket.create_connection((parsed.hostname, parsed.port), timeout=3)
+                stop, done = threading.Event(), threading.Event()
+                errors = []
+                if phase == "headers":
+                    initial = b"POST /v1/messages HTTP/1.1\r\nHost: local"
+                else:
+                    initial = (f"POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: 10000\r\n\r\n{{").encode()
+                client.sendall(initial)
+                def drip():
+                    while not stop.wait(.05):
+                        try:
+                            client.sendall(b" ")
+                        except OSError:
+                            return
+                sender = threading.Thread(target=drip, daemon=True)
+                sender.start()
+                time.sleep(.3)
+                def close():
+                    try:
+                        manager.__exit__(None, None, None)
+                    except Exception as error:
+                        errors.append(error)
+                    finally:
+                        done.set()
+                closer = threading.Thread(target=close, daemon=True)
+                closer.start()
+                try:
+                    self.assertTrue(done.wait(3), "slow client prevented shutdown")
+                finally:
+                    stop.set()
+                    client.close()
+                    sender.join(3)
+                    closer.join(3)
+                self.assertEqual(errors, [])
+                self.assertFalse(closer.is_alive())
+
+    def test_shutdown_interrupts_backpressured_response(self):
+        ready = threading.Event()
+        instance = mock_instance = self.construct()
+        def generate(*_):
+            ready.set()
+            return ({"text": "x" * (16 * 1024 * 1024)}, {})
+        instance.generate = generate
+        manager = backend.serve({})
+        with patch.object(backend, "Backend", return_value=mock_instance):
+            _, url, token = manager.__enter__()
+        parsed = urlsplit(url)
+        client = socket.create_connection((parsed.hostname, parsed.port), timeout=3)
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        wire = json.dumps(request()).encode()
+        client.sendall((f"POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: {len(wire)}\r\n\r\n").encode() + wire)
+        self.assertTrue(ready.wait(3))
+        time.sleep(.3)
+        done, errors = threading.Event(), []
+        def close():
+            try:
+                manager.__exit__(None, None, None)
+            except Exception as error:
+                errors.append(error)
+            finally:
+                done.set()
+        closer = threading.Thread(target=close, daemon=True)
+        closer.start()
+        try:
+            self.assertTrue(done.wait(3), "backpressured writer prevented shutdown")
+        finally:
+            client.close()
+            closer.join(5)
+        self.assertFalse(closer.is_alive())
+        self.assertEqual(errors, [])
+
+    def test_ambiguous_and_truncated_request_framing_is_rejected(self):
+        instance = self.construct()
+        with patch.object(backend, "Backend", return_value=instance), backend.serve({}) as (_, url, token):
+            parsed = urlsplit(url)
+            body = json.dumps(request()).encode()
+            for headers, wire in ((f"Content-Length: {len(body)}\r\nContent-Length: {len(body)}\r\n", body),
+                                  (f"Content-Length: {len(body)}\r\nTransfer-Encoding: chunked\r\n", body),
+                                  (f"Content-Length: +{len(body)}\r\n", body),
+                                  ("Content-Length: 1_0\r\n", body),
+                                  (f"Content-Length: {len(body) + 5}\r\n", body)):
+                with self.subTest(headers=headers):
+                    connection = socket.create_connection((parsed.hostname, parsed.port), timeout=3)
+                    try:
+                        connection.sendall((f"POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n{headers}\r\n").encode() + wire)
+                        connection.shutdown(socket.SHUT_WR)
+                        response = b""
+                        while chunk := connection.recv(4096):
+                            response += chunk
+                        self.assertIn(b" 400 ", response)
+                    finally:
+                        connection.close()
+
+    def test_slow_drip_request_has_absolute_deadline(self):
+        for phase in ("headers", "body"):
+            with self.subTest(phase=phase), patch.object(backend, "HEADER_TIMEOUT_SECONDS", .6), \
+                    patch.object(backend, "BODY_TIMEOUT_SECONDS", .6):
+                instance = self.construct()
+                with patch.object(backend, "Backend", return_value=instance), backend.serve({}) as (_, url, token):
+                    parsed = urlsplit(url)
+                    client = socket.create_connection((parsed.hostname, parsed.port), timeout=3)
+                    client.settimeout(3)
+                    if phase == "headers":
+                        initial = b"POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nX-Drip: "
+                    else:
+                        initial = (f"POST /v1/messages HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: 10000\r\n\r\n{{").encode()
+                    client.sendall(initial)
+                    stop = threading.Event()
+                    def drip():
+                        while not stop.wait(.05):
+                            try:
+                                client.sendall(b"x")
+                            except OSError:
+                                return
+                    sender = threading.Thread(target=drip, daemon=True)
+                    sender.start()
+                    try:
+                        try:
+                            result = client.recv(1024)
+                        except (ConnectionAbortedError, ConnectionResetError):
+                            result = b""
+                        self.assertEqual(result, b"")
+                    finally:
+                        stop.set()
+                        client.close()
+                        sender.join(3)
+
+    def test_incomplete_headers_cannot_spawn_unbounded_connections(self):
+        instance = self.construct()
+        self.enterContext(patch.object(backend, "MAX_CONNECTIONS", 1))
+        self.enterContext(patch.object(backend, "HEADER_TIMEOUT_SECONDS", 2))
+        with patch.object(backend, "Backend", return_value=instance), backend.serve({}) as (_, url, _):
+            parsed = urlsplit(url)
+            first = socket.create_connection((parsed.hostname, parsed.port), timeout=3)
+            second = None
+            try:
+                first.sendall(b"POST /v1/messages HTTP/1.1\r\nHost: localhost\r\n")
+                time.sleep(.2)
+                second = socket.create_connection((parsed.hostname, parsed.port), timeout=3)
+                second.settimeout(3)
+                second.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                try:
+                    response = second.recv(1024)
+                except (ConnectionResetError, ConnectionAbortedError):
+                    response = b""
+                self.assertEqual(response, b"", "excess connection should be closed")
+            finally:
+                first.close()
+                if second:
+                    second.close()
+
     def test_loopback_accepts_only_four_concurrent_generations(self):
         release = threading.Event()
         entered = threading.Condition()

@@ -5,6 +5,7 @@ import json
 import importlib.util
 import os
 import runpy
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -25,6 +26,19 @@ class OpenRouterConfigTests(unittest.TestCase):
     def write(self, model="fixture/model-a", key="sk-or-synthetic-key"):
         (self.root / ".env.openrouter").write_text(
             f"ANTHROPIC_AUTH_TOKEN={key}\nOPENROUTER_MODEL={model}\n", encoding="utf-8")
+
+    def test_self_test_isolated_from_existing_settings_and_environment(self):
+        (self.root / "openclaude.config.yaml").write_text("invalid: [\n", encoding="utf-8")
+        os.environ.update(MAX_THINKING_TOKENS="42", CLAUDE_CONFIG_DIR=str(self.root / "custom"),
+                          CLAUDE_CODE_DISABLE_ADVISOR_TOOL="1")
+        before = dict(os.environ)
+        production_handoff = mock.Mock()
+        production_handoff.read_text.side_effect = AssertionError("self-test read the real handoff")
+        with mock.patch.object(route, "HANDOFF_FILE", production_handoff), \
+                mock.patch.dict(sys.modules, {route.__name__: route}), contextlib.redirect_stdout(io.StringIO()):
+            route.self_test()
+        production_handoff.read_text.assert_not_called()
+        self.assertEqual(dict(os.environ), before)
 
     def test_explicit_provider_models_and_suffixes_are_not_deepseek_specific(self):
         for model in ("vendor-a/model-a", "vendor-b/model-b:free", "~vendor-c/latest", "@preset/code"):

@@ -123,7 +123,7 @@ async function fixture(t, upstream = jsonResponse, config = {}) {
     fetch(base + path, { method, signal, headers: { 'content-type': 'application/json',
       'x-local-route-token': NONCE, ...headers },
     ...(method === 'HEAD' || method === 'GET' ? {} : { body: raw ?? JSON.stringify(body) }) });
-  return { calls, request };
+  return { calls, request, server };
 }
 
 async function consume(request) {
@@ -1566,6 +1566,41 @@ test('stalled Plan error body honors timeout and cancels its reader', { timeout:
   assert.equal(response.status, 502);
   await response.text();
   assert.equal(cancelled, true);
+});
+
+test('Plan timeout closes a downstream response stuck on backpressure', { timeout: 2500 }, async t => {
+  let cancelled = false, signal;
+  const stalled = new Response(new ReadableStream({
+    start(controller) { controller.enqueue(new Uint8Array(1024)); },
+    cancel() { cancelled = true; },
+  }));
+  const { request, server } = await fixture(t, (_url, options) => { signal = options.signal; return stalled; },
+    { planIdleMs: 80, planHeaderMs: 500 });
+  let forced = false, closed;
+  const closedPromise = new Promise(resolve => { closed = resolve; });
+  server.prependListener('request', (_req, res) => {
+    const write = res.write.bind(res);
+    res.write = (...args) => { forced = true; write(...args); return false; };
+    res.once('close', closed);
+  });
+  const response = await request(requestBody(OPUS, { stream: true }), { headers: proHeaders });
+  await assert.rejects(response.text());
+  assert.equal(forced, true);
+  assert.equal(signal.aborted, true);
+  assert.equal(cancelled, true);
+  await closedPromise;
+});
+
+test('Plan successful stream timeout does not await stuck cancellation', { timeout: 2500 }, async t => {
+  let cancelCalled = false;
+  const stalled = new Response(new ReadableStream({
+    start(controller) { controller.enqueue(new TextEncoder().encode('event: ping\n\n')); },
+    cancel() { cancelCalled = true; return new Promise(() => {}); },
+  }), { headers: { 'content-type': 'text/event-stream' } });
+  const { request } = await fixture(t, () => stalled, { planIdleMs: 40, planHeaderMs: 80 });
+  const response = await request(requestBody(OPUS, { stream: true }), { headers: proHeaders });
+  assert.match(await response.text(), /upstream stream failed/);
+  assert.equal(cancelCalled, true);
 });
 
 test('Plan error timeout does not await a stuck source cancellation', { timeout: 2500 }, async t => {

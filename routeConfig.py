@@ -429,16 +429,14 @@ class Store:
         time. An in-process lock alone lets both read the same text and replace it, which
         either loses one service's update or makes a replace fail with sharing contention.
         The lock lives in a sibling dot-file so it never looks like a settings file; git
-        ignores it. If the lock file cannot be created at all, saving still proceeds (the
-        single-dashboard case is the normal one) rather than turning a permission problem
-        into a new failure mode.
+        ignores it. A lock that cannot be opened fails closed: continuing without it could
+        silently overwrite a concurrent dashboard's saved settings.
         """
         lock_path = self.path.with_name("." + self.path.name + ".lock")
         try:
             handle = open(lock_path, "a+b")
         except OSError:
-            yield
-            return
+            raise ConfigError("config_busy") from None
         acquired = False
         try:
             if os.name == "nt":
@@ -504,12 +502,14 @@ class Store:
                 handle.write(text)
             if original_bytes is not None:
                 backup = self.path.with_name(self.path.name + ".bak")
-                backup.write_bytes(original_bytes)
-                if os.name != "nt":
-                    try:
-                        os.chmod(backup, 0o600)  # the previous file may contain a key
-                    except OSError:
-                        pass
+                # Open with restrictive permissions before writing credentials. Reject
+                # symlinks where supported instead of following a pre-existing backup link.
+                flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(backup, flags, 0o600)
+                with os.fdopen(descriptor, "wb") as handle:
+                    if os.name != "nt":
+                        os.fchmod(handle.fileno(), 0o600)
+                    handle.write(original_bytes)
             if not _replace_with_retry(temporary, self.path):
                 raise OSError("could not replace the settings file")
         finally:

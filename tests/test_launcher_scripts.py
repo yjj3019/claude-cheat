@@ -67,6 +67,18 @@ class LauncherEnvironmentTests(unittest.TestCase):
         self.assertIn("clean", result.stdout)
         self.assertNotIn("LEAKED", result.stdout)
 
+    def test_setup_with_stream_never_changes_the_environment(self):
+        # Run a disposable copy with a fake dashboard; setup must not launch a browser.
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "OpenClaude.ps1").write_bytes(LAUNCHER.read_bytes())
+            (root / "OpenClaudeDashboard.ps1").write_text(
+                "param([switch]$Open)\nif ($env:ROUTE_STREAM_PASSTHROUGH -ne 'original') { throw 'environment changed' }\n$global:LASTEXITCODE = 0\n", encoding="utf-8")
+            result = self.run_script("$env:ROUTE_STREAM_PASSTHROUGH = 'original'; "
+                                     f"& '{root / 'OpenClaude.ps1'}' -Setup -Stream")
+            self.assertEqual(result.returncode, 0, result.stderr[-400:])
+
     def test_stream_switch_restores_a_previous_value(self):
         result = self.run_script(
             "$env:ROUTE_STREAM_PASSTHROUGH = 'keep-me'; "

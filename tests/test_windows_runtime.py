@@ -220,7 +220,7 @@ class AtomicJsonStateTests(unittest.TestCase):
         self.temporary = self.handoff.with_suffix(self.handoff.suffix + ".tmp")
 
     def write_handoff(self):
-        route.write_handoff(port=2222, nonce="fresh", proxy_pid=2, provider="local", cli_pid=os.getpid())
+        route.write_handoff(port=2222, nonce="fresh", proxy_pid=2, provider="local", cli_pid=os.getpid(), mode="ordinary")
 
     def assert_replaced(self):
         record = json.loads(self.handoff.read_text(encoding="utf-8"))

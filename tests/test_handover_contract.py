@@ -116,11 +116,46 @@ class HandoverErrorTests(unittest.TestCase):
 
 
 class TakeoverGuardTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch.object(advisor.shutil, "which", return_value="fixture"))
+        self.enterContext(mock.patch.object(advisor, "provider_config", return_value={}))
+
+    def test_invalid_replacement_config_never_drains_existing_session(self):
+        for failure in (ValueError("private config"), OSError("private path")):
+            with self.subTest(failure=type(failure).__name__), \
+                    mock.patch.object(advisor, "read_handoff", return_value={"port": 48432, "nonce": "n", "mode": "ordinary"}), \
+                    mock.patch.object(advisor, "port_open", return_value=True), \
+                    mock.patch.object(advisor, "provider_config", side_effect=failure), \
+                    mock.patch.object(advisor, "request_handover") as handover:
+                with self.assertRaisesRegex(RuntimeError, "existing session was not changed") as caught:
+                    advisor.takeover("local")
+                self.assertNotIn("private", str(caught.exception))
+                handover.assert_not_called()
+
     def _with_running_session(self):
-        record = {"port": 48432, "nonce": "nonce"}
+        record = {"port": 48432, "nonce": "nonce", "mode": "ordinary"}
         patches = [mock.patch.object(advisor, "read_handoff", return_value=record),
                    mock.patch.object(advisor, "port_open", return_value=True)]
         return patches
+
+    def test_takeover_refuses_isolated_or_unknown_modes_before_draining(self):
+        for mode in (None, "local_only", "local_compat", "openrouter_compat", "unknown"):
+            with self.subTest(mode=mode), \
+                    mock.patch.object(advisor, "read_handoff", return_value={"port": 48432, "nonce": "n", "mode": mode}), \
+                    mock.patch.object(advisor, "request_handover") as handover:
+                with self.assertRaisesRegex(RuntimeError, "restart"):
+                    advisor.takeover("local")
+                handover.assert_not_called()
+
+    def test_takeover_rejects_incompatible_command_line_flags(self):
+        for flags in (["--local-mode", "--provider", "local"], ["--openrouter-compat"],
+                      ["--local-compat", "--provider", "local"], ["--print", "x"],
+                      ["--check-local", "--provider", "local"]):
+            with self.subTest(flags=flags), mock.patch.object(advisor, "takeover") as takeover:
+                with self.assertRaises(SystemExit) as caught:
+                    advisor.main(["--takeover", *flags])
+                self.assertEqual(caught.exception.code, 2)
+                takeover.assert_not_called()
 
     def test_takeover_stops_when_the_previous_proxy_kept_serving(self):
         patches = self._with_running_session()
@@ -139,20 +174,20 @@ class TakeoverGuardTests(unittest.TestCase):
 
     def test_takeover_refuses_a_session_without_a_token(self):
         self.enterContext(mock.patch.object(advisor, "read_handoff",
-                                            return_value={"port": 48432, "nonce": ""}))
+                                            return_value={"port": 48432, "nonce": "", "mode": "ordinary"}))
         with self.assertRaises(RuntimeError) as caught:
             advisor.takeover("openrouter")
         self.assertIn("token", str(caught.exception))
 
     def test_takeover_refuses_when_nothing_listens(self):
         self.enterContext(mock.patch.object(advisor, "read_handoff",
-                                            return_value={"port": 48432, "nonce": "n"}))
+                                            return_value={"port": 48432, "nonce": "n", "mode": "ordinary"}))
         self.enterContext(mock.patch.object(advisor, "port_open", return_value=False))
         with self.assertRaises(RuntimeError) as caught:
             advisor.takeover("openrouter")
         self.assertIn("Nothing is listening", str(caught.exception))
 
-    DUAL_RECORD = {"port": 48432, "nonce": "n", "provider": "openrouter",
+    DUAL_RECORD = {"port": 48432, "nonce": "n", "provider": "openrouter", "mode": "ordinary",
                    "dual": {"provider": "local", "alias": "claude-route-local", "model": "local-model"}}
     DUAL_WANTED = {"ROUTE_ALT_PROVIDER": "local", "ROUTE_ALT_ALIAS": "claude-route-local",
                    "ROUTE_ALT_MODEL": "local-model", "ROUTE_ALT_URL": "http://127.0.0.1:9/v1/messages",

@@ -232,8 +232,8 @@ function validContentBlock(block) {
   if (block.type === 'text') return typeof block.text === 'string';
   if (block.type === 'thinking') return typeof block.thinking === 'string';
   if (block.type === 'redacted_thinking') return typeof block.data === 'string';
-  if (block.type === 'tool_use') return typeof block.id === 'string' && typeof block.name === 'string' &&
-    block.input !== null && typeof block.input === 'object' && !Array.isArray(block.input);
+  if (block.type === 'tool_use') return typeof block.id === 'string' && block.id.trim().length > 0 &&
+    typeof block.name === 'string' && block.name.trim().length > 0 && block.input !== null && typeof block.input === 'object' && !Array.isArray(block.input);
   return false;
 }
 
@@ -499,7 +499,6 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false)
           sawThinking = true;
         }
         indices.add(event.index);
-        usable ||= usableContent(event.content_block);
         usable ||= usableContent(event.content_block);
         blocks.set(event.index, { type: event.content_block.type, json: '', hasJson: false });
       }
@@ -982,6 +981,9 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     if (!tokenMatches(req.headers['x-local-route-token'])) return reject(403, 'Local authorization required');
     if (req.method === 'HEAD' && req.url === '/api/hello') { res.writeHead(200); res.end(); return; }
     if (req.method === 'POST' && req.url === '/api/handover') {
+      // Older launchers do not preserve isolated-session flags. Never let them replace
+      // a no-Plan proxy with an ordinary proxy that could route to Plan.
+      if (noPlan) return reject(409, 'Isolated session cannot be taken over; restart the session');
       // One drain run serves every concurrent request: a duplicate POST joins the same
       // wait instead of starting a second countdown. A run that hit the cap reverts, so
       // the next POST may try again while the proxy keeps serving.
@@ -1257,11 +1259,18 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               const { done, value } = await abortable(reader.read(), plan.signal);
               client.signal.throwIfAborted();
               if (done) break;
-              if (!res.write(value)) await once(res, 'drain', { signal: client.signal });
+              if (!res.write(value)) {
+                try {
+                  await once(res, 'drain', { signal: plan.signal });
+                } catch (error) {
+                  if (plan.signal.aborted) res.destroy();
+                  throw error;
+                }
+              }
             }
           } finally {
             client.signal.removeEventListener('abort', cancel);
-            await reader.cancel().catch(() => {});
+            reader.cancel().catch(() => {});
             reader.releaseLock();
           }
         }

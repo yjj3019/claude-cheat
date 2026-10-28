@@ -142,7 +142,7 @@ class ProviderChoiceTests(unittest.TestCase):
 
     def test_takeover_auto_follows_the_live_sessions_provider(self):
         self.set_default("openrouter")
-        record = {"port": 48432, "nonce": "nonce", "provider": "local", "proxy_pid": 1}
+        record = {"port": 48432, "nonce": "nonce", "provider": "local", "proxy_pid": 1, "mode": "ordinary"}
         session = mock.MagicMock()
         session.__enter__ = mock.Mock(return_value={})
         session.__exit__ = mock.Mock(return_value=False)
@@ -150,6 +150,8 @@ class ProviderChoiceTests(unittest.TestCase):
              mock.patch.object(route, "port_open", return_value=True), \
              mock.patch.object(route, "request_handover", return_value={"drained": True}), \
              mock.patch.object(route, "wait_for_port_release", return_value=True), \
+             mock.patch.object(route.shutil, "which", return_value="fixture"), \
+             mock.patch.object(route, "provider_config", return_value={}), \
              mock.patch.object(route, "routed_session", return_value=session) as routed, \
              mock.patch.object(route.time, "sleep", side_effect=KeyboardInterrupt):
             self.assertEqual(route.takeover("auto"), 0)

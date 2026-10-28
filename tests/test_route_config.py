@@ -396,6 +396,15 @@ class StoreTests(unittest.TestCase):
         # the untouched keys survived every write
         self.assertEqual(store.read_provider("openrouter")["ANTHROPIC_AUTH_TOKEN"], "sk-or-v1-abcdefghijkl")
 
+    def test_save_fails_without_cross_process_lock(self):
+        store = make_store(self.tmp, **{"openclaude.config.yaml": VALID})
+        before = store.path.read_bytes()
+        with mock.patch("builtins.open", side_effect=PermissionError("lock unavailable")):
+            with self.assertRaises(cfg.ConfigError) as caught:
+                store.write_provider("local", {"LOCAL_LLM_MODEL": "new"})
+        self.assertEqual(caught.exception.code, "config_busy")
+        self.assertEqual(store.path.read_bytes(), before)
+
     def test_saves_from_two_processes_are_serialised(self):
         # Two dashboards on different ports can save at once; the in-process lock cannot
         # order them, so a lock file must (otherwise one update is lost or a replace fails).
@@ -443,6 +452,18 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(values["ANTHROPIC_AUTH_TOKEN"], "sk-or-legacy")
         self.assertEqual(store.read_provider("local")["LOCAL_LLM_MODEL"], "keep")
         self.assertEqual(store.source("openrouter"), "yaml")
+
+    @unittest.skipUnless(os.name != "nt" and hasattr(os, "O_NOFOLLOW"), "POSIX no-follow support required")
+    def test_backup_does_not_follow_a_symlink(self):
+        store = make_store(self.tmp, **{"openclaude.config.yaml": VALID})
+        victim = Path(self.tmp) / "unrelated.txt"
+        victim.write_text("preserve", encoding="utf-8")
+        backup = store.path.with_name(store.path.name + ".bak")
+        backup.symlink_to(victim)
+        with self.assertRaises(OSError):
+            store.write_provider("local", {"LOCAL_LLM_MODEL": "new"})
+        self.assertEqual(victim.read_text(encoding="utf-8"), "preserve")
+        self.assertEqual(store.path.read_text(encoding="utf-8"), VALID)
 
     def test_a_save_preserves_crlf_bom_comments_and_exact_backup_bytes(self):
         tmp = self.enterContext(tempfile.TemporaryDirectory())

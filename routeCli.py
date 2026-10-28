@@ -2,6 +2,7 @@
 import json
 import math
 import os
+import signal
 import re
 import shutil
 import subprocess
@@ -177,13 +178,21 @@ def run_safely(argv, *, stdin_text=None, cwd, env, timeout, max_bytes=1048576):
         with open(in_path, "rb") as fin, open(out_path, "wb") as fout, open(err_path, "wb") as ferr:
             try:
                 process = subprocess.Popen(argv, stdin=fin, stdout=fout, stderr=ferr, cwd=cwd, env=env, shell=False,
-                                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                                           start_new_session=os.name != "nt")
             except (OSError, ValueError):
                 raise CliError("spawn_failed") from None
         # Own the diagnostic's tree from here: closing this job kills children the CLI leaves
         # behind even when its root exits first (taskkill /T cannot find the tree after that).
         job = localProcessTree.create_job_for(process.pid)
         identity = localProcessTree.process_identity(process.pid)
+        if os.name == "nt" and job is None:
+            localProcessTree.kill_owned_tree(process, identity)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            raise CliError("process_tracking_unavailable")
         while process.poll() is None:
             if time.monotonic() - started > timeout:
                 timed_out = True
@@ -192,12 +201,27 @@ def run_safely(argv, *, stdin_text=None, cwd, env, timeout, max_bytes=1048576):
             else:
                 time.sleep(0.05)
                 continue
-            localProcessTree.kill_owned_tree(process, identity)
+            if os.name == "nt":
+                localProcessTree.kill_owned_tree(process, identity)
+            else:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             try:
                 process.wait(5)
             except subprocess.TimeoutExpired:
                 pass
             break
+        # Stop descendants before measuring and reading the final output files.
+        if job:
+            localProcessTree.close_job(job)
+            job = None
+        elif os.name != "nt":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         size = os.path.getsize(out_path) + os.path.getsize(err_path)
         with open(out_path, "rb") as f:
             stdout = f.read(max_bytes)
@@ -207,9 +231,16 @@ def run_safely(argv, *, stdin_text=None, cwd, env, timeout, max_bytes=1048576):
                 "truncated": truncated or size > max_bytes, "elapsed_ms": int((time.monotonic() - started) * 1000),
                 "stdout": stdout, "stderr_len": os.path.getsize(err_path), "stderr_head": stderr_head}
     finally:
-        if job:
-            localProcessTree.close_job(job)
-        _rmtree(tmp)
+        try:
+            if job:
+                localProcessTree.close_job(job)
+            elif os.name != "nt" and "process" in locals():
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        finally:
+            _rmtree(tmp)
 
 
 def probe_version(argv_prefix, env, timeout=10):

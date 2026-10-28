@@ -373,7 +373,7 @@ def write_json_state(path: Path, payload: dict) -> bool:
             pass
 
 
-def write_handoff(*, port, nonce, proxy_pid, provider, cli_pid, dual=None):
+def write_handoff(*, port, nonce, proxy_pid, provider, cli_pid, mode, dual=None):
     """Record the live route so another terminal can take it over without changing the port.
 
     ``dual`` is the non-secret alternate topology ({provider, alias, model}) an ordinary
@@ -383,7 +383,7 @@ def write_handoff(*, port, nonce, proxy_pid, provider, cli_pid, dual=None):
     if not isinstance(port, int) or not isinstance(proxy_pid, int):
         return  # nothing usable to record (also keeps mocked sessions out of the file)
     payload = {"port": port, "nonce": nonce, "proxy_pid": proxy_pid, "launcher_pid": cli_pid,
-               "provider": provider, "started": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+               "provider": provider, "mode": mode, "started": datetime.now(timezone.utc).isoformat(timespec="seconds")}
     if dual:
         payload["dual"] = {"provider": dual["ROUTE_ALT_PROVIDER"], "alias": dual["ROUTE_ALT_ALIAS"],
                            "model": dual["ROUTE_ALT_MODEL"]}
@@ -679,8 +679,9 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
                        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
         log_route_marker(f"launcher start pid={os.getpid()} proxy={proxy.pid} port={port}")
         # Remember the live route so a second terminal can take it over without the CLI noticing.
+        mode = "openrouter_compat" if openrouter_compat else "local_compat" if local_compat else "local_only" if local_only else "ordinary"
         write_handoff(port=port, nonce=nonce, proxy_pid=proxy.pid, provider=provider,
-                      cli_pid=os.getpid(), dual=dual)
+                      cli_pid=os.getpid(), dual=dual, mode=mode)
         yield env
     finally:
         log_route_marker(f"launcher exit pid={os.getpid()}")
@@ -795,6 +796,9 @@ def takeover(provider: str = "auto", debug: bool = False) -> int:
     record = read_handoff()
     if not record:
         raise RuntimeError("No running session to take over (missing .session-handoff.json)")
+    # Older records lack mode metadata and cannot prove that fallback was permitted.
+    if record.get("mode") != "ordinary":
+        raise RuntimeError("Session mode cannot be safely preserved during takeover; restart the session instead")
     port, nonce = record["port"], record.get("nonce")
     if not isinstance(nonce, str) or not nonce:
         raise RuntimeError("The recorded session has no token; restart the session normally")
@@ -822,6 +826,14 @@ def takeover(provider: str = "auto", debug: bool = False) -> int:
                 f"The recorded session exposes the {alt or 'alternate'} service in /model"
                 " (routing: dual_provider), but the current settings no longer provide that"
                 " same alternate; restart the CLI session instead of taking over")
+    # Check predictable local failures before stopping the only working proxy. This cannot
+    # guarantee a successful bind, authentication or replacement startup after the drain.
+    if not shutil.which("claude") or not shutil.which("node"):
+        raise RuntimeError("Claude Code and Node.js are required; existing session was not changed")
+    try:
+        provider_config(provider)
+    except (OSError, ValueError):
+        raise RuntimeError("Replacement provider configuration is invalid; existing session was not changed") from None
     try:
         report = request_handover(port, nonce)
     except (OSError, ValueError) as error:
@@ -967,6 +979,15 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
 
 
 def self_test() -> None:
+    # Keep diagnostics independent of user settings, credentials and inherited routing.
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as directory, \
+            patch.dict(globals(), ROOT=Path(directory), HANDOFF_FILE=Path(directory) / "handoff.json"), \
+            patch.dict(os.environ, {}, clear=True):
+        _self_test_isolated()
+
+
+def _self_test_isolated() -> None:
     import contextlib
     import io
     from unittest.mock import Mock, patch
@@ -1101,6 +1122,10 @@ Exit codes: 0 = success, 2 = usage/service choice required, others = failure.
             if native_args:
                 parser.error("Use either -- suffix or encoded CLI arguments, not both")
             native_args = decode_claude_args(options.cli_args_b64)
+        if options.takeover and (options.local_mode or options.local_compat or options.openrouter_compat
+                                 or options.check_local or options.diagnose_local or options.print_prompt is not None
+                                 or options.print_text):
+            parser.error("--takeover cannot be combined with session modes, diagnostics or --print")
         if native_args and (options.takeover or options.check_local or options.diagnose_local):
             parser.error("Native Claude arguments cannot be combined with takeover or connection diagnostics")
         validate_claude_args(native_args, local_only=options.local_mode or options.local_compat,

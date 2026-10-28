@@ -24,6 +24,21 @@ def route_line(stamp, payload):
     return f"{stamp} {json.dumps(payload)}\n"
 
 
+class SnapshotErrorRedactionTests(unittest.TestCase):
+    def test_refresh_error_never_exposes_exception_text(self):
+        state = {"data": {"fixture": True}, "error": None, "reported": None}
+        stderr = io.StringIO()
+        with mock.patch.object(dash, "_SNAPSHOT", state), \
+                mock.patch.object(dash, "snapshot", side_effect=RuntimeError("private-synthetic-marker")), \
+                mock.patch.object(dash.time, "sleep", side_effect=KeyboardInterrupt), \
+                contextlib.redirect_stderr(stderr):
+            with self.assertRaises(KeyboardInterrupt):
+                dash._refresh_loop(1)
+            self.assertNotIn("private-synthetic-marker", json.dumps(dash.cached_snapshot()))
+        self.assertNotIn("private-synthetic-marker", stderr.getvalue())
+        self.assertIn("Snapshot refresh failed", stderr.getvalue())
+
+
 class ResponseDisconnectTests(unittest.TestCase):
     def handler(self):
         handler = object.__new__(dash.Handler)
@@ -1284,7 +1299,7 @@ class ConfigTests(unittest.TestCase):
         self.enterContext(mock.patch.object(dash, "account_state", side_effect=AssertionError("Local must not call OpenRouter")))
         self.enterContext(mock.patch.object(dash, "model_pricing", side_effect=AssertionError("Local must not use OpenRouter pricing")))
         route.write_handoff(port=port, nonce="fixture-session", proxy_pid=proxy.pid,
-                            provider="local", cli_pid=os.getpid())
+                            provider="local", cli_pid=os.getpid(), mode="ordinary")
         server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
@@ -1648,6 +1663,15 @@ class RouteTailTests(unittest.TestCase):
         self.assertEqual(second[-1]["ts"], "2026-01-01T00:00:02+00:00")
         self.assertEqual(dash.parse_route_log(self.path), second)  # unchanged file: no growth
 
+    def test_incremental_append_after_large_prefix_keeps_first_line(self):
+        lines = [route_line("2026-01-01T00:00:00+00:00", {"event": "route_selected", "provider": "plan", "padding": "x" * 300})]
+        self.write(lines)
+        self.assertEqual(len(dash.parse_route_log(self.path)), 1)
+        self.write([route_line("2026-01-01T00:00:01+00:00", {"event": "route_selected", "provider": "openrouter"})], mode="a")
+        events = dash.parse_route_log(self.path)
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[-1]["provider"], "openrouter")
+
     def test_truncation_starts_over(self):
         self.write([route_line("2026-01-01T00:00:00+00:00", {"event": "route_selected", "provider": "plan"})])
         self.assertEqual(len(dash.parse_route_log(self.path)), 1)
@@ -1665,6 +1689,32 @@ class RouteTailTests(unittest.TestCase):
         events = dash.parse_route_log(self.path)
         self.assertEqual(len(events), 2)
         self.assertEqual(events[-1]["provider"], "openrouter")
+
+    def test_replaced_log_with_same_prefix_resets_cached_events(self):
+        prefix = route_line("2026-01-01T00:00:00+00:00", {"event": "prefix", "padding": "x" * 300})
+        old = route_line("2026-01-01T00:00:01+00:00", {"event": "old"})
+        new = route_line("2026-01-01T00:00:02+00:00", {"event": "new"})
+        self.write([prefix, old])
+        self.assertEqual([e["event"] for e in dash.parse_route_log(self.path)], ["prefix", "old"])
+        replacement = self.root / "replacement"
+        replacement.write_text(prefix + new, encoding="utf-8")
+        replacement.replace(self.path)
+        self.assertEqual([e["event"] for e in dash.parse_route_log(self.path)], ["prefix", "new"])
+
+    def test_rewritten_partial_line_resets_parked_offset(self):
+        self.write([route_line("2026-01-01T00:00:00+00:00", {"event": "old", "padding": "x" * 400})])
+        self.assertEqual(len(dash.parse_route_log(self.path)), 1)
+        new_line = route_line("2026-01-01T00:00:01+00:00", {"event": "new", "padding": "y" * 500})
+        self.write([new_line[:300]])
+        self.assertEqual(dash.parse_route_log(self.path), [])
+        self.write([new_line[300:]], mode="a")
+        self.assertEqual([item["event"] for item in dash.parse_route_log(self.path)], ["new"])
+
+    def test_cold_tail_preserves_line_aligned_to_boundary(self):
+        lines = [route_line("2026-01-01T00:00:00+00:00", {"event": event}) for event in ("a", "b", "c")]
+        self.path.write_bytes("".join(lines).encode("utf-8"))
+        with mock.patch.object(dash, "ROUTE_TAIL_BYTES", len((lines[1] + lines[2]).encode())):
+            self.assertEqual([item["event"] for item in dash.parse_route_log(self.path)], ["b", "c"])
 
     def test_full_read_ignores_the_parked_offset(self):
         self.write([route_line("2026-01-01T00:00:00+00:00", {"event": "route_selected", "provider": "plan"})])

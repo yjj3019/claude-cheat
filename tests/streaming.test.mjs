@@ -91,6 +91,24 @@ test('by default the proxy buffers the whole stream before answering', async () 
   }
 });
 
+test('passthrough rejects empty tool identities before publishing', async () => {
+  const chunks = [frame('message_start', { message: { ...META, model: 'stream/model' } }),
+    frame('content_block_start', { index: 0, content_block: { type: 'tool_use', id: '', name: '', input: {} } }),
+    frame('content_block_stop', { index: 0 }),
+    frame('message_delta', { delta: { stop_reason: 'tool_use' } }), frame('message_stop', {})];
+  const planCalls = [];
+  const { server, base } = await start({ passthrough: true, chunks, planCalls });
+  try {
+    const result = await request(base);
+    assert.match(result.body, /plan ok/);
+    assert.doesNotMatch(result.body, /tool_use/);
+    assert.ok(planCalls.length > 0);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
 test('passthrough delivers the first token while the provider is still generating', { timeout: 10000 }, async () => {
   let release;
   const gate = new Promise(resolve => { release = resolve; });

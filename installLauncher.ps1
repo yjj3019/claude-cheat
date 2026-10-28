@@ -28,17 +28,42 @@ if ($destination -eq $origin) {
     throw "-Target must not be this checkout ($origin): installing there would overwrite the scripts it forwards to."
 }
 
-function Test-Forwarder([string]$path) {
+function Get-ForwarderBody([string]$targetScript, [string]$label) {
+    $quoted = (Join-Path $PSScriptRoot $targetScript).Replace("'", "''")
+    return @(
+        "$marker - $label, forwards to the checkout.",
+        "`$ErrorActionPreference = 'Stop'",
+        'try {',
+        "    & '$quoted' @args",
+        '    $code = $LASTEXITCODE',
+        '} catch {',
+        '    Write-Error $_.Exception.Message',
+        '    exit 1',
+        '}',
+        'if ($null -eq $code) { $code = 0 }',
+        'exit $code'
+    )
+}
+
+function Test-Forwarder([string]$path, [string]$targetScript, [string]$label) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
-    $first = Get-Content -LiteralPath $path -TotalCount 1 -ErrorAction SilentlyContinue
-    return ($first -like "$marker*")
+    try { $actual = [System.IO.File]::ReadAllBytes($path) }
+    catch { return $false }
+    $text = ((Get-ForwarderBody $targetScript $label) -join [Environment]::NewLine) + [Environment]::NewLine
+    $encoding = [System.Text.UTF8Encoding]::new($true)
+    $expected = $encoding.GetPreamble() + $encoding.GetBytes($text)
+    if ($actual.Length -ne $expected.Length) { return $false }
+    for ($i = 0; $i -lt $expected.Length; $i++) {
+        if ($actual[$i] -ne $expected[$i]) { return $false }
+    }
+    return $true
 }
 
 if ($Remove) {
     foreach ($name in $commands.Keys) {
         $path = Join-Path $destination $name
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
-        if (-not (Test-Forwarder $path)) {
+        if (-not (Test-Forwarder $path $commands[$name][0] $commands[$name][1])) {
             Write-Warning "kept $name (not created by this installer)"
             continue
         }
@@ -60,25 +85,11 @@ foreach ($name in $commands.Keys) {
         continue
     }
     $path = Join-Path $destination $name
-    if ((Test-Path -LiteralPath $path) -and -not (Test-Forwarder $path)) {
+    if ((Test-Path -LiteralPath $path) -and -not (Test-Forwarder $path $targetScript $label)) {
         Write-Warning "kept $name (a file not created by this installer already exists)"
         continue
     }
-    # A single quote in the checkout path would end the literal early.
-    $quoted = $resolved.Replace("'", "''")
-    $body = @(
-        "$marker - $label, forwards to the checkout.",
-        "`$ErrorActionPreference = 'Stop'",
-        'try {',
-        "    & '$quoted' @args",
-        '    $code = $LASTEXITCODE',
-        '} catch {',
-        '    Write-Error $_.Exception.Message',
-        '    exit 1',
-        '}',
-        'if ($null -eq $code) { $code = 0 }',
-        'exit $code'
-    )
+    $body = @(Get-ForwarderBody $targetScript $label)
     # Flavor 7 needs utf8BOM; 5.1 writes a BOM for plain utf8 and rejects the name.
     $encoding = if ($PSVersionTable.PSVersion.Major -ge 6) { 'utf8BOM' } else { 'utf8' }
     Set-Content -LiteralPath $path -Value $body -Encoding $encoding
@@ -89,5 +100,5 @@ $onPath = ($env:PATH -split ';' | Where-Object { $_ }) -contains $destination
 if ($onPath) {
     Write-Host 'run from any folder:  OpenClaude   |   OpenClaudeDashboard'
 } else {
-    Write-Warning "$destination is not on PATH; add it with:  [Environment]::SetEnvironmentVariable('PATH', `$env:PATH + ';$destination', 'User')"
+    Write-Warning "$destination is not on PATH; add this directory to your user PATH using Windows Environment Variables settings."
 }

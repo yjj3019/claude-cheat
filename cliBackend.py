@@ -1,6 +1,7 @@
 """A loopback Messages adapter: the backend CLI plans, the front Claude Code executes tools."""
 import contextlib
 import hmac
+import io
 import json
 import math
 import os
@@ -21,6 +22,10 @@ import localProcessTree
 import routeCli
 
 MAX_BYTES = 4 * 1024 * 1024
+HEADER_TIMEOUT_SECONDS = 10
+BODY_TIMEOUT_SECONDS = 10
+READ_POLL_SECONDS = .2
+MAX_CONNECTIONS = 16
 VERIFIED_VERSIONS = {"codex": {"0.165.0"}, "claude": {"2.1.312"}, "grok": set()}
 SCHEMA = {"type": "object", "additionalProperties": False, "required": ["text", "tool_calls"],
           "properties": {"text": {"type": "string"}, "tool_calls": {"type": "array", "items": {
@@ -405,12 +410,43 @@ def serve(values):
     backend = Backend(values)
     token, closing = secrets.token_urlsafe(32), threading.Event()
     slots = threading.BoundedSemaphore(4)
+
+    class RequestReader(io.RawIOBase):
+        def __init__(self, connection):
+            self.connection = connection
+            self.deadline = time.monotonic() + HEADER_TIMEOUT_SECONDS
+
+        def readable(self):
+            return True
+
+        def readinto(self, buffer):
+            while True:
+                if closing.is_set() or time.monotonic() >= self.deadline:
+                    raise TimeoutError("request deadline reached")
+                try:
+                    size = self.connection.recv_into(buffer)
+                except socket.timeout:
+                    continue
+                if closing.is_set() or time.monotonic() >= self.deadline:
+                    raise TimeoutError("request deadline reached")
+                return size
+
     class Handler(BaseHTTPRequestHandler):
+        def setup(self):
+            super().setup()
+            self.rfile.close()
+            self.request_reader = RequestReader(self.connection)
+            self.rfile = io.BufferedReader(self.request_reader)
+            self.connection.settimeout(READ_POLL_SECONDS)
+
         def log_message(self, *_):
             pass
         def send(self, status, value, metadata=None):
             raw = json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
             try:
+                if closing.is_set():
+                    return
+                self.connection.settimeout(READ_POLL_SECONDS)
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(raw)))
@@ -419,8 +455,21 @@ def serve(values):
                 if model:
                     self.send_header("X-CLI-Reported-Model", model)
                 self.end_headers()
-                self.wfile.write(raw)
-            except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+                deadline = time.monotonic() + 10
+                remaining = memoryview(raw)
+                while remaining:
+                    if closing.is_set() or time.monotonic() >= deadline:
+                        self.close_connection = True
+                        return
+                    try:
+                        sent = self.connection.send(remaining)
+                    except socket.timeout:
+                        continue
+                    if not sent:
+                        self.close_connection = True
+                        return
+                    remaining = remaining[sent:]
+            except OSError:
                 self.close_connection = True
         def cancelled(self):
             if closing.is_set():
@@ -437,11 +486,20 @@ def serve(values):
             if self.path != "/v1/messages":
                 return self.send(404, {"error": "not_found"})
             try:
-                size = int(self.headers.get("Content-Length", "0"))
+                lengths = self.headers.get_all("Content-Length", [])
+                if (len(lengths) != 1 or self.headers.get_all("Transfer-Encoding")
+                        or not re.fullmatch(r"[0-9]+", lengths[0])):
+                    raise BackendError("invalid_request")
+                size = int(lengths[0])
                 if not 0 < size <= MAX_BYTES:
                     return self.send(413, {"error": "request_too_large"})
-                self.connection.settimeout(10)
-                body = _json(self.rfile.read(size).decode("utf-8"))
+                self.request_reader.deadline = time.monotonic() + BODY_TIMEOUT_SECONDS
+                raw = self.rfile.read(size)
+                if closing.is_set() or time.monotonic() >= self.request_reader.deadline:
+                    return
+                if len(raw) != size:
+                    raise BackendError("invalid_request")
+                body = _json(raw.decode("utf-8"))
                 if not isinstance(body, dict):
                     raise BackendError("invalid_request")
                 if body.get("model") != backend.protocol_model:
@@ -454,10 +512,35 @@ def serve(values):
                     slots.release()
                 self.send(200, message, metadata)
             except (BackendError, ValueError, UnicodeError, OSError) as error:
+                if closing.is_set() or isinstance(error, TimeoutError):
+                    self.close_connection = True
+                    return
                 code = error.code if isinstance(error, BackendError) else "invalid_request"
                 self.send(400, {"error": code})
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    server.daemon_threads = False
+    class Server(ThreadingHTTPServer):
+        daemon_threads = False
+
+        def __init__(self, address, handler):
+            self.connection_slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+            super().__init__(address, handler)
+
+        def process_request(self, connection, address):
+            if not self.connection_slots.acquire(blocking=False):
+                self.shutdown_request(connection)
+                return
+            try:
+                super().process_request(connection, address)
+            except BaseException:
+                self.connection_slots.release()
+                raise
+
+        def process_request_thread(self, connection, address):
+            try:
+                super().process_request_thread(connection, address)
+            finally:
+                self.connection_slots.release()
+
+    server = Server(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:

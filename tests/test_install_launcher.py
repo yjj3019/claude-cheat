@@ -90,6 +90,28 @@ class InstallLauncherTests(unittest.TestCase):
         self.assertEqual(removed.returncode, 0, removed.stderr[-400:])
         self.assertTrue(foreign.exists(), "a user file must survive -Remove")
 
+    def test_modified_generated_forwarder_is_preserved(self):
+        self.assertEqual(self.run_installer().returncode, 0)
+        path = self.target / "OpenClaude.ps1"
+        modified = path.read_text(encoding="utf-8-sig") + "# user change\n"
+        path.write_text(modified, encoding="utf-8")
+        self.assertEqual(self.run_installer().returncode, 0)
+        self.assertEqual(path.read_text(encoding="utf-8-sig"), modified)
+        self.assertEqual(self.run_installer("-Remove").returncode, 0)
+        self.assertEqual(path.read_text(encoding="utf-8-sig"), modified)
+
+    def test_encoding_only_change_is_preserved(self):
+        self.assertEqual(self.run_installer().returncode, 0)
+        path = self.target / "OpenClaude.ps1"
+        raw = path.read_bytes()
+        self.assertTrue(raw.startswith(b"\xef\xbb\xbf"))
+        changed = raw[3:]
+        path.write_bytes(changed)
+        self.assertEqual(self.run_installer().returncode, 0)
+        self.assertEqual(path.read_bytes(), changed)
+        self.assertEqual(self.run_installer("-Remove").returncode, 0)
+        self.assertEqual(path.read_bytes(), changed)
+
     def test_install_is_idempotent(self):
         self.assertEqual(self.run_installer().returncode, 0)
         first = (self.target / "OpenClaude.ps1").read_text(encoding="utf-8-sig")
