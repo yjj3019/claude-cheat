@@ -4,7 +4,7 @@
 
 [MIT License](LICENSE) · [License selection review](LICENSE-REVIEW.md)
 
-A local router that preserves the existing Claude Code Plan login and settings while sending compatible Sonnet requests to the configured OpenRouter model or a local LLM. The repository includes the launcher, proxy, and synthetic regression tests. It does not contain API keys, OAuth credentials, personal settings, or private diagnostic scripts.
+A local router that preserves the existing Claude Code Plan login and settings while sending compatible Sonnet requests to the configured OpenRouter model, local LLM, or verified CLI model backend. The repository includes the launcher, proxy, and synthetic regression tests. It does not contain API keys, OAuth credentials, personal settings, or private diagnostic scripts.
 
 **Status: provider selection, retries, Plan fallback, and recovery are implemented. Preserving every native feature while actually replacing the main Sonnet model is not fully achieved.**
 
@@ -49,7 +49,7 @@ From the checkout root:
 .\OpenClaude.ps1 -Provider Local
 ```
 
-`-Provider` defaults to **Auto**: it first uses `routing.default_provider` from `openclaude.config.yaml`. If the preference is absent or `auto`, exactly one configured service is selected automatically. With both configured and no explicit preference, it exits with code 2 and actionable guidance:
+`-Provider` defaults to **Auto**: it first uses `routing.default_provider` from `openclaude.config.yaml`. If the preference is absent or `auto`, exactly one configured service is selected automatically. With multiple services configured and no explicit preference, it exits with code 2 and actionable guidance:
 
 ```text
 Both OpenRouter and Local settings are configured. Choose one explicitly:
@@ -62,7 +62,7 @@ The settings editor selector marks whether each service is configured. The defau
 ### Save a default service and launch without flags
 
 1. Run `.\OpenClaude.ps1 -Setup`.
-2. Under **설정할 서비스** (service to edit), choose OpenRouter or Local LLM, enter its settings and save them.
+2. Under **설정할 서비스** (service to edit), choose OpenRouter, Local LLM or CLI, enter its settings and save them.
 3. Under **기본 실행 서비스** (default launch service), choose the service and press **기본값 저장** (save default).
 4. Run `.\OpenClaude.ps1` to start a new session. Repeating `-Provider` is no longer necessary.
 
@@ -70,16 +70,16 @@ The settings editor selection is remembered in the browser; the launch default i
 
 ```yaml
 routing:
-  default_provider: "local"  # auto | openrouter | local
+  default_provider: "local"  # auto | openrouter | local | cli
 ```
 
-An explicit `-Provider OpenRouter` or `-Provider Local` overrides the saved choice for that invocation without changing the file. `-Takeover` keeps the live session's service. An invalid preference or a broken selected service fails explicitly instead of silently selecting another service. The dashboard can reset an invalid preference to `auto` without requiring a configured service. The isolated modes (`-LocalMode`, `-LocalCompat`, `-OpenRouterCompat`) still require an explicit `-Provider`.
+An explicit `-Provider OpenRouter`, `-Provider Local`, or `-Provider CLI` overrides the saved choice for that invocation without changing the file. `-Takeover` keeps the live session's service. An invalid preference or a broken selected service fails explicitly instead of silently selecting another service. The dashboard can reset an invalid preference to `auto` without requiring a configured service. The isolated modes (`-LocalMode`, `-LocalCompat`, `-OpenRouterCompat`) still require an explicit `-Provider`.
 
-The CLI section remains **detection and connection tests only**; it is not a routing service and cannot be selected as the default. Keep both OpenRouter and Local settings if needed; choosing a default does not require deleting either.
+CLI is also a saved default service. Claude Code stays the front end; the selected CLI serves only as the model backend. See the backend section below for verified versions and restrictions.
 
 Run `.\OpenClaude.ps1 -Help` or `python openrouterAdvisor.py --help` for options, runnable examples and exit codes without starting a session. The old `startOpenClaude.ps1` command remains a forwarding shim. A provider-choice usage error retains exit code 2 and no longer produces a redundant PowerShell error stack.
 
-The authenticated `POST /api/default-provider` endpoint accepts `{"provider":"local"}` (also `auto` and `openrouter`). `GET /api/config` reports `default_provider` and `default_provider_error`. Existing Host, token, Origin, request-size and rate checks protect writes. Provider settings and the default have separate save actions; a failed default save leaves the previous preference intact.
+The authenticated `POST /api/default-provider` endpoint accepts `{"provider":"local"}` (also `auto`, `openrouter` and `cli`). `GET /api/config` reports `default_provider` and `default_provider_error`. Existing Host, token, Origin, request-size and rate checks protect writes. Provider settings and the default have separate save actions; a failed default save leaves the previous preference intact.
 
 This workflow follows the relevant [CLI design guidance](https://github.com/cursor/plugins/blob/main/cli-for-agent/skills/cli-for-agents/SKILL.md) and [documentation reliability guidance](https://github.com/cursor/plugins/blob/main/agent-compatibility/agents/docs-reliability-review.md): explicit flags, practical examples, actionable errors and docs matching actual behavior. Claude-Cheat is not a Cursor plugin or a port of the entire repository, and this work does not implement CLI-backed request routing.
 
@@ -116,9 +116,13 @@ Configure OpenRouter once in the web console — it runs without a routing sessi
 
 `-Setup` never creates or edits `openclaude.config.yaml` or any legacy `.env.*` file and does not start a session; you save the values on the web page yourself. The `[setup required]` hint printed by `OpenClaude.ps1` when settings are missing also mentions this command.
 
-Pick OpenRouter or Local LLM in the **service** select box at the top; only that service's fields are shown (each option is tagged `configured` / `setup needed`, and the last choice is remembered in the browser). For OpenRouter, fill in a **model ID** and **API key**, press **Model check**, then **Save**, and start the session. The check also runs on unsaved values, and saving without an existing `openclaude.config.yaml` seeds the file from `openclaude.config.example.yaml` so its comments stay. API keys and server addresses are shown only in part and the stored original is never sent back to the browser, so type the full value only when changing it (empty keeps it; the optional HTTP-exception and model-list addresses have a **Clear** button). Starting the launcher with missing or invalid settings exits with the console address instead of opening a session. Editing the files by hand still works exactly as before.
+Pick OpenRouter, Local LLM or CLI in the **service** select box at the top; only that service's fields are shown (each option is tagged `configured` / `setup needed`, and the last choice is remembered in the browser). For OpenRouter, fill in a **model ID** and **API key**, press **Model check**, then **Save**, and start the session. The check also runs on unsaved values, and saving without an existing `openclaude.config.yaml` seeds the file from `openclaude.config.example.yaml` so its comments stay. API keys and server addresses are shown only in part and the stored original is never sent back to the browser, so type the full value only when changing it (empty keeps it; the optional HTTP-exception and model-list addresses have a **Clear** button). Starting the launcher with missing or invalid settings exits with the console address instead of opening a session. Editing the files by hand still works exactly as before.
 
-A routed session starts Claude Code with experimental beta features disabled (`CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`, `CLAUDE_CODE_DISABLE_ADVISOR_TOOL`). The inline `tool_addition`, `context_management`, and advisor tool shape that Claude Code 2.1.310 sends by default is rejected by external Messages API providers with HTTP 400, so Plan requests in the same session also use the stable protocol. Advisor, inline tools, and server-side context editing are therefore unavailable in that session. Thinking and effort settings still travel per request, and ordinary mode still never asks the external provider for thinking.
+Ordinary OpenRouter, Local and CLI launches preserve native Claude Code beta and advisor settings. Unsupported requests retain the original Plan route. Explicit compatibility and restricted profiles have separate policies.
+
+Ordinary Local-only-provider sessions do not set these switches and retain SSH/MCP, tool search, plugins, hooks, and user/project permission settings. Known deferred MCP tool and CLI control fields use the existing compatibility validator and buffered JSON transport, converted to CLI SSE when needed. Native `tool_addition` declarations move into the Local tool list while conversation content and tool results stay intact. Conflicting definitions and unknown shapes retain the original conversation and tool definitions on Plan. Only a null `tool_use.provider_specific_fields` value added to CLI history is normalized away on Local and Plan; objects and signatures are not removed by this rule. Cache boundaries can change with this translation. Unsupported native features, Opus/Haiku/Fable selections, and Local failures retain the existing Plan route. Ordinary external thinking remains disabled so Local signatures cannot contaminate Plan history.
+
+Ordinary Local launches default to an 8,192-token output budget to reduce context overflows caused by native Sonnet output limits. An explicit positive whole-number `CLAUDE_CODE_MAX_OUTPUT_TOKENS` is preserved. Only this setting is passed per launch; user/project settings files are unchanged. Large inputs or explicit output limits can still exceed the model context. Use an ordinary launch to retain native client integrations; `-LocalMode` is a separate restricted mode that disables MCP.
 
 ## Routing, retries, and recovery
 
@@ -127,11 +131,11 @@ A routed session starts Claude Code with experimental beta features disabled (`C
 | Compatible Sonnet request | Configured OpenRouter model or local model |
 | Unsupported native Sonnet feature or conversation history | Original Plan Sonnet request, unchanged |
 | Opus, Haiku, Fable | Existing Plan OAuth path |
-| External provider fails all four attempts | One request to the original Plan Sonnet model |
+| HTTP provider fails all four attempts, or CLI backend fails its single attempt | One request to the original Plan Sonnet model |
 
 - OpenRouter uses the required `OPENROUTER_MODEL` setting, with no default model.
 - OpenRouter and Local are selected at launch; the router does not switch between them automatically. Select Sonnet in `/model` for eligible replacement requests.
-- The external provider receives the initial attempt plus three retries. Each attempt has a 30-second limit, with a one-second delay between attempts. A provider `Retry-After` is parsed from seconds or any RFC 7231 HTTP-date and honored internally only up to 10 seconds (`ROUTE_RETRY_MAX_WAIT_MS`); a longer wait is returned to the client as a `Retry-After` header on the 429/529 failure instead of freezing the turn. A bare 429 invents no delay.
+- HTTP providers receive the initial attempt plus three retries. CLI backends receive one attempt with their configured deadline. Each attempt has a 30-second limit, with a one-second delay between attempts. A provider `Retry-After` is parsed from seconds or any RFC 7231 HTTP-date and honored internally only up to 10 seconds (`ROUTE_RETRY_MAX_WAIT_MS`); a longer wait is returned to the client as a `Retry-After` header on the 429/529 failure instead of freezing the turn. A bare 429 invents no delay.
 - Four full timeouts plus retry delays can take approximately 123 seconds before the Plan request begins. Plan response time and the CLI's own retries may add further time. Cancelling stops router retries and fallback.
 - The circuit breaker distinguishes causes: transport failures, timeouts, 5xx, 408 and unusable 2xx answers open it as provider faults; 401/402/403 keep their provider-wide cooldown; a 429 uses the parsed `Retry-After` (bounded at ten minutes) as its cooldown, and a request-level 4xx never opens it. Exactly one half-open probe is admitted, and late completions from older generations cannot overwrite the newer circuit state.
 - A client that stalls mid-body is dropped after an idle timeout (30 seconds by default, `ROUTE_REQUEST_IDLE_TIMEOUT_MS`, `0` disables it), releasing its turn; slow but live uploads are not cut. A disconnected client's upstream read, timers and retry are released instead of retried.
@@ -139,7 +143,7 @@ A routed session starts Claude Code with experimental beta features disabled (`C
 - **Tool call ids are brought to the Anthropic contract on the Plan route.** An external provider may mint ids such as `Bash:0#abc` that the native route rejects. Just before a Plan request is forwarded, only those ids are remapped per request while `tool_use`/`tool_result` pairing is preserved; ids that already conform stay byte-identical so the prompt cache is unaffected. The external route is never rewritten, and an empty id is rejected locally with a 400 before any upstream call.
 - During a 30-second cooldown, requests use Plan. Afterward, one compatible real request checks recovery; concurrent requests use Plan. A validated external response restores the external route. There are no separate paid background probes.
 - External responses are buffered, up to 32 MiB, until model identity, message completion, block indices, and tool-input JSON are validated. Failed attempts do not expose partial text or tool calls to the CLI. This delays visible responses, and retries may incur duplicate inference costs.
-- Plan requests, responses, streams, and errors pass through unchanged. A routed session disables Claude Code's experimental betas, so the CLI does not build advisor or inline tool requests. `system`-role context turns, including text blocks, and the `interleaved-thinking-2025-05-14`, `effort-2025-11-24` and `context-1m-2025-08-07` betas the CLI always sends are accepted in every mode. Provider `citations` are returned in responses and echoed back in later history, so they are accepted on input too. Signed reasoning blocks are dropped from the external copy only, so a conversation returns to the replacement provider on its next request instead of staying on Plan. Unsupported server tools still bypass. Such a bypass is not counted as an external recovery check.
+- Plan requests, responses, streams, and errors pass through unchanged. Ordinary sessions preserve native feature settings; unsupported requests use Plan. `system`-role context turns, including text blocks, and the `interleaved-thinking-2025-05-14`, `effort-2025-11-24` and `context-1m-2025-08-07` betas the CLI always sends are accepted in every mode. Provider `citations` are returned in responses and echoed back in later history, so they are accepted on input too. Signed reasoning blocks are dropped from the external copy only, so a conversation returns to the replacement provider on its next request instead of staying on Plan. Unsupported server tools still bypass. Such a bypass is not counted as an external recovery check.
 - The router does not block account-level usage credits, so Plan routing is not a guarantee of zero additional account charges.
 - Model access and usage credits remain subject to the Claude app and account plan. There is no separate Fable ban or credits-OFF requirement. External providers do not receive the Plan OAuth credential.
 
@@ -305,7 +309,7 @@ Requires Claude Code 2.1.304 or newer and the same two `openclaude.config.yaml` 
 
 Responses are fully validated as JSON before conversion to client SSE. This mode uses one 120-second upstream attempt and a 30-second failure cooldown, with OpenRouter provider fallback disabled. Model identity, Messages/tool support and reasoning behavior still depend on the selected model; forwarding effort does not establish Sonnet-equivalent reasoning.
 
-Every interactive launch now makes one minimal provider-only inference check before opening the CLI: a 15-second deadline and a 512-token budget. OpenRouter charges may apply. Logs contain `connection_check`, provider, inference/model/reply booleans, a fixed reason and optional HTTP status, never endpoints, keys or response bodies. Check failure logs `provider_connection_unavailable` with `action: continue` and still opens the CLI. Ordinary mode retains Plan routing/fallback; explicit Local-only and compatibility modes retain their Plan block. Configuration errors and missing executables remain startup errors. Standalone `-CheckLocal` and `-DiagnoseLocal` still exit after diagnosis.
+Every interactive launch now makes one minimal provider-only inference check before opening the CLI: a 15-second deadline and a 512-token budget for HTTP providers; CLI backends use their configured deadline and native output constraints. OpenRouter charges may apply. Logs contain `connection_check`, provider, inference/model/reply booleans, a fixed reason and optional HTTP status, never endpoints, keys or response bodies. Check failure logs `provider_connection_unavailable` with `action: continue` and still opens the CLI. Ordinary mode retains Plan routing/fallback; explicit Local-only and compatibility modes retain their Plan block. Configuration errors and missing executables remain startup errors. Standalone `-CheckLocal` and `-DiagnoseLocal` still exit after diagnosis.
 
 `ready` confirms the configured model, exact diagnostic reply and normal completion. `timeout`, `authentication_failed`, `http_error` and `connection_failed` identify connection failures. `reply_mismatch`, `incomplete_response` and `invalid_response` identify response-validation failures: a reasoning model may exhaust this small budget or return extra text despite a working connection. The check does not prove complete CLI compatibility.
 
@@ -337,7 +341,7 @@ The **insights** card ranks *what changed, why, and what to do next* instead of 
 
 | Panel | Content |
 | --- | --- |
-| Now | **OpenRouter or Local LLM serving / Plan bypass / idle**, the **last request's actual routing model**, age, reason |
+| Now | **OpenRouter, Local LLM or CLI serving / Plan bypass / idle**, the **last request's actual routing model**, age, reason |
 | Alerts | Shown when Plan bypass reaches 50% within ten minutes, a circuit opens, a 400/413/422 rejection repeats, or the balance drops below 10% |
 | Last 60 minutes | Replacement versus Plan counts, circuit opens |
 | Bypass reasons | Counts per `native_feature` `detail` with **meaning and action**, external failure statuses and validation classes |
@@ -368,7 +372,7 @@ Settings live on a **separate page** (`http://127.0.0.1:8787/settings`) reached 
 | Clear | Optional addresses (HTTP exception, model list) are erased with the **Clear** button (the `clear` list of `POST /api/config`). Required fields and keys cannot be cleared |
 | Validation | Model ID shape, key shape and Local URL rules (loopback, HTTPS, same origin) are checked before writing; a failure leaves the file untouched |
 | Protection | Both reading settings (`GET /api/config`) and saving them require the session token embedded in the page; POST also requires a same-origin request, so other sites cannot call it |
-| Tests | **Model check** reads the model list only; **inference test** sends one 16-token request (may cost a small amount) |
+| Tests | **Model check** reads the model list only; **inference test** sends one request with a 16-token OpenRouter or 512-token Local output limit (may incur costs or use server resources). Local verifies the selected model ID, exact `OK` reply, and normal completion |
 | Model picker | **목록** opens a searchable list with context length and price and fills the field. `GET /api/models?provider=openrouter\|local` (session token required, 10 minute cache) |
 | When it applies | Saved settings take effect in the **next** session; restart a running one |
 
@@ -376,31 +380,31 @@ Settings live on a **separate page** (`http://127.0.0.1:8787/settings`) reached 
 
 Distinguish the configured model (settings for the next session), the connection-test model (the response model ID is checked against the requested ID), and the last routed model (recorded after response validation). An ordinary session can still start after a failed connection check, with a warning and Plan fallback available. Model-list metadata checks do not prove inference works.
 
-The dashboard does not read Claude Code's current `/model` selection in real time. With no live session or no requests yet, settings and historical records are not proof of a current model connection.
+The dashboard does not read Claude Code's current `/model` selection in real time. With no live session or no requests yet, settings and historical records are not proof of a current model connection. During a live session, it compares the latest authenticated proxy metrics with that session's logs rather than attributing an old session's route or code hash to the current proxy. The current-state card distinguishes the session provider, loaded primary model and last processed model. A Plan or dual-provider request whose model is not reported remains unknown rather than being guessed.
+
+The 60-minute and 10-minute route statistics use actual current-session logs. When those records are absent, the dashboard says the log window is unavailable and points to the proxy's cumulative counters. Session totals are not presented as time-window counts.
 
 The picker lists an exact model ID only once per service, trimming surrounding whitespace and retaining the first row's metadata. IDs differing in case or a suffix such as `:latest` remain distinct. Selecting an item fills the input; saving is a separate action. Per-request provider selection and alternate-alias collision checks also apply. This does not prohibit different servers using the same model name or multiple independent sessions.
 
-### CLI detection and connection test (diagnostics only)
+### CLI model backends
 
-The **CLI (connection test only)** entry on the settings page finds the installed Codex, Grok and Claude Code CLIs, shows their versions and checks whether they can reach their service. It is a **diagnostic tool; routing requests to a CLI is not supported yet** (`OpenClaude.ps1 -Provider` has no CLI value).
+Choose **CLI** as the default execution service, select **Claude Code, Codex or Grok**, save its settings and the default, then run `OpenClaude.ps1`. A one-off override is `-Provider CLI`. Claude Code remains the front end and executes SSH/MCP tools, skills, plugins, hooks and permissions. The backend returns validated JSON text or tool-call proposals; it cannot execute its own tools.
 
-| Item | Behaviour |
-| --- | --- |
-| Detection | Looks in `PATH` and known install folders (`~\.grok\bin`, `%APPDATA%\npm`, `~\.local\bin`); if the running session's PATH is stale it re-reads the user and machine PATH from the registry. `GET /api/cli` (session token required) |
-| Detect check | Runs `--version` only (no network use) |
-| Connection test | Sends **one fixed line**, `Reply with exactly OK`, to the selected CLI. It **really calls that CLI's external service with its own login**, which may use a little quota or money |
-| How it runs | No shell. An npm `.cmd` wrapper is read and resolved to its real target (an unrecognised wrapper is refused). A pinned executable must be an absolute path whose file name matches the kind and exists; **UNC paths and symbolic links are refused** (a hard link is still indistinguishable). Each run uses a fresh empty temp folder and the prompt goes in a file or stdin, never in argv. On Windows the child goes into a **kill-on-close Job Object**, so descendants left behind are cleaned up when the run ends even if the CLI root exited first |
-| Environment | Only an allowlist reaches the child (PATH and system variables, proxy and certificate variables, that CLI's own login variables). `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_*`, `OPENROUTER_*` and the dashboard token are never passed, which prevents `claude -p` from calling this proxy again in a loop |
-| Result | Only a category, exit code and duration: `ready`, `timeout` (firewall or proxy suspected), `not_logged_in`, `unsupported_flag` (the CLI version rejected an option), `not_found`, and so on. CLI output and error text are neither shown nor logged |
-| Limits | One run at a time; time limit 10-120 s (default 60) |
+Verified versions are Claude Code **2.1.312** and Codex **0.165.0**. Other versions fail closed until validated. Grok is detected and selectable, but backend execution is currently refused with `backend_version_unverified` because its tool isolation has not been verified. Installed does not mean connected or supported.
 
-The tool-blocking flags (for example Codex `--disable shell_tool`) are **best effort and have not been verified to stop file reads.** The test prompt is a fixed string, but a CLI is an agent: do not use it to send untrusted input.
+Backend processes run without a shell in an empty temporary directory, with isolated configuration and a filtered environment. Prompts and responses stay in memory. Responses must reference advertised tools and valid argument JSON. Cancellation cleans up owned children. Each request makes one backend attempt before ordinary Plan fallback, with a configurable 10–120 second deadline (default 60) and at most four concurrent backend requests.
+
+Explicit connection tests and startup checks send a fixed `OK` request using the backend CLI's own login and may consume quota. Readonly `/api/diagnostics` never starts inference or login. Requested model, reported model and measured usage remain separate; missing native metadata is shown as unknown.
+
+Forward native front-end arguments with `-CliArgs @('--resume', 'session id', '--plugin-dir', 'C:\my-plugin')`; direct Python invocation accepts arguments after `--`. Help, version and management commands bypass routing and inference checks. Conflicting restricted-mode options fail explicitly. Front-end Claude Code login and backend login are separate requirements. Backend model quality and complete native feature parity are not guaranteed.
+
+See the [requirement audit](docs/REQUIREMENTS-AUDIT.ko.md) for implementation evidence and remaining validation limits.
 
 ### Request-shape measurement (sizing a CLI backend)
 
 The **request shape (CLI candidates)** card on the dashboard counts requests by **model family x tools**, to find out how many requests a text-only CLI could serve (no tools, tool results or images).
 - The proxy writes one content-free event per request (`request_shape`: family, tools, tool blocks, non-text media, stream) to the route log. It never records the model id, a prompt or a tool name.
-- It is recorded only in OpenRouter sessions (when a route log exists), and is also exposed as `request_shapes` in `/api/status`.
+- It is recorded in Local and OpenRouter sessions (when a route log exists), and is also exposed as `request_shapes` in `/api/status`.
 - Note: Opus, Haiku and Fable requests always go to Plan today, so a CLI candidate must be a tool-less **Sonnet** request. If this number is small, CLI routing would have little effect.
 
 ### Status API for scripts and agents
@@ -617,7 +621,7 @@ What the measurements changed: the request body was serialized **four times insi
 - Running only a native advisor on the subscription path during external inference is not implemented. Full native-feature equivalence, including remote managed settings and organization policy with a custom `ANTHROPIC_BASE_URL`, is not guaranteed.
 - Request bodies above 32 MiB receive HTTP 413 before fallback. Only versioned `claude-sonnet-*`, `claude-opus-*`, `claude-haiku-*`, `claude-fable-*` names whose version starts with a digit, the configured OpenRouter model ID, and the historical client alias are accepted. Unknown models receive HTTP 403.
 - Allowed paths are POST `/v1/messages` and `/v1/messages/count_tokens` (optionally `?beta=true`), plus local readiness HEAD `/api/hello`. Other paths are rejected, not forwarded to the subscription route.
-- A custom `CLAUDE_CONFIG_DIR` is preserved unless absent or set to the historical `~/.claude-openrouter`, in which case the child uses `~/.claude`. Old MCP/plugin registrations are not automatically migrated; directories are not copied or deleted.
+- If `CLAUDE_CONFIG_DIR` is absent, empty, or the historical `~/.claude-openrouter`, the child leaves it unset to preserve native Claude Code configuration discovery. Explicit paths, including `~/.claude`, are preserved. Injecting `~/.claude` changes where personal `.claude.json` MCP registrations are read; see the [official MCP configuration locations](https://code.claude.com/docs/en/mcp-quickstart#find-your-configuration-on-disk). No directories, settings, or authentication files are copied, migrated, or deleted.
 - The per-session random token (nonce) of Local/compat isolated sessions appears in the Claude Code process's `--settings` argument and environment. Any same-user process (including EDR or audit tools that log command lines) can read it, and a leaked token allows consuming OpenRouter/Local usage through the local proxy for that session. It is regenerated per session and bound to `127.0.0.1` only; it grants no Plan access.
 - If `claude` resolves to an npm `.cmd`/`.bat` shim, isolated modes (Local, OpenRouter compatibility) print a warning. cmd.exe may mis-parse quotes, `&` or `%` in arguments passed through a shim; this was not reproduced. Prefer the native `claude.exe` install.
 - Diagnose HTTP 429 using the affected account's Usage screen and response. Account-specific limits and reset schedules are not published here.

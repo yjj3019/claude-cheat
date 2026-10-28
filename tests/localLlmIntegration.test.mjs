@@ -54,9 +54,9 @@ async function fixture(t, handler, config = {}) {
     },
   });
   const proxyUrl = await listen(t, proxy) + '/v1/messages';
-  const request = (extra, signal) => fetch(proxyUrl, { method: 'POST', signal,
+  const request = (extra, signal, beta = 'oauth-2025-04-20') => fetch(proxyUrl, { method: 'POST', signal,
     headers: { 'content-type': 'application/json', 'x-local-route-token': 'loopback-nonce',
-      authorization: OAUTH, 'anthropic-beta': 'oauth-2025-04-20' }, body: JSON.stringify(body(extra)) });
+      authorization: OAUTH, 'anthropic-beta': beta }, body: JSON.stringify(body(extra)) });
   return { local, localUrl, localCalls, proCalls, attempts, request };
 }
 
@@ -376,5 +376,108 @@ for (const localOnly of [false, true]) {
     await next.text();
     assert.equal(f.localCalls.length, 2);
     assert.equal(f.proCalls.length, 0);
+  });
+}
+
+for (const stream of [false, true]) {
+  test(`ordinary Local preserves deferred MCP tools and Plan fallback (stream ${stream})`, async t => {
+    const f = await fixture(t, (_req, res) => json(res, { ...message(), id:'fixture-message', role:'assistant',
+      usage:{input_tokens:4,output_tokens:1} }));
+    const tools = [{ name:'mcp__mcp-ssh__checkConnectivity', defer_loading:true,
+      input_schema:{type:'object',properties:{hostAlias:{type:'string'}}} }];
+    const beta = 'oauth-2025-04-20,advanced-tool-use-2025-11-20';
+    const response = await f.request({stream,tools}, undefined, beta);
+    assert.equal(response.status, 200);
+    const text = await response.text();
+    assert.match(text, /local fixture answer/);
+    assert.equal(f.localCalls.length, 1);
+    assert.deepEqual(f.localCalls[0].body.tools, tools);
+    assert.deepEqual(f.localCalls[0].body.thinking, {type:'disabled'});
+    assert.equal(f.localCalls[0].body.stream, false);
+    assert.equal(f.localCalls[0].headers['anthropic-beta'], beta);
+    assert.equal(f.proCalls.length, 0);
+    const native = {model:'claude-opus-5-5',tools,stream:false};
+    await (await f.request(native,undefined,beta)).text();
+    assert.equal(f.localCalls.length, 1);
+    assert.equal(f.proCalls.length, 1);
+    assert.deepEqual(f.proCalls[0].body, body(native));
+  });
+}
+
+test('ordinary Local compatibility keeps failed requests recoverable on Plan without changing the native body', async t => {
+  const f = await fixture(t, (_req,res) => {res.writeHead(400);res.end('{}');});
+  const extra = {tools:[{name:'mcp__fixture__echo',defer_loading:true,input_schema:{type:'object'}}]};
+  const response = await f.request(extra,undefined,'oauth-2025-04-20,advanced-tool-use-2025-11-20');
+  assert.equal(response.status,200);
+  await response.text();
+  assert.equal(f.localCalls.length,1);
+  assert.equal(f.proCalls.length,1);
+  assert.deepEqual(f.proCalls[0].body,body(extra));
+});
+
+for (const fail of [false,true]) {
+  test(`ordinary Local expands inline MCP tool declarations without changing Plan history (failure ${fail})`, async t => {
+    const f = await fixture(t, (_req,res) => {
+      if (fail) {res.writeHead(400);res.end('{}');return;}
+      json(res, {...message(),id:'fixture-message',role:'assistant',usage:{input_tokens:4,output_tokens:1}});
+    });
+    const oldTool = {name:'mcp__fixture__echo',defer_loading:true,input_schema:{type:'object'}};
+    const loadedTool = {...oldTool,description:'loaded fixture tool'};
+    const extra = {tools:[oldTool],messages:[{role:'user',content:[{type:'text',text:'fixture input'},
+      {type:'tool_addition',tool:{type:'tool_definition',definition:loadedTool},cache_control:{type:'ephemeral'}}]}],stream:true};
+    const response = await f.request(extra,undefined,'oauth-2025-04-20,inline-tools-2026-09-15');
+    assert.equal(response.status,200);
+    await response.text();
+    assert.equal(f.localCalls.length,1);
+    assert.deepEqual(f.localCalls[0].body.messages,[{role:'user',content:[{type:'text',text:'fixture input'}]}]);
+    assert.deepEqual(f.localCalls[0].body.tools,[{...loadedTool,cache_control:{type:'ephemeral'}}]);
+    assert.equal(f.proCalls.length,fail?1:0);
+    if (fail) assert.deepEqual(f.proCalls[0].body,body(extra));
+  });
+}
+
+test('unknown inline tool declaration fields stay on Plan unchanged', async t => {
+  const f = await fixture(t,()=>{throw new Error('no Local call expected');});
+  const extra = {messages:[{role:'user',content:[{type:'tool_addition',tool:{name:'Read',input_schema:{type:'object'}},unknown_flag:true}]}]};
+  await (await f.request(extra,undefined,'oauth-2025-04-20,inline-tools-2026-09-15')).text();
+  assert.equal(f.localCalls.length,0);
+  assert.deepEqual(f.proCalls[0].body,body(extra));
+});
+
+test('ordinary Local materializes native system tool declarations and retains user text', async t => {
+  const f = await fixture(t,(_req,res)=>json(res,message()));
+  const definition = {name:'mcp__fixture__echo',input_schema:{type:'object'}};
+  const extra = {messages:[{role:'user',content:'fixture input'},
+    {role:'system',output_config:{effort:'medium'},content:[{type:'text',text:'fixture reminder'},{type:'tool_addition',tool:{type:'tool_definition',definition}}]}]};
+  const response = await f.request(extra,undefined,'oauth-2025-04-20,inline-tools-2026-09-15');
+  assert.equal(response.status,200);await response.text();
+  assert.equal(f.localCalls.length,1);
+  assert.deepEqual(f.localCalls[0].body.tools,[definition]);
+  assert.deepEqual(f.localCalls[0].body.messages,[{role:'user',content:'fixture input'},
+    {role:'system',output_config:{effort:'medium'},content:[{type:'text',text:'fixture reminder'}]}]);
+  assert.equal(f.proCalls.length,0);
+});
+
+for (const fail of [false,true]) {
+  test(`ordinary Local tool-result history treats null metadata as absent (failure ${fail})`, async t => {
+    const f = await fixture(t,(_req,res)=>{
+      if (fail) {res.writeHead(400);res.end('{}');return;}
+      json(res,message());
+    });
+    const tool = {type:'tool_use',id:'t1',name:'mcp__fixture__echo',input:{},provider_specific_fields:null};
+    const extra = {messages:[{role:'user',content:'fixture input'},
+      {role:'assistant',content:[tool]}, {role:'user',content:[{type:'tool_result',tool_use_id:'t1',content:'fixture output'}]}]};
+    const response = await f.request(extra);
+    assert.equal(response.status,200);await response.text();
+    assert.equal(f.localCalls.length,1);
+    assert.equal(Object.hasOwn(f.localCalls[0].body.messages[1].content[0],'provider_specific_fields'),false);
+    assert.equal(f.proCalls.length,fail?1:0);
+    if (fail) {
+      const expected=body(extra);
+      expected.messages=extra.messages.map((m,index)=> index===1?{...m,content:[{type:'tool_use',id:'t1',name:'mcp__fixture__echo',input:{}}]}:m);
+      assert.deepEqual(f.proCalls[0].body,expected);
+    }
+    assert.equal(Object.hasOwn(tool,'provider_specific_fields'),true);
+    assert.equal(tool.provider_specific_fields,null);
   });
 }

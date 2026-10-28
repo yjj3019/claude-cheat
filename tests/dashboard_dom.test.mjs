@@ -7,7 +7,7 @@ import vm from 'node:vm';
 
 // Run the exact scripts embedded in the served pages, including computed Python appends.
 const ASSETS = JSON.parse(execFileSync(process.env.PYTHON || 'python', ['-c',
-  'import json,re,routeDashboard as d; print(json.dumps({name:re.search(r"<script>(.*)</script>",page,re.S).group(1) for name,page in (("dashboard",d.PAGE),("settings",d.SETTINGS_PAGE))}))'],
+  'import json,re,routeDashboard as d; print(json.dumps({name:re.search(r"<script>(.*)</script>",page,re.S).group(1) for name,page in (("dashboard",d.PAGE),("settings",d.SETTINGS_PAGE))} | {"settings_html":d.SETTINGS_PAGE}))'],
 { cwd: new URL('..', import.meta.url), encoding: 'utf-8' }));
 
 function scriptBundle() {
@@ -225,6 +225,34 @@ test('Local routing is labeled correctly and does not show OpenRouter account fa
   assert.doesNotMatch(nodes.get('grid').innerHTML, /not_applicable/);
 });
 
+test('live service and loaded model are separate from an unreported Plan model and log windows', () => {
+  const base = fixture();
+  const nodes = render(fixture({ active_session: {provider:'local'}, proxy_stale:false, insights:[], alerts:[],
+    summary:'Plan으로 우회 중',
+    routing: {...base.routing, state:'plan', counts:{external:0,plan:0},
+      last:{provider:'plan', model:null, reason:'native_feature', age_seconds:2}},
+    proxy_metrics:{requests:7, failed:1, routes:{external:0,plan:7}, uptimeMs:10000,
+      stale:false, configuration:{provider:'local', model:'loaded-local-model'}} }));
+  assert.equal(nodes.get('live-text').textContent, 'Plan 우회 중');
+  const grid = nodes.get('grid').innerHTML;
+  assert.match(grid, /실행 서비스/);
+  assert.match(grid, /Local LLM/);
+  assert.match(grid, /로드 모델/);
+  assert.match(grid, /loaded-local-model/);
+  assert.match(grid, /보고되지 않음/);
+  assert.match(grid, /최근 구간의 라우팅 로그가 없습니다/);
+  assert.match(grid, /최근 구간의 우회 사유 로그가 없습니다/);
+  assert.match(grid, /새 Local·OpenRouter 세션에서 요청이 오가면 기록됩니다/);
+  assert.doesNotMatch(grid, /Plan 우회 없음/);
+  assert.doesNotMatch(grid, /실행기 코드가 오래됨/);
+});
+
+test('an external route with no provider evidence is not labeled as OpenRouter', () => {
+  const base = fixture();
+  const nodes = render(fixture({routing:{...base.routing,last:{provider:null,model:null}}}));
+  assert.equal(nodes.get('live-text').textContent, '외부 서비스 사용 중');
+});
+
 test('historical proxy counters are labeled as a previous run', () => {
   const nodes = render(fixture({ proxy_metrics: { requests: 4, stale: true, age_seconds: 120 } }));
   assert.match(nodes.get('grid').innerHTML, /지난 실행 기록/);
@@ -370,7 +398,7 @@ test('an unconfigured CLI card is never preselected over the routing services', 
   const page = await settingsPage({ config: { openrouter: READY_OPENROUTER, local: READY_LOCAL } });
   assert.deepEqual(visible(page.nodes), ['openrouter']);
   assert.equal(page.nodes.get('card-cli').hidden, true);
-  assert.match(page.select.innerHTML, /CLI \(연결 테스트 전용\) · 설정 필요/);
+  assert.match(page.select.innerHTML, /CLI 모델 백엔드 · 설정 필요/);
 });
 
 test('a CLI test result shows the version, exit code and a firewall hint on timeout', async () => {
@@ -384,3 +412,42 @@ test('a CLI test result shows the version, exit code and a firewall hint on time
   assert.doesNotMatch(result.innerHTML, /종료 코드/, 'a null exit code is not shown');
 });
 
+
+
+test('CLI launch default saves its nested engine before selecting the service', async () => {
+  const page = await settingsPage({config:{openrouter:READY_OPENROUTER,local:READY_LOCAL,default_provider:'local',
+    cli:{fields:{CLI_KIND:{value:'codex'},CLI_MODEL:{value:'old-model'},CLI_BINARY:{value:'old-binary'},CLI_TIMEOUT_S:{value:'45'}}}}});
+  page.nodes.get('default-provider').value = 'cli';
+  vm.runInContext('renderDefaultCli()', page.sandbox);
+  assert.equal(page.nodes.get('default-cli-options').hidden, false);
+  page.nodes.get('default-cli-kind').value = 'claude';
+  const calls = [];
+  page.sandbox.fetch = async (url, options) => {
+    const payload = JSON.parse(options.body); calls.push({url,payload});
+    return {json:async()=>url === '/api/config' ? {saved:true,config:{cli:{fields:{CLI_KIND:{value:'claude'}}}}} : {saved:true,default_provider:'cli'}};
+  };
+  await vm.runInContext('saveDefaultProvider()', page.sandbox);
+  assert.deepEqual(calls.map(call=>call.url), ['/api/config','/api/default-provider']);
+  assert.deepEqual(calls[0].payload, {provider:'cli',values:{CLI_KIND:'claude',CLI_MODEL:'',CLI_BINARY:'',CLI_TIMEOUT_S:'45'}});
+  assert.deepEqual(calls[1].payload, {provider:'cli'});
+  assert.equal(vm.runInContext('CONFIG.default_provider', page.sandbox), 'cli');
+});
+
+test('CLI live status does not invent a model or token cost', () => {
+  const base = fixture();
+  const nodes = render(fixture({active_session:{provider:'cli'},account:{ok:false,error:'not_applicable'},
+    routing:{...base.routing,last:{provider:'cli',model:null}},
+    proxy_metrics:{configuration:{provider:'cli',cliKind:'codex',model:null,requestedModel:'requested-x',usageMeasured:false}}}));
+  const html = nodes.get('grid').innerHTML;
+  assert.match(html, /CLI/);
+  assert.match(html, /CLI 토큰 사용량과 비용의 일일 합계는 집계되지 않습니다/);
+  assert.doesNotMatch(html, /토큰과 추정 비용/);
+});
+
+
+test('served settings offer CLI as the third backend with three nested engines', () => {
+  const html = ASSETS.settings_html;
+  assert.match(html, /id="default-provider"[^>]*>[\s\S]*?<option value="cli">CLI<\/option>/);
+  assert.match(html, /id="default-cli-kind">[\s\S]*?<option value="claude">Claude Code<\/option>[\s\S]*?<option value="codex">Codex<\/option>[\s\S]*?<option value="grok">Grok<\/option>/);
+  assert.doesNotMatch(html, /CLI는 감지·연결 테스트 전용/);
+});

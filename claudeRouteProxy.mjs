@@ -139,7 +139,7 @@ function stabilizeSystem(system) {
 }
 
 // Diagnostic mirror: routing events also land in a file so a session can be explained afterwards.
-// The launcher sets ROUTE_LOG_PATH for OpenRouter sessions; without it nothing is written.
+// The launcher sets ROUTE_LOG_PATH for Local and OpenRouter sessions; without it nothing is written.
 const routeLogPath = process.env.ROUTE_LOG_PATH;
 const ROUTE_LOG_LIMIT = 8 * 1024 * 1024;
 if (routeLogPath) {
@@ -275,6 +275,66 @@ const COMPAT_BETAS = new Set(['interleaved-thinking-2025-05-14', 'redact-thinkin
   'advanced-tool-use-2025-11-20', 'effort-2025-11-24', 'structured-outputs-2025-12-15',
   'dangerous-tool-use-2026-09-03', 'thinking-display-updates-2026-08-18', 'afk-mode-2026-01-31',
   'extended-cache-ttl-2025-04-11', 'fallback-credit-2026-06-01', 'thinking-token-count-2026-05-13']);
+function withoutNullToolMetadata(body) {
+  if (!Array.isArray(body.messages)) return body;
+  let changed = false;
+  const messages = body.messages.map(message => {
+    if (!Array.isArray(message?.content)) return message;
+    const content = message.content.map(block => {
+      if (block?.type !== 'tool_use' || block.provider_specific_fields !== null) return block;
+      changed = true;
+      const copy = { ...block }; delete copy.provider_specific_fields;
+      return copy;
+    });
+    return { ...message, content };
+  });
+  return changed ? { ...body, messages } : body;
+}
+
+function localInlineTools(body) {
+  body = withoutNullToolMetadata(body);
+  if (!Array.isArray(body.messages) || (body.tools !== undefined && !Array.isArray(body.tools))) return null;
+  const tools = [...(body.tools || [])], messages = [];
+  const sameDefinition = (first, second) => {
+    const a = { ...first }, b = { ...second };
+    delete a.cache_control; delete b.cache_control;
+    return JSON.stringify(a) === JSON.stringify(b);
+  };
+  for (const message of body.messages) {
+    if (!message || typeof message !== 'object') return null;
+    if (!Array.isArray(message.content)) { messages.push(message); continue; }
+    const content = [];
+    for (const block of message.content) {
+      if (block?.type !== 'tool_addition') { content.push(block); continue; }
+      if (!['user', 'system'].includes(message.role) || Object.keys(block).some(key => !['type', 'tool', 'cache_control'].includes(key)) ||
+          !block.tool || typeof block.tool !== 'object' || Array.isArray(block.tool)) return null;
+      if (block.tool.type !== 'tool_definition' || Object.keys(block.tool).some(key => !['type', 'definition'].includes(key))) return null;
+      const definition = block.tool.definition;
+      if (!definition || typeof definition !== 'object' || Array.isArray(definition) || typeof definition.name !== 'string') return null;
+      const tool = { ...definition };
+      if (block.cache_control !== undefined) {
+        const cache = block.cache_control;
+        if (!cache || cache.type !== 'ephemeral' || Object.keys(cache).some(key => !['type', 'ttl'].includes(key)) ||
+            (cache.ttl !== undefined && !['5m', '1h'].includes(cache.ttl)) ||
+            (tool.cache_control !== undefined && JSON.stringify(tool.cache_control) !== JSON.stringify(cache))) return null;
+        tool.cache_control = cache;
+      }
+      const index = tools.findIndex(previous => previous?.name === tool.name);
+      if (index < 0) tools.push(tool);
+      else if (tools[index].defer_loading === true || sameDefinition(tools[index], tool)) tools[index] = tool;
+      else return null;
+    }
+    if (!content.length) return null;
+    messages.push({ ...message, content });
+  }
+  if (!messages.length) return null;
+  const cacheCount = tools.filter(tool => tool?.cache_control).length +
+    messages.reduce((count, message) => count + (Array.isArray(message.content) ? message.content.filter(block => block?.cache_control).length : 0), 0) +
+    (Array.isArray(body.system) ? body.system.filter(block => block?.cache_control).length : 0);
+  if (cacheCount > 4) return null;
+  return { ...body, tools, messages };
+}
+
 function compatExclusion(body, beta) {
   // Check extensions separately; the original request, not this validation copy, is forwarded.
   if (!Array.isArray(body.messages)) return 'unsupported_message_shape';
@@ -711,7 +771,7 @@ export function parseRetryAfter(value, nowMs = Date.now()) {
 }
 
 export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrouter', openrouterModel, localUrl,
-  localModel, localKey, localAllowRemote = false, localHttpUrl, localOnly = false, localCompat = false, openrouterCompat = false, fallbackModel = 'claude-sonnet-5-5', retryDelayMs = 1000,
+  localModel, localKey, localAllowRemote = false, localHttpUrl, cliKind = null, cliRequestedModel = null, localOnly = false, localCompat = false, openrouterCompat = false, fallbackModel = 'claude-sonnet-5-5', retryDelayMs = 1000,
   cooldownMs = 30000, attemptTimeoutMs = localOnly || openrouterCompat ? 120000 : 30000, planHeaderMs = 120000, planIdleMs = 300000, attemptCeilingMs = 300000, now = Date.now,
   metricsPath = process.env.ROUTE_METRICS_PATH,
   streamPassthrough = process.env.ROUTE_STREAM_PASSTHROUGH === '1',
@@ -740,13 +800,14 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   if (!nonce || (provider === 'openrouter' && !key)) throw new Error('Proxy credentials required');
   const nonceDigest = createHash('sha256').update(nonce).digest();
   const tokenMatches = value => typeof value === 'string' && timingSafeEqual(createHash('sha256').update(value).digest(), nonceDigest);
-  if (!['openrouter', 'local'].includes(provider)) throw new Error('Unsupported Sonnet provider');
+  if (!['openrouter', 'local', 'cli'].includes(provider)) throw new Error('Unsupported Sonnet provider');
+  if (provider === 'cli' && (!['claude', 'codex', 'grok'].includes(cliKind) || localModel !== 'cli/' + cliKind || altProvider !== null)) throw new Error('Invalid CLI backend');
   if (provider === 'openrouter' && !validOpenRouterModel(openrouterModel))
     throw new Error('OpenRouter model required; no default model is selected');
   if (typeof localAllowRemote !== 'boolean') throw new Error('Remote Local setting must be boolean');
   if (localKey !== undefined && (typeof localKey !== 'string' || /[\x00-\x1f\x7f]/.test(localKey))) throw new Error('Invalid Local credential');
-  const externalUrl = provider === 'local' ? localEndpoint(localUrl, localAllowRemote, localHttpUrl) : 'https://openrouter.ai/api/v1/messages';
-  if (provider === 'local' && (typeof localModel !== 'string' || !localModel.trim())) throw new Error('Local model required');
+  const externalUrl = provider !== 'openrouter' ? localEndpoint(localUrl, provider === 'cli' ? false : localAllowRemote, provider === 'cli' ? '' : localHttpUrl) : 'https://openrouter.ai/api/v1/messages';
+  if (provider !== 'openrouter' && (typeof localModel !== 'string' || !localModel.trim())) throw new Error('Local model required');
   // Dual provider is an ordinary-session feature only: local-only and compatibility modes
   // rewrite requests and disable Plan fallback, so a second provider there would bypass
   // those guarantees. The alias is the exact model id the CLI must send to select it.
@@ -776,8 +837,9 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   if (!Number.isFinite(retryMaxWaitMs) || retryMaxWaitMs < 0) throw new Error('Invalid retry wait');
   // Breaker state is per provider: one failing provider must not make the other look down.
   const newCircuit = () => ({ openUntil: 0, probing: false, generation: 0, lastLocalFailure: 'upstream_error' });
-  const circuits = { openrouter: newCircuit(), local: newCircuit() };
+  const circuits = { openrouter: newCircuit(), local: newCircuit(), cli: newCircuit() };
   const primaryCircuit = circuits[provider];
+  let cliReportedModel = null, cliUsageMeasured = false;
   // The last rate-limit answer a provider gave; kept for exposure and the breaker decision.
   let lastRateLimit = null;
   // Breaker classification. Transport/timeout, 5xx and unusable 2xx answers mean the provider
@@ -810,13 +872,15 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     return { count: sorted.length, p50: at(0.5), p95: at(0.95), max: at(1) };
   };
   const publicMetricModel = value => validOpenRouterModel(value) &&
+    !/^(?:sk-|xai-|Bearer\s)/i.test(value) &&
     !/^[A-Za-z]:|:\/\/|\\/.test(value) &&
     ![nonce, key, localKey, altKey].some(secret => typeof secret === 'string' && secret.length > 0 && value.includes(secret)) ? value : null;
   const metricsSnapshot = () => ({
     configuration: {
       provider,
-      model: publicMetricModel(provider === 'local' ? localModel : openrouterModel),
-      modelRedacted: publicMetricModel(provider === 'local' ? localModel : openrouterModel) === null,
+      model: provider === 'cli' ? cliReportedModel : publicMetricModel(provider === 'local' ? localModel : openrouterModel),
+      modelRedacted: provider === 'cli' ? false : publicMetricModel(provider === 'local' ? localModel : openrouterModel) === null,
+      ...(provider === 'cli' ? {cliKind, requestedModel: publicMetricModel(cliRequestedModel), usageMeasured: cliUsageMeasured} : {}),
       alternate: altExternalUrl === null ? null : {
         provider: altProvider, model: publicMetricModel(altModel), modelRedacted: publicMetricModel(altModel) === null,
       },
@@ -1129,7 +1193,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         // Native Plan has a stricter tool-id contract than third-party providers. Normalize
         // only unrepresentable ids here; the external route is never rewritten (it translates
         // its own ids), and conforming ids stay byte-identical for the prompt cache.
-        const normalizedIds = normalizeToolCallIds(body);
+        const planInput = provider !== 'openrouter' ? withoutNullToolMetadata(body) : body;
+        const normalizedIds = normalizeToolCallIds(planInput);
         if (normalizedIds.empty) return reject(400, 'Invalid tool call id');
         if (normalizedIds.changed) logEvent({ event: 'tool_ids_normalized', provider: 'plan', count: normalizedIds.count });
         // The model that actually serves a Plan request may differ from the client alias.
@@ -1143,8 +1208,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         for (const [name, value] of Object.entries(req.headers))
           if (typeof value === 'string' && !['host', 'content-length', 'accept-encoding', 'connection',
             'transfer-encoding', 'x-local-route-token', 'x-api-key'].includes(name)) headers[name] = value;
-        const planBody = normalizedIds.changed ? normalizedIds.body : body;
-        const proBody = planModel === model && !normalizedIds.changed ? raw
+        const planBody = normalizedIds.changed ? normalizedIds.body : planInput;
+        const proBody = planModel === model && planInput === body && !normalizedIds.changed ? raw
           : JSON.stringify({ ...planBody, model: planModel });
         // Bound a stalled Plan upstream; user cancellation still flows through client.signal.
         const plan = new AbortController();
@@ -1206,15 +1271,25 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           client.signal.removeEventListener('abort', cancelPlan);
         }
       };
-      const nativeDetail = req.url.startsWith('/v1/messages/count_tokens') ? 'token_count' : compatProfile ?
+      let nativeDetail = req.url.startsWith('/v1/messages/count_tokens') ? 'token_count' : compatProfile ?
         compatExclusion(body, req.headers['anthropic-beta']) : isPro(model) ? 'plan_model' : externalExclusion(body, req.headers['anthropic-beta'], localOnly);
+      // Preserve MCP/tool-search request shapes without disabling client integrations.
+      // Ordinary thinking stays disabled so Local signatures never contaminate Plan fallback.
+      const localBody = provider !== 'openrouter' && !localOnly && !altRequested ? localInlineTools(body) : null;
+      const localRequestCompat = localBody && provider !== 'openrouter' && !localOnly && !altRequested &&
+        nativeDetail && !['token_count', 'plan_model'].includes(nativeDetail) &&
+        !body.messages.some(message => Array.isArray(message.content) && message.content.some(block =>
+          block?.type === 'tool_use' && Object.hasOwn(block, 'provider_specific_fields') && block.provider_specific_fields !== null)) &&
+        !compatExclusion(localBody, req.headers['anthropic-beta']);
+      if (localRequestCompat) nativeDetail = null;
       if (nativeDetail) return await sendPro('native_feature', nativeDetail);
+      const forceJson = noPlan || localRequestCompat || provider === 'cli';
       // The alternate model id selects the second provider; anything else keeps the session's
       // primary provider, so a single-provider session behaves exactly as before.
       const target = altRequested
         ? { name: altProvider, model: altModel, url: altExternalUrl, key: altKey, openrouter: altProvider === 'openrouter' }
-        : { name: provider, model: provider === 'local' ? localModel : openrouterModel, url: externalUrl,
-            key: provider === 'local' ? localKey : key, openrouter: provider === 'openrouter' };
+        : { name: provider, model: provider !== 'openrouter' ? localModel : openrouterModel, url: externalUrl,
+            key: provider !== 'openrouter' ? localKey : key, openrouter: provider === 'openrouter' };
       circuitState = circuits[target.name];
       // An expired breaker admits exactly one half-open probe: the first request takes the
       // lease synchronously, everyone else falls back to Plan (or is told recovery is in
@@ -1226,17 +1301,17 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       let succeeded = false, localFailure = 'upstream_error', failureClass = null;
       try {
         const externalModel = target.model;
-        const externalBody = { ...body, model: externalModel };
+        const externalBody = { ...(localRequestCompat ? localBody : body), model: externalModel };
         if (Array.isArray(externalBody.messages) && hasNativeThinking(externalBody.messages)) {
           externalBody.messages = withoutNativeThinking(externalBody.messages);
         }
         delete externalBody.metadata; // client account/session identifiers stay off third-party providers
-        if (noPlan) {
+        if (forceJson) {
           externalBody.stream = false;
         }
         // Ordinary mode: external thinking blocks would pin the next turn to Plan (unsigned history), so never request them.
         if (!compatProfile) externalBody.thinking = { type: 'disabled' };
-        if (body.tools) externalBody.tools = body.tools.map(tool => ({ ...tool, input_schema: compatibleSchema(tool.input_schema) }));
+        if (externalBody.tools) externalBody.tools = externalBody.tools.map(tool => ({ ...tool, input_schema: compatibleSchema(tool.input_schema) }));
         if (target.openrouter) externalBody.provider = { allow_fallbacks: false };
         // Opt-in prefix-cache stabilization: only the very last system text block may lose a
         // trailing, unfenced token-count footer. User/assistant content is never touched.
@@ -1250,14 +1325,14 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         const logReplacement = () => {
           if (routeLogged) return;
           routeLogged = true;
-          logEvent({ event: 'route_selected', provider: target.name, reason: 'replacement', model: externalModel });
+          logEvent({ event: 'route_selected', provider: target.name, reason: 'replacement', model: provider === 'cli' ? cliReportedModel : externalModel });
           noteRoute('external', 'replacement');
         };
         const headers = { 'content-type': 'application/json', 'anthropic-version': req.headers['anthropic-version'] || '2023-06-01' };
-        if (compatProfile && req.headers['anthropic-beta']) headers['anthropic-beta'] = req.headers['anthropic-beta'];
+        if ((compatProfile || localRequestCompat) && req.headers['anthropic-beta']) headers['anthropic-beta'] = req.headers['anthropic-beta'];
         const credential = target.key;
         if (credential) headers.authorization = `Bearer ${credential}`;
-        const attempts = noPlan ? 1 : 4;
+        const attempts = noPlan || provider === 'cli' ? 1 : 4;
         // Permanent 4xx will not change on retry; request-level ones must not open the provider-wide circuit.
         let requestRejected = false;
         for (let attempt = 0; attempt < attempts; attempt++) {
@@ -1314,8 +1389,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
                 res.once('drain', done);
                 res.once('close', done);
               });
-              const streaming = streamPassthrough && !noPlan && body.stream === true;
-              const validated = await bufferedResponse(response, externalModel, model, noPlan ? false : body.stream,
+              const streaming = streamPassthrough && !forceJson && body.stream === true;
+              const validated = await bufferedResponse(response, externalModel, model, forceJson ? false : body.stream,
                 controller.signal, () => { noteFirstByte(); if (!noPlan) arm(); }, target.openrouter,
                 streaming ? onFrame : null, !compatProfile && !localOnly, streaming ? onDrain : null);
               if (compatProfile) {
@@ -1350,7 +1425,12 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               // shortcut: textual match can false-positive on a tool_use input object containing this literal; refine if seen.
               if (!validated.streamed && !compatProfile && !localOnly && /"type"\s*:\s*"(?:redacted_thinking|thinking|thinking_delta|signature_delta)"/.test(validated.text))
                 throw new Error('Thinking response in ordinary mode');
-              return noPlan && body.stream === true ? jsonMessageStream(validated.text, !compatProfile) : validated;
+              const result = forceJson && body.stream === true ? jsonMessageStream(validated.text, !compatProfile) : validated;
+              if (provider === 'cli') {
+                result.cliReportedModel = response.headers.get('x-cli-reported-model');
+                result.cliUsageMeasured = response.headers.get('x-cli-usage-measured') === 'true';
+              }
+              return result;
             })();
             const response = await abortable(operation, controller.signal);
             client.signal.throwIfAborted();
@@ -1358,6 +1438,10 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             if (claimedGeneration === circuitState.generation) {
               if (circuitState.openUntil) logEvent({ event: 'circuit_recovered', provider: target.name });
               circuitState.openUntil = 0;
+            }
+            if (provider === 'cli') {
+              cliReportedModel = publicMetricModel(response.cliReportedModel);
+              cliUsageMeasured = response.cliUsageMeasured === true;
             }
             logReplacement();
             if (response.streamed) { res.end(); return; }
@@ -1467,6 +1551,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   const config = { key: process.env.OPENROUTER_API_KEY, openrouterModel: process.env.OPENROUTER_MODEL, nonce: process.env.LOCAL_ROUTE_TOKEN,
     provider: process.env.SONNET_PROVIDER || 'openrouter', localUrl: process.env.LOCAL_LLM_URL,
     localModel: process.env.LOCAL_LLM_MODEL, localKey: process.env.LOCAL_LLM_API_KEY,
+    cliKind: process.env.CLI_KIND, cliRequestedModel: process.env.CLI_MODEL,
+    attemptTimeoutMs: process.env.SONNET_PROVIDER === 'cli' ? (Number(process.env.CLI_TIMEOUT_S) || 60) * 1000 : undefined,
     localOnly: process.env.LOCAL_ROUTE_ONLY === '1', localCompat: process.env.LOCAL_ROUTE_COMPAT === '1', openrouterCompat: process.env.OPENROUTER_ROUTE_COMPAT === '1', localHttpUrl: process.env.LOCAL_LLM_HTTP_URL, localAllowRemote: process.env.LOCAL_LLM_ALLOW_REMOTE === 'true',
     metricsPath: process.env.ROUTE_METRICS_PATH,
     altProvider: process.env.ROUTE_ALT_PROVIDER || null, altModel: process.env.ROUTE_ALT_MODEL, altUrl: process.env.ROUTE_ALT_URL,
@@ -1474,7 +1560,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     altAlias: process.env.ROUTE_ALT_ALIAS };
   for (const name of ['OPENROUTER_API_KEY', 'OPENROUTER_MODEL', 'LOCAL_ROUTE_TOKEN', 'LOCAL_ROUTE_ONLY', 'LOCAL_ROUTE_COMPAT', 'OPENROUTER_ROUTE_COMPAT', 'SONNET_PROVIDER', 'LOCAL_LLM_URL',
     'LOCAL_LLM_MODEL', 'LOCAL_LLM_API_KEY', 'LOCAL_LLM_ALLOW_REMOTE', 'LOCAL_LLM_HTTP_URL', 'LOCAL_LLM_MODELS_URL', 'ROUTE_METRICS_PATH', 'ROUTE_ALT_PROVIDER', 'ROUTE_ALT_MODEL', 'ROUTE_ALT_URL',
-    'ROUTE_ALT_KEY', 'ROUTE_ALT_ALLOW_REMOTE', 'ROUTE_ALT_HTTP_URL', 'ROUTE_ALT_ALIAS']) delete process.env[name];
+    'ROUTE_ALT_KEY', 'ROUTE_ALT_ALLOW_REMOTE', 'ROUTE_ALT_HTTP_URL', 'ROUTE_ALT_ALIAS', 'CLI_KIND', 'CLI_MODEL', 'CLI_TIMEOUT_S']) delete process.env[name];
   if (process.argv.slice(2).includes('--check-connection')) {
     try {
       const result = await checkConnection(config);

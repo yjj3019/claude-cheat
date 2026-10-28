@@ -393,7 +393,7 @@ class Store:
     def default_provider(self):
         """An explicit preference for new sessions; old files retain automatic selection."""
         provider = self.read_provider("routing").get("ROUTE_DEFAULT_PROVIDER", "auto")
-        if provider not in ("auto", "openrouter", "local"):
+        if provider not in ("auto", "openrouter", "local", "cli"):
             raise ConfigError("invalid_default_provider")
         return provider
 

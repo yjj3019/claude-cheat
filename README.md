@@ -1,10 +1,10 @@
-# Claude-Cheat: Claude Code의 Sonnet을 OpenRouter 또는 Local LLM으로 사용하기
+# Claude-Cheat: Claude Code의 Sonnet을 OpenRouter · Local LLM · CLI로 연결하기
 
 **한국어** | [English](README.en.md) · [MIT License](LICENSE)
 
-기존 Claude Code의 **Plan 로그인과 사용자 설정을 사용하면서**, 호환되는 Sonnet 요청을 지정한 OpenRouter 모델 또는 Local LLM으로 보내는 로컬 라우터입니다. 일반 모드는 외부 모델 요청이 재시도 정책에 따라 실패하면 기존 Plan Sonnet으로 fallback하고, 연결이 복구되면 다시 외부 모델을 시도합니다. Plan을 사용하지 않는 전용·호환 모드는 별도로 제공합니다.
+기존 Claude Code의 **Plan 로그인과 사용자 설정을 사용하면서**, 호환되는 Sonnet 요청을 지정한 OpenRouter 모델, Local LLM 또는 CLI 모델 백엔드로 보내는 로컬 라우터입니다. 일반 모드는 외부 모델 요청이 재시도 정책에 따라 실패하면 기존 Plan Sonnet으로 fallback하고, 연결이 복구되면 다시 외부 모델을 시도합니다. Plan을 사용하지 않는 전용·호환 모드는 별도로 제공합니다.
 
-**현재 상태:** OpenRouter·Local 라우팅, 기본 실행 서비스 저장, 응답 모델 ID 검증, 모델 목록 중복 제거, AI용 진단 API를 제공합니다. CLI 항목은 감지·연결 테스트 전용입니다. 다만 **모든 Claude 고유 기능을 유지하면서 모든 Sonnet 요청을 외부 모델로 대체하는 것은 아직 달성하지 못했습니다.** 일반 모드의 미지원 기능이나 대화 이력은 원본 Plan 경로를 사용합니다. [검증 범위와 한계](#9-검증-방법과-남은-한계)를 먼저 확인하세요.
+**현재 상태:** OpenRouter·Local·CLI의 실행 서비스 선택과 저장, 모델 검증·중복 제거, AI용 진단 API를 제공합니다. CLI에서도 화면과 도구 실행 주체는 Claude Code입니다. 검증된 Claude Code/Codex 백엔드 버전만 허용하며 Grok 백엔드는 도구 차단 미검증으로 실행을 거부합니다. 모든 네이티브 요청의 외부 모델 대체를 보장하지 않으며 미지원 요청은 일반 모드의 Plan 경로를 사용합니다. [요구사항 점검표](docs/REQUIREMENTS-AUDIT.ko.md)에서 구현·검증·제한을 확인하세요.
 
 ## 빠른 시작
 
@@ -122,7 +122,7 @@ claude auth status
 
 `-Setup`은 설정 파일(`openclaude.config.yaml`과 예전 `.env.*`)을 만들거나 고치지 않고 세션도 시작하지 않습니다. 값은 웹 페이지에서 직접 저장합니다. 설정이 없을 때 `OpenClaude.ps1`이 출력하는 `[setup required]` 안내에도 이 명령이 포함됩니다.
 
-상단의 **설정할 서비스** 선택 상자에서 OpenRouter 또는 Local LLM을 고르면 해당 서비스의 입력란만 표시됩니다(옵션에 `설정됨`/`설정 필요`가 함께 표시되고, 마지막 선택은 브라우저에 기억됩니다). OpenRouter라면 **모델 ID**와 **API 키**를 입력하고 **모델 확인** → **저장**을 누른 뒤 세션을 시작하세요. 모델 확인은 저장 전 값으로도 실행되며, `openclaude.config.yaml`이 없으면 저장 시 `openclaude.config.example.yaml`의 주석을 그대로 가져와 값만 채웁니다. API 키와 서버 주소는 화면에 일부만 표시되고 저장된 원문은 브라우저로 전송되지 않으므로, 바꿀 때만 전체를 입력합니다(비워 두면 유지, 선택 항목인 HTTP 예외·모델 목록 주소는 **지우기**로 삭제). 설정이 없거나 잘못된 상태로 실행기를 시작하면 세션을 열지 않고 콘솔 주소를 안내합니다.
+상단의 **설정할 서비스** 선택 상자에서 OpenRouter·Local LLM·CLI를 고르면 해당 서비스의 입력란만 표시됩니다(옵션에 `설정됨`/`설정 필요`가 함께 표시되고, 마지막 선택은 브라우저에 기억됩니다). OpenRouter라면 **모델 ID**와 **API 키**를 입력하고 **모델 확인** → **저장**을 누른 뒤 세션을 시작하세요. 모델 확인은 저장 전 값으로도 실행되며, `openclaude.config.yaml`이 없으면 저장 시 `openclaude.config.example.yaml`의 주석을 그대로 가져와 값만 채웁니다. API 키와 서버 주소는 화면에 일부만 표시되고 저장된 원문은 브라우저로 전송되지 않으므로, 바꿀 때만 전체를 입력합니다(비워 두면 유지, 선택 항목인 HTTP 예외·모델 목록 주소는 **지우기**로 삭제). 설정이 없거나 잘못된 상태로 실행기를 시작하면 세션을 열지 않고 콘솔 주소를 안내합니다.
 
 설정 파일을 직접 편집하는 방식도 지원합니다.
 
@@ -174,10 +174,10 @@ OpenClaude.ps1 -Provider OpenRouter
 
 ### 기본 서비스를 저장하고 옵션 없이 실행하기
 
-Claude-Cheat는 프로젝트 이름이며, OpenRouter와 Local LLM은 연결할 서비스입니다. 대시보드에는 **설정할 서비스**와 **기본 실행 서비스**가 구분되어 있습니다. 다른 서비스의 키나 모델을 편집하는 것만으로 기본 실행 대상이 바뀌지는 않습니다.
+Claude-Cheat는 프로젝트 이름이며, OpenRouter·Local LLM·CLI는 연결할 서비스입니다. 대시보드에는 **설정할 서비스**와 **기본 실행 서비스**가 구분되어 있습니다. 다른 서비스의 키나 모델을 편집하는 것만으로 기본 실행 대상이 바뀌지는 않습니다.
 
 1. `.\OpenClaude.ps1 -Setup`으로 설정 화면을 엽니다.
-2. **설정할 서비스**에서 OpenRouter 또는 Local LLM을 골라 모델·접속 설정을 입력하고 **저장**합니다.
+2. **설정할 서비스**에서 OpenRouter·Local LLM·CLI 중 하나를 골라 모델·접속 설정을 입력하고 **저장**합니다.
 3. **기본 실행 서비스**에서 사용할 서비스를 고르고 **기본값 저장**을 누릅니다.
 4. 새 PowerShell 터미널에서 `.\OpenClaude.ps1`을 실행합니다. 이후에는 `-Provider`를 매번 입력할 필요가 없습니다.
 
@@ -187,12 +187,12 @@ Claude-Cheat는 프로젝트 이름이며, OpenRouter와 Local LLM은 연결할 
 | --- | --- |
 | `.\OpenClaude.ps1` 실행, 기본 서비스 저장됨 | 저장된 서비스 사용 |
 | 기본값이 `auto`이거나 없는 기존 파일, 사용 가능한 서비스가 하나 | 해당 서비스 자동 선택 |
-| 기본값이 `auto`이거나 없는 기존 파일, 두 서비스 모두 사용 가능 | `provider_choice_required` 안내 후 종료 코드 `2`; 기본값 저장 또는 일회성 옵션 필요 |
-| `-Provider OpenRouter` 또는 `-Provider Local` 지정 | 저장된 기본값보다 우선; 해당 실행에만 적용 |
+| 기본값이 `auto`이거나 없는 기존 파일, 여러 서비스 사용 가능 | `provider_choice_required` 안내 후 종료 코드 `2`; 기본값 저장 또는 일회성 옵션 필요 |
+| `-Provider OpenRouter`, `-Provider Local`, `-Provider CLI` 지정 | 저장된 기본값보다 우선; 해당 실행에만 적용 |
 | `.\OpenClaude.ps1 -Takeover` | 기본값을 바꿨어도 기존 세션의 서비스를 유지하며 프록시 교체 |
-| 대시보드에서 CLI 선택·저장 | 설치된 CLI의 감지·연결 테스트 설정 저장; 라우팅 대상으로 선택되지 않음 |
+| 대시보드에서 CLI 선택·저장 | Claude Code를 유지하고 선택한 CLI를 모델 백엔드로 사용; 새 세션부터 적용 |
 
-두 서비스의 설정은 함께 보관할 수 있습니다. 기본값을 저장하기 위해 다른 서비스 설정을 지울 필요는 없습니다. 서비스 설정을 먼저 저장해야 기본값으로 지정할 수 있으며, CLI는 기본 실행 서비스 목록에 포함되지 않습니다.
+세 서비스의 설정은 함께 보관할 수 있습니다. 기본값을 저장하기 위해 다른 서비스 설정을 지울 필요는 없습니다. 서비스 설정을 먼저 저장해야 기본값으로 지정할 수 있으며, CLI도 기본 실행 서비스로 저장할 수 있습니다. CLI 종류와 모델을 먼저 저장하세요.
 
 ```powershell
 # 저장된 기본 서비스로 새 세션 시작
@@ -211,7 +211,7 @@ Claude-Cheat는 프로젝트 이름이며, OpenRouter와 Local LLM은 연결할 
 .\OpenClaude.ps1 -Help
 ```
 
-직접 설정할 때는 다음 항목을 사용합니다. 허용값은 `auto`, `openrouter`, `local`입니다.
+직접 설정할 때는 다음 항목을 사용합니다. 허용값은 `auto`, `openrouter`, `local`, `cli`입니다.
 
 ```yaml
 routing:
@@ -224,9 +224,13 @@ routing:
 
 서비스 선택 API는 `POST /api/default-provider`에 `{"provider":"local"}` 형태로 요청합니다. `GET /api/config`의 `default_provider`와 `default_provider_error`로 저장 상태를 확인할 수 있습니다. 읽기·저장에는 페이지의 세션 토큰이 필요하며, 저장에는 기존 Origin·Host·요청 크기·횟수 제한도 적용됩니다.
 
-이번 실행 흐름과 문서 개선은 Cursor의 [CLI 설계 지침](https://github.com/cursor/plugins/blob/main/cli-for-agent/skills/cli-for-agents/SKILL.md)과 [문서 신뢰성 검토 지침](https://github.com/cursor/plugins/blob/main/agent-compatibility/agents/docs-reliability-review.md)을 참고했습니다. 명시적 옵션·실행 예제·조치 가능한 오류·문서와 동작의 일치를 적용 대상으로 삼았습니다. Claude-Cheat는 Cursor 플러그인이나 해당 저장소 전체의 이식판이 아니며, CLI를 모델 제공자로 연결하는 기능도 포함하지 않습니다.
+이번 실행 흐름과 문서 개선은 Cursor의 [CLI 설계 지침](https://github.com/cursor/plugins/blob/main/cli-for-agent/skills/cli-for-agents/SKILL.md)과 [문서 신뢰성 검토 지침](https://github.com/cursor/plugins/blob/main/agent-compatibility/agents/docs-reliability-review.md)을 참고했습니다. 명시적 옵션·실행 예제·조치 가능한 오류·문서와 동작의 일치를 적용 대상으로 삼았습니다. Claude-Cheat는 Cursor 플러그인이나 해당 저장소 전체의 이식판이 아니며, 해당 저장소 전체를 이식했다고 주장하지 않습니다.
 
-라우팅 세션은 Claude Code의 실험 beta를 끄고 시작합니다(`CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`, `CLAUDE_CODE_DISABLE_ADVISOR_TOOL`). Claude Code 2.1.310이 기본으로 보내는 `tool_addition`·`context_management`·advisor 도구 요청은 외부 Messages API가 HTTP 400으로 거절하므로, 같은 세션의 Plan 요청도 안정 프로토콜로 전송됩니다. 그 결과 이 세션에서는 advisor·inline 도구·서버 문맥 편집이 사용되지 않습니다. thinking·effort 설정은 요청마다 따로 전달되며, 일반 모드에서는 아래 5절대로 외부 요청에 thinking을 요구하지 않습니다.
+일반 OpenRouter·Local·CLI 실행은 원본 Claude Code의 beta·advisor 설정을 임의로 끄지 않습니다. 지원되는 요청만 외부 경로로 보내고 미지원 네이티브 기능은 Plan으로 보냅니다. 명시적인 호환·제한 모드는 별도 정책을 적용합니다.
+
+Local 단독 일반 세션에서는 이 두 비활성화 스위치를 설정하지 않으며, SSH/MCP·도구 검색·플러그인·hooks·사용자/프로젝트 권한 설정을 유지합니다. 알려진 MCP 지연 로딩·CLI 제어 필드는 기존 호환성 검증을 거쳐 Local로 전달합니다. 원본 CLI의 `tool_addition` 선언은 대화 내용과 도구 결과를 유지하면서 Local 도구 목록으로 변환합니다. 충돌하는 도구 재정의·알 수 없는 형식은 원본 대화와 도구 정의를 유지한 Plan 경로로 보냅니다. CLI가 도구 이력에 넣는 `provider_specific_fields: null`만 값 없음으로 정리하며, 실제 객체 데이터나 서명은 이 규칙으로 제거하지 않습니다. 캐시 경계는 서버 형식에 맞게 바뀔 수 있습니다. 해당 요청은 JSON 응답을 검증한 뒤 필요한 경우 CLI용 SSE로 바꿉니다. 지원하지 않는 네이티브 기능·Opus/Haiku/Fable 선택·Local 실패에는 기존 Plan 경로를 유지합니다. Local 추론 서명이 Plan 이력과 충돌하지 않도록 일반 모드의 외부 thinking 비활성화 정책도 유지합니다.
+
+일반 Local 실행의 기본 출력 예산은 8,192토큰입니다. 원본 Sonnet의 큰 출력 한도로 Local 문맥 한도를 초과하는 문제를 줄이며, 명시적인 `CLAUDE_CODE_MAX_OUTPUT_TOKENS` 양의 정수값은 그대로 사용합니다. 이 값만 실행별 설정으로 전달하고 사용자·프로젝트 설정 파일은 수정하지 않습니다. 큰 입력·명시적인 큰 출력 예산은 여전히 모델 한도를 초과할 수 있습니다. `-LocalMode`는 MCP 등을 차단하는 별도 제한 모드이므로 원본 Claude Code의 연동 기능을 유지하려면 일반 실행을 사용하세요.
 
 ### OpenRouter 호환 모드: Plan 전환 차단
 
@@ -435,7 +439,7 @@ Local 응답은 JSON으로 받아 설정한 모델을 검증한 뒤 CLI용 SSE�
 
 ```text
 호환 Sonnet 요청
-  → 외부 제공자 최초 시도 + 재시도 3회 = 최대 4회
+  → HTTP 제공자 최초 시도 + 재시도 3회 = 최대 4회 (CLI 백엔드는 1회)
   → 401·402·403·404는 재시도 없이 즉시 Plan + 30초 대기, 400·413·422는 해당 요청만 Plan(대기 없음)
   → 외부로 보내는 요청에서 `metadata`(계정·세션 식별자)와 이전 응답의 서명된 thinking 블록은 제거, 일반 모드에서는 thinking을 요청하지 않음(외부 응답에 thinking이 오면 그 요청만 Plan)
   → Plan 전달은 스트림 요청의 헤더 120초·청크 간 무응답 300초를 넘기면 끊음, 요청 본문 상한은 32MiB
@@ -446,7 +450,7 @@ Local 응답은 JSON으로 받아 설정한 모델을 검증한 뒤 CLI용 SSE�
       └─ 실패: Plan fallback 및 대기 기간 재시작
 ```
 
-- 일반 모드의 외부 시도는 **무응답 30초**(헤더 대기·청크 간 간격)를 넘기면 실패하고, 응답이 계속 오는 동안은 최대 300초까지 기다립니다. 재시도 간격은 **1초**이며, HTTP 429의 `Retry-After`가 더 길면 그 값(내부 대기 상한 기본 **10초**)을 따릅니다. 네 번 모두 무응답이라면 Plan 요청 전까지 대략 123초가 걸릴 수 있습니다. Local·compat 모드는 기존의 고정 총 시간 제한을 유지합니다. Plan 응답 시간이나 CLI 자체 재시도는 여기에 추가될 수 있습니다.
+- CLI 백엔드는 위 CLI 절의 단일 시도·설정된 시간 제한을 사용합니다. HTTP 제공자의 일반 모드 외부 시도는 **무응답 30초**(헤더 대기·청크 간 간격)를 넘기면 실패하고, 응답이 계속 오는 동안은 최대 300초까지 기다립니다. 재시도 간격은 **1초**이며, HTTP 429의 `Retry-After`가 더 길면 그 값(내부 대기 상한 기본 **10초**)을 따릅니다. 네 번 모두 무응답이라면 Plan 요청 전까지 대략 123초가 걸릴 수 있습니다. Local·compat 모드는 기존의 고정 총 시간 제한을 유지합니다. Plan 응답 시간이나 CLI 자체 재시도는 여기에 추가될 수 있습니다.
 - `Retry-After`는 정수 초와 HTTP-date(RFC 7231)를 모두 읽고 최대 10분으로 자릅니다. 제공자가 긴 대기를 요구하면 프록시는 턴을 붙잡지 않고, **최종 실패 응답에 429/529 상태와 `Retry-After`(초)**를 실어 클라이언트가 기다리게 합니다. 단순 429에 임의의 기본 대기시간을 만들지 않습니다.
 - **회로 차단은 실패 원인을 구분합니다.** 전송 실패·타임아웃·5xx·408·검증 불가한 2xx는 제공자 장애로 보고 회로를 열며, 401·402·403은 제공자 설정 문제로 기존처럼 쿨다운합니다. 반면 429는 제공자가 알려준 `Retry-After`(최대 10분)을 쿨다운으로 사용하고, **요청 자체가 잘못된 4xx는 회로를 열지 않습니다**. half-open 복구 확인은 동시에 하나만 허용되며, 늦게 도착한 이전 시도의 성공·실패는 새 세대의 회로 상태를 덮어쓰지 않습니다.
 - 클라이언트가 요청 본문을 보내다 멈추면 **유휴 기준 타임아웃(기본 30초, `ROUTE_REQUEST_IDLE_TIMEOUT_MS`)** 후 연결을 끊고 점유한 턴을 반납합니다. 느리지만 계속 보내는 큰 업로드는 끊지 않습니다. 연결이 끊긴 요청은 업스트림 읽기·타이머를 정리하고 재시도하지 않습니다.
@@ -537,7 +541,7 @@ Sonnet 선택과 HUD의 모델·비용 표시는 실제 외부 라우팅이나 �
 
 | 항목 | 내용 |
 | --- | --- |
-| 지금 상태 | 마지막 `route_selected` 기준 **OpenRouter 또는 Local LLM 사용 중 / Plan 우회 중 / 유휴**, **최근 요청의 실제 라우팅 모델**, 경과 시간, 사유 |
+| 지금 상태 | 현재 프록시와 로그 중 최신 근거의 **OpenRouter·Local LLM·CLI 사용 중 / Plan 우회 중 / 유휴**, 실행 서비스·로드 모델·최근 처리 모델·시작 시각 |
 | 경고 배너 | 최근 10분에 Plan 우회 50% 이상, 회로 차단, 400·413·422 거부, 잔액 10% 이하일 때 표시 |
 | 최근 60분 | 외부 서비스 대 Plan 비율, 회로 차단 횟수; 저장된 라우팅 기록 기준 |
 | 우회 사유 | `native_feature`의 `detail`별 건수와 **의미·조치 설명**, 외부 실패 상태·검증 실패 분류 |
@@ -570,7 +574,7 @@ Sonnet 선택과 HUD의 모델·비용 표시는 실제 외부 라우팅이나 �
 | 지우기 | 선택 항목(HTTP 예외·모델 목록 주소)은 **지우기** 버튼으로 삭제합니다(`POST /api/config`의 `clear` 목록). 필수 항목과 키는 지울 수 없습니다 |
 | 검증 | 모델 ID 형식, 키 형식, Local URL 규칙(루프백·HTTPS·동일 출처)을 저장 전에 확인하며 실패하면 파일을 건드리지 않습니다 |
 | 보호 | 설정 조회(`GET /api/config`)와 저장(POST) 모두 페이지에 내장된 세션 토큰이 필요하고, POST는 동일 출처일 때만 허용합니다(다른 사이트에서 호출 불가) |
-| 연결 테스트 | **모델 확인**은 모델 목록만 조회하고, **추론 테스트**는 16토큰으로 1회 호출합니다(소액 과금 가능) |
+| 연결 테스트 | **모델 확인**은 모델 목록만 조회하고, **추론 테스트**는 OpenRouter 16토큰·Local 512토큰 한도로 1회 호출합니다(과금 또는 서버 자원 사용 가능). Local은 선택 모델 ID·정확한 `OK` 답변·정상 종료까지 확인합니다 |
 | 모델 선택 | **목록** 버튼으로 제공자 모델을 검색해 고릅니다(컨텍스트 길이·가격 표시). `GET /api/models?provider=openrouter\|local` (세션 토큰 필요, 10분 캐시) |
 | 적용 시점 | 저장한 설정은 **새 세션부터** 적용됩니다. 실행 중인 세션은 재시작하세요 |
 
@@ -587,25 +591,37 @@ Sonnet 선택과 HUD의 모델·비용 표시는 실제 외부 라우팅이나 �
 
 실행 중인 Claude Code의 `/model` 선택값을 대시보드가 실시간으로 읽지는 않습니다. 세션이 없거나 아직 요청을 보내지 않았다면 설정값·과거 기록만으로 현재 모델에 연결됐다고 판단하면 안 됩니다. **모델 확인**은 목록 조회이고 **추론 테스트**와는 다릅니다.
 
-실행기는 기본적으로 OpenRouter 세션에 경로 로그·메트릭 파일 경로를 설정합니다. Local 세션에서는 과거 OpenRouter 라우팅 기록이 남아 보일 수 있으므로, 현재 로드 모델은 `session.loaded_model`, 최근 기록의 소속은 `last_route.current_session`으로 구분하세요. 구버전 프록시가 모델을 보고하지 않거나 민감값이라 생략된 경우에는 로드 모델이 `null`입니다.
+실행기는 기본적으로 OpenRouter 세션에 경로 로그·메트릭 파일 경로를 설정합니다. 활성 세션에서는 이전 세션의 로그·코드 해시를 현재 상태에 사용하지 않고, 인증된 프록시의 최신 메트릭과 현재 세션 로그를 비교합니다. 현재 로드 모델은 `session.loaded_model`, 최신 요청의 소속은 `last_route.current_session`으로 구분하세요. Plan 경로나 두 제공자 중 실제 처리 모델을 알 수 없는 경우에는 최근 처리 모델을 추정하지 않고 `null`로 표시합니다. 구버전 프록시가 모델을 보고하지 않거나 민감값이라 생략된 경우에도 로드 모델은 `null`입니다.
+
+최근 60분·10분의 경로 비율은 현재 세션의 실제 로그만 집계합니다. 해당 구간 로그가 없는 Local 세션에서는 비율을 0%로 단정하지 않고 기록 없음으로 안내하며, 세션 전체의 누적 요청·외부/Plan 건수는 **프록시 처리량** 카드에서 확인합니다. 누적 카운터를 최근 구간 통계로 바꾸어 표시하지 않습니다.
 
 모델 선택 목록에서는 같은 서비스의 **동일한 모델 ID를 한 번만** 표시합니다. 앞뒤 공백을 제거한 ID가 같으면 첫 항목의 메타데이터를 유지하며, 대소문자나 `:latest` 같은 접미사가 다른 ID는 임의로 합치지 않습니다. 항목 선택은 입력칸만 채우고, 저장 버튼을 눌러야 설정이 바뀝니다. 요청별 기본·대체 제공자 선택과 별칭 충돌 검사도 적용됩니다. 같은 모델 이름을 가진 서로 다른 서버나 여러 세션의 실행 자체를 금지하는 기능은 아닙니다.
 
-### CLI 감지와 연결 테스트 (진단 전용)
+### CLI를 모델 백엔드로 사용하기
 
-설정 화면의 **CLI (연결 테스트 전용)** 항목은 설치된 Codex · Grok · Claude Code CLI를 찾아 버전을 보여 주고, 외부 통신이 되는지 확인하는 **진단 도구**입니다. **요청을 CLI로 보내는 라우팅은 아직 지원하지 않습니다**(`OpenClaude.ps1 -Provider`에 CLI는 없습니다).
+설정 화면의 **기본 실행 서비스**에서 CLI를 선택하고, 하위 종류에서 **Claude Code · Codex · Grok**을 고릅니다. CLI 설정과 기본값을 저장한 뒤 `.\OpenClaude.ps1`을 실행하면 됩니다. 일회성 실행은 `.\OpenClaude.ps1 -Provider CLI`입니다. CLI 종류를 바꾼 경우 모델·실행 파일도 다시 확인하세요.
 
-| 항목 | 동작 |
+화면과 SSH/MCP·Skills·Plugins·hooks·권한 처리는 원본 Claude Code가 맡습니다. 백엔드 CLI는 대화와 도구 목록을 받아 엄격한 JSON으로 답변 또는 도구 호출을 제안하며, 실제 도구 실행은 전면 Claude Code가 수행합니다. 백엔드에서 자체 도구·프로젝트 규칙을 실행하는 이중 에이전트 동작은 허용하지 않습니다.
+
+| 항목 | 동작과 제한 |
 | --- | --- |
-| 감지 | `PATH`와 알려진 설치 폴더(`~\.grok\bin`, `%APPDATA%\npm`, `~\.local\bin`)를 찾고, 이미 실행 중인 세션의 PATH가 낡았으면 사용자·시스템 PATH를 레지스트리에서 다시 읽어 보정합니다. `GET /api/cli`(세션 토큰 필요) |
-| 감지 확인 | `--version`만 실행합니다(네트워크 사용 없음) |
-| 연결 테스트 | `Reply with exactly OK` **한 줄**을 선택한 CLI로 보냅니다. 그 CLI의 **로그인으로 외부 서비스를 실제로 호출**하므로 소액 과금이나 사용량이 생길 수 있습니다 |
-| 실행 방식 | 셸 없이 직접 실행합니다(npm `.cmd` 래퍼는 내용을 읽어 실제 대상으로 풀고, 인식 못 하면 거부). 실행 파일은 **절대 경로 + 이름 일치 + 존재**를 확인하고 **UNC 경로와 심볼릭 링크는 거부**합니다(하드 링크는 여전히 구분 못 함). 매번 빈 임시 폴더에서 실행하고 프롬프트는 인자가 아니라 파일/표준 입력으로 전달합니다. Windows에서는 자식 프로세스를 **kill-on-close Job Object**에 넣어, CLI 루트가 먼저 끝나도 남은 손자 프로세스를 실행 종료 시 정리합니다 |
-| 환경 | 허용 목록만 자식 프로세스에 전달합니다(PATH·시스템 변수, 프록시·인증서 변수, 해당 CLI의 로그인 변수). `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_*`, `OPENROUTER_*`, 대시보드 토큰은 절대 전달하지 않습니다(`claude -p`가 이 프록시를 다시 호출하는 재귀를 막기 위함) |
-| 결과 | `ready`, `timeout`(방화벽·프록시 의심), `not_logged_in`, `unsupported_flag`(CLI 버전이 옵션을 거부), `not_found` 등 **분류·종료 코드·소요 시간만** 표시합니다. CLI의 출력·오류 원문은 표시도 기록도 하지 않습니다 |
-| 제한 | 동시에 하나만 실행합니다. 제한 시간은 10~120초(기본 60)입니다 |
+| 지원 판정 | 설치 여부와 백엔드 검증 여부를 구분합니다. 현재 허용 버전은 Claude Code `2.1.312`, Codex `0.165.0`이며 다른 버전은 재검증 전 거부합니다. |
+| Grok | 목록과 감지는 제공하지만 현재 설치 버전의 도구 차단이 검증되지 않아 `backend_version_unverified`로 거부합니다. |
+| 연결 확인 | 명시적인 연결 테스트와 시작 시 검사에서 고정 `OK` 요청을 실제 백엔드에 보냅니다. 해당 CLI의 별도 로그인이 필요하며 사용량이 발생할 수 있습니다. 감지만으로 연결 성공을 표시하지 않습니다. |
+| 실행 격리 | 셸 없이 빈 임시 작업 폴더에서 실행합니다. 백엔드 도구·MCP·hooks 등을 검증된 프로필로 차단하고, 라우터 인증·주소는 전달하지 않습니다. 프롬프트와 응답은 메모리에서 처리합니다. |
+| 도구·이력 | 광고된 도구 이름과 인자 JSON, 호출·결과 짝, 선택 제약을 검사합니다. 미지원 입력이나 잘못된 응답은 일반 모드의 원본 Plan 경로로 보냅니다. |
+| 재시도 | CLI 백엔드는 한 번 호출한 뒤 실패 시 Plan으로 전환합니다. 중복 백엔드 추론을 위한 자동 재시도는 하지 않습니다. 제한 시간은 10~120초(기본 60), 동시 요청은 최대 4개입니다. 취소 시 소유한 자식 프로세스를 정리합니다. |
+| 모델·사용량 | 요청한 모델과 실제 보고된 모델을 분리합니다. CLI가 실제 모델·사용량을 보고하지 않으면 미확인으로 남기며 프로토콜 식별자를 실제 모델명으로 표시하지 않습니다. |
+| 상태 API | `/api/diagnostics`는 읽기 전용이며 CLI 추론이나 로그인을 시작하지 않습니다. CLI 원문 출력·오류나 인증 정보는 대시보드에 노출하지 않습니다. |
 
-도구 차단 플래그(예: Codex `--disable shell_tool`)는 **최선 노력이며 실제로 파일 읽기를 막는지는 검증하지 않았습니다.** 연결 테스트의 프롬프트는 고정 문자열이지만, CLI는 에이전트이므로 신뢰하지 않는 입력을 보내는 용도로 쓰지 마세요.
+원본 Claude Code 옵션은 PowerShell에서 `-CliArgs`로 전달할 수 있습니다.
+
+```powershell
+.\OpenClaude.ps1 -CliArgs @('--resume', 'session id', '--plugin-dir', 'C:\my-plugin')
+.\OpenClaude.ps1 -CliArgs @('--help')
+```
+
+Python 직접 실행은 `python openrouterAdvisor.py -- --resume "session id"`처럼 `--` 뒤에 인자를 넣습니다. 도움말·버전·관리 명령은 라우팅 및 추론 검사 없이 원본 CLI로 전달합니다. 제한 모드와 충돌하는 옵션은 명확한 오류로 거부합니다. 전면 Claude Code 로그인과 선택한 백엔드 로그인은 별개이며, 이 기능은 모든 모델의 도구 이해 능력이나 Sonnet과 동일한 품질을 보장하지 않습니다.
 
 ### 요청 구성 계측 (CLI 후보 측정)
 
@@ -715,7 +731,7 @@ node --test tests/dashboard_dom.test.mjs
 | HUD·MCP 일부가 동작하지 않음 | 일반 Claude에서도 같은지 비교; 설정 로드와 서버 연결·권한 정상 여부는 별도 |
 | 응답 전 대기가 길어짐 | 외부 4회 시도와 버퍼링 여부 확인; 사용자가 취소하면 후속 시도도 중단 |
 
-라우팅 세션은 판단 근거를 실행기 폴더의 `.route.log`에 함께 남깁니다. 세션을 시작할 때마다 `proxy start` 줄이 추가되고, `route_selected`·`external_attempt_failed`·`circuit_open` 같은 이벤트가 시각과 함께 쌓입니다. `-Debug`를 켜지 않은 지난 세션도 이 파일로 확인할 수 있으며, `*.log` 규칙으로 Git에서 제외됩니다.
+Local과 OpenRouter 모두 라우팅 판단 근거를 실행기 폴더의 `.route.log`에 함께 남깁니다. 세션을 시작할 때마다 `proxy start` 줄이 추가되고, `route_selected`·`external_attempt_failed`·`circuit_open` 같은 이벤트가 시각과 함께 쌓입니다. `-Debug`를 켜지 않은 지난 세션도 이 파일로 확인할 수 있으며, `*.log` 규칙으로 Git에서 제외됩니다.
 
 같은 턴의 로그 줄은 **8자리 `traceId`** 로 묶이므로 `external_attempt_failed` 4회와 `circuit_open`·`route_selected`를 한 번에 재구성할 수 있습니다(`metrics.last.traceId`에도 같은 값). 로그는 **단일 sink에서 자격증명을 세척**합니다: 설정된 API 키, `Bearer …`, `sk-*`/`sk-ant-*`/`sk-or-*`, `x-api-key` 값은 `[redacted:provider-key|bearer-token|api-key]` 태그로 바뀌고 모델명·상태코드·traceId는 유지됩니다. 제공자 오류 본문은 최대 **64KiB**까지만 읽어 같은 규칙으로 세척한 뒤 전달하며, 더 긴 본문은 잘렸다는 이벤트를 남깁니다. 세척은 패턴 기반이므로 문자열이 난독화된 자격증명까지 보장하지는 않습니다.
 
@@ -837,7 +853,7 @@ python tests/bench_dashboard.py            # 10MB 로그 · 2,000개 세션 파�
 - 외부 추론의 네이티브 advisor만 별도로 구독 경로에서 실행하는 기능은 구현하지 않았습니다. custom `ANTHROPIC_BASE_URL`에서 원격 managed settings·organization policy를 포함한 모든 네이티브 기능의 동등성을 보장하지 않습니다.
 - 요청 본문은 32MiB로 제한하며 초과 시 fallback 전에 HTTP 413을 반환합니다. 버전이 숫자로 시작하는 `claude-sonnet-*`, `claude-opus-*`, `claude-haiku-*`, `claude-fable-*`, 설정한 OpenRouter 모델 ID와 과거 클라이언트 모델 별칭을 허용하며, 미등록 모델은 HTTP 403으로 거부합니다.
 - 프록시의 추론 경로는 POST `/v1/messages`, `/v1/messages/count_tokens`(선택적 `?beta=true`)입니다. 같은 세션 토큰이 필요한 HEAD `/api/hello`, GET `/api/metrics`, POST `/api/handover`도 제공합니다. 그 밖의 프록시 경로는 구독으로 우회하지 않고 거부합니다. 대시보드의 `/api/diagnostics` 등은 별도 대시보드 포트에서 제공합니다.
-- 사용자 지정 `CLAUDE_CONFIG_DIR`는 유지하되, 미설정 또는 과거 전용 `~/.claude-openrouter`이면 자식에서 `~/.claude`를 사용합니다. 과거 폴더의 MCP·플러그인을 자동 이전하거나 폴더를 복사·삭제하지 않습니다.
+- `CLAUDE_CONFIG_DIR`가 미설정·빈 값·과거 전용 `~/.claude-openrouter`이면 자식 환경에서 제거해 원본 Claude Code의 설정 탐색을 유지합니다. 사용자가 명시한 경로는 `~/.claude`를 포함해 그대로 보존합니다. `~/.claude`를 강제로 지정하면 개인 MCP 설정을 읽는 `.claude.json` 위치까지 바뀌므로 기본값처럼 주입하지 않습니다([공식 MCP 저장 위치 안내](https://code.claude.com/docs/en/mcp-quickstart#find-your-configuration-on-disk)). 폴더·설정·인증 파일을 복사·이전·삭제하지 않습니다.
 - Local·compat 격리 세션의 임의 토큰(nonce)은 Claude Code 프로세스의 `--settings` 인자와 환경변수에 들어갑니다. 같은 사용자 권한의 프로세스(명령줄을 수집하는 EDR·감사 도구 포함)가 읽을 수 있고, 유출되면 해당 세션 동안 로컬 프록시를 통해 OpenRouter/Local 사용량을 소비할 수 있습니다. 세션마다 새로 생성하며 `127.0.0.1`에만 바인드합니다. Plan 접근 권한은 주지 않습니다.
 - 두 제공자 모두 응답 모델 ID·콘텐츠·종료 사유를 검증합니다. OpenRouter에는 `id`·`role=assistant`·토큰 `usage`도 요구하며, SSE `event:` 이름과 JSON `type`이 다르면 거부합니다. 일반 Local과 Local 호환 모드는 OpenRouter 전용 메타데이터 요구를 적용하지 않지만 공통 검증은 유지합니다. Local 전용 모드에서 JSON을 CLI용 스트림으로 변환할 때는 메타데이터도 요구합니다. 2026-10-24 실호출 결과는 당시 검증한 모델의 기록이며 다른 모델의 호환성을 보장하지 않습니다.
 - `claude`가 npm 설치의 `.cmd`/`.bat` shim으로 해석되면 격리 모드(Local·OpenRouter compat)는 경고를 출력합니다. cmd.exe가 shim을 거치는 인자의 따옴표·`&`·`%`를 잘못 해석할 가능성이 있으나 실제 재현은 하지 못했습니다. 네이티브 `claude.exe` 설치를 권장합니다.

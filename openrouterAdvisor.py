@@ -1,6 +1,8 @@
 """Session-only Claude Code launcher and one stdio MCP advisor tool."""
 
 import http.client
+import base64
+import binascii
 import json
 import os
 from datetime import datetime, timezone
@@ -20,6 +22,8 @@ import time
 import argparse
 import localProcessTree
 import routeConfig
+import routeCli
+import cliBackend
 from urllib.parse import urlsplit, urlunsplit
 import urllib.request
 import urllib.error
@@ -62,13 +66,23 @@ class OpenRouterConfigError(ValueError):
             "and fill the OpenRouter settings there.")
 
 
+class PlanLoginError(RuntimeError):
+    def __init__(self):
+        super().__init__("Existing first-party Plan login required; run claude auth login, then restart Claude-Cheat")
+
+
+class LauncherArgumentsError(ValueError):
+    pass
+
+
 class ProviderChoiceError(ValueError):
-    """Both providers are configured; a launch must not pick one silently."""
+    """Several services are configured; a launch must not pick one silently."""
 
     code = "provider_choice_required"
 
-    def __init__(self):
-        super().__init__("Both OpenRouter and Local settings are configured; choose one explicitly")
+    def __init__(self, providers=("openrouter", "local")):
+        self.providers = list(providers)
+        super().__init__("Multiple services are configured; choose one explicitly")
 
 
 def read_env(path: Path) -> dict:
@@ -108,6 +122,20 @@ def local_endpoint(url: str, allow_remote: bool, http_url: str = "") -> tuple:
 
 
 def provider_config(provider: str, require_model: bool = True) -> dict:
+    if provider == "cli":
+        values = settings("cli")
+        kind = (values.get("CLI_KIND") or "").strip()
+        model = (values.get("CLI_MODEL") or "").strip()
+        binary = (values.get("CLI_BINARY") or "").strip()
+        seconds = values.get("CLI_TIMEOUT_S") or "60"
+        if kind not in routeCli.KINDS or model and not routeCli._MODEL_RE.fullmatch(model):
+            raise routeCli.CliError("invalid_cli_configuration")
+        if not re.fullmatch(r"[0-9]{1,3}", seconds) or not 10 <= int(seconds) <= 120:
+            raise routeCli.CliError("invalid_cli_timeout")
+        if binary:
+            routeCli.validate_binary(kind, binary)
+        return {"SONNET_PROVIDER": "cli", "CLI_KIND": kind, "CLI_MODEL": model,
+                "CLI_BINARY": binary, "CLI_TIMEOUT_S": seconds}
     if provider == "openrouter":
         try:
             values = settings("openrouter")
@@ -157,17 +185,19 @@ def configured_provider() -> str:
         provider_config(preferred)
         return preferred
     ready, failures = [], []
-    for name in ("openrouter", "local"):
+    for name in ("openrouter", "local", "cli"):
         try:
             provider_config(name)
         except (OSError, ValueError) as error:
             failures.append((name, error))
         else:
             ready.append(name)
-    if len(ready) == 2:
-        raise ProviderChoiceError()
+    if len(ready) > 1:
+        raise ProviderChoiceError(ready)
     if len(ready) == 1:
         return ready[0]
+    if any(settings("cli").get(key) for key in ("CLI_KIND", "CLI_MODEL", "CLI_BINARY")):
+        raise routeCli.CliError("invalid_cli_configuration")
     # Nothing is usable. Point a Local-only user at the Local section instead of telling
     # them to fill OpenRouter; a first-run install still gets the OpenRouter setup help.
     try:
@@ -188,6 +218,8 @@ def dual_provider_setup(provider: str) -> dict | None:
     Opt-in through ``routing: dual_provider``. A missing or broken other provider keeps the
     session single-provider instead of failing startup: this is a convenience, not a need.
     """
+    if provider not in DUAL_ALIASES:
+        return None
     try:
         enabled = (settings("routing").get("ROUTE_DUAL_PROVIDER") or "").strip().lower()
     except (OSError, ValueError):
@@ -465,8 +497,27 @@ def run_owned(args: list, env: dict, cwd: str, prompt: str = "", timeout: int = 
 
 @contextlib.contextmanager
 def routed_session(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False,
+                   openrouter_compat: bool = False, debug: bool = False, port=None, nonce=None):
+    options = dict(local_only=local_only, local_compat=local_compat, openrouter_compat=openrouter_compat,
+                   debug=debug, port=port, nonce=nonce)
+    if provider != "cli":
+        with _routed_session(provider, **options) as env:
+            yield env
+        return
+    if local_only or local_compat or openrouter_compat:
+        raise ValueError("CLI backend requires ordinary Claude Code mode")
+    values = provider_config("cli")
+    with cliBackend.serve(values) as (backend, url, token):
+        config = {**values, "LOCAL_LLM_URL": url, "LOCAL_LLM_MODEL": backend.protocol_model,
+                  "LOCAL_LLM_API_KEY": token, "LOCAL_LLM_ALLOW_REMOTE": "false", "LOCAL_LLM_HTTP_URL": ""}
+        with _routed_session(provider, **options, _config=config, _backend=backend) as env:
+            yield env
+
+
+@contextlib.contextmanager
+def _routed_session(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False,
                   openrouter_compat: bool = False, debug: bool = False,
-                  port: int | None = None, nonce: str | None = None):
+                  port: int | None = None, nonce: str | None = None, _config=None, _backend=None):
     """Own one loopback proxy; ordinary sessions alone use the subscription login."""
     if (local_only and provider != "local") or (local_compat and not local_only):
         raise ValueError("Local CLI mode requires the local provider")
@@ -493,20 +544,17 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
                    ANTHROPIC_SMALL_FAST_MODEL="claude-haiku-5-5", CLAUDE_CODE_SUBAGENT_MODEL="claude-sonnet-5-5")
     # Dual provider is an ordinary-session convenience: local-only and compatibility modes
     # rewrite requests and disable Plan fallback, so they never get a second provider.
-    # Resolved before the CLI env so a dual OpenRouter participant also pins the stable
-    # protocol below; the /model entry itself is applied after the env cleanup that follows.
+    # Ordinary sessions keep native features; unsupported provider requests retain Plan fallback.
     dual = None if isolated or compat else dual_provider_setup(provider)
-    if provider == "openrouter" or (dual is not None and dual["ROUTE_ALT_PROVIDER"] == "openrouter"):
-        # Claude Code 2.1.310 sends experimental betas whose request shape (inline tool_addition
-        # blocks, context_management, advisor tool) the Messages API providers reject with HTTP 400.
-        # Keep the routed session on the stable protocol; thinking and effort stay per request.
+    if openrouter_compat:
+        # Explicit no-Plan mode needs the provider's stable protocol.
         env.update(CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="1", CLAUDE_CODE_DISABLE_ADVISOR_TOOL="1")
     # The user's own Git Bash location is needed by the Bash tool; it is not provider routing.
     if isolated and "CLAUDE_CODE_GIT_BASH_PATH" in os.environ:
         env["CLAUDE_CODE_GIT_BASH_PATH"] = os.environ["CLAUDE_CODE_GIT_BASH_PATH"]
     env.pop("LOCAL_ROUTE_COMPAT", None)
     env.pop("OPENROUTER_ROUTE_COMPAT", None)
-    for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER"):
+    for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER", "CLI_KIND", "CLI_MODEL", "CLI_BINARY", "CLI_TIMEOUT_S"):
         env.pop(name, None)
     for name in _CLI_ENV_STRIP:
         env.pop(name, None)
@@ -520,22 +568,29 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
             env.pop(name)
     config_dir = env.get("CLAUDE_CONFIG_DIR")
     if not config_dir or Path(config_dir).resolve() == (Path.home() / ".claude-openrouter").resolve():
-        env["CLAUDE_CONFIG_DIR"] = str(Path.home() / ".claude")
+        # An explicit ~/.claude moves .claude.json inside it and hides native MCP registrations.
+        env.pop("CLAUDE_CONFIG_DIR", None)
     command = [claude]
     if not isolated:
         # The probe reads the user's own login, including an env-provided OAuth token that
         # the routed child must not inherit. Base it on the caller's environment.
         probe_env = dict(os.environ)
-        probe_env["CLAUDE_CONFIG_DIR"] = env["CLAUDE_CONFIG_DIR"]
+        if "CLAUDE_CONFIG_DIR" in env:
+            probe_env["CLAUDE_CONFIG_DIR"] = env["CLAUDE_CONFIG_DIR"]
+        else:
+            probe_env.pop("CLAUDE_CONFIG_DIR", None)
         probe_env.pop("ANTHROPIC_BASE_URL", None)
         probe_env.pop("ANTHROPIC_AUTH_TOKEN", None)
         probe_env.pop("ANTHROPIC_API_KEY", None)
         for name in _CLI_ENV_STRIP:
             probe_env.pop(name, None)
-        auth = run_owned(command + ["auth", "status", "--json"], probe_env, str(Path.home()), timeout=60)
+        try:
+            auth = run_owned(command + ["auth", "status", "--json"], probe_env, str(Path.home()), timeout=60)
+        except RuntimeError:
+            raise PlanLoginError() from None
         if not (auth.get("loggedIn") is True and auth.get("authMethod") == "claude.ai"
                 and auth.get("apiProvider") == "firstParty" and auth.get("subscriptionType") == "pro"):
-            raise RuntimeError("Existing first-party Plan login required; no API fallback")
+            raise PlanLoginError()
     node = shutil.which("node")
     if not node:
         if isolated:
@@ -547,7 +602,7 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
                  "ROUTE_ALT_PROVIDER", "ROUTE_ALT_MODEL", "ROUTE_ALT_URL", "ROUTE_ALT_KEY", "ROUTE_ALT_ALLOW_REMOTE", "ROUTE_ALT_HTTP_URL", "ROUTE_ALT_ALIAS"):
         proxy_env.pop(name, None)
     try:
-        config = provider_config(provider)
+        config = _config if _config is not None else provider_config(provider)
     except (OSError, ValueError):
         if local_only:
             raise LocalStartupError("local_configuration_invalid") from None
@@ -559,18 +614,19 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
                 env.pop(name)
     if dual:
         env.update(dual_cli_env(dual))
-    if check_connection(provider, config=config) != 0:
+    connection_result = check_cli_backend(_backend) if _backend is not None else check_connection(provider, config=config)
+    if connection_result != 0:
         print(json.dumps({"event": "provider_connection_unavailable", "provider": provider,
                           "action": "continue", "plan_fallback": not isolated}), flush=True)
     proxy_env.update(config, LOCAL_ROUTE_TOKEN=nonce, LOCAL_ROUTE_ONLY="1" if local_only else "0")
     if dual:
         proxy_env.update(dual)
-    if provider == "openrouter":
+    if provider in {"openrouter", "local", "cli"}:
         # Keep routing decisions for later diagnosis; -Debug only shows them live in the terminal.
         proxy_env["ROUTE_LOG_PATH"] = str(ROOT / ".route.log")
         proxy_env["ROUTE_METRICS_PATH"] = str(ROOT / ".proxy-metrics.json")
         # Opt-in frame passthrough (OpenClaude.ps1 -Stream); the proxy reads it at startup.
-        if os.environ.get("ROUTE_STREAM_PASSTHROUGH"):
+        if provider == "openrouter" and os.environ.get("ROUTE_STREAM_PASSTHROUGH"):
             proxy_env["ROUTE_STREAM_PASSTHROUGH"] = os.environ["ROUTE_STREAM_PASSTHROUGH"]
     proxy_env.pop("LOCAL_ROUTE_COMPAT", None)
     proxy_env.pop("OPENROUTER_ROUTE_COMPAT", None)
@@ -650,6 +706,24 @@ def diagnose_local() -> int:
     return subprocess.call([node, str(ROOT / "claudeRouteProxy.mjs"), "--diagnose-local"], env=env)
 
 
+def check_cli_backend(backend):
+    import cliBackend
+    result = {"connection_check": False, "provider": "cli", "kind": backend.kind,
+              "inference_checked": False, "model_confirmed": False, "reply_confirmed": False}
+    try:
+        result["inference_checked"] = True
+        message, metadata = backend.generate({"model": backend.protocol_model, "max_tokens": 512,
+            "messages": [{"role": "user", "content": "Reply with exactly OK"}]})
+        reply = "".join(b.get("text", "") for b in message["content"] if b.get("type") == "text").strip()
+        result.update(connection_check=reply == "OK", reply_confirmed=reply == "OK",
+                      model_confirmed=bool(metadata["reported_model"] and (not backend.model or metadata["reported_model"] == backend.model)),
+                      reason="ready" if reply == "OK" else "unexpected_reply")
+    except cliBackend.BackendError as error:
+        result["reason"] = error.code
+    print(json.dumps(result), flush=True)
+    return 0 if result["connection_check"] else 1
+
+
 def check_connection(provider: str, config: dict | None = None) -> int:
     """One provider-only inference before interactive startup; no Plan route."""
     failed = {"connection_check": False, "provider": provider, "inference_checked": False,
@@ -727,7 +801,7 @@ def takeover(provider: str = "auto", debug: bool = False) -> int:
     if provider == "auto":
         # The replacement must serve the same provider as the session it takes over.
         recorded = record.get("provider")
-        provider = recorded if recorded in ("openrouter", "local") else configured_provider()
+        provider = recorded if recorded in ("openrouter", "local", "cli") else configured_provider()
     if not port_open(port):
         raise RuntimeError(f"Nothing is listening on the recorded port {port}; start a normal session")
     # The recorded session may expose the other provider in the CLI's /model picker
@@ -771,8 +845,45 @@ def takeover(provider: str = "auto", debug: bool = False) -> int:
             return 0
 
 
+_CLAUDE_MANAGEMENT = {"--help", "-h", "--version", "-v", "auth", "mcp", "plugin", "plugins", "agents", "doctor", "install", "update", "import", "ultrareview"}
+
+
+def validate_claude_args(values, *, local_only=False, compat=False, print_prompt=None):
+    if not isinstance(values, (list, tuple)) or any(not isinstance(value, str) or "\0" in value for value in values):
+        raise LauncherArgumentsError("invalid_cli_arguments")
+    result = list(values)
+    if result and local_only and not compat:
+        raise LauncherArgumentsError("Native CLI arguments require ordinary or compatibility mode; LocalMode is restricted")
+    flags = {value.split("=", 1)[0] for value in result}
+    if compat and "--settings" in flags:
+        raise LauncherArgumentsError("--settings cannot override compatibility routing; use ordinary mode for custom settings")
+    if print_prompt is not None and flags & {"-p", "--print", "--output-format"}:
+        raise LauncherArgumentsError("Do not combine launcher -Print with native print/output arguments")
+    if print_prompt is not None and result and result[0] in _CLAUDE_MANAGEMENT:
+        raise LauncherArgumentsError("Do not combine launcher -Print with native management commands")
+    return result
+
+
+def decode_claude_args(encoded):
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+        if len(raw) > 1024 * 1024:
+            raise ValueError()
+        values = json.loads(raw.decode("utf-8"))
+        return validate_claude_args(values)
+    except (ValueError, UnicodeError, binascii.Error):
+        raise LauncherArgumentsError("invalid_cli_arguments") from None
+
+
 def launch(provider: str = "auto", local_only: bool = False, local_compat: bool = False, openrouter_compat: bool = False, debug: bool = False,
-           print_prompt: str | None = None, print_json: bool = True) -> int:
+           print_prompt: str | None = None, print_json: bool = True, cli_args: list[str] | None = None) -> int:
+    native_args = validate_claude_args(cli_args or [], local_only=local_only,
+                                       compat=local_compat or openrouter_compat, print_prompt=print_prompt)
+    if native_args and native_args[0] in _CLAUDE_MANAGEMENT:
+        claude = shutil.which("claude")
+        if not claude:
+            raise FileNotFoundError("Claude Code executable not found")
+        return subprocess.call(routeCli.resolve_command(claude) + native_args, env=os.environ.copy())
     if provider == "auto":
         provider = configured_provider()
     if (local_only and provider != "local") or (local_compat and not local_only):
@@ -833,14 +944,26 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
                 settings["env"][name] = ""
             command[settings_index] = json.dumps(settings)
             try:
-                return subprocess.call(command + print_args, env=env)
+                return subprocess.call((routeCli.resolve_command(command[0]) + command[1:] if native_args else command) + print_args + native_args, env=env)
             except OSError:
                 raise startup_error("local_cli_start_failed") from None
     print(f"Sonnet replacement: {provider}. Opus/Haiku/Fable keep Claude Plan OAuth.")
-    print("Initial request + 3 retries, then Plan fallback (subscription Sonnet); recovery checked on a later request.")
+    print("One CLI backend attempt, then Plan fallback; backend tools are executed only by front Claude Code." if provider == "cli" else
+          "Initial request + 3 retries, then Plan fallback (subscription Sonnet); recovery checked on a later request.")
     print("Native-only features stay on Plan. Replacement replies are buffered until validated.")
     with routed_session(provider, debug=debug) as env:
-        return subprocess.call([claude, "--model", "sonnet"] + print_args, env=env)
+        command = [claude, "--model", "sonnet"]
+        if provider in {"local", "cli"}:
+            # Avoid the native Sonnet output cap exhausting a smaller Local context window.
+            budget = env.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS") or "8192"
+            try:
+                tokens = float(budget)
+            except ValueError:
+                raise LocalStartupError("local_output_budget_invalid") from None
+            if not tokens.is_integer() or tokens <= 0:
+                raise LocalStartupError("local_output_budget_invalid")
+            command += ["--settings", json.dumps({"env": {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(int(tokens))}})]
+        return subprocess.call((routeCli.resolve_command(command[0]) + command[1:] if native_args else command) + print_args + native_args, env=env)
 
 
 def self_test() -> None:
@@ -865,7 +988,7 @@ def self_test() -> None:
         process.kill.assert_called_once()
         if os.name == "nt":
             terminate.assert_called_once()
-    with contextlib.redirect_stdout(io.StringIO()) as launch_output, patch("shutil.which", return_value="claude"), patch("builtins.input", side_effect=AssertionError("Launch must not ask for input")), patch(__name__ + ".routed_session", return_value=contextlib.nullcontext({})), patch("subprocess.call", return_value=0) as child:
+    with contextlib.redirect_stdout(io.StringIO()) as launch_output, patch(__name__ + ".configured_provider", return_value="openrouter"), patch("shutil.which", return_value="claude"), patch("builtins.input", side_effect=AssertionError("Launch must not ask for input")), patch(__name__ + ".routed_session", return_value=contextlib.nullcontext({})), patch("subprocess.call", return_value=0) as child:
         assert launch() == 0
         child.assert_called_once()
         args = child.call_args.args[0]
@@ -879,10 +1002,10 @@ def self_test() -> None:
     with patch(__name__ + ".run_owned", return_value=auth), patch("shutil.which", return_value="executable"), patch(__name__ + ".read_env", return_value={"ANTHROPIC_AUTH_TOKEN": "sk-or-test-placeholder", "OPENROUTER_MODEL": "fixture/model"}), patch(__name__ + ".provider_config", return_value={"SONNET_PROVIDER": "openrouter", "OPENROUTER_API_KEY": "sk-or-test-placeholder", "OPENROUTER_MODEL": "fixture/model"}), patch(__name__ + ".check_connection", return_value=0), patch("subprocess.Popen", return_value=proxy) as start:
         with routed_session() as env:
             assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
-            assert env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "1"
-            assert env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] == "1"
+            assert "CLAUDE_CODE_DISABLE_ADVISOR_TOOL" not in env
+            assert "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS" not in env
             assert "MAX_THINKING_TOKENS" not in env
-            assert env["CLAUDE_CONFIG_DIR"] == str(Path.home() / ".claude")
+            assert "CLAUDE_CONFIG_DIR" not in env
             assert "ANTHROPIC_AUTH_TOKEN" not in env and "ANTHROPIC_API_KEY" not in env
             assert "OPENROUTER_API_KEY" not in env and "CLAUDE_CODE_OAUTH_TOKEN" not in env
             assert start.call_args.kwargs["env"]["OPENROUTER_API_KEY"] == "sk-or-test-placeholder"
@@ -934,7 +1057,11 @@ def self_test() -> None:
 def main(argv=None) -> int:
     try:
         arguments = list(sys.argv[1:] if argv is None else argv)
-        if arguments == ["--self-test"]:
+        native_args = []
+        if "--" in arguments:
+            split = arguments.index("--")
+            arguments, native_args = arguments[:split], arguments[split + 1:]
+        if arguments == ["--self-test"] and not native_args:
             self_test()
             return 0
         parser = argparse.ArgumentParser(
@@ -944,15 +1071,17 @@ def main(argv=None) -> int:
   python openrouterAdvisor.py                         Use the saved default service
   python openrouterAdvisor.py --provider openrouter   Override it for this session
   python openrouterAdvisor.py --provider local        Use Local LLM for this session
+  python openrouterAdvisor.py --provider cli          Keep Claude Code; use the saved CLI model backend
+  python openrouterAdvisor.py -- --continue           Forward native Claude session arguments
   python openrouterAdvisor.py --check-local           Check Local model metadata only
   python openrouterAdvisor.py --takeover              Keep the live session's service
 
 Setup: .\OpenClaude.ps1 -Setup
 Save a default service in the dashboard to launch without --provider.
-CLI settings are for connection tests, not request routing.
+CLI backend mode keeps Claude Code as the tool host. Select claude/codex/grok in dashboard settings.
 Exit codes: 0 = success, 2 = usage/service choice required, others = failure.
 """)
-        parser.add_argument("--provider", choices=("auto", "openrouter", "local"), default="auto",
+        parser.add_argument("--provider", choices=("auto", "openrouter", "local", "cli"), default="auto",
                             help="auto uses the saved default, then the only configured service; explicit values override the default")
         parser.add_argument("--check-local", action="store_true", help="Check local model metadata without inference or Plan login")
         parser.add_argument("--diagnose-local", action="store_true", help="One synthetic Local inference without CLI, native features or Plan fallback")
@@ -966,7 +1095,16 @@ Exit codes: 0 = success, 2 = usage/service choice required, others = failure.
                             help="Run one non-interactive turn through the proxy and exit (automation/CI)")
         parser.add_argument("--print-text", action="store_true",
                             help="With --print, keep the CLI's human output instead of JSON")
+        parser.add_argument("--cli-args-b64", default=None, help=argparse.SUPPRESS)
         options = parser.parse_args(arguments)
+        if options.cli_args_b64 is not None:
+            if native_args:
+                parser.error("Use either -- suffix or encoded CLI arguments, not both")
+            native_args = decode_claude_args(options.cli_args_b64)
+        if native_args and (options.takeover or options.check_local or options.diagnose_local):
+            parser.error("Native Claude arguments cannot be combined with takeover or connection diagnostics")
+        validate_claude_args(native_args, local_only=options.local_mode or options.local_compat,
+                             compat=options.local_compat or options.openrouter_compat, print_prompt=options.print_prompt)
         if options.openrouter_compat and options.provider == "auto":
             # The flag itself names the provider; keep the pre-Auto behavior for this mode.
             options.provider = "openrouter"
@@ -995,24 +1133,37 @@ Exit codes: 0 = success, 2 = usage/service choice required, others = failure.
         return launch(options.provider, local_only=options.local_mode or options.local_compat,
                       local_compat=options.local_compat, openrouter_compat=options.openrouter_compat,
                       debug=options.debug, print_prompt=options.print_prompt,
-                      print_json=not options.print_text)
-    except ProviderChoiceError:
-        payload = {"event": "provider_choice_required", "providers": ["openrouter", "local"],
+                      print_json=not options.print_text, **({"cli_args": native_args} if native_args else {}))
+    except ProviderChoiceError as error:
+        payload = {"event": "provider_choice_required", "providers": error.providers,
                    "action": "choose_provider",
-                   "commands": ["OpenClaude.ps1 -Provider OpenRouter", "OpenClaude.ps1 -Provider Local"]}
+                   "commands": ["OpenClaude.ps1 -Provider " + ("CLI" if p == "cli" else p.title()) for p in error.providers]}
         print(json.dumps(payload), file=sys.stderr)
-        print("Both OpenRouter and Local settings are configured. Choose one explicitly:", file=sys.stderr)
-        print("  OpenClaude.ps1 -Provider OpenRouter", file=sys.stderr)
-        print("  OpenClaude.ps1 -Provider Local", file=sys.stderr)
+        print("Multiple services are configured. Choose one explicitly:" if "cli" in error.providers else
+              "Both OpenRouter and Local settings are configured. Choose one explicitly:", file=sys.stderr)
+        for provider in error.providers:
+            print("  OpenClaude.ps1 -Provider " + ("CLI" if provider == "cli" else provider.title()), file=sys.stderr)
         print("  (or run OpenClaude.ps1 -Setup to save a default service)", file=sys.stderr)
-        print("\n[Claude-Cheat] OpenRouter와 Local LLM 설정이 모두 있어 실행할 서비스를 선택해야 합니다.", file=sys.stderr)
+        print("\n[Claude-Cheat] 실행할 서비스를 선택해야 합니다. 저장된 기본 서비스가 있으면 추가 옵션 없이 실행됩니다.", file=sys.stderr)
         print("  OpenRouter 사용: .\\OpenClaude.ps1 -Provider OpenRouter", file=sys.stderr)
         print("  Local LLM 사용:  .\\OpenClaude.ps1 -Provider Local", file=sys.stderr)
         print("  설정 확인:      .\\OpenClaude.ps1 -Setup", file=sys.stderr)
         print("  대시보드에서 서비스 설정을 저장한 뒤 '기본 실행 서비스'를 지정하면 옵션 없이 실행할 수 있습니다.", file=sys.stderr)
-        print("  CLI 항목은 연결 테스트 전용입니다. CLI를 라우팅 서비스로 실행할 수는 없습니다.", file=sys.stderr)
+        print("  CLI 백엔드도 선택할 수 있으며 앞단 Claude Code의 MCP·Skills·Plugins·hooks를 유지합니다.", file=sys.stderr)
         print("  설정은 유지되며 세션은 시작하지 않았습니다. 원하는 서비스의 명령을 실행하세요.", file=sys.stderr)
         return 2
+    except LauncherArgumentsError as error:
+        print(json.dumps({"event": "invalid_launcher_arguments", "project": "Claude-Cheat", "code": str(error),
+                          "action": "review_cli_arguments"}), file=sys.stderr)
+        return 2
+    except PlanLoginError:
+        print(json.dumps({"event": "claude_login_required", "project": "Claude-Cheat", "code": "plan_login_required",
+                          "action": "login_front_claude", "command": "claude auth login"}), file=sys.stderr)
+        return 1
+    except (cliBackend.BackendError, routeCli.CliError) as error:
+        print(json.dumps({"event": "cli_backend_start_failed", "project": "Claude-Cheat", "code": error.code,
+                          "action": "review_cli_backend", "command": ".\\OpenClaude.ps1 -Setup"}), file=sys.stderr)
+        return 1
     except routeConfig.ConfigError as exc:
         print(json.dumps({"event": "routing_configuration_invalid", "code": exc.code,
                           "line": exc.line, "action": "review_default_provider",

@@ -137,7 +137,7 @@ class ProviderChoiceTests(unittest.TestCase):
         self.assertEqual(payload["action"], "choose_provider")
         self.assertIn("OpenClaude.ps1 -Provider Local", payload["commands"])
         self.assertIn("옵션 없이 실행할 수 있습니다", text)
-        self.assertIn("연결 테스트 전용", text)
+        self.assertIn("CLI 백엔드", text)
         self.assertIn("세션은 시작하지 않았습니다", text)
 
     def test_takeover_auto_follows_the_live_sessions_provider(self):

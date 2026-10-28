@@ -133,7 +133,7 @@ class OpenRouterConfigTests(unittest.TestCase):
         text = (self.root / ".route.log").read_text(encoding="utf-8")
         self.assertRegex(text.strip(), r"^\S+Z --- launcher start pid=1 ---$")
 
-    def test_routed_openrouter_sessions_disable_experimental_protocol(self):
+    def test_only_explicit_openrouter_compat_pins_stable_protocol(self):
         self.write()
         proxy = mock.Mock()
         proxy.stdout.readline.return_value = '{"port":12345}\n'
@@ -145,8 +145,12 @@ class OpenRouterConfigTests(unittest.TestCase):
                      mock.patch.object(route.shutil, "which", return_value="synthetic-executable"), \
                      mock.patch.object(route.subprocess, "Popen", return_value=proxy):
                     with route.routed_session("openrouter", **flags) as env:
-                        self.assertEqual(env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "1")
-                        self.assertEqual(env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"], "1")
+                        if flags:
+                            self.assertEqual(env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "1")
+                            self.assertEqual(env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"], "1")
+                        else:
+                            self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", env)
+                            self.assertNotIn("CLAUDE_CODE_DISABLE_ADVISOR_TOOL", env)
                         # Thinking stays a per-request decision, so Plan fallback keeps its own settings.
                         self.assertNotIn("MAX_THINKING_TOKENS", env)
 

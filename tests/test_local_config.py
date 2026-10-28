@@ -211,6 +211,8 @@ class LocalCliModeTests(LocalTestCase):
                         proxy_env = spawn.call_args.kwargs["env"]
                         self.assertEqual(proxy_env.get("LOCAL_ROUTE_COMPAT"), "1" if compat else None)
                         self.assertEqual(proxy_env["LOCAL_ROUTE_ONLY"], "1")
+                        self.assertEqual(proxy_env["ROUTE_LOG_PATH"], str(self.root / ".route.log"))
+                        self.assertEqual(proxy_env["ROUTE_METRICS_PATH"], str(self.root / ".proxy-metrics.json"))
                         self.assertEqual(proxy_env["LOCAL_LLM_API_KEY"], "private-local-key")
                         self.assertEqual(spawn.call_args.args[0][-1], "--parent-pipe")
                 proxy.terminate.assert_called_once()
@@ -337,7 +339,7 @@ class LocalCliModeTests(LocalTestCase):
                 self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:12345")
                 self.assertNotEqual(env["ANTHROPIC_AUTH_TOKEN"], "private-plan-key")
                 self.assertEqual(env["ANTHROPIC_CUSTOM_HEADERS"], "X-Local-Route-Token: " + env["ANTHROPIC_AUTH_TOKEN"])
-                self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(self.root / ".claude"))
+                self.assertNotIn("CLAUDE_CONFIG_DIR", env)
                 self.assertEqual(env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "1")
                 self.assertEqual(env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"], "1")
                 self.assertEqual(env["CLAUDE_CODE_AUTO_CONNECT_IDE"], "false")
@@ -509,12 +511,38 @@ class LocalCliModeTests(LocalTestCase):
         proxy.terminate.assert_called_once()
         proxy.stdin.close.assert_called_once()
 
+    def test_native_config_lookup_and_auth_probe_keep_unset_and_explicit_paths(self):
+        self.configure()
+        auth = {"loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "pro"}
+        for configured in (None, "", str(self.root / ".claude-openrouter"), str(self.root / "custom"), str(self.root / ".claude")):
+            expected = None if not configured or configured == str(self.root / ".claude-openrouter") else configured
+            with self.subTest(configured=configured):
+                if configured is None: os.environ.pop("CLAUDE_CONFIG_DIR", None)
+                else: os.environ["CLAUDE_CONFIG_DIR"] = configured
+                proxy = mock.Mock()
+                proxy.stdout.readline.return_value = '{"port":12345}\n'
+                with mock.patch.object(route.Path, "home", return_value=self.root), mock.patch.object(route.shutil, "which", return_value="synthetic-cli"), mock.patch.object(route, "run_owned", return_value=auth) as probe, mock.patch.object(route.subprocess, "Popen", return_value=proxy):
+                    with route.routed_session("local") as env:
+                        self.assertEqual(env.get("CLAUDE_CONFIG_DIR"), expected)
+                    self.assertEqual(probe.call_args.args[1].get("CLAUDE_CONFIG_DIR"), expected)
+
+    def test_ordinary_local_default_budget_preserves_native_integrations(self):
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(route.shutil, "which", return_value="synthetic-cli"), mock.patch.object(route, "routed_session", return_value=contextlib.nullcontext({})), mock.patch.object(route.subprocess, "call", return_value=0) as child:
+            self.assertEqual(route.launch("local"), 0)
+        command = child.call_args.args[0]
+        self.assertEqual(command[:4], ["synthetic-cli", "--model", "sonnet", "--settings"])
+        self.assertEqual(json.loads(command[4]), {"env": {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "8192"}})
+        for flag in ("--safe-mode", "--strict-mcp-config", "--disallowedTools", "--no-chrome"):
+            self.assertNotIn(flag, command)
+
     def test_ordinary_launch_preserves_existing_output_budget(self):
         env = {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "2048"}
         with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(route.shutil, "which", return_value="synthetic-cli"), mock.patch.object(route, "routed_session", return_value=contextlib.nullcontext(env)) as session, mock.patch.object(route.subprocess, "call", return_value=0) as child:
             self.assertEqual(route.launch("local"), 0)
         session.assert_called_once_with("local", debug=False)
-        self.assertEqual(child.call_args.args[0], ["synthetic-cli", "--model", "sonnet"])
+        command = child.call_args.args[0]
+        self.assertEqual(command[:3], ["synthetic-cli", "--model", "sonnet"])
+        self.assertEqual(json.loads(command[4]), {"env": {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "2048"}})
         self.assertEqual(child.call_args.kwargs["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"], "2048")
 
     def test_local_mode_cli_rejects_other_modes_before_network(self):

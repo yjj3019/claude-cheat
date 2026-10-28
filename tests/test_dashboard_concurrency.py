@@ -15,6 +15,7 @@ import routeDashboard as dash
                      "hammers the server with 12 threads; set CLAUDE_CHEAT_SLOW=1 to run")
 class DashboardConcurrencyTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(mock.patch.object(dash, "_live_session", return_value=(None, None)))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.log = self.root / ".route.log"
         stamp = datetime.now(timezone.utc)

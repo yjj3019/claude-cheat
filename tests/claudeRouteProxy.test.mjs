@@ -930,7 +930,7 @@ test('Local-only non-streaming requests retain validated JSON', async t => {
 
 for (const localOnly of [false, true]) {
   for (const metadata of [null, { state: { signature: 'opaque-fixture', counter: 1 } }]) {
-    test(`provider tool metadata is preserved only in Local mode (${localOnly}, ${metadata === null ? 'null' : 'object'})`, async t => {
+    test(`nonempty provider tool metadata is preserved only in Local mode (${localOnly}, ${metadata === null ? 'null' : 'object'})`, async t => {
       const { calls, request } = await fixture(t, jsonResponse, { provider: 'local', localOnly,
         localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-local' });
       const tool = { type: 'tool_use', id: 't1', name: 'Read', input: {}, provider_specific_fields: metadata };
@@ -938,8 +938,8 @@ for (const localOnly of [false, true]) {
         { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'fixture result' }] }] });
       assert.equal((await request(body, { headers: proHeaders })).status, 200);
       assert.equal(calls.length, 1);
-      assert.equal(calls[0].url, localOnly ? 'http://127.0.0.1:11434/v1/messages' : proURL);
-      assert.deepEqual(calls[0].parsedBody.messages[1].content[0].provider_specific_fields, metadata);
+      assert.equal(calls[0].url, localOnly || metadata === null ? 'http://127.0.0.1:11434/v1/messages' : proURL);
+      assert.deepEqual(calls[0].parsedBody.messages[1].content[0].provider_specific_fields, !localOnly && metadata === null ? undefined : metadata);
     });
   }
 }

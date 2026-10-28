@@ -162,6 +162,90 @@ class RouteLogTests(unittest.TestCase):
         self.assertIsNone(state["last"]["model"])
 
 
+class CurrentRoutingTests(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime(2026, 10, 28, 6, 10, tzinfo=timezone.utc)
+        self.started = self.now - timedelta(minutes=5)
+        self.session = {"provider": "local", "started": self.started.isoformat()}
+        self.metrics = {"startedAt": self.started.isoformat(), "configuration": {
+            "provider": "local", "model": "fixture-loaded", "alternate": None},
+            "requests": 7, "routes": {"external": 0, "plan": 7},
+            "last": {"ts": (self.now - timedelta(seconds=2)).isoformat(), "route": "plan",
+                     "reason": "native_feature", "status": 200, "outcome": "ok"}}
+
+    def event(self, when, provider="plan", model="historical-model"):
+        return {"ts": when.isoformat(), "event": "route_selected", "provider": provider,
+                "reason": "replacement" if provider == "local" else "native_feature", "model": model}
+
+    def test_timestamp_order_does_not_use_clamped_durations(self):
+        older = (self.started - timedelta(days=2)).isoformat()
+        self.assertEqual(dash._seconds_between(self.started.isoformat(), older), 0)
+        self.assertFalse(dash._in_session(older, self.started.isoformat(), self.now))
+        self.assertTrue(dash._in_session(self.started.isoformat(), self.started.isoformat(), self.now))
+        self.assertFalse(dash._in_session((self.now + timedelta(seconds=1)).isoformat(), self.started.isoformat(), self.now))
+
+    def test_live_plan_route_replaces_a_previous_sessions_log_and_hash(self):
+        events = [{"ts": (self.started - timedelta(days=2)).isoformat(), "event": "proxy_start", "hash": "old-hash"},
+                  self.event(self.started - timedelta(minutes=1))]
+        routing = dash._current_routing(events, self.session, self.metrics, now=self.now)
+        self.assertEqual(routing["state"], "plan")
+        self.assertEqual(routing["last"]["ts"], self.metrics["last"]["ts"])
+        self.assertEqual(routing["last"]["provider"], "plan")
+        self.assertIsNone(routing["last"]["model"], "metrics do not report the actual Plan model")
+        self.assertIsNone(routing["proxy_hash"])
+        self.assertEqual(routing["proxy_started_at"], self.metrics["startedAt"])
+        with mock.patch.object(dash, "code_modified_at", return_value=self.started - timedelta(hours=1)):
+            self.assertFalse(dash.proxy_stale(routing))
+
+    def test_cumulative_counters_are_not_fabricated_as_windowed_log_counts(self):
+        events = [self.event(self.started - timedelta(minutes=1)),
+                  self.event(self.now - timedelta(seconds=4))]
+        routing = dash._current_routing(events, self.session, self.metrics, now=self.now)
+        self.assertEqual(routing["counts"], {"external": 0, "plan": 1})
+        self.assertEqual(routing["short"]["counts"], {"external": 0, "plan": 1})
+        self.assertEqual(len(routing["recent"]), 1)
+        self.assertEqual(self.metrics["requests"], 7)
+
+    def test_newer_log_evidence_is_not_overwritten_by_older_completed_metrics(self):
+        event = self.event(self.now - timedelta(seconds=1), provider="local", model="fixture-loaded")
+        routing = dash._current_routing([event], self.session, self.metrics, now=self.now)
+        self.assertEqual(routing["last"]["model"], "fixture-loaded")
+        self.assertEqual(routing["state"], "external")
+
+    def test_unknown_or_future_live_routes_do_not_become_plan(self):
+        for route, stamp in (("none", self.now.isoformat()),
+                             ("plan", (self.now + timedelta(seconds=1)).isoformat())):
+            with self.subTest(route=route):
+                self.metrics["last"].update(route=route, ts=stamp)
+                routing = dash._current_routing([self.event(self.started - timedelta(minutes=1))],
+                                                self.session, self.metrics, now=self.now)
+                self.assertEqual(routing["state"], "unknown")
+                self.assertIsNone(routing["last"])
+
+    def test_single_external_model_is_reported_but_dual_model_is_not_guessed(self):
+        self.metrics["last"].update(route="external", reason="replacement")
+        routing = dash._current_routing([], self.session, self.metrics, now=self.now)
+        self.assertEqual(routing["last"]["model"], "fixture-loaded")
+        self.metrics["configuration"]["alternate"] = {"provider": "openrouter", "model": "other-model"}
+        routing = dash._current_routing([], self.session, self.metrics, now=self.now)
+        self.assertIsNone(routing["last"]["model"])
+        self.assertIsNone(routing["last"]["provider"])
+
+    def test_failed_external_request_is_not_described_as_success(self):
+        self.metrics["last"].update(route="external", reason="replacement", status=503, outcome="failed")
+        routing = dash._current_routing([], self.session, self.metrics, now=self.now)
+        summary = dash.summary_line(routing, dash._empty_usage(), {"ok": False}, [], live=True)
+        self.assertIn("최근 요청 실패", summary)
+        self.assertNotIn("정상 처리", summary)
+
+    def test_current_openrouter_startup_hash_is_retained(self):
+        self.session["provider"] = "openrouter"
+        event = {"ts": (self.started - timedelta(milliseconds=20)).isoformat(),
+                 "event": "proxy_start", "hash": "current-hash"}
+        routing = dash._current_routing([event], self.session, self.metrics, now=self.now)
+        self.assertEqual(routing["proxy_hash"], "current-hash")
+
+
 class SessionScanTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -655,6 +739,25 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIn("snapshot_stale", [item["code"] for item in report["checks"]])
         self.assertTrue(report["session"]["active"])
 
+    def test_previous_session_route_is_not_marked_current_and_live_evidence_is_used(self):
+        metrics = self.live_proxy()
+        now = datetime.now(timezone.utc)
+        started = now - timedelta(minutes=5)
+        self.live.return_value[0]["started"] = started.isoformat()
+        metrics["startedAt"] = started.isoformat()
+        old = {"ts": (started - timedelta(days=2)).isoformat(), "event": "route_selected",
+               "provider": "plan", "model": "historical-model", "reason": "fallback"}
+        with mock.patch.object(dash, "parse_route_log", return_value=[old]):
+            report = dash.diagnostics_report()
+            self.assertFalse(report["last_route"]["current_session"])
+            self.assertIsNone(report["last_route"]["model"])
+            metrics["last"] = {"ts": (now - timedelta(seconds=1)).isoformat(),
+                               "route": "plan", "reason": "native_feature", "status": 200}
+            report = dash.diagnostics_report()
+            self.assertTrue(report["last_route"]["current_session"])
+            self.assertEqual(report["last_route"]["timestamp"], metrics["last"]["ts"])
+            self.assertIsNone(report["last_route"]["model"])
+
     def test_http_contract_is_read_only_redacted_and_rejects_foreign_hosts(self):
         import threading
 
@@ -681,6 +784,7 @@ class DiagnosticsTests(unittest.TestCase):
 
 class StatusReportTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(mock.patch.object(dash, "_live_session", return_value=(None, None)))
         self.enterContext(mock.patch.object(dash, "read_settings", return_value={
             "ANTHROPIC_AUTH_TOKEN": "sk-or-synthetic", "OPENROUTER_MODEL": "vendor/model"}))
 
@@ -1274,7 +1378,7 @@ class ConfigTests(unittest.TestCase):
                 ({"x-dashboard-token": dash.TOKEN, "origin": "https://foreign.invalid"},
                  {"provider": "openrouter"}, 403, "origin_rejected"),
                 ({"x-dashboard-token": dash.TOKEN}, {"provider": []}, 400, "invalid_default_provider"),
-                ({"x-dashboard-token": dash.TOKEN}, {"provider": "cli"}, 400, "invalid_default_provider"),
+                ({"x-dashboard-token": dash.TOKEN}, {"provider": "cli"}, 400, "default_provider_not_configured"),
                 ({"x-dashboard-token": dash.TOKEN}, {"provider": "openrouter"}, 200, None),
             ]
             for headers, payload, status, error in cases:
@@ -1416,6 +1520,19 @@ class ConfigTests(unittest.TestCase):
             wrong = dash.run_connection_test("openrouter", "inference")
         self.assertFalse(wrong["ok"])
         self.assertEqual(wrong["reason"], "wrong_model")
+
+    def test_local_inference_requires_selected_model_complete_fixed_reply_and_enough_budget(self):
+        values = {"LOCAL_LLM_URL": "http://127.0.0.1:11434/v1/messages", "LOCAL_LLM_MODEL": "fixture-local"}
+        reply = {"model": "fixture-local", "stop_reason": "end_turn", "content": [{"type": "text", "text": "OK"}]}
+        cases = [(reply, True, "ready"), ({**reply, "model": "other"}, False, "wrong_model"),
+                 ({**reply, "stop_reason": "max_tokens"}, False, "invalid_response"),
+                 ({**reply, "content": []}, False, "empty_reply"),
+                 ({**reply, "content": [{"type": "text", "text": "O"}]}, False, "invalid_response")]
+        for response, ok, reason in cases:
+            with self.subTest(reason=reason), mock.patch.object(dash, "_http_json", return_value=(200, response)) as request:
+                result = dash.run_connection_test("local", "inference", values)
+            self.assertEqual((result["ok"], result["reason"]), (ok, reason))
+            self.assertEqual(request.call_args.args[2]["max_tokens"], 512)
 
     def test_connection_test_accepts_unsaved_values(self):
         with mock.patch.object(dash, "_http_json", return_value=(200, {"data": [{"id": "vendor/b"}]})):
@@ -1614,6 +1731,7 @@ class SnapshotReuseTests(unittest.TestCase):
 
 class ProxyMetricsTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(mock.patch.object(dash, "_live_session", return_value=(None, None)))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.path = self.root / ".proxy-metrics.json"
         self.enterContext(mock.patch.object(dash, "METRICS_FILE", self.path))
@@ -2022,7 +2140,7 @@ class InsightTests(unittest.TestCase):
         insights = dash.build_insights(self.routing(), self.usage(cost=1.5), {"ok": False}, None,
                                        now=self.NOW)
         line = dash.summary_line(self.routing(), self.usage(cost=1.5), {"ok": False}, insights)
-        self.assertIn("OpenRouter로 정상 처리 중", line)
+        self.assertIn("외부 서비스로 정상 처리 중", line)
         self.assertIn("$1.500", line)
 
     def test_refresh_interval_follows_activity(self):
@@ -2033,12 +2151,15 @@ class InsightTests(unittest.TestCase):
 
 
 class SnapshotTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch.object(dash, "_live_session", return_value=(None, None)))
+
     def test_snapshot_shape_and_loopback_only_binding(self):
         with mock.patch.object(dash, "scan_sessions", return_value=dash._empty_usage()), \
              mock.patch.object(dash, "parse_route_log", return_value=[]), \
              mock.patch.object(dash, "account_state", return_value={"ok": False, "error": "configuration_missing"}), \
              mock.patch.object(dash, "model_pricing", return_value={"ok": False, "error": "configuration_missing"}), \
-             mock.patch.object(dash, "read_settings", return_value={"OPENROUTER_MODEL": "vendor/model"}):
+             mock.patch.object(dash, "read_settings", return_value={"OPENROUTER_MODEL": "vendor/model", "ROUTE_DEFAULT_PROVIDER": "openrouter"}):
             data = dash.snapshot()
         self.assertEqual(sorted(data),
                          ["account", "active_session", "alerts", "configured", "generated_at", "help",
@@ -2116,7 +2237,7 @@ class CliSettingsTests(unittest.TestCase):
     def valid(self, **extra):
         return {"CLI_KIND": "codex", "CLI_MODEL": "gpt-x", "CLI_BINARY": "", "CLI_TIMEOUT_S": "45", **extra}
 
-    def test_the_cli_section_is_saved_validated_and_does_not_count_as_a_routing_service(self):
+    def test_the_cli_section_is_saved_validated_and_counts_as_a_routing_service(self):
         self.assertFalse(dash.any_provider_configured())
         dash.save_config("cli", self.valid())
         self.assertEqual(dash.read_settings("cli"),
@@ -2124,7 +2245,30 @@ class CliSettingsTests(unittest.TestCase):
         snapshot = dash.config_snapshot()["cli"]
         self.assertEqual(snapshot["fields"]["CLI_KIND"]["value"], "codex")
         self.assertFalse(snapshot["fields"]["CLI_KIND"]["secret"])
-        self.assertFalse(dash.any_provider_configured(), "a CLI is a diagnosis target, not a configured provider")
+        self.assertTrue(dash.any_provider_configured())
+        dash.save_default_provider("cli")
+        self.assertEqual(dash.config_snapshot()["default_provider"], "cli")
+
+    def test_cli_diagnostics_separate_requested_and_reported_models_without_spawning(self):
+        dash.save_config("cli", self.valid(CLI_MODEL="requested-model"))
+        dash.save_default_provider("cli")
+        started = datetime.now(timezone.utc).isoformat()
+        session = {"provider": "cli", "started": started}
+        metrics = {"startedAt": started, "configuration": {"provider": "cli", "cliKind": "codex",
+                   "requestedModel": "requested-model", "model": None, "usageMeasured": False}}
+        with mock.patch.object(dash, "_live_session", return_value=(session, metrics)), \
+                mock.patch.object(dash, "parse_route_log", return_value=[]), \
+                mock.patch.object(dash, "_cli_detection", side_effect=AssertionError("read-only must not spawn")), \
+                mock.patch.object(dash, "_cli_test", side_effect=AssertionError("read-only must not infer")):
+            report = dash.diagnostics_report()
+        self.assertEqual(report["configuration"]["next_provider"], "cli")
+        self.assertEqual(report["configuration"]["configured_model"], "requested-model")
+        self.assertEqual(report["session"]["requested_model"], "requested-model")
+        self.assertIsNone(report["session"]["loaded_model"])
+        self.assertEqual(report["session"]["model_status"], "unreported")
+        self.assertFalse(report["session"]["usage_measured"])
+        self.assertFalse(report["inference_performed"])
+        self.assertIn("cli_model_unreported", [entry["code"] for entry in report["checks"]])
 
     def test_invalid_values_are_rejected_before_writing(self):
         dash.save_config("cli", self.valid())
@@ -2157,14 +2301,33 @@ class CliSettingsTests(unittest.TestCase):
         self.assertEqual(dash.run_connection_test("cli", "metadata", {"CLI_KIND": "nope"})["reason"],
                          "invalid_configuration")
 
-    def test_the_connection_test_passes_the_saved_options_and_never_returns_cli_output(self):
-        result = dash.run_connection_test("cli", "inference", self.valid(CLI_MODEL="m-1"))
-        self.assertEqual(result["reason"], "ready")
-        self.assertNotIn("stdout", result)
-        self.assertNotIn("SHOULD NOT LEAK", json.dumps(result))
-        kind, options = self.calls[-1][1], self.calls[-1][2]
-        self.assertEqual(kind, "codex")
-        self.assertEqual((options["model"], options["timeout_s"], options["binary"]), ("m-1", 45, None))
+    def test_the_connection_test_uses_the_model_backend_and_keeps_actual_model_unknown(self):
+        import types
+        backend = mock.Mock(protocol_model="cli/codex", version="0.165.0")
+        backend.generate.return_value = ({"content": [{"type": "text", "text": "OK"}], "stop_reason": "end_turn"},
+                                         {"reported_model": None, "usage_measured": False})
+        constructor = mock.Mock(return_value=backend)
+        with mock.patch.dict(sys.modules, {"cliBackend": types.SimpleNamespace(Backend=constructor)}):
+            result = dash.run_connection_test("cli", "inference", self.valid(CLI_MODEL="m-1"))
+        self.assertEqual(result["reason"], "ok")
+        self.assertIsNone(result["model"])
+        self.assertEqual(result["model_status"], "unreported")
+        self.assertFalse(result["usage_measured"])
+        self.assertEqual(constructor.call_args.args[0]["CLI_MODEL"], "m-1")
+        self.assertEqual(backend.generate.call_args.args[0]["model"], "cli/codex")
+        self.assertFalse([call for call in self.calls if call[0] == "connection_test"])
+
+    def test_backend_errors_are_sanitized_and_unverified_versions_fail_closed(self):
+        import types
+        for code, expected in (("backend_version_unverified", "backend_version_unverified"),
+                               ("secret C:/private/path", "cli_backend_failed")):
+            error = ValueError("SHOULD NOT LEAK")
+            error.code = code
+            with mock.patch.dict(sys.modules, {"cliBackend": types.SimpleNamespace(Backend=mock.Mock(side_effect=error))}):
+                result = dash.run_connection_test("cli", "inference", self.valid())
+            self.assertEqual(result["reason"], expected)
+            self.assertNotIn("SHOULD NOT LEAK", json.dumps(result))
+            self.assertNotIn("private", json.dumps(result))
 
     def test_unsaved_values_are_validated_before_anything_runs(self):
         result = dash.run_connection_test("cli", "inference", self.valid(CLI_TIMEOUT_S="999"))
@@ -2490,7 +2653,7 @@ class ProviderSelectionDisplayTests(unittest.TestCase):
     def test_provider_states_reports_each_routing_service(self):
         with mock.patch.object(dash, "provider_configured",
                                side_effect=lambda name: name == "local"):
-            self.assertEqual(dash.provider_states(), {"openrouter": False, "local": True})
+            self.assertEqual(dash.provider_states(), {"openrouter": False, "local": True, "cli": False})
 
     def test_active_session_exposes_only_provider_and_started(self):
         self.handoff({"provider": "local", "started": "2026-10-26T00:00:00+00:00",
@@ -2552,12 +2715,41 @@ class ProviderSelectionDisplayTests(unittest.TestCase):
              mock.patch.object(dash, "proxy_metrics", return_value=None):
             report = dash.status_report(offline=True)
             data = dash.snapshot()
-        self.assertEqual(report["providers"], {"openrouter": True, "local": True})
+        self.assertEqual(report["providers"], {"openrouter": True, "local": True, "cli": True})
         self.assertIsNone(report["active_session"], "offline mode does not authenticate a live proxy")
-        self.assertEqual(data["providers"], {"openrouter": True, "local": True})
+        self.assertEqual(data["providers"], {"openrouter": True, "local": True, "cli": True})
         self.assertEqual(data["active_session"]["provider"], "openrouter")
         self.assertNotIn("private-token", json.dumps(report))
         self.assertNotIn("private-token", json.dumps(data))
+
+
+class RequirementAuditRegressionTests(unittest.TestCase):
+    def test_nonobject_and_malformed_inference_replies_are_sanitized_errors(self):
+        replies = [None, [], 3, "fixture", {"content": 7}, {"content": {}},
+                   {"content": [None]}, {"content": [{"type": "text", "text": 3}]}]
+        for provider in ("openrouter", "local"):
+            values = {"ANTHROPIC_AUTH_TOKEN": "sk-or-synthetic", "OPENROUTER_MODEL": "fixture/model"} if provider == "openrouter" else {
+                "LOCAL_LLM_URL": "http://127.0.0.1:11434/v1/messages", "LOCAL_LLM_MODEL": "fixture-model"}
+            for reply in replies:
+                with self.subTest(provider=provider, reply=reply), mock.patch.object(dash, "_effective_values", return_value=values), mock.patch.object(dash, "_http_json", return_value=(200, reply)):
+                    result = dash.run_connection_test(provider, "inference")
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["reason"], "invalid_response")
+                self.assertNotIn("sk-or-synthetic", json.dumps(result))
+
+    def test_stale_proxy_never_has_a_healthy_exit_code(self):
+        for state in ("external", "idle"):
+            report = {"ok": False, "state": state, "config": {"proxy_stale": True}, "alerts": []}
+            self.assertEqual(dash.status_exit_code(report), 3)
+
+    def test_ambiguous_auto_provider_has_no_guessed_account_or_model(self):
+        with mock.patch.object(dash, "read_settings", return_value={"ROUTE_DEFAULT_PROVIDER": "auto"}), mock.patch.object(dash, "provider_configured", return_value=True):
+            provider, values, model = dash._display_service({"last": {}}, None)
+        self.assertEqual((provider, values, model), (None, {}, None))
+        with mock.patch.object(dash, "account_state", side_effect=AssertionError("no selected account")), mock.patch.object(dash, "model_pricing", side_effect=AssertionError("no selected model")):
+            account, pricing = dash._service_finances(provider, values, model)
+        self.assertEqual(account["error"], "not_applicable")
+        self.assertIsNone(pricing)
 
 
 if __name__ == "__main__":

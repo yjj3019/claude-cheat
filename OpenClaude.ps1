@@ -14,17 +14,28 @@ Use Local LLM for this session without changing the saved default.
 .\OpenClaude.ps1 -Provider OpenRouter
 Use OpenRouter for this session without changing the saved default.
 .EXAMPLE
+.\OpenClaude.ps1 -CliArgs @('--continue')
+Continue with native Claude arguments while keeping the saved model backend.
+.EXAMPLE
 .\OpenClaude.ps1 -Takeover
 Replace the live proxy while keeping its service.
 .EXAMPLE
 .\OpenClaude.ps1 -Help
 Show options, examples and exit codes without launching a session.
 #>
-param([ValidateSet('Auto', 'OpenRouter', 'Local')][string]$Provider = 'Auto', [switch]$CheckLocal, [switch]$DiagnoseLocal, [switch]$LocalMode, [switch]$LocalCompat, [switch]$OpenRouterCompat, [switch]$Debug, [switch]$Stream, [switch]$Takeover, [switch]$Setup, [string]$Print, [switch]$Help)
+param([ValidateSet('Auto', 'OpenRouter', 'Local', 'CLI')][string]$Provider = 'Auto', [switch]$CheckLocal, [switch]$DiagnoseLocal, [switch]$LocalMode, [switch]$LocalCompat, [switch]$OpenRouterCompat, [switch]$Debug, [switch]$Stream, [switch]$Takeover, [switch]$Setup, [string]$Print, [switch]$Help, [string[]]$CliArgs = @())
 # Auto uses the saved default, or selects the only configured service in older settings.
 # An explicit -Provider overrides the saved default for this invocation only.
 # -Stream forwards provider frames as they validate (lower first-token latency) but a late
 # protocol error can no longer fall back to Plan; the default buffers and keeps fallback.
+if ($args.Count -gt 0) {
+    Write-Warning 'Use -CliArgs @(''--continue'') for native Claude arguments.'
+    exit 2
+}
+if ($CliArgs.Count -gt 0 -and ($Help -or $Setup -or $CheckLocal -or $DiagnoseLocal -or $Takeover)) {
+    Write-Warning 'Native Claude arguments cannot be combined with launcher help, setup, takeover or diagnostics.'
+    exit 2
+}
 if ($Help) {
     & python (Join-Path $PSScriptRoot 'openrouterAdvisor.py') --help
     exit $LASTEXITCODE
@@ -46,6 +57,12 @@ if ($LocalMode) { $routeArgs += '--local-mode' }
 if ($LocalCompat) { $routeArgs += '--local-compat' }
 if ($OpenRouterCompat) { $routeArgs += '--openrouter-compat' }
 if ($Debug) { $routeArgs += '--debug' }
+if ($CliArgs.Count -gt 0) {
+    # Windows PowerShell 5 alters native quoting; this preserves the exact UTF-8 argument vector.
+    $nativeArgsJson = ConvertTo-Json -InputObject @($CliArgs) -Compress -Depth 20
+    $nativeArgsEncoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($nativeArgsJson))
+    $routeArgs += @('--cli-args-b64', $nativeArgsEncoded)
+}
 try {
     & python (Join-Path $PSScriptRoot 'openrouterAdvisor.py') @routeArgs
     $routeExit = $LASTEXITCODE

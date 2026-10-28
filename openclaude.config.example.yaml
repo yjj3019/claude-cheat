@@ -35,22 +35,22 @@ local:
   http_url: ""
 
 cli:
-  # Installed command-line clients (Codex, Grok, Claude Code). For now this section only drives the
-  # settings page's detection list and its connection test; requests are NOT routed to a CLI.
-  # The test sends one fixed line to the selected CLI's own service, using that CLI's own login.
+  # CLI model backend; original Claude Code remains the host for tools, MCP and plugins.
+  # Uses the selected CLI's own login. Unsupported/unverified CLI versions fail closed.
+  # Empty kind leaves this service unconfigured.
   # codex | grok | claude
   kind: ""
   # Optional model name passed to the CLI; empty = the CLI's own default.
   model: ""
   # Optional absolute path to pin the executable; empty = detect it. Its file name must match the kind.
   binary: ""
-  # Connection-test time limit in seconds (10-120); empty = 60.
+  # Backend request time limit in seconds (10-120); empty = 60.
   timeout_s: ""
 
 routing:
   # New sessions use this service without -Provider. auto = use the only configured
-  # service; when both are configured, ask the user to select a default in the dashboard.
-  # auto | openrouter | local. CLI is for diagnostics only.
+  # service; when multiple are configured, select a default in the dashboard.
+  # auto | openrouter | local | cli.
   default_provider: "auto"
   # "true": when BOTH openrouter and local are configured, an ordinary session also shows the
   # other provider as one extra entry in Claude Code's /model picker (model ids

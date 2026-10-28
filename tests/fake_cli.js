@@ -22,8 +22,8 @@ function reply(text) {
   else console.log(text);
 }
 function grandchild(detached) {
-  // The detached one outlives the parent briefly; the owned one must be killed by the tree kill.
-  const child = cp.spawn(process.execPath, ['-e', `setTimeout(() => {}, ${detached ? 4000 : 30000})`],
+  // Both children outlive the test deadline unless owned-tree cleanup closes them.
+  const child = cp.spawn(process.execPath, ['-e', `setTimeout(() => {}, 30000)`],
     { detached, stdio: 'inherit', windowsHide: true });
   fs.writeFileSync(path.join(dir, 'gpid.txt'), String(child.pid));
   if (detached) child.unref();

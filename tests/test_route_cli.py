@@ -282,7 +282,10 @@ class RunSafely(FakeCase):
         with mock.patch.object(rc.tempfile, "mkdtemp", side_effect=lambda **k: made.append(real(**k)) or made[-1]):
             result = self.run_fake("spawn_child")
         self.assertEqual(result["exit_code"], 0)
-        self.assertLess(result["elapsed_ms"], 3500)  # the grandchild holds the handles for 4 s
+        # The child holds inherited handles for 30 s, beyond run_fake's 10 s deadline.
+        # Test the no-hang/cleanup contract without charging Windows startup to a 3.5 s budget.
+        self.assertFalse(result["timed_out"])
+        self.assertTrue(wait_gone(int(side_file("gpid.txt").read_text()), 2))
         wait_gone(int(side_file("gpid.txt").read_text()), 8)
         for d in made:
             shutil.rmtree(d, ignore_errors=True)

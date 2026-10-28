@@ -1,5 +1,7 @@
 """Launcher switches must not change the caller's environment after the run."""
 import os
+import base64
+import json
 import shutil
 import subprocess
 import unittest
@@ -16,6 +18,18 @@ class LauncherEnvironmentTests(unittest.TestCase):
         return subprocess.run([POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass",
                                "-Command", body], cwd=str(ROOT), capture_output=True, text=True,
                               timeout=180, encoding="utf-8", errors="replace")
+
+    def test_cli_args_transport_keeps_json_unicode_and_empty_arguments(self):
+        values = ["--resume", "session id", "--plugin-dir", "C:\\fixture plugin\\", "--mcp-config", '{"fixture":{"args":["a b"]}}', "", "??"]
+        literals = ",".join("'" + value.replace("'", "''") + "'" for value in values)
+        result = self.run_script(
+            "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+            "function global:python { [Console]::WriteLine((ConvertTo-Json -InputObject @($args) -Compress)); $global:LASTEXITCODE = 0 }; "
+            f"& '{LAUNCHER}' -Provider CLI -CliArgs @({literals})")
+        self.assertEqual(result.returncode, 0, result.stderr[-400:])
+        arguments = json.loads(result.stdout.strip())
+        position = arguments.index("--cli-args-b64")
+        self.assertEqual(json.loads(base64.b64decode(arguments[position + 1]).decode("utf-8")), values)
 
     def test_usage_error_keeps_exit_two_without_a_powershell_error_stack(self):
         for script in (LAUNCHER, ROOT / "startOpenClaude.ps1"):
