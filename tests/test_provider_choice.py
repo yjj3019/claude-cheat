@@ -50,6 +50,10 @@ class ProviderChoiceTests(unittest.TestCase):
             self.set_default(provider)
             self.assertEqual(route.configured_provider(), provider)
 
+    def test_saved_sonnet_is_explicit_and_does_not_require_a_provider_config(self):
+        self.set_default("sonnet")
+        self.assertEqual(route.configured_provider(), "sonnet")
+
     def test_auto_preference_retains_the_existing_choice_requirement(self):
         self.write_openrouter()
         self.write_local()

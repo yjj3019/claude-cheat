@@ -764,6 +764,29 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertTrue(all(value is None for value in metrics["routingTimingMs"].values()))
         self.assertEqual(metrics["attemptCounts"], {"external": None, "plan": None})
 
+    def test_cli_metrics_are_allowlisted_and_invalid_counts_unreported(self):
+        report = dash._diagnostic_cli_metrics({
+            "cliActivity": {"active": 2, "queued": True, "limit": -1, "rejected": 1, "secret": "private"},
+            "cliFailures": {"timeout": 1, "status429": 2, "connection": float("inf")},
+            "cliUsage": {"responses": 4, "inputSamples": 3, "inputTokens": 0, "outputSamples": 2, "outputTokens": 5},
+            "other": "private"})
+        self.assertEqual(report["cliActivity"], {"active": 2, "queued": None, "limit": None, "rejected": 1})
+        self.assertEqual(report["cliFailures"]["timeout"], 1)
+        self.assertIsNone(report["cliFailures"]["connection"])
+        self.assertEqual(report["cliUsage"]["inputTokens"], 0)
+        self.assertNotIn("private", json.dumps(report))
+        self.assertEqual(dash._diagnostic_cli_metrics(None), {"cliActivity": None, "cliFailures": None, "cliUsage": None, "cliProcessMs": None})
+
+    def test_cli_process_timing_allows_only_bounded_numeric_summary(self):
+        row = {"count": 2, "p50": 12.5, "p95": 19, "max": 21, "secret": "private"}
+        result = dash._diagnostic_cli_metrics({"cliProcessMs": row})["cliProcessMs"]
+        self.assertEqual(result, {"count": 2, "p50": 12.5, "p95": 19, "max": 21})
+        for invalid in ({"count": 513}, {"count": True}, {"count": 1, "p50": 1, "p95": float("inf"), "max": 2},
+                        {"count": 1, "p50": 1, "p95": 2, "max": 180001}):
+            self.assertIsNone(dash._diagnostic_cli_metrics({"cliProcessMs": invalid})["cliProcessMs"])
+        self.assertEqual(dash._diagnostic_cli_metrics({"cliProcessMs": {"count": 0}})["cliProcessMs"],
+                         {"count": 0, "p50": None, "p95": None, "max": None})
+
     def test_invalid_config_returns_a_code_without_source_values(self):
         self.path.write_text('routing:\n  default_provider: "private-invalid-value"\n', encoding="utf-8")
         report = dash.diagnostics_report()
@@ -1021,10 +1044,16 @@ class PageTests(unittest.TestCase):
         self.assertNotIn("saveSettings", dashboard)
         self.assertIn("saveSettings", settings)
         self.assertNotIn("renderGrid", settings)
-        for page in (dash.PAGE, dash.SETTINGS_PAGE):
+        for page in (dash.PAGE, dash.SETTINGS_PAGE, dash.BLACKBOX_PAGE):
             self.assertIn('const TOKEN = "__DASHBOARD_TOKEN__"', page)
             self.assertIn('href="/"', page)
             self.assertIn('href="/settings"', page)
+            self.assertIn('href="/blackbox"', page)
+
+        self.assertNotIn('id="blackbox-title"', dash.PAGE)
+        self.assertIn('id="blackbox-title"', dash.BLACKBOX_PAGE)
+        self.assertIn('href="/blackbox" aria-current="page"', dash.BLACKBOX_PAGE)
+        self.assertNotIn('function poll()', dash.BLACKBOX_PAGE)
 
     def test_settings_page_offers_one_service_select_and_dashboard_does_not(self):
         self.assertIn('id="provider-select"', dash.SETTINGS_PAGE)
@@ -1047,6 +1076,7 @@ class PageTests(unittest.TestCase):
             base = f"http://127.0.0.1:{port}"
             dashboard = opener.open(base + "/", timeout=10).read().decode("utf-8")
             settings = opener.open(base + "/settings", timeout=10).read().decode("utf-8")
+            blackbox_page = opener.open(base + "/blackbox", timeout=10).read().decode("utf-8")
             with self.assertRaises(urllib.error.HTTPError) as missing:
                 opener.open(base + "/nope", timeout=10)
         finally:
@@ -1056,6 +1086,9 @@ class PageTests(unittest.TestCase):
         missing.exception.close()
         self.assertIn("renderGrid", dashboard)
         self.assertIn("saveSettings", settings)
+        self.assertIn('id="blackbox-title"', blackbox_page)
+        self.assertNotIn('id="blackbox-title"', dashboard)
+        self.assertNotIn("__DASHBOARD_TOKEN__", blackbox_page)
         self.assertNotIn("__DASHBOARD_TOKEN__", dashboard)
         self.assertNotIn("__DASHBOARD_TOKEN__", settings)
 
@@ -1238,6 +1271,13 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(dash.save_default_provider("openrouter"), "openrouter")
         self.assertEqual(self.path.read_bytes(), before)
         self.assertEqual(dash._store("openrouter").read_provider("openrouter"), values)
+
+    def test_sonnet_default_preserves_provider_settings(self):
+        self.put_openrouter()
+        before = dash._store("openrouter").read_provider("openrouter")
+        self.assertEqual(dash.save_default_provider("sonnet"), "sonnet")
+        self.assertEqual(dash.config_snapshot()["default_provider"], "sonnet")
+        self.assertEqual(dash._store("openrouter").read_provider("openrouter"), before)
 
     def test_dashboard_saved_default_is_used_by_the_launcher(self):
         import openrouterAdvisor as route
@@ -2729,6 +2769,45 @@ class ConfigEndpointAuthTests(unittest.TestCase):
         response = self.get([("x-dashboard-token", "\xff")])
         self.assertIn(b"403", response.split(b"\r\n", 1)[0])
         self.assertIn(b"token_required", response)
+
+    def test_blackbox_actions_require_token_and_reject_cross_origin(self):
+        import blackbox
+        import urllib.error
+        import urllib.request
+        base = f"http://127.0.0.1:{self.port}/api/blackbox"
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        def send(action, headers, with_body=True):
+            request = urllib.request.Request(base, data=json.dumps(action).encode() if with_body else b"",
+                                             headers=headers, method="POST")
+            try:
+                with opener.open(request, timeout=10) as response:
+                    return response.status, json.load(response)
+            except urllib.error.HTTPError as error:
+                with error:
+                    return error.code, json.load(error)
+        good = {"x-dashboard-token": dash.TOKEN}
+        recorder = mock.Mock()
+        recorder.start.return_value = {"active": True, "mode": "detailed", "incidents": 0, "details_available": False}
+        recorder.mark.return_value = {"active": True, "mode": "detailed", "incidents": 1, "details_available": False}
+        recorder.stop.return_value = {"active": False, "mode": "detailed", "incidents": 1, "details_available": False}
+        recorder.status.return_value = {"active": True, "mode": "detailed", "incidents": 1, "details_available": False}
+        with mock.patch.object(blackbox, "Blackbox", return_value=recorder), \
+             mock.patch.object(dash, "diagnostics_report", return_value={"session": {"active": False}}):
+            self.assertEqual(send({}, {}, False)[0], 403)
+            self.assertEqual(send({}, {**good, "Origin": "http://evil.invalid"}, False)[0], 403)
+            self.assertEqual(send({"action": "start", "mode": "unknown"}, good)[0], 400)
+            status, result = send({"action": "start", "mode": "detailed"}, good)
+            self.assertEqual((status, result["mode"]), (200, "detailed"))
+            recorder.start.assert_called_once_with("detailed", {"session": {"active": False}})
+            status, result = send({"action": "mark", "content": "PRIVATE"}, good)
+            self.assertEqual((status, result["incidents"]), (200, 1))
+            recorder.mark.assert_called_once_with({"session": {"active": False}})
+            self.assertNotIn("PRIVATE", json.dumps(result))
+            self.assertEqual(send({"action": "stop"}, good)[0], 200)
+            self.assertEqual(recorder.stop.call_count, 1)
+            request = urllib.request.Request(base, headers=good)
+            with opener.open(request, timeout=10) as response:
+                self.assertEqual(json.load(response)["incidents"], 1)
 
     def test_reset_endpoint_requires_token_and_origin_and_checks_scope(self):
         import urllib.request

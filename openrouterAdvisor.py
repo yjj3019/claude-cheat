@@ -20,6 +20,7 @@ import socket
 import threading
 import time
 import argparse
+import uuid
 import localProcessTree
 import routeConfig
 import routeCli
@@ -182,7 +183,8 @@ def configured_provider() -> str:
     preferred = routeConfig.Store(ROOT / routeConfig.CONFIG_NAME).default_provider()
     if preferred != "auto":
         # A broken preference must not silently route to a different service.
-        provider_config(preferred)
+        if preferred != "sonnet":
+            provider_config(preferred)
         return preferred
     ready, failures = [], []
     for name in ("openrouter", "local", "cli"):
@@ -870,6 +872,80 @@ def takeover(provider: str = "auto", debug: bool = False) -> int:
 _CLAUDE_MANAGEMENT = {"--help", "-h", "--version", "-v", "auth", "mcp", "plugin", "plugins", "agents", "doctor", "install", "update", "upgrade", "import", "ultrareview",
                       "attach", "logs", "respawn", "stop", "kill", "rm", "purge", "gateway", "setup-token"}
 
+# Direct mode must not silently route a purported first-party Sonnet request to a
+# different endpoint/model. The values are checked but never echoed or modified.
+_SONNET_ROUTE_KEYS = frozenset({"ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
+    "ANTHROPIC_CUSTOM_HEADERS", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"})
+
+
+def prepare_blackbox_hook(env, native_args):
+    """Connect an explicitly enabled detailed recording only to a known new session.
+
+    User-supplied settings and resumed sessions are left untouched. The helper's
+    argv form avoids shell interpretation of executable and workspace paths.
+    """
+    env.pop("CLAUDE_CHEAT_BLACKBOX_TOKEN", None)
+    try:
+        import blackbox
+        recorder = blackbox.Blackbox(ROOT)
+        state = recorder.status()
+        if not state.get("active") or state.get("mode") != "detailed":
+            return None
+        flags = {value.split("=", 1)[0] for value in native_args}
+        if flags & {"--resume", "-r", "--continue", "-c", "--session-id", "--fork-session",
+                    "--from-pr", "--settings", "--setting-sources"}:
+            print("[Claude-Cheat] 상세 블랙박스: 기존 세션/사용자 설정 인자는 자동 연결하지 않습니다. Claude는 그대로 실행합니다.", file=sys.stderr)
+            return None
+        helper = ROOT / "blackbox_hook.py"
+        if not helper.is_file():
+            raise ValueError("missing_helper")
+        session_id = str(uuid.uuid4())
+        config_dir = Path(env.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
+        projects = config_dir / "projects"
+        token = recorder.prepare_launch(session_id, projects)
+        if token is None:
+            print("[Claude-Cheat] 상세 블랙박스가 이 새 세션에 연결되지 않았습니다. 기존 기록 상태를 확인하세요.", file=sys.stderr)
+            return None
+        env["CLAUDE_CHEAT_BLACKBOX_TOKEN"] = token
+        hook = {"SessionStart": [{"hooks": [{"type": "command", "command": sys.executable,
+                                               "args": [str(helper)], "timeout": 3}]}]}
+        return session_id, hook
+    except (ImportError, OSError, ValueError, TypeError):
+        print("[Claude-Cheat] 상세 블랙박스 연결을 준비하지 못했습니다. Claude는 그대로 실행합니다.", file=sys.stderr)
+        return None
+
+
+def validate_original_sonnet(env, native_args):
+    flags = {value.split("=", 1)[0] for value in native_args}
+    if flags & {"--model", "-m", "--settings", "--setting-sources"}:
+        raise LauncherArgumentsError("original_sonnet_conflicting_arguments")
+    if any(env.get(key) for key in _SONNET_ROUTE_KEYS):
+        raise LauncherArgumentsError("original_sonnet_routing_environment_conflict")
+    config_dir = Path(env.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
+    cwd = Path.cwd()
+    candidates = [config_dir / "settings.json"]
+    for parent in (cwd, *cwd.parents):
+        candidates.extend((parent / ".claude" / "settings.json", parent / ".claude" / "settings.local.json"))
+    for path in dict.fromkeys(candidates):
+        try:
+            with path.open("rb") as handle:
+                raw = handle.read(1024 * 1024 + 1)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise LauncherArgumentsError("original_sonnet_settings_unreadable") from None
+        try:
+            if len(raw) > 1024 * 1024:
+                raise ValueError()
+            config = json.loads(raw.decode("utf-8-sig"))
+            if not isinstance(config, dict) or not isinstance(config.get("env", {}), dict):
+                raise ValueError()
+        except (ValueError, UnicodeError, RecursionError):
+            raise LauncherArgumentsError("original_sonnet_settings_unreadable") from None
+        if config.get("apiKeyHelper") or any(config.get("env", {}).get(key) for key in _SONNET_ROUTE_KEYS):
+            raise LauncherArgumentsError("original_sonnet_settings_routing_conflict")
+
 
 def validate_claude_args(values, *, local_only=False, compat=False, print_prompt=None):
     if not isinstance(values, (list, tuple)) or any(not isinstance(value, str) or "\0" in value for value in values):
@@ -926,6 +1002,17 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
         if isolated:
             raise startup_error("local_cli_not_found")
         raise FileNotFoundError("Claude Code executable not found")
+    if provider == "sonnet":
+        env = os.environ.copy()
+        validate_original_sonnet(env, native_args)
+        print("Original Sonnet: direct Claude Code session; proxy metrics are not available.")
+        command = routeCli.resolve_command(claude) + ["--model", "sonnet"]
+        recording = prepare_blackbox_hook(env, native_args)
+        if recording:
+            session_id, hooks = recording
+            command += ["--session-id", session_id, "--settings", json.dumps({"hooks": hooks})]
+        command += print_args + native_args
+        return subprocess.call(command, env=env)
     if isolated and Path(claude).suffix.lower() in (".cmd", ".bat"):
         # shortcut: warn only; cmd.exe can mis-parse quotes/&/% in the workspace path or settings JSON passed through a shim.
         # Upgrade to a hard error if an injection is ever reproduced.
@@ -976,6 +1063,8 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
     print("Native-only features stay on Plan. Replacement replies are buffered until validated.")
     with routed_session(provider, debug=debug) as env:
         command = [claude, "--model", "sonnet"]
+        recording = prepare_blackbox_hook(env, native_args)
+        session_settings = {}
         if provider in {"local", "cli"}:
             # Avoid the native Sonnet output cap exhausting a smaller Local context window.
             budget = env.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS") or "8192"
@@ -985,7 +1074,13 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
                 raise LocalStartupError("local_output_budget_invalid") from None
             if not tokens.is_integer() or tokens <= 0:
                 raise LocalStartupError("local_output_budget_invalid")
-            command += ["--settings", json.dumps({"env": {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(int(tokens))}})]
+            session_settings["env"] = {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": str(int(tokens))}
+        if recording:
+            session_id, hooks = recording
+            command += ["--session-id", session_id]
+            session_settings["hooks"] = hooks
+        if session_settings:
+            command += ["--settings", json.dumps(session_settings)]
         return subprocess.call((routeCli.resolve_command(command[0]) + command[1:] if native_args else command) + print_args + native_args, env=env)
 
 
@@ -1104,6 +1199,7 @@ def main(argv=None) -> int:
   python openrouterAdvisor.py --provider openrouter   Override it for this session
   python openrouterAdvisor.py --provider local        Use Local LLM for this session
   python openrouterAdvisor.py --provider cli          Keep Claude Code; use the saved CLI model backend
+  python openrouterAdvisor.py --provider sonnet       Run original Sonnet without the routing proxy
   python openrouterAdvisor.py -- --continue           Forward native Claude session arguments
   python openrouterAdvisor.py --check-local           Check Local model metadata only
   python openrouterAdvisor.py --takeover              Keep the live session's service
@@ -1113,7 +1209,7 @@ Save a default service in the dashboard to launch without --provider.
 CLI backend mode keeps Claude Code as the tool host. Select claude/codex/grok in dashboard settings.
 Exit codes: 0 = success, 2 = usage/service choice required, others = failure.
 """)
-        parser.add_argument("--provider", choices=("auto", "openrouter", "local", "cli"), default="auto",
+        parser.add_argument("--provider", choices=("auto", "openrouter", "local", "cli", "sonnet"), default="auto",
                             help="auto uses the saved default, then the only configured service; explicit values override the default")
         parser.add_argument("--check-local", action="store_true", help="Check local model metadata without inference or Plan login")
         parser.add_argument("--diagnose-local", action="store_true", help="One synthetic Local inference without CLI, native features or Plan fallback")
@@ -1165,6 +1261,8 @@ Exit codes: 0 = success, 2 = usage/service choice required, others = failure.
                 error = OpenRouterStartupError if options.openrouter_compat else LocalStartupError
                 raise error("local_process_cleanup_failed") from None
         if options.takeover:
+            if options.provider == "sonnet":
+                parser.error("--takeover is unavailable for original Sonnet sessions")
             return takeover(options.provider, debug=options.debug)
         return launch(options.provider, local_only=options.local_mode or options.local_compat,
                       local_compat=options.local_compat, openrouter_compat=options.openrouter_compat,
@@ -1191,6 +1289,8 @@ Exit codes: 0 = success, 2 = usage/service choice required, others = failure.
     except LauncherArgumentsError as error:
         print(json.dumps({"event": "invalid_launcher_arguments", "project": "Claude-Cheat", "code": str(error),
                           "action": "review_cli_arguments"}), file=sys.stderr)
+        if str(error).startswith("original_sonnet_"):
+            print("[Claude-Cheat] 원본 Sonnet 직접 실행을 확인할 수 없습니다. Claude 설정과 환경변수의 제공자 주소·인증·모델 덮어쓰기 또는 --model/--settings 인자를 확인하세요. 값은 표시하지 않았으며 설정을 변경하지 않았습니다.", file=sys.stderr)
         return 2
     except PlanLoginError:
         if os.environ.get("CLAUDE_CHEAT_HUMAN_GUIDANCE") != "1":

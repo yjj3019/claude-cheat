@@ -38,6 +38,61 @@ function captureEvents(t) {
   return events;
 }
 
+test('CLI activity measures proxy-side in-flight requests and closes once after cancellation', async t => {
+  const ready = deferred();
+  const f = await fixture(t, async () => { ready.resolve(); return new Promise(() => {}); },
+    {provider:'cli', localModel:'cli/codex', cliKind:'codex'});
+  const controller = new AbortController();
+  const pending = f.send(controller.signal).catch(() => null);
+  await ready.promise;
+  assert.deepEqual((await f.metrics()).cliActivity, {active:1,limit:4,queued:0,rejected:0});
+  controller.abort(); await pending;
+  await waitFor(async () => (await f.metrics()).cliActivity.active === 0);
+  const result = await f.metrics();
+  assert.equal(result.cliActivity.active, 0);
+  assert.equal(result.aborted, 1);
+  await delay(20);
+  assert.deepEqual((await f.metrics()).cliActivity, result.cliActivity);
+});
+
+test('CLI process duration accepts only bounded numeric metadata on completed validated replies', async t => {
+  let reported = '128.35';
+  const f = await fixture(t, async () => Response.json(message('cli/codex'),
+    {headers: {'x-cli-process-ms': reported}}), {provider:'cli', localModel:'cli/codex', cliKind:'codex'});
+  assert.equal((await f.send()).status, 200);
+  assert.deepEqual((await f.metrics()).cliProcessMs, {count:1,p50:128.35,p95:128.35,max:128.35});
+  for (const value of ['-1', 'Infinity', '180001', '1e3', '1.234']) {
+    reported = value;
+    assert.equal((await f.send()).status, 200);
+  }
+  assert.deepEqual((await f.metrics()).cliProcessMs, {count:1,p50:128.35,p95:128.35,max:128.35});
+});
+
+test('CLI failure categories and 429 count distinguish backend responses from Plan fallback', async t => {
+  const cases = [
+    ['status429', () => new Response('', {status:429})],
+    ['status4xx', () => new Response('', {status:400})],
+    ['status5xx', () => new Response('', {status:503})],
+    ['validation', () => Response.json(message('wrong-model'))],
+    ['connection', () => { throw new Error('fixture'); }],
+    ['timeout', () => new Promise(() => {})],
+  ];
+  for (const [category, fail] of cases) {
+    await t.test(category, async sub => {
+      const f = await fixture(sub, async url => url === PLAN ? Response.json(message(body.model)) : fail(),
+        {provider:'cli', localModel:'cli/codex', cliKind:'codex', attemptTimeoutMs:30});
+      assert.equal((await f.send()).status, 200);
+      const m = await f.metrics();
+      assert.equal(m.cliFailures[category], 1);
+      assert.equal(Object.values(m.cliFailures).reduce((a,b) => a+b, 0), 1);
+      assert.equal(m.cliActivity.rejected, category === 'status429' ? 1 : 0);
+      assert.equal(m.cliActivity.active, 0);
+      assert.equal(m.routes.plan, 1);
+      assert.equal(m.cliUsage.responses, 0);
+    });
+  }
+});
+
 test('empty JSON diagnostics contain bounded enums/counts and safe usage, never content or arbitrary metadata', async t => {
   const events = captureEvents(t);
   const secret = 'PRIVATE-PAYLOAD-DO-NOT-LOG';

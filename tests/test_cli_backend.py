@@ -65,6 +65,18 @@ class BackendTest(unittest.TestCase):
         self.assertEqual(json.loads(backend.request_prompt(body).split("REQUEST_JSON:\n", 1)[1]), original)
         self.assertEqual(body, original)
 
+    def test_backend_sandbox_guidance_preserves_host_tool_results(self):
+        body = request()
+        body["messages"] += [
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "host1", "name": "Read", "input": {"path": "sample"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "host1", "is_error": True, "content": "Permission denied"}]},
+        ]
+        prompt = backend.request_prompt(body)
+        guidance, serialized = prompt.split("REQUEST_JSON:\n", 1)
+        self.assertIn("do not infer that the host is read-only", guidance)
+        self.assertIn("respect the host's permission decisions", guidance)
+        self.assertEqual(json.loads(serialized), body)
+
     def test_unsupported_request_cannot_silently_drop_content(self):
         variants = [[], {"messages": []}]
         for block in ({"type": "image", "source": {}}, {"type": "thinking", "thinking": "private"},
@@ -176,6 +188,27 @@ class BackendTest(unittest.TestCase):
             self.assertEqual(headers["X-CLI-Reported-Model"], "native-test")
             self.assertEqual(headers["X-CLI-Usage-Measured"], "true")
             self.assertEqual(body["model"], "cli/codex")
+
+    def test_loopback_emits_only_bounded_process_duration_metadata(self):
+        instance = self.construct(runner=lambda *_: codex_output())
+        message, metadata = instance.generate(request())
+        metadata["process_ms"] = 123.45
+        with patch.object(instance, "generate", return_value=(message, metadata)), \
+                patch.object(backend, "Backend", return_value=instance), backend.serve({}) as (_, url, token):
+            parsed = urlsplit(url)
+            def header():
+                connection = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+                connection.request("POST", parsed.path, json.dumps(request()), {"Authorization": "Bearer " + token})
+                response = connection.getresponse()
+                value = response.getheader("X-CLI-Process-Ms")
+                response.read()
+                connection.close()
+                return value
+            self.assertEqual(header(), "123.45")
+            metadata["process_ms"] = 180001
+            self.assertIsNone(header())
+            metadata["process_ms"] = True
+            self.assertIsNone(header())
 
     def test_common_effort_levels_use_native_flags_without_guessing_other_levels(self):
         for kind in ("codex", "claude"):
@@ -452,6 +485,15 @@ class BackendTest(unittest.TestCase):
             def run(script, timeout=15, cancelled=lambda: False):
                 return backend._run([sys.executable, "-c", script], "synthetic", os.environ.copy(), directory, timeout, cancelled)
             self.assertEqual(run("import sys; print(sys.stdin.read(), end='')"), "synthetic")
+            timing = {}
+            self.assertEqual(backend._run([sys.executable, "-c", "print('done')"], "", os.environ.copy(),
+                                          directory, 15, lambda: False, timing).strip(), "done")
+            self.assertTrue(0 <= timing["process_ms"] <= 180000)
+            timing = {}
+            with self.assertRaises(backend.BackendError):
+                backend._run([sys.executable, "-c", "import time; time.sleep(10)"], "", os.environ.copy(),
+                             directory, .15, lambda: False, timing)
+            self.assertEqual(timing, {})
             self.error("not_logged_in", run, "import sys; sys.stderr.write('authentication required'); sys.exit(1)")
             self.error("timeout", run, "import time; time.sleep(10)", .15)
             start = time.monotonic()

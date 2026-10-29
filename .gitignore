@@ -21,6 +21,7 @@ SESSION_LOG.md
 .usage-cache.json.tmp
 .bench/
 .agent/
+.blackbox/
 openclaude.config.yaml
 openclaude.config.yaml.*
 .openclaude.config.yaml.*

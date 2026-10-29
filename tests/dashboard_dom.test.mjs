@@ -7,7 +7,7 @@ import vm from 'node:vm';
 
 // Run the exact scripts embedded in the served pages, including computed Python appends.
 const ASSETS = JSON.parse(execFileSync(process.env.PYTHON || 'python', ['-c',
-  'import json,re,routeDashboard as d; print(json.dumps({name:re.search(r"<script>(.*)</script>",page,re.S).group(1) for name,page in (("dashboard",d.PAGE),("settings",d.SETTINGS_PAGE))} | {"settings_html":d.SETTINGS_PAGE}))'],
+  'import json,re,routeDashboard as d; print(json.dumps({name:re.search(r"<script>(.*)</script>",page,re.S).group(1) for name,page in (("dashboard",d.PAGE),("settings",d.SETTINGS_PAGE),("blackbox",d.BLACKBOX_PAGE))} | {"settings_html":d.SETTINGS_PAGE}))'],
 { cwd: new URL('..', import.meta.url), encoding: 'utf-8' }));
 
 function scriptBundle() {
@@ -89,6 +89,47 @@ function render(data) {
   sandbox.render(data);
   return context.nodes;
 }
+
+test('blackbox distinguishes waiting, connected and unavailable without showing content', () => {
+  const context = buildContext();
+  const sandbox = {...context, globalThis: null};
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(ASSETS.blackbox, sandbox, {filename:'blackbox.js'});
+  const status = context.nodes.get('blackbox-status');
+  sandbox.renderBlackbox({active:true, mode:'detailed', detail_status:'waiting', incidents:0});
+  assert.match(status.textContent, /새 세션 연결 대기/);
+  assert.match(status.textContent, /기록을 종료하고 다시 시작한 뒤 새 세션/);
+  sandbox.renderBlackbox({active:true, mode:'detailed', detail_status:'connected', details_available:true, incidents:1, content:'PRIVATE'});
+  assert.match(status.textContent, /새 세션 연결됨/);
+  assert.match(status.textContent, /상세 내용 저장됨/);
+  assert.doesNotMatch(status.textContent, /PRIVATE/);
+  sandbox.renderBlackbox({active:true, mode:'detailed', detail_status:'unavailable', incidents:1});
+  assert.match(status.textContent, /상세 수집 불가/);
+});
+
+test('separate blackbox page uses existing authenticated recording actions', async () => {
+  const context = buildContext();
+  const calls = [];
+  context.window.confirm = () => true;
+  context.fetch = async (url, options) => {
+    calls.push({url, options});
+    return {ok:true, json:async () => ({active:true, mode:'detailed', incidents:0})};
+  };
+  const sandbox = {...context, globalThis:null};
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(ASSETS.blackbox, sandbox, {filename:'blackbox.js'});
+  await Promise.resolve();
+  context.document.getElementById('blackbox-detailed').checked = true;
+  await sandbox.blackboxAction('start');
+  await sandbox.blackboxAction('mark');
+  await sandbox.blackboxAction('stop');
+  const writes = calls.filter(call => call.options.method === 'POST');
+  assert.deepEqual(writes.map(call => JSON.parse(call.options.body).action), ['start','mark','stop']);
+  assert.equal(JSON.parse(writes[0].options.body).mode, 'detailed');
+  assert.ok(writes.every(call => call.url === '/api/blackbox' && call.options.headers['x-dashboard-token']));
+});
 
 test('dashboard renders the insights card with its evidence and copy action', () => {
   const nodes = render(fixture());
@@ -202,7 +243,36 @@ test('charts do not fabricate data for empty or unmeasured sessions', () => {
   assert.match(html, /최근 24시간에 표시할 토큰 사용 기록이 없습니다/);
   base.active_session = {provider:'cli'};
   html = render(base).get('grid').innerHTML;
-  assert.match(html, /CLI 토큰 사용량은 이 그래프에서 집계하지 않습니다/);
+  assert.match(html, /CLI 토큰 시계열 미보고/);
+  assert.match(html, /입력 사용량 보고 <b>미보고/);
+});
+
+test('CLI live metrics show measured usage coverage and distinguish failures from Plan', () => {
+  const history = [
+    {minute:'2026-10-25T07:10:00Z',completed:2,ok:2,failed:0,aborted:0,latencyMsSum:2000,tokenSamples:1,outputTokens:0,tokenElapsedMs:1000,
+      cliExternalSuccess:2,cliInputSamples:1,cliOutputSamples:1,cliInputTokens:40,cliOutputTokens:0},
+    {minute:'2026-10-25T07:11:00Z',completed:1,ok:1,failed:0,aborted:0,latencyMsSum:1000,tokenSamples:0,outputTokens:0,tokenElapsedMs:0,
+      cliExternalSuccess:1,cliInputSamples:0,cliOutputSamples:0,cliInputTokens:0,cliOutputTokens:0},
+  ];
+  const data = fixture({active_session:{provider:'cli'},proxy_metrics:{startedAt:'2026-10-25T07:00:00Z',requests:3,ok:3,failed:0,
+    configuration:{provider:'cli'},monitoringHistory:history,cliActivity:{active:1,queued:0,limit:4,rejected:2},
+    cliFailures:{timeout:1,status429:2,status4xx:1,status5xx:0,validation:0,connection:0},
+    cliUsage:{responses:3,inputSamples:1,inputTokens:40,outputSamples:1,outputTokens:0},
+    cliProcessMs:{count:2,p50:410,p95:600,max:620}}});
+  const html = render(data).get('grid').innerHTML;
+  assert.match(html, /CLI 프록시 진행 1건 · 백엔드 동시 한도 4/);
+  assert.match(html, /CLI 별도 대기열 없음/);
+  assert.match(html, /CLI 토큰 사용량 추이/);
+  assert.match(html, /1 \/ 3건 \(33\.3%\)/);
+  assert.match(html, /0 · 1건/); // measured zero differs from unreported
+  assert.match(html, /백엔드 내부 제한 시간 초과와 검증 오류는 4xx에 포함될 수 있습니다/);
+  assert.match(html, /CLI 시도 실패 횟수이며 Plan 우회 요청 수와 다릅니다/);
+  assert.match(html, /미보고 구간은 0으로 표시하지 않습니다/);
+  assert.match(html, /CLI 프로세스 실행 · 성공 응답만/);
+  assert.match(html, /410 \/ 600 \/ 620 ms \(2건\)/);
+  assert.match(html, /순수 모델 추론 시간이 아닙니다/);
+  delete data.proxy_metrics.cliProcessMs;
+  assert.match(render(data).get('grid').innerHTML, /CLI 프로세스 실행 · 성공 응답만<\/span><span class="v">미보고/);
 });
 
 test('diagnostics are grouped below live charts and disclosure choices survive polling', () => {
@@ -798,7 +868,8 @@ test('served settings explain safe switching without a duplicate CLI engine sele
   assert.match(html, /id="default-provider"[^>]*>[\s\S]*?<option value="cli">CLI<\/option>/);
   assert.doesNotMatch(html, /id="default-cli-kind"/);
   assert.match(html, /CLI 종류와 모델은 아래 서비스 설정에서/);
-  assert.match(html, /Plan은 별도 실행 선택지가 아니라/);
+  assert.match(html, /원본 Sonnet은 프록시 없이 직접 실행/);
+  assert.match(html, /<option value="sonnet">원본 Claude Sonnet<\/option>/);
   assert.match(html, /진행 중인 요청을 마치고/);
 });
 

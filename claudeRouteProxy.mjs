@@ -209,6 +209,16 @@ const SCHEMA_ARRAYS = new Set(['allOf', 'anyOf', 'oneOf', 'prefixItems']);
 const SCHEMA_NODES = new Set(['additionalProperties', 'unevaluatedProperties', 'propertyNames', 'items',
   'additionalItems', 'unevaluatedItems', 'contains', 'if', 'then', 'else', 'not', 'contentSchema']);
 
+// A model's own runtime restrictions do not describe the Claude Code tool host.
+// Keep all host/user policies authoritative; this guidance never grants permissions.
+const HOST_TOOL_ACCESS_GUIDANCE = 'Host tool access: Determine workspace access from the host-provided environment, applicable system and project instructions, and actual tool results. Do not infer that the host workspace is read-only merely from a separate model runtime or sandbox. Respect any explicit read-only restriction and all host permission decisions; do not bypass them. If appropriate tools are available, use them within those limits. Report an access restriction only when supported by the host instructions, environment, or tool results.';
+function withHostToolAccessGuidance(system) {
+  if (system === undefined) return HOST_TOOL_ACCESS_GUIDANCE;
+  if (typeof system === 'string') return system + '\n\n' + HOST_TOOL_ACCESS_GUIDANCE;
+  // Preserve every original block and cache marker; the added text is never cached by itself.
+  return [...system, { type: 'text', text: HOST_TOOL_ACCESS_GUIDANCE }];
+}
+
 function compatibleSchema(schema) {
   if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return schema;
   return Object.fromEntries(Object.entries(schema).map(([name, value]) => {
@@ -915,6 +925,10 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   const circuits = { openrouter: newCircuit(), local: newCircuit(), cli: newCircuit() };
   const primaryCircuit = circuits[provider];
   let cliReportedModel = null, cliUsageMeasured = false;
+  // Proxy-side in-flight requests, not the CLI process count. The bridge rejects
+  // over-capacity requests immediately; it does not provide a waiting queue.
+  const cliActivity = { active: 0, limit: 4, queued: 0, rejected: 0 };
+  const cliFailures = { timeout: 0, status429: 0, status4xx: 0, status5xx: 0, validation: 0, connection: 0 };
   // The last rate-limit answer a provider gave; kept for exposure and the breaker decision.
   let lastRateLimit = null;
   // Breaker classification. Transport/timeout, 5xx and unusable 2xx answers mean the provider
@@ -959,6 +973,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       .map(([minute, counts]) => ({ minute: new Date(minute * 60000).toISOString(), ...counts }));
   };
   const LATENCY_WINDOW = 512;
+  const cliProcessTiming = [];
   const routingTiming = { queueWait: [], externalAttempt: [], retryWait: [], plan: [], total: [] };
   const attemptCounts = { external: 0, plan: 0 };
   const recordTiming = (phase, elapsed) => {
@@ -999,6 +1014,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     // Independent phase distributions, not additive percentiles. Total excludes inbound body parsing.
     routingTimingMs: Object.fromEntries(Object.entries(routingTiming).map(([name, values]) => [name, latencySummary(values)])),
     attemptCounts: { ...attemptCounts },
+    ...(provider === 'cli' ? { cliActivity: { ...cliActivity }, cliFailures: { ...cliFailures },
+      cliUsage: { ...tokenFlow.cli }, cliProcessMs: latencySummary(cliProcessTiming) } : {}),
     modelPerformance: Object.fromEntries(Object.entries(modelPerformance).map(([name, value]) => [name, { ...value }])),
     tokenFlow: Object.fromEntries(Object.entries(tokenFlow).map(([name, value]) => [name, { ...value }])),
     monitoringHistory: historySnapshot(),
@@ -1263,7 +1280,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         let history = monitoringHistory.get(minute);
         if (!history) {
           history = { completed: 0, ok: 0, failed: 0, aborted: 0, external: 0, plan: 0,
-            latencyMsSum: 0, tokenSamples: 0, outputTokens: 0, tokenElapsedMs: 0 };
+            latencyMsSum: 0, tokenSamples: 0, outputTokens: 0, tokenElapsedMs: 0,
+            cliExternalSuccess: 0, cliInputSamples: 0, cliOutputSamples: 0, cliInputTokens: 0, cliOutputTokens: 0 };
           monitoringHistory.set(minute, history);
         }
         history.completed += 1;
@@ -1282,6 +1300,21 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           if (performanceSample.outputTokens !== null) {
             flow.outputSamples += 1;
             flow.outputTokens += performanceSample.outputTokens;
+          }
+          if (performanceSample.provider === 'cli') {
+            if (performanceSample.cliProcessMs !== null) {
+              cliProcessTiming.push(performanceSample.cliProcessMs);
+              if (cliProcessTiming.length > LATENCY_WINDOW) cliProcessTiming.shift();
+            }
+            history.cliExternalSuccess += 1;
+            if (performanceSample.inputTokens !== null) {
+              history.cliInputSamples += 1;
+              history.cliInputTokens += performanceSample.inputTokens;
+            }
+            if (performanceSample.outputTokens !== null) {
+              history.cliOutputSamples += 1;
+              history.cliOutputTokens += performanceSample.outputTokens;
+            }
           }
         }
         if (!aborted && !responseFailed && res.statusCode < 400 && routeKind === 'external' &&
@@ -1523,6 +1556,10 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         if (stabilizePromptCache && externalBody.system !== undefined) {
           externalBody.system = stabilizeSystem(externalBody.system);
         }
+        // CLI backends receive equivalent guidance in their adapter; do not duplicate it.
+        if (target.name === 'local' || target.name === 'openrouter') {
+          externalBody.system = withHostToolAccessGuidance(externalBody.system);
+        }
         // Serialize once: the retry loop reuses the same payload, and a large history would
         // otherwise be stringified up to four times.
         const externalPayload = JSON.stringify(externalBody);
@@ -1557,12 +1594,23 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           const ceiling = noPlan ? undefined : setTimeout(() => controller.abort('attempt_timeout'), attemptCeilingMs);
           let status, retryAfterMs = 0, congested = false;
           const finishAttempt = startPhase('externalAttempt');
+          let finishCli = () => {};
+          if (target.name === 'cli') {
+            cliActivity.active += 1;
+            finishCli = () => {
+              if (!openPhases.delete(finishCli)) return;
+              cliActivity.active -= 1;
+            };
+            openPhases.add(finishCli);
+            scheduleMetricsFlush();
+          }
           try {
             const operation = (async () => {
               attemptCounts.external += 1;
               const response = await fetchImpl(target.url, { method: 'POST', headers,
                 body: externalPayload, redirect: 'error', signal: controller.signal });
               status = response.status;
+              if (target.name === 'cli' && status === 429) cliActivity.rejected += 1;
               if (!response.ok) {
                 // Only a failed answer carries a wait for the client; a Retry-After on a
                 // successful response is not part of the result and must not taint metrics.
@@ -1648,6 +1696,9 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               if (provider === 'cli') {
                 result.cliReportedModel = response.headers.get('x-cli-reported-model');
                 result.cliUsageMeasured = response.headers.get('x-cli-usage-measured') === 'true';
+                const reportedMs = response.headers.get('x-cli-process-ms');
+                const duration = typeof reportedMs === 'string' && /^\d{1,6}(?:\.\d{1,2})?$/.test(reportedMs) ? Number(reportedMs) : NaN;
+                result.cliProcessMs = Number.isFinite(duration) && duration <= 180000 ? duration : null;
               }
               return result;
             })();
@@ -1664,7 +1715,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             }
             logReplacement();
             performanceSample = { provider: target.name, inputTokens: response.inputTokens ?? null,
-              outputTokens: response.outputTokens ?? null };
+              outputTokens: response.outputTokens ?? null, cliProcessMs: response.cliProcessMs ?? null };
             if (response.streamed) { res.end(); return; }
             res.writeHead(200, { 'content-type': response.contentType, 'cache-control': 'no-store' });
             res.end(response.text);
@@ -1691,6 +1742,12 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               'Empty message response': 'empty_response', 'Invalid message response': 'invalid_message',
               'Invalid stream metadata': 'invalid_stream_metadata', 'Expected JSON Local response': 'expected_json', 'Unsupported Local response content': 'unsupported_local_content',
               'Local thinking response disabled': 'thinking_response', 'Thinking response in ordinary mode': 'thinking_response', 'Unsupported Local response fields': 'unsupported_content_fields' }[error?.message];
+            if (target.name === 'cli') {
+              const category = controller.signal.reason === 'attempt_timeout' ? 'timeout' :
+                status === 429 ? 'status429' : status >= 400 && status < 500 ? 'status4xx' :
+                status >= 500 ? 'status5xx' : Number.isInteger(status) && status >= 200 && status < 300 ? 'validation' : 'connection';
+              cliFailures[category] += 1;
+            }
             if (noPlan) localFailure = controller.signal.reason === 'attempt_timeout' ? 'timeout' :
               status === 401 || status === 403 ? 'authentication_failed' : status === 402 ? 'payment_required' : validation === 'empty_response' ? 'empty_response' : 'upstream_error';
             if (Number.isInteger(status)) failureStatus = status;
@@ -1712,6 +1769,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             if ([400, 404, 413, 422].includes(status) || error?.message === 'Thinking response in ordinary mode') requestRejected = true;
             if (requestRejected || [401, 402, 403, 404].includes(status)) break;
           } finally {
+            finishCli();
             finishAttempt();
             clearTimeout(timer);
             clearTimeout(ceiling);

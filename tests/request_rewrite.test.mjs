@@ -190,6 +190,52 @@ test('a Plan fallback request carries normalized ids while the external attempts
   });
 
 const FOOTER = '<total_tokens>1234 tokens left</total_tokens>';
+const withoutHostGuidance = system => typeof system === 'string'
+  ? system.slice(0, system.lastIndexOf('\n\nHost tool access:'))
+  : system.slice(0, -1);
+
+test('Local and OpenRouter receive host access guidance without losing system instructions or tool results',
+  { timeout: 15000 }, async t => {
+    const configs = [
+      { provider: 'openrouter', expected: EXTERNAL },
+      { provider: 'local', localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: UPSTREAM_MODEL,
+        expected: 'http://127.0.0.1:11434/v1/messages' },
+    ];
+    for (const { expected, ...config } of configs) {
+      const proxy = await startProxy(t, config);
+      for (const system of [undefined, 'Project: read-only.', [
+        { type: 'text', text: 'Project: read-only.', cache_control: { type: 'ephemeral' } },
+      ]]) {
+        const body = { model: MODEL, max_tokens: 64,
+          messages: [{ role: 'user', content: 'Please inspect.' },
+            { role: 'assistant', content: [{ type: 'tool_use', id: 'tool1', name: 'Read', input: {} }] },
+            { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tool1', is_error: true, content: 'Permission denied' }] }] };
+        if (system !== undefined) body.system = system;
+        const response = await proxy.send(body);
+        assert.equal(response.status, 200);
+        await response.text();
+        const call = proxy.calls.at(-1);
+        assert.equal(call.url, expected);
+        assert.deepEqual(call.parsed.messages, body.messages, 'actual host denial remains unchanged');
+        const sent = call.parsed.system;
+        const guidance = Array.isArray(sent) ? sent.at(-1).text : sent;
+        assert.match(guidance, /Respect any explicit read-only restriction/);
+        assert.match(guidance, /all host permission decisions/);
+        assert.match(guidance, /If appropriate tools are available/);
+        if (typeof system === 'string') assert.equal(withoutHostGuidance(sent), system);
+        if (Array.isArray(system)) assert.deepEqual(withoutHostGuidance(sent), system);
+        if (system === undefined) assert.match(sent, /^Host tool access:/);
+      }
+    }
+  });
+
+test('Plan fallback receives the original system without injected host guidance', { timeout: 15000 }, async t => {
+  const proxy = await startProxy(t, { respond: ({url}) => url === PLAN ? planReply() : new Response('down', {status: 500}) });
+  const body = { model: MODEL, max_tokens: 64, system: 'Project: read-only.', messages: [{role:'user',content:'Inspect.'}] };
+  assert.equal((await proxy.send(body)).status, 200);
+  assert.equal(proxy.calls.at(-1).url, PLAN);
+  assert.deepEqual(proxy.calls.at(-1).parsed, body);
+});
 
 test('the opt-in stabilizer peels only a trailing system footer', { timeout: 15000 }, async t => {
   const system = `System guidance.\n${FOOTER}`;
@@ -201,13 +247,13 @@ test('the opt-in stabilizer peels only a trailing system footer', { timeout: 150
   await (await enabled.send(body)).text();
   const before = disabled.calls[0].parsed;
   const after = enabled.calls[0].parsed;
-  assert.equal(before.system, system, 'off by default: the footer stays');
-  assert.equal(after.system, 'System guidance.\n');
+  assert.equal(withoutHostGuidance(before.system), system, 'off by default: the footer stays');
+  assert.equal(withoutHostGuidance(after.system), 'System guidance.\n');
   assert.deepEqual({ ...after, system: before.system }, before, 'every other field is unchanged');
   // A body whose only system content is the footer becomes an empty string, no more.
   const onlyFooter = await startProxy(t, { stabilizePromptCache: true });
   await (await onlyFooter.send({ ...body, system: FOOTER })).text();
-  assert.equal(onlyFooter.calls[0].parsed.system, '');
+  assert.equal(withoutHostGuidance(onlyFooter.calls[0].parsed.system), '');
 });
 
 test('the stabilizer leaves non-matching and fenced footers byte-identically untouched',
@@ -224,7 +270,7 @@ test('the stabilizer leaves non-matching and fenced footers byte-identically unt
       const body = { model: MODEL, max_tokens: 32, system, messages: [{ role: 'user', content: 'hi' }] };
       await (await enabled.send(body)).text();
       await (await disabled.send(body)).text();
-      assert.equal(enabled.calls[index].parsed.system, system, `system must stay identical: ${JSON.stringify(system)}`);
+      assert.equal(withoutHostGuidance(enabled.calls[index].parsed.system), system, `system must stay identical: ${JSON.stringify(system)}`);
       // Enabling the stabilizer must not change a single byte when no footer is peelable.
       assert.equal(Buffer.from(enabled.calls[index].body).toString(),
         Buffer.from(disabled.calls[index].body).toString(), `body must stay byte-identical: ${JSON.stringify(system)}`);
@@ -240,7 +286,7 @@ test('only the last system text block may be stabilized', { timeout: 15000 }, as
   ];
   await (await proxy.send({ model: MODEL, max_tokens: 32, system,
     messages: [{ role: 'user', content: 'hi' }] })).text();
-  const captured = proxy.calls[0].parsed.system;
+  const captured = withoutHostGuidance(proxy.calls[0].parsed.system);
   assert.equal(captured.length, 3);
   assert.equal(captured[0].text, `first block ${FOOTER}`, 'earlier footer blocks are untouched');
   assert.equal(captured[1].text, `second block\n${FOOTER}`, 'only the last text block is considered');
@@ -257,7 +303,7 @@ test('the last system text block is peeled with its cache marker intact',
     ];
     await (await proxy.send({ model: MODEL, max_tokens: 32, system,
       messages: [{ role: 'user', content: 'hi' }] })).text();
-    const captured = proxy.calls[0].parsed.system;
+    const captured = withoutHostGuidance(proxy.calls[0].parsed.system);
     assert.equal(captured[0].text, 'earlier');
     assert.equal(captured[1].text, 'tracked\n');
     assert.deepEqual(captured[1].cache_control, { type: 'ephemeral' });

@@ -678,7 +678,9 @@ for (const model of [DEEPSEEK, SONNET]) {
     assert.equal((await response.json()).model, model);
     const { metadata, ...expected } = body;
     assert.equal(calls[0].parsedBody.metadata, undefined);
-    assert.deepEqual(calls[0].parsedBody, { ...expected, thinking: { type: 'disabled' }, model: DEEPSEEK, provider: { allow_fallbacks: false } });
+    const { system, ...received } = calls[0].parsedBody;
+    assert.match(system, /Host tool access:/);
+    assert.deepEqual(received, { ...expected, thinking: { type: 'disabled' }, model: DEEPSEEK, provider: { allow_fallbacks: false } });
     assert.equal(calls[0].headers.authorization, `Bearer ${KEY}`);
     assert.equal(JSON.stringify(calls[0].headers).includes(OAUTH), false);
     assert.equal(calls[0].headers['anthropic-beta'], undefined);
@@ -1259,7 +1261,11 @@ for (const thinking of [{ type: 'disabled' }, { type: 'enabled', budget_tokens: 
     const { calls, request } = await fixture(t);
     assert.equal((await request(body, { headers: { ...proHeaders, 'anthropic-beta': BETA + ',claude-code-20250219,prompt-caching-2024-07-31' } })).status, 200);
     assert.equal(calls[0].url, externalURL);
-    assert.deepEqual(calls[0].parsedBody, { ...body, thinking: { type: 'disabled' }, model: DEEPSEEK, provider: { allow_fallbacks: false } });
+    const { system, ...received } = calls[0].parsedBody;
+    assert.deepEqual(system.slice(0, -1), body.system);
+    assert.match(system.at(-1).text, /Host tool access:/);
+    const { system: _originalSystem, ...expected } = body;
+    assert.deepEqual(received, { ...expected, thinking: { type: 'disabled' }, model: DEEPSEEK, provider: { allow_fallbacks: false } });
     assert.equal(calls[0].headers['anthropic-beta'], undefined);
   });
 }
@@ -1453,7 +1459,9 @@ test('explicit remote HTTPS uses exactly the configured endpoint, model and isol
   assert.equal((await response.json()).model, SONNET);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].url, localUrl);
-  assert.deepEqual(calls[0].parsedBody, { ...requestBody(SONNET), thinking: { type: 'disabled' }, model: localModel });
+  const { system, ...received } = calls[0].parsedBody;
+  assert.match(system, /Host tool access:/);
+  assert.deepEqual(received, { ...requestBody(SONNET), thinking: { type: 'disabled' }, model: localModel });
   assert.equal(calls[0].headers.authorization, `Bearer ${localKey}`);
   assert.equal(calls[0].headers['anthropic-beta'], undefined);
   assert.equal(calls[0].headers['x-api-key'], undefined);
@@ -1569,7 +1577,7 @@ test('stale in-flight failure does not reopen a recovered circuit', async t => {
   const gate = new Promise(resolve => { release = resolve; });
   const { calls, request } = await fixture(t, async (url, options) => {
     if (url === proURL) return jsonResponse(url, options);
-    if (JSON.parse(options.body).system === 'A') { await gate; return new Response('fail', { status: 500 }); }
+    if (JSON.parse(options.body).system.startsWith('A\n\nHost tool access:')) { await gate; return new Response('fail', { status: 500 }); }
     return healthy ? jsonResponse(url, options) : new Response('fail', { status: 500 });
   }, { cooldownMs: 10, attemptTimeoutMs: 5000, now: () => time });
   const stale = request(requestBody(SONNET, { system: 'A' }), { headers: proHeaders });

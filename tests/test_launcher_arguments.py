@@ -14,6 +14,94 @@ import openrouterAdvisor as route
 
 
 class LauncherArgumentsTests(unittest.TestCase):
+    def test_original_sonnet_runs_directly_without_proxy_and_preserves_native_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "settings.json"
+            config.write_text(json.dumps({"enabledPlugins": {"fixture": True}, "env": {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}}), encoding="utf-8")
+            env = {"CLAUDE_CONFIG_DIR": directory, "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(route.Path, "cwd", return_value=root), \
+                 mock.patch.object(route.shutil, "which", return_value="fixture"), \
+                 mock.patch.object(route.routeCli, "resolve_command", return_value=["fixture"]), \
+                 mock.patch.object(route, "prepare_blackbox_hook", return_value=None), \
+                 mock.patch.object(route, "routed_session", side_effect=AssertionError("must not start proxy")), \
+                 mock.patch.object(route.subprocess, "call", return_value=0) as called:
+                self.assertEqual(route.launch("sonnet", cli_args=["--resume", "fixture"]), 0)
+            self.assertEqual(called.call_args.args[0], ["fixture", "--model", "sonnet", "--resume", "fixture"])
+            self.assertEqual(called.call_args.kwargs["env"], env)
+            self.assertEqual(json.loads(config.read_text(encoding="utf-8"))["enabledPlugins"], {"fixture": True})
+
+    def test_original_sonnet_rejects_custom_routing_without_printing_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(route.Path, "cwd", return_value=root), mock.patch.object(route.Path, "home", return_value=root):
+                for key in ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_DEFAULT_SONNET_MODEL", "CLAUDE_CODE_USE_BEDROCK"):
+                    with self.subTest(key=key), self.assertRaises(route.LauncherArgumentsError) as error:
+                        route.validate_original_sonnet({key: "fixture-private"}, [])
+                    self.assertNotIn("fixture-private", str(error.exception))
+                for flag in ("--model=other", "--settings", "--setting-sources"):
+                    with self.subTest(flag=flag), self.assertRaises(route.LauncherArgumentsError):
+                        route.validate_original_sonnet({}, [flag])
+                project = root / ".claude"
+                project.mkdir()
+                (project / "settings.local.json").write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "fixture-private"}}), encoding="utf-8")
+                with self.assertRaisesRegex(route.LauncherArgumentsError, "settings_routing_conflict") as error:
+                    route.validate_original_sonnet({}, [])
+                self.assertNotIn("fixture-private", str(error.exception))
+
+    def test_original_sonnet_unreadable_settings_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / ".claude"
+            project.mkdir()
+            (project / "settings.json").write_text("{broken", encoding="utf-8")
+            with mock.patch.object(route.Path, "cwd", return_value=root), mock.patch.object(route.Path, "home", return_value=root):
+                with self.assertRaisesRegex(route.LauncherArgumentsError, "settings_unreadable"):
+                    route.validate_original_sonnet({}, [])
+
+    def test_detailed_blackbox_hook_uses_exec_argv_and_session_nonce(self):
+        import types
+        recorder = mock.Mock()
+        recorder.status.return_value = {"active": True, "mode": "detailed"}
+        recorder.prepare_launch.return_value = "fixture-nonce"
+        module = types.SimpleNamespace(Blackbox=mock.Mock(return_value=recorder))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "blackbox_hook.py").write_text("# fixture", encoding="utf-8")
+            env = {"CLAUDE_CONFIG_DIR": directory}
+            with mock.patch.object(route, "ROOT", root), mock.patch.dict(sys.modules, {"blackbox": module}):
+                session, hooks = route.prepare_blackbox_hook(env, [])
+                self.assertEqual(env["CLAUDE_CHEAT_BLACKBOX_TOKEN"], "fixture-nonce")
+                self.assertEqual(recorder.prepare_launch.call_args.args, (session, root / "projects"))
+                command = hooks["SessionStart"][0]["hooks"][0]
+                self.assertEqual(command["command"], sys.executable)
+                self.assertEqual(command["args"], [str(root / "blackbox_hook.py")])
+                self.assertNotIn("fixture-nonce", json.dumps(hooks))
+                recorder.prepare_launch.reset_mock()
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertIsNone(route.prepare_blackbox_hook(env, ["--resume", "existing"]))
+                recorder.prepare_launch.assert_not_called()
+                self.assertNotIn("CLAUDE_CHEAT_BLACKBOX_TOKEN", env)
+                recorder.prepare_launch.side_effect = OSError("fixture-private")
+                with contextlib.redirect_stderr(io.StringIO()) as error:
+                    self.assertIsNone(route.prepare_blackbox_hook(env, []))
+                self.assertNotIn("fixture-private", error.getvalue())
+                self.assertNotIn("CLAUDE_CHEAT_BLACKBOX_TOKEN", env)
+
+    def test_cli_detailed_blackbox_merges_hooks_and_existing_output_settings(self):
+        env = {}
+        hooks = {"SessionStart": [{"hooks": [{"type": "command", "command": "fixture", "args": []}]}]}
+        with mock.patch.object(route.shutil, "which", return_value="fixture"), \
+             mock.patch.object(route, "routed_session", return_value=contextlib.nullcontext(env)), \
+             mock.patch.object(route, "prepare_blackbox_hook", return_value=("fixture-id", hooks)), \
+             mock.patch.object(route.subprocess, "call", return_value=0) as called:
+            self.assertEqual(route.launch("cli"), 0)
+        command = called.call_args.args[0]
+        self.assertEqual(command[command.index("--session-id") + 1], "fixture-id")
+        settings = json.loads(command[command.index("--settings") + 1])
+        self.assertEqual(settings["hooks"], hooks)
+        self.assertEqual(settings["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"], "8192")
+
     def test_utf8_encoding_preserves_argument_boundaries(self):
         values = ["--resume", "session id", "--plugin-dir", "C:\\fixture plugin\\", "--mcp-config",
                   json.dumps({"mcpServers": {"fixture": {"args": ["a b", 'quoted"']}}}), "", "??"]
@@ -132,6 +220,7 @@ class LauncherArgumentsTests(unittest.TestCase):
             receiver.write_text("import json,sys; from pathlib import Path; Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:],ensure_ascii=False),encoding='utf-8')", encoding="utf-8")
             with mock.patch.object(route.shutil, "which", return_value="fixture.cmd"), \
                  mock.patch.object(route.routeCli, "resolve_command", return_value=[sys.executable, str(receiver), str(output)]), \
+                 mock.patch.object(route, "prepare_blackbox_hook", return_value=None), \
                  mock.patch.object(route, "routed_session", return_value=contextlib.nullcontext(dict(os.environ))), \
                  contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(route.launch("openrouter", cli_args=values), 0)

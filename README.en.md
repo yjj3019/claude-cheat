@@ -413,13 +413,31 @@ The picker lists an exact model ID only once per service, trimming surrounding w
 
 ### CLI model backends
 
+### Original Sonnet and black box
+
+Select **Original Claude Sonnet** as the default service or run `OpenClaude.ps1 -Provider Sonnet` to launch Claude Code with `--model sonnet` directly, without a proxy. Existing sessions are not stopped. Conflicting provider credentials, route or model settings cause a safe stop with guidance; values are not printed or changed. Managed policy and the model actually answering are not verified merely by requesting Sonnet.
+
+Open the **Black Box** menu to start recording and mark an incident when a problem occurs. Metadata mode records limited diagnostics. Explicit detailed mode can capture conversation and tool input/output added after a newly launched session is bound; continuing an existing session, custom `--settings`, disabled hooks or managed policy can prevent binding. Check the connection status. A direct Sonnet session has no proxy metrics; a separate proxy snapshot may belong to another session.
+
+Records are stored in `.blackbox/recording.json` with a 2 MiB / 256 event bound; older events are discarded. Detailed records can contain sensitive information even after pattern-based redaction. Windows directory permissions depend on the parent ACL. Only complete recent transcript records within 64 KiB are included at each incident; older or oversized content may be omitted. The recording directory is gitignored.
+
 The OpenRouter and Local settings provide separate actions to delete the stored API credential or reset that service's managed settings. They sanitize the service's managed values in the active YAML, existing `.bak`, and its legacy `.env` while preserving other services and the default selection. If the reset service remains the default, configure it again or select another before the next launch.
 
 Deletion is irreversible and a failure across multiple files may leave some values behind. Running sessions can retain loaded credentials until stopped. Environment variables, external copies and backups, arbitrary comments outside managed fields, and provider-issued keys are not removed or revoked; revoke a key at its provider when necessary.
 
 Choose the CLI kind in its settings, save those settings, and then select **CLI** as the default execution service. Run `OpenClaude.ps1` for a new session; a one-off override is `-Provider CLI`. Claude Code remains the front end and executes SSH/MCP tools, skills, plugins, hooks and permissions. The backend returns validated JSON text or tool-call proposals; it cannot execute its own tools.
 
+The Codex backend runs in an isolated read-only temporary workspace. That restriction does not determine the front-end Claude Code tools' access to the project. The backend is instructed to follow actual host tool permissions and results; this does not bypass a genuine access restriction.
+
+Local LLM and OpenRouter requests also receive guidance to judge tool access from the host's stated policies and actual tool results, respecting explicit read-only restrictions. This guidance is not inserted into direct Sonnet or Plan fallback requests.
+
 For Codex, the CLI model picker reads its local model cache without running inference. The cache does not guarantee current account access or backend compatibility. If unavailable, enter a model ID manually. Claude Code and Grok currently have no verified catalog integration and require manual entry; the Grok backend is not yet enabled.
+
+CLI monitoring reports proxy requests in flight, HTTP 429 responses, failure categories, and the last 60 minutes of reported input/output tokens and usage coverage. The CLI adapter has a concurrency limit of four and rejects excess requests without a queue. Proxy in-flight requests are not the actual CLI process count or GPU load. Coverage uses successful CLI responses as its denominator; unreported usage is not treated as zero. HTTP 4xx can include CLI backend validation errors. Restart the session to collect the new metrics; older proxies leave them unreported.
+
+CLI process time measures just before process start through observed termination, including startup, CLI preparation and communication; it is not pure model inference time. It retains up to 512 validated successful response samples and excludes failures, cancellations and unreported timings. An unreported actual model is never inferred from the requested model.
+
+Run `python tests/live_cli_smoke.py --run` explicitly to make one real Codex inference through the authenticated local adapter, using the saved CLI configuration and login. Usage may be incurred. The isolated test checks a synthetic tool proposal and executes no tool. It does not verify the proxy, front-end Claude Code, Agent Teams or SSH/MCP combinations.
 
 Saved settings apply to the next session, not to requests already running. Finish work and subagents, exit Claude Code normally, restart, and check the active session and recent route in the dashboard. Plan is currently a fallback route, not a separately selectable default; there is no automatic Local-to-CLI switching. A started response is not replayed on another route. Saved settings do not prove connectivity: inference tests make real calls and may incur usage. CLI backends require their own login and a verified version; Grok is not currently enabled. Verify the model and executable after changing CLI kind.
 

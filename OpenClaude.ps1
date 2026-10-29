@@ -23,7 +23,7 @@ Replace the live proxy while keeping its service.
 .\OpenClaude.ps1 -Help
 Show options, examples and exit codes without launching a session.
 #>
-param([ValidateSet('Auto', 'OpenRouter', 'Local', 'CLI')][string]$Provider = 'Auto', [switch]$CheckLocal, [switch]$DiagnoseLocal, [switch]$LocalMode, [switch]$LocalCompat, [switch]$OpenRouterCompat, [switch]$Debug, [switch]$Stream, [switch]$Takeover, [switch]$Setup, [string]$Print, [switch]$Help, [string[]]$CliArgs = @())
+param([ValidateSet('Auto', 'OpenRouter', 'Local', 'CLI', 'Sonnet')][string]$Provider = 'Auto', [switch]$CheckLocal, [switch]$DiagnoseLocal, [switch]$LocalMode, [switch]$LocalCompat, [switch]$OpenRouterCompat, [switch]$Debug, [switch]$Stream, [switch]$Takeover, [switch]$Setup, [string]$Print, [switch]$Help, [string[]]$CliArgs = @())
 # Auto uses the saved default, or selects the only configured service in older settings.
 # An explicit -Provider overrides the saved default for this invocation only.
 # -Stream forwards provider frames as they validate (lower first-token latency) but a late

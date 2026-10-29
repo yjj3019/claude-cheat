@@ -38,7 +38,7 @@ test('minute history counts concurrent outcomes, routes and reported tokens once
  assert.deepEqual([h.external,h.plan],[2,1]);
  assert.equal(h.tokenSamples,2);assert.equal(h.outputTokens,14);
  assert.ok(h.latencyMsSum>0);assert.ok(h.tokenElapsedMs>0);
- assert.deepEqual(Object.keys(h).sort(),['aborted','completed','external','failed','latencyMsSum','minute','ok','outputTokens','plan','tokenElapsedMs','tokenSamples'].sort());
+ assert.deepEqual(Object.keys(h).sort(),['aborted','completed','external','failed','latencyMsSum','minute','ok','outputTokens','plan','tokenElapsedMs','tokenSamples','cliExternalSuccess','cliInputSamples','cliOutputSamples','cliInputTokens','cliOutputTokens'].sort());
  const flow=(await f.metrics()).tokenFlow;
  assert.deepEqual(flow.local,{responses:2,inputSamples:2,inputTokens:6,outputSamples:2,outputTokens:14});
  assert.deepEqual(flow.openrouter,{responses:0,inputSamples:0,inputTokens:0,outputSamples:0,outputTokens:0});
@@ -82,8 +82,12 @@ test('CLI placeholder usage is unreported until bridge confirms measurement',asy
    body:JSON.stringify({model:sonnet,max_tokens:256,messages:[{role:'user',content:'fixture'}]})});
  const metrics=async()=>await(await fetch(base+'/api/metrics',{headers:{'x-local-route-token':token}})).json();
  await (await send()).text();measured=true;await (await send()).text();
- assert.deepEqual((await metrics()).tokenFlow.cli,
-   {responses:2,inputSamples:1,inputTokens:3,outputSamples:1,outputTokens:7});
+ const result=await metrics();
+ const usage={responses:2,inputSamples:1,inputTokens:3,outputSamples:1,outputTokens:7};
+ assert.deepEqual(result.tokenFlow.cli,usage);
+ assert.deepEqual(result.cliUsage,usage);
+ const h=result.monitoringHistory[0];
+ assert.deepEqual([h.cliExternalSuccess,h.cliInputSamples,h.cliInputTokens,h.cliOutputSamples,h.cliOutputTokens],[2,1,3,1,7]);
 });
 
 test('successful directly streamed external replies have unknown token usage',async t=>{

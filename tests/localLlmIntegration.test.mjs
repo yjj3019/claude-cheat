@@ -72,7 +72,9 @@ for (const localKey of [undefined, 'synthetic-local-key']) {
     const received = f.localCalls[0];
     assert.equal(received.method, 'POST');
     assert.equal(received.path, '/v1/messages');
-    assert.deepEqual(received.body, { ...body({ tools }), thinking: { type: 'disabled' }, model: MODEL });
+    const { system, ...receivedBody } = received.body;
+    assert.match(system, /Host tool access:/);
+    assert.deepEqual(receivedBody, { ...body({ tools }), thinking: { type: 'disabled' }, model: MODEL });
     assert.equal(received.headers.authorization, localKey ? `Bearer ${localKey}` : undefined);
     for (const name of ['anthropic-beta', 'x-api-key', 'x-local-route-token']) assert.equal(received.headers[name], undefined);
     assert.equal(JSON.stringify(received).includes(OAUTH), false);
