@@ -99,6 +99,26 @@ test('dashboard renders the insights card with its evidence and copy action', ()
   assert.match(grid, /지금 상태/);
 });
 
+test('performance card shows measured throughput and completed-request failure rate', () => {
+  const data = fixture({proxy_metrics: {
+    startedAt: '2026-10-25T07:00:00+00:00', uptimeMs: 3600000, requests: 60, ok: 45, failed: 5, aborted: 10,
+    configuration: {provider: 'local'}, routes: {external: 40, plan: 20},
+    latencyMs: {external: {p50: 100, p95: 500, count: 40}, plan: {p50: 200, p95: 600, count: 20}, ttfb: {p50: 80, p95: 400, count: 40}},
+    modelPerformance: {local: {samples: 2, outputTokens: 40, elapsedMs: 4000}},
+  }});
+  const html = render(data).get('grid').innerHTML;
+  assert.match(html, /1\.00 건\/분/);
+  assert.match(html, /10\.0% \(5 \/ 50건\)/);
+  assert.match(html, /10\.00 토큰\/초 \(2건\)/);
+  assert.match(html, /첫 바이트는 첫 토큰과 다릅니다/);
+});
+
+test('unreported model throughput is not presented as zero', () => {
+  const html = render(fixture({proxy_metrics: {startedAt:'2026-10-25T07:00:00+00:00', uptimeMs:3600000,
+    requests:0, ok:0, failed:0, configuration:{provider:'local'}}})).get('grid').innerHTML;
+  assert.match(html, /미측정/);
+});
+
 test('an alert that shares an insight code is not repeated', () => {
   const nodes = render(fixture());
   const alerts = nodes.get('alerts').innerHTML;

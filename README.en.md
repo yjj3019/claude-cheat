@@ -325,6 +325,8 @@ Stopping a previous instance (including `python routeDashboard.py --stop`) happe
 
 The refresh interval follows the situation: two seconds while routing is active, ten seconds while idle, fifteen when the tab is hidden. The header shows a one-line summary (`오늘 43.8M토큰 · $1.42 · 남은 한도 $48.25 · 우선 확인: …`).
 
+The performance card reuses proxy counters and sends no additional inference requests. Observed output tokens/second is the sum of reported output tokens divided by total request time for eligible successful responses. It includes queueing, network and retries; multiple models may share one provider bucket. Plan, direct streaming, cancellation, failures and unreported usage are excluded. GPU utilization and pure generation speed are unavailable. New token counters begin after restarting the proxy with the updated code.
+
 The **insights** card ranks *what changed, why, and what to do next* instead of listing numbers, with the measurements it used as chips. A banner that shares an insight's cause is not repeated.
 
 | Insight | Trigger | Suggested action |
@@ -336,12 +338,13 @@ The **insights** card ranks *what changed, why, and what to do next* instead of 
 | Limit exhaustion forecast | today's burn rate exhausts the limit within 7 days | adjust model price or volume |
 | Burn rate | days of headroom estimate | reference |
 | Cache reuse low | ≥200k prompt tokens with <15% reuse | keep the prompt prefix stable |
-| Latency | session p95 ≥20s | splits **first-byte time from generation time** so a proxy problem is not confused with model speed |
+| Latency | session p95 ≥20s | shows **response and first-byte p95 separately**; they can describe different requests and include network, queueing and buffering |
 | Session idle | no decision for 30 minutes | reference |
 
 | Panel | Content |
 | --- | --- |
 | Now | **OpenRouter, Local LLM or CLI serving / Plan bypass / idle**, the **last request's actual routing model**, age, reason |
+| Performance | Live proxy session requests, failure rate, average requests per minute, external and Plan routes, response and first-byte latency. Observed output token throughput is shown only when response usage is reported. |
 | Alerts | Shown when Plan bypass reaches 50% within ten minutes, a circuit opens, a 400/413/422 rejection repeats, or the balance drops below 10% |
 | Last 60 minutes | Replacement versus Plan counts, circuit opens |
 | Bypass reasons | Counts per `native_feature` `detail` with **meaning and action**, external failure statuses and validation classes |

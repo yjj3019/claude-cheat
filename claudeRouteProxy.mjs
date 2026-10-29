@@ -863,6 +863,9 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     retries: 0, externalAttempts: 0, aborted: 0, bytesIn: 0, bytesOut: 0, circuitOpens: 0,
     routes: { external: 0, plan: 0 },
     reasons: {}, latency: { external: [], plan: [] }, ttfb: [], last: null };
+  // Bounded lifetime aggregates for validated, usage-reporting external JSON responses.
+  const modelPerformance = Object.fromEntries(['local', 'openrouter', 'cli'].map(name =>
+    [name, { samples: 0, outputTokens: 0, elapsedMs: 0 }]));
   const LATENCY_WINDOW = 512;
   const latencySummary = values => {
     if (!values.length) return { count: 0, p50: null, p95: null, max: null };
@@ -894,6 +897,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     bytesIn: metrics.bytesIn, bytesOut: metrics.bytesOut, circuitOpens: metrics.circuitOpens,
     latencyMs: { external: latencySummary(metrics.latency.external), plan: latencySummary(metrics.latency.plan),
       ttfb: latencySummary(metrics.ttfb) },
+    modelPerformance: Object.fromEntries(Object.entries(modelPerformance).map(([name, value]) => [name, { ...value }])),
     last: metrics.last,
     rateLimit: lastRateLimit ? { ...lastRateLimit } : null,
   });
@@ -1115,7 +1119,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         if (chunk) metrics.bytesOut += Buffer.byteLength(chunk);
         return originalEnd(chunk, encoding, callback);
       };
-      let routeKind = null, routeReason = null, recorded = false;
+      let routeKind = null, routeReason = null, recorded = false, performanceSample = null;
       const noteRoute = (kind, reason) => {
         if (routeKind) return;
         routeKind = kind;
@@ -1131,6 +1135,12 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         if (aborted) { metrics.aborted += 1; metrics.failed += 1; }
         else if (!responseFailed && res.statusCode < 400) metrics.ok += 1;
         else metrics.failed += 1;
+        if (!aborted && !responseFailed && res.statusCode < 400 && routeKind === 'external' && performanceSample && elapsed > 0) {
+          const aggregate = modelPerformance[performanceSample.provider];
+          aggregate.samples += 1;
+          aggregate.outputTokens += performanceSample.outputTokens;
+          aggregate.elapsedMs += elapsed;
+        }
         if (routeKind) {
           const bucket = metrics.latency[routeKind];
           bucket.push(elapsed);
@@ -1434,7 +1444,16 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               // shortcut: textual match can false-positive on a tool_use input object containing this literal; refine if seen.
               if (!validated.streamed && !compatProfile && !localOnly && /"type"\s*:\s*"(?:redacted_thinking|thinking|thinking_delta|signature_delta)"/.test(validated.text))
                 throw new Error('Thinking response in ordinary mode');
+              // Only complete JSON replies carry directly verifiable usage here; SSE and
+              // CLI bridge placeholders do not imply measured output tokens.
+              let outputTokens = null;
+              if (validated.contentType === 'application/json' &&
+                  (target.name !== 'cli' || response.headers.get('x-cli-usage-measured') === 'true')) {
+                const count = JSON.parse(validated.text).usage?.output_tokens;
+                if (Number.isSafeInteger(count) && count >= 0) outputTokens = count;
+              }
               const result = forceJson && body.stream === true ? jsonMessageStream(validated.text, !compatProfile) : validated;
+              result.outputTokens = outputTokens;
               if (provider === 'cli') {
                 result.cliReportedModel = response.headers.get('x-cli-reported-model');
                 result.cliUsageMeasured = response.headers.get('x-cli-usage-measured') === 'true';
@@ -1453,6 +1472,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               cliUsageMeasured = response.cliUsageMeasured === true;
             }
             logReplacement();
+            if (response.outputTokens !== null && response.outputTokens !== undefined)
+              performanceSample = { provider: target.name, outputTokens: response.outputTokens };
             if (response.streamed) { res.end(); return; }
             res.writeHead(200, { 'content-type': response.contentType, 'cache-control': 'no-store' });
             res.end(response.text);

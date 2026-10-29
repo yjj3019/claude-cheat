@@ -1182,8 +1182,13 @@ Exit codes: 0 = success, 2 = usage/service choice required, others = failure.
                           "action": "review_cli_arguments"}), file=sys.stderr)
         return 2
     except PlanLoginError:
-        print(json.dumps({"event": "claude_login_required", "project": "Claude-Cheat", "code": "plan_login_required",
-                          "action": "login_front_claude", "command": "claude auth login"}), file=sys.stderr)
+        if os.environ.get("CLAUDE_CHEAT_HUMAN_GUIDANCE") != "1":
+            print(json.dumps({"event": "claude_login_required", "project": "Claude-Cheat", "code": "plan_login_required",
+                              "action": "login_front_claude", "command": "claude auth login"}), file=sys.stderr)
+        print("\n[Claude-Cheat] Claude Code 로그인이 필요하여 세션을 시작하지 않았습니다.", file=sys.stderr)
+        print("  1. 현재 터미널에서 claude auth login 을 실행하고 로그인을 완료하세요.", file=sys.stderr)
+        print("  2. claude auth status 로 로그인 상태를 확인하세요.", file=sys.stderr)
+        print("  3. OpenClaude.ps1 을 다시 실행하세요. Local LLM 설정은 그대로 유지됩니다.", file=sys.stderr)
         return 1
     except (cliBackend.BackendError, routeCli.CliError) as error:
         print(json.dumps({"event": "cli_backend_start_failed", "project": "Claude-Cheat", "code": error.code,

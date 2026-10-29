@@ -62,11 +62,15 @@ if ($CliArgs.Count -gt 0) {
     $routeArgs += @('--cli-args-b64', $nativeArgsEncoded)
 }
 $previousStream = $env:ROUTE_STREAM_PASSTHROUGH
+$previousHumanGuidance = $env:CLAUDE_CHEAT_HUMAN_GUIDANCE
 try {
+    $env:CLAUDE_CHEAT_HUMAN_GUIDANCE = '1'
     if ($Stream) { $env:ROUTE_STREAM_PASSTHROUGH = '1' }
     & python (Join-Path $PSScriptRoot 'openrouterAdvisor.py') @routeArgs
     $routeExit = $LASTEXITCODE
 } finally {
+    if ($null -eq $previousHumanGuidance) { Remove-Item Env:CLAUDE_CHEAT_HUMAN_GUIDANCE -ErrorAction SilentlyContinue }
+    else { $env:CLAUDE_CHEAT_HUMAN_GUIDANCE = $previousHumanGuidance }
     # Do not leave the switch behind: the next launch in this shell must not inherit it.
     if ($Stream) {
         if ($null -eq $previousStream) { Remove-Item Env:ROUTE_STREAM_PASSTHROUGH -ErrorAction SilentlyContinue }
@@ -77,6 +81,10 @@ if ($routeExit -ne 0) {
     if ($routeExit -eq 2) {
         # The child already printed usage guidance; avoid a PowerShell error stack.
         Write-Warning 'Claude-Cheat needs an explicit service choice or corrected arguments. See the guidance above (exit code 2).'
+        exit $routeExit
+    }
+    if ($routeExit -eq 1) {
+        # The child has already explained the failure; retain its code without a second error stack.
         exit $routeExit
     }
     # Keep the child's exit code ($routeExit) so wrappers can tell a usage error (2) from a

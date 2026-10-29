@@ -114,6 +114,15 @@ class LauncherArgumentsTests(unittest.TestCase):
         result = json.loads(stderr.getvalue().splitlines()[0])
         self.assertEqual(result["event"], "claude_login_required")
         self.assertEqual(result["command"], "claude auth login")
+        self.assertIn("claude auth status", stderr.getvalue())
+        self.assertIn("OpenClaude.ps1", stderr.getvalue())
+        self.assertIn("로그인이 필요", stderr.getvalue())
+        with mock.patch.object(route, "launch", side_effect=route.PlanLoginError()), \
+             mock.patch.dict(os.environ, {"CLAUDE_CHEAT_HUMAN_GUIDANCE": "1"}), \
+             contextlib.redirect_stderr(io.StringIO()) as human_output:
+            self.assertEqual(route.main(["--provider", "cli"]), 1)
+        self.assertNotIn('"event"', human_output.getvalue())
+        self.assertIn("claude auth login", human_output.getvalue())
 
 
 if __name__ == "__main__":

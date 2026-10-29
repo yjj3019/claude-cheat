@@ -42,6 +42,17 @@ class LauncherEnvironmentTests(unittest.TestCase):
                 self.assertNotIn("FullyQualifiedErrorId", result.stderr)
                 self.assertNotIn("WriteErrorException", result.stderr)
 
+    def test_exit_one_preserves_code_without_a_powershell_error_stack(self):
+        for script in (LAUNCHER, ROOT / "startOpenClaude.ps1"):
+            with self.subTest(script=script.name):
+                result = self.run_script(
+                    "function global:python { [Console]::WriteLine('claude auth login'); $global:LASTEXITCODE = 1 }; "
+                    f"& '{script}'; exit $LASTEXITCODE")
+                self.assertEqual(result.returncode, 1, result.stderr[-400:])
+                self.assertIn("claude auth login", result.stdout)
+                self.assertNotIn("FullyQualifiedErrorId", result.stderr)
+                self.assertNotIn("WriteErrorException", result.stderr)
+
     def test_runtime_failure_keeps_its_original_exit_code(self):
         result = self.run_script(
             "function global:python { $global:LASTEXITCODE = 7 }; "
