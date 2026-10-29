@@ -330,6 +330,39 @@ for (const nativeFeature of ['beta', 'unsupported output configuration', 'nested
   });
 }
 
+test('native Retry-After date becomes seconds without losing error recovery headers or body', async t => {
+  const clock = Date.parse('2026-10-29T00:00:00Z');
+  const payload = JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: 'synthetic overload' } });
+  const { request } = await fixture(t, () => new Response(payload, { status: 529, headers: {
+    'content-type': 'application/json', 'retry-after': new Date(clock + 90000).toUTCString(),
+    'x-should-retry': 'true', 'request-id': 'fixture-request',
+  } }), { now: () => clock });
+  const answer = await request(requestBody(OPUS), { headers: proHeaders });
+  assert.equal(answer.status, 529);
+  assert.equal(answer.headers.get('retry-after'), '90');
+  assert.equal(answer.headers.get('x-should-retry'), 'true');
+  assert.equal(answer.headers.get('request-id'), 'fixture-request');
+  assert.equal(await answer.text(), payload);
+});
+
+for (const message of [
+  'thinking.type adaptive is not supported',
+  'context_management: Extra inputs are not permitted',
+  'output_config.effort: Extra inputs are not permitted',
+  "Input tag 'advisor_20260301' is unrecognized",
+  'thinking block bound to a different conversation',
+]) {
+  test(`native capability recovery preserves ${message}`, async t => {
+    const payload = JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message } });
+    const { request } = await fixture(t, () => new Response(payload, { status: 400,
+      headers: { 'content-type': 'application/json', 'x-should-retry': 'false' } }));
+    const answer = await request(requestBody(OPUS), { headers: proHeaders });
+    assert.equal(answer.status, 400);
+    assert.equal(answer.headers.get('x-should-retry'), 'false');
+    assert.equal(await answer.text(), payload);
+  });
+}
+
 test('native 429 does not stop external routing or subsequent native recovery', async t => {
   let limited = true;
   const { calls, request } = await fixture(t, (url, options) => {
@@ -1388,6 +1421,26 @@ for (const localAllowRemote of [undefined, false]) {
       localUrl: 'https://llm.example.invalid/v1/messages', localModel: 'configured-model', localAllowRemote }));
   });
 }
+
+test('ordinary Local route preserves long tool history and token budget', async t => {
+  const messages = Array.from({ length: 100 }, (_, index) => [
+    { role: 'assistant', content: [{ type: 'tool_use', id: `call_${index}`, name: 'Read', input: { path: `file_${index}` } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: `call_${index}`, content: 'result '.repeat(100) }] },
+  ]).flat();
+  const body = requestBody(SONNET, { messages, max_tokens: 8192,
+    tools: [{ name: 'Read', input_schema: { type: 'object', properties: { path: { type: 'string' } } } }] });
+  const localUrl = 'http://127.0.0.1:11434/v1/messages';
+  const { calls, request } = await fixture(t, jsonResponse, { provider: 'local', key: undefined,
+    localUrl, localModel: 'configured-model' });
+  const response = await request(body, { headers: proHeaders });
+  assert.equal(response.status, 200);
+  await response.text();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, localUrl);
+  assert.deepEqual(calls[0].parsedBody.messages, messages);
+  assert.deepEqual(calls[0].parsedBody.tools, body.tools);
+  assert.equal(calls[0].parsedBody.max_tokens, 8192);
+});
 
 test('explicit remote HTTPS uses exactly the configured endpoint, model and isolated credential', async t => {
   const localUrl = 'https://llm.example.invalid:8443/v1/messages';

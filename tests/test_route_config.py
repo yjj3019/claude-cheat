@@ -201,6 +201,70 @@ class StoreTests(unittest.TestCase):
         lock = "." + cfg.CONFIG_NAME + ".lock"
         return sorted(p.name for p in Path(self.tmp).iterdir() if p.name != lock)
 
+    def test_reset_credentials_sanitizes_primary_backup_and_legacy_without_touching_other_values(self):
+        main = 'openrouter:\n  model: "vendor/a"\n  api_key: "SECRET_MAIN" # SECRET_COMMENT\nlocal:\n  model: "keep"\n  api_key: "OTHER_KEY"\nrouting:\n  default_provider: "openrouter"\n'
+        backup = main.replace('SECRET_MAIN', 'SECRET_BACKUP')
+        store = make_store(self.tmp, **{"openclaude.config.yaml": main,
+            "openclaude.config.yaml.bak": backup,
+            ".env.openrouter": "ANTHROPIC_AUTH_TOKEN=SECRET_LEGACY\nOPENROUTER_MODEL=vendor/old\nEXTRA=keep\n"})
+        store.reset_provider("openrouter", "credential")
+        self.assertEqual(store.read_provider("openrouter"), {"OPENROUTER_MODEL": "vendor/a"})
+        self.assertEqual(store.read_provider("local")["LOCAL_LLM_API_KEY"], "OTHER_KEY")
+        self.assertEqual(store.default_provider(), "openrouter")
+        for name in ("openclaude.config.yaml", "openclaude.config.yaml.bak", ".env.openrouter"):
+            self.assertNotIn("SECRET_", (Path(self.tmp) / name).read_text(encoding="utf-8"))
+        self.assertIn("EXTRA=keep", (Path(self.tmp) / ".env.openrouter").read_text(encoding="utf-8"))
+        store.write_provider("openrouter", {"OPENROUTER_MODEL": "vendor/new"})
+        self.assertNotIn("SECRET_", (Path(self.tmp) / "openclaude.config.yaml.bak").read_text(encoding="utf-8"))
+
+    def test_reset_preserves_bom_and_crlf_and_rejects_hardlinks(self):
+        raw = b'\xef\xbb\xbfopenrouter:\r\n  api_key: "SECRET"\r\n  model: "vendor/a"\r\n'
+        store = make_store(self.tmp, **{"openclaude.config.yaml": raw})
+        store.reset_provider("openrouter", "credential")
+        result = store.path.read_bytes()
+        self.assertTrue(result.startswith(b'\xef\xbb\xbf'))
+        self.assertNotIn(b'SECRET', result)
+        self.assertNotIn(b'\n', result.replace(b'\r\n', b''))
+        alias = Path(self.tmp) / "alias"
+        try:
+            os.link(store.path, alias)
+        except OSError:
+            self.skipTest("hard links unavailable")
+        with self.assertRaisesRegex(cfg.ConfigError, "reset_unsafe_path"):
+            store.reset_provider("openrouter", "service")
+        self.assertEqual(store.path.read_bytes(), result)
+
+    def test_reset_service_preserves_other_services_and_blocks_legacy_fallback(self):
+        store = make_store(self.tmp, **{".env.local-llm": "LOCAL_LLM_MODEL=local-model\nLOCAL_LLM_API_KEY=LOCAL_SECRET\nEXTRA=keep\n",
+            ".env.openrouter": "ANTHROPIC_AUTH_TOKEN=OTHER_KEY\nOPENROUTER_MODEL=vendor/a\n"})
+        store.reset_provider("local", "service")
+        self.assertEqual(store.read_provider("local"), {})
+        self.assertEqual(store.source("local"), "yaml")
+        self.assertEqual(store.read_provider("openrouter")["ANTHROPIC_AUTH_TOKEN"], "OTHER_KEY")
+        self.assertEqual((Path(self.tmp) / ".env.local-llm").read_text(encoding="utf-8"), "EXTRA=keep\n")
+        self.assertNotIn("LOCAL_SECRET", store.path.read_text(encoding="utf-8"))
+
+    def test_credential_reset_preserves_legacy_non_secret_values_when_section_missing(self):
+        store = make_store(self.tmp, **{"openclaude.config.yaml": 'openrouter:\n  model: "vendor/a"\n',
+            ".env.local-llm": "LOCAL_LLM_URL=http://127.0.0.1:11434/v1/messages\nLOCAL_LLM_MODEL=llama\nLOCAL_LLM_API_KEY=SECRET\n"})
+        store.reset_provider("local", "credential")
+        values = store.read_provider("local")
+        self.assertEqual(values["LOCAL_LLM_URL"], "http://127.0.0.1:11434/v1/messages")
+        self.assertEqual(values["LOCAL_LLM_MODEL"], "llama")
+        self.assertNotIn("LOCAL_LLM_API_KEY", values)
+        self.assertNotIn("SECRET", (Path(self.tmp) / ".env.local-llm").read_text(encoding="utf-8"))
+
+    def test_reset_rejects_invalid_backups_and_reports_partial_failure(self):
+        store = make_store(self.tmp, **{"openclaude.config.yaml": VALID, "openclaude.config.yaml.bak": "bad yaml"})
+        with self.assertRaisesRegex(cfg.ConfigError, "reset_invalid_file"):
+            store.reset_provider("local", "service")
+        self.assertEqual(store.path.read_text(encoding="utf-8"), VALID)
+        (Path(self.tmp) / "openclaude.config.yaml.bak").write_text(VALID, encoding="utf-8")
+        with mock.patch.object(cfg, "_replace_with_retry", side_effect=[True, False]):
+            with self.assertRaisesRegex(cfg.ConfigError, "reset_incomplete"):
+                store.reset_provider("local", "credential")
+        self.assertEqual(store.path.read_text(encoding="utf-8"), VALID)
+
     def test_reads_environment_style_names(self):
         store = make_store(self.tmp, **{"openclaude.config.yaml": VALID})
         self.assertEqual(store.read_provider("openrouter"),

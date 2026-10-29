@@ -23,6 +23,12 @@
 | 문서 | 한국어·영문 README의 CLI·기본값·기능 정책 현행화 | 구현 및 검증 범위를 명시합니다. |
 | 커밋·푸시·배포 | 검증 후 실제 수행 결과로 판단 | 이전 배포와 이번 작업 중 변경을 혼동하지 않습니다. 실행 중 사용자 세션은 임의 종료하지 않습니다. |
 
+## 2026-10-29 Agent Teams·병렬 기능 보존 재점검
+
+원본 Claude Code를 실행하고 설정을 유지하는 것은 전체 기능 동등성의 증명이 아닙니다. Agent Teams의 생성·메시지·완료, 병렬 subagent와 SSH/MCP·Skills·Plugins·hooks의 조합을 최신 실행에서 전수 검증하지 않았습니다. 일반 Local 모드의 프록시 동시2/대기8/5초 정책은 정상 병렬 작업도 Plan으로 우회시킬 수 있습니다. 명시적 LocalMode의 background 제한과 compat 모드의 환경·모델 재설정도 구분해야 합니다.
+
+[DeepSeek Harness·OpenCode 정밀 비교](HARNESS-COMPATIBILITY-REVIEW.ko.md)에 고정 커밋, 코드·테스트 근거, 모드별 제약, 우선순위와 합격 기준을 기록했습니다. 보완안은 아직 런타임에 적용하지 않았습니다.
+
 ## 남은 확인 사항
 
 - Grok은 자체 도구를 완전히 비활성화하는 실행 프로필이 검증될 때까지 백엔드 실행을 거부합니다.
@@ -36,3 +42,16 @@
 - Full Python suite: 514 run, 9 skipped; two process-timing failures were investigated separately. Authentication classification passed on serial rerun. The inherited-handle test now checks successful completion before its deadline and actual descendant cleanup, with a child lifetime exceeding that deadline. Final targeted results are recorded in the completion report.
 - Live dashboard: `/settings` and `/api/diagnostics` returned HTTP 200; saved Local provider and selected DeepSeek model matched. Served settings contain CLI, Claude Code, Codex and Grok options.
 - Independent static review found no confirmed critical/high-severity defects. Real authenticated CLI-backend conversations remain unverified. Automated Chrome screenshot capture timed out; visual layout verification is incomplete.
+
+
+## 후속 구현·검증 (2026-10-29)
+
+앞선 표와 5초 대기 설명은 최초 조사 시점의 기록입니다. 사용자 승인에 따라 Local 큐 대기를 기본 60초로 변경했습니다. `ROUTE_LOCAL_QUEUE_WAIT_MS`로 0~60000ms 범위에서 설정하며 동시 실행 2개·대기 8개는 유지합니다. 큐 만료·포화 시 기존 Plan/오류 정책을 적용합니다. 이는 추론과 재시도를 포함한 전체 응답 기한이 아닙니다. 실행 중인 프록시에는 재시작 후 적용됩니다.
+
+호환 실행 경로에서 명시된 Agent Teams·subagent·작업 목록·background·IDE·plugin·skill 환경 선호를 보존합니다. 인증 격리와 명시적 제한 LocalMode는 유지합니다. Claude 자체 관리 명령을 모델 연결 검사 없이 전달하도록 보완했으나, `--bg` 이후 프록시 수명 문제까지 해결한 것은 아닙니다.
+
+Plan의 날짜형 Retry-After를 초로 변환하고 일반적인 기능 거부 오류의 본문·헤더 보존을 검증했습니다. 빈 응답은 본문이나 도구 인자를 기록하지 않고 `validation_detail`의 제한된 분류값으로 구분합니다. 자격증명 마스킹과 오류 크기 제한은 유지합니다.
+
+회귀 검증: 대상 Node 테스트 318개, 전체 Node 테스트 598개 통과. Python 런처 테스트 11개 통과, 설정 테스트 118개 실행 중 1개 건너뜀, 실패 없음. 실제 설치된 Claude Code 2.1.312의 격리된 합성 백엔드에서 하위 에이전트 2개 및 4개가 직접 연결과 프록시 연결 모두 병렬 실행·완료됨을 확인했습니다. 4개 시험에서 프록시는 최대 2개씩 처리했고 Local 6건·Plan 0건으로 고유한 자식 결과 4개와 부모 완료를 확인했습니다. 재현 명령은 `node tests/native_subagents_smoke.mjs 2` 및 `node tests/native_subagents_smoke.mjs 4`입니다. 이는 실제 공유 Local 모델의 추론·도구 수행 능력이나 Agent Teams 전체 과정 검증을 대신하지 않습니다.
+
+남은 주요 경계는 사용자 지정 API URL에서의 Remote Control 제한, 분리 실행(`--bg`)의 프록시 수명, 실제 인증 환경의 Agent Teams·SSH/MCP·Skills·Plugins 통합 검증입니다. 전체 기능 동등성은 아직 입증되지 않았습니다.

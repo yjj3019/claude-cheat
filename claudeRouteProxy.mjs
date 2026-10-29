@@ -223,6 +223,26 @@ function compatibleSchema(schema) {
 
 const STOP_REASONS = new Set(['end_turn', 'max_tokens', 'stop_sequence', 'tool_use', 'refusal', 'model_context_window_exceeded']);
 const CONTROL_STOPS = new Set(['refusal', 'model_context_window_exceeded']);
+const DIAGNOSTIC_BLOCK_TYPES = ['text', 'tool_use', 'thinking', 'redacted_thinking'];
+const DIAGNOSTIC_USAGE_FIELDS = ['input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'];
+// Keep diagnostics separate from throwable provider objects: an upstream cannot inject
+// arbitrary error properties into the log. Only bounded enums/counts leave this boundary.
+const emptyResponseDiagnostics = new WeakMap();
+function safeResponseUsage(usage) {
+  return Object.fromEntries(DIAGNOSTIC_USAGE_FIELDS.filter(name =>
+    Number.isSafeInteger(usage?.[name]) && usage[name] >= 0).map(name => [name, usage[name]]));
+}
+function emptyResponseError(detail, format, stopReason, counts = {}, usage = {}) {
+  const error = Object.assign(new Error('Empty message response'), { validationDetail: detail });
+  const blockTypes = Object.fromEntries(DIAGNOSTIC_BLOCK_TYPES.filter(type => counts[type] > 0)
+    .map(type => [type, Math.min(65535, counts[type])]));
+  emptyResponseDiagnostics.set(error, {
+    format, stop_reason: STOP_REASONS.has(stopReason) ? stopReason : null,
+    block_count: Math.min(65535, Object.values(blockTypes).reduce((sum, count) => sum + count, 0)),
+    block_types: blockTypes, usage: safeResponseUsage(usage),
+  });
+  return error;
+}
 function usableContent(block) {
   return block.type === 'text' ? block.text.trim().length > 0 :
     block.type === 'tool_use' && block.id.trim().length > 0 && block.name.trim().length > 0;
@@ -467,6 +487,8 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false)
   let publishable = false, sawThinking = false;
   const blocks = new Map();
   const indices = new Set();
+  const diagnosticCounts = {};
+  let diagnosticUsage = {};
   const thinking = block => ['thinking', 'redacted_thinking'].includes(block?.type);
   return {
     get started() { return started; },
@@ -487,6 +509,7 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false)
         if (event.message.content !== undefined && (!Array.isArray(event.message.content) || event.message.content.length))
           throw new Error('Nonempty stream start content');
         started = true;
+        diagnosticUsage = safeResponseUsage(event.message.usage);
         event.message.model = clientModel;
       } else if (event.type !== 'ping' && !started) throw new Error('Missing start');
       if (event.type === 'content_block_start') {
@@ -499,6 +522,8 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false)
           sawThinking = true;
         }
         indices.add(event.index);
+        const type = event.content_block.type;
+        if (DIAGNOSTIC_BLOCK_TYPES.includes(type)) diagnosticCounts[type] = Math.min(65535, (diagnosticCounts[type] || 0) + 1);
         usable ||= usableContent(event.content_block);
         blocks.set(event.index, { type: event.content_block.type, json: '', hasJson: false });
       }
@@ -533,6 +558,7 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false)
         if (blocks.size || !STOP_REASONS.has(event.delta?.stop_reason)) throw new Error('Incomplete message');
         delta = true;
         stopReason = event.delta.stop_reason;
+        diagnosticUsage = { ...diagnosticUsage, ...safeResponseUsage(event.usage) };
       }
       if (event.type === 'message_stop') {
         if (!started || !delta || blocks.size) throw new Error('Missing start or delta');
@@ -543,7 +569,8 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false)
     },
     finish() {
       if (!started || !stopped) throw new Error('Truncated stream');
-      if (!usable && !CONTROL_STOPS.has(stopReason)) throw new Error('Empty message response');
+      if (!usable && !CONTROL_STOPS.has(stopReason)) throw emptyResponseError(
+        'stream_without_usable_content', 'sse', stopReason, diagnosticCounts, diagnosticUsage);
       if (rejectThinking && sawThinking) throw new Error('Thinking response in ordinary mode');
     },
   };
@@ -551,8 +578,8 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false)
 
 async function bufferedResponse(upstream, model, clientModel, stream, signal, onProgress, strictMeta = false, onFrame = null, rejectThinking = false, onDrain = null) {
   if (!upstream.ok) throw new Error('External request failed');
-  if (!upstream.body) throw new Error('Empty message response');
   const sse = (upstream.headers.get('content-type') || '').includes('text/event-stream');
+  if (!upstream.body) throw emptyResponseError('missing_body', sse ? 'sse' : 'json');
   if (stream === true && !sse) throw new Error('Invalid response');
   if (stream !== true && sse) throw new Error('Unexpected SSE response');
   const reader = upstream.body.getReader();
@@ -629,12 +656,17 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal, on
   }
   if (!sse) {
     const text = (chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)).toString('utf8');
-    if (!text.trim()) throw new Error('Empty message response');
+    if (!text.trim()) throw emptyResponseError('empty_body', 'json');
     const response = JSON.parse(text);
     if (response.type !== 'message' || response.model !== model || !Array.isArray(response.content) ||
         !response.content.every(validContentBlock) || !STOP_REASONS.has(response.stop_reason) ||
         (strictMeta && !validMessageMeta(response))) throw new Error('Invalid message response');
-    if (!response.content.some(usableContent) && !CONTROL_STOPS.has(response.stop_reason)) throw new Error('Empty message response');
+    if (!response.content.some(usableContent) && !CONTROL_STOPS.has(response.stop_reason)) {
+      const counts = {};
+      for (const block of response.content) counts[block.type] = Math.min(65535, (counts[block.type] || 0) + 1);
+      throw emptyResponseError(response.content.length ? 'content_without_usable_output' : 'empty_content',
+        'json', response.stop_reason, counts, response.usage);
+    }
     response.model = clientModel;
     return { contentType: 'application/json', text: JSON.stringify(response), streamed: false };
   }
@@ -782,6 +814,9 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   // wait at most this long and the full hint reaches the client as Retry-After instead.
   retryMaxWaitMs = Number.isFinite(Number(process.env.ROUTE_RETRY_MAX_WAIT_MS))
     ? Number(process.env.ROUTE_RETRY_MAX_WAIT_MS) : 10000,
+  localConcurrency = 2, localQueueLimit = 8,
+  localQueueWaitMs = process.env.ROUTE_LOCAL_QUEUE_WAIT_MS === undefined
+    ? 60000 : Number(process.env.ROUTE_LOCAL_QUEUE_WAIT_MS),
   // Opt-in: peel the CLI's trailing token-count footer from system text before the external
   // request so the provider's prefix cache survives between turns. Documented in the README.
   stabilizePromptCache = process.env.ROUTE_STABILIZE_PROMPT_CACHE === '1',
@@ -834,6 +869,47 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     if (!Number.isFinite(value) || value < 0) throw new Error('Invalid routing timeout');
   if (!Number.isFinite(requestIdleTimeoutMs) || requestIdleTimeoutMs < 0) throw new Error('Invalid request idle timeout');
   if (!Number.isFinite(retryMaxWaitMs) || retryMaxWaitMs < 0) throw new Error('Invalid retry wait');
+  if (!Number.isSafeInteger(localConcurrency) || localConcurrency < 1 || localConcurrency > 64 ||
+      !Number.isSafeInteger(localQueueLimit) || localQueueLimit < 0 || localQueueLimit > 256 ||
+      !Number.isFinite(localQueueWaitMs) || localQueueWaitMs < 0 || localQueueWaitMs > 60000)
+    throw new Error('Invalid Local admission limits');
+  // This bounds this proxy's contribution, not other users of the shared server.
+  const localQueue = [];
+  let localActive = 0, localQueueRejected = 0;
+  const localPermit = () => {
+    localActive++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      localActive--;
+      localQueue[0]?.(true);
+    };
+  };
+  const acquireLocal = signal => {
+    signal.throwIfAborted();
+    if (localActive < localConcurrency) return Promise.resolve(localPermit());
+    if (localQueue.length >= localQueueLimit || localQueueWaitMs === 0) {
+      localQueueRejected++;
+      return Promise.resolve(null);
+    }
+    return new Promise((resolve, reject) => {
+      const finish = admitted => {
+        clearTimeout(timer);
+        signal.removeEventListener('abort', cancel);
+        const index = localQueue.indexOf(finish);
+        if (index < 0) return;
+        localQueue.splice(index, 1);
+        if (signal.aborted) return reject(new Error('Request aborted'));
+        if (!admitted) localQueueRejected++;
+        resolve(admitted ? localPermit() : null);
+      };
+      const cancel = () => finish(false);
+      const timer = setTimeout(() => finish(false), localQueueWaitMs);
+      localQueue.push(finish);
+      signal.addEventListener('abort', cancel, { once: true });
+    });
+  };
   // Breaker state is per provider: one failing provider must not make the other look down.
   const newCircuit = () => ({ openUntil: 0, probing: false, generation: 0, lastLocalFailure: 'upstream_error' });
   const circuits = { openrouter: newCircuit(), local: newCircuit(), cli: newCircuit() };
@@ -866,7 +942,30 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   // Bounded lifetime aggregates for validated, usage-reporting external JSON responses.
   const modelPerformance = Object.fromEntries(['local', 'openrouter', 'cli'].map(name =>
     [name, { samples: 0, outputTokens: 0, elapsedMs: 0 }]));
+  // Observed provider usage only; response count lets clients distinguish missing usage from zero.
+  const tokenFlow = Object.fromEntries(['local', 'openrouter', 'cli'].map(name =>
+    [name, { responses: 0, inputSamples: 0, inputTokens: 0, outputSamples: 0, outputTokens: 0 }]));
+  // Only completed request aggregates, never content or individual request records.
+  const monitoringHistory = new Map();
+  const currentMinute = () => Math.floor(now() / 60000);
+  const pruneHistory = minute => {
+    for (const key of monitoringHistory.keys()) {
+      if (key < minute - 59 || key > minute) monitoringHistory.delete(key);
+    }
+  };
+  const historySnapshot = () => {
+    pruneHistory(currentMinute());
+    return [...monitoringHistory.entries()].sort(([a], [b]) => a - b)
+      .map(([minute, counts]) => ({ minute: new Date(minute * 60000).toISOString(), ...counts }));
+  };
   const LATENCY_WINDOW = 512;
+  const routingTiming = { queueWait: [], externalAttempt: [], retryWait: [], plan: [], total: [] };
+  const attemptCounts = { external: 0, plan: 0 };
+  const recordTiming = (phase, elapsed) => {
+    const samples = routingTiming[phase];
+    samples.push(Math.max(0, elapsed));
+    if (samples.length > LATENCY_WINDOW) samples.shift();
+  };
   const latencySummary = values => {
     if (!values.length) return { count: 0, p50: null, p95: null, max: null };
     const sorted = [...values].sort((a, b) => a - b);
@@ -897,7 +996,14 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     bytesIn: metrics.bytesIn, bytesOut: metrics.bytesOut, circuitOpens: metrics.circuitOpens,
     latencyMs: { external: latencySummary(metrics.latency.external), plan: latencySummary(metrics.latency.plan),
       ttfb: latencySummary(metrics.ttfb) },
+    // Independent phase distributions, not additive percentiles. Total excludes inbound body parsing.
+    routingTimingMs: Object.fromEntries(Object.entries(routingTiming).map(([name, values]) => [name, latencySummary(values)])),
+    attemptCounts: { ...attemptCounts },
     modelPerformance: Object.fromEntries(Object.entries(modelPerformance).map(([name, value]) => [name, { ...value }])),
+    tokenFlow: Object.fromEntries(Object.entries(tokenFlow).map(([name, value]) => [name, { ...value }])),
+    monitoringHistory: historySnapshot(),
+    localAdmission: { active: localActive, queued: localQueue.length, rejected: localQueueRejected,
+      concurrency: localConcurrency, queueLimit: localQueueLimit, queueWaitMs: localQueueWaitMs },
     last: metrics.last,
     rateLimit: lastRateLimit ? { ...lastRateLimit } : null,
   });
@@ -910,7 +1016,9 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     try {
       // Replace atomically: a reader must never see a half-written snapshot.
       const temporary = `${metricsPath}.tmp`;
-      writeFileSync(temporary, JSON.stringify(metricsSnapshot()));
+      // The minute history is live-session only; keep the existing disk snapshot compact.
+      const { monitoringHistory: _liveHistory, tokenFlow: _liveTokenFlow, ...persisted } = metricsSnapshot();
+      writeFileSync(temporary, JSON.stringify(persisted));
       renameSync(temporary, metricsPath);
     } catch {}
   };
@@ -1120,6 +1228,16 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         return originalEnd(chunk, encoding, callback);
       };
       let routeKind = null, routeReason = null, recorded = false, performanceSample = null;
+      const openPhases = new Set();
+      const startPhase = phase => {
+        const start = performance.now();
+        const finish = (end = performance.now()) => {
+          if (!openPhases.delete(finish)) return;
+          recordTiming(phase, end - start);
+        };
+        openPhases.add(finish);
+        return finish;
+      };
       const noteRoute = (kind, reason) => {
         if (routeKind) return;
         routeKind = kind;
@@ -1131,15 +1249,50 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         if (recorded) return;
         recorded = true;
         releaseTurn();
-        const elapsed = Number((performance.now() - startedAt).toFixed(2));
+        const completedAt = performance.now();
+        // finish/close can run before an attempt's finally, especially on client cancellation.
+        // Close active timers now; later finally calls become no-ops.
+        for (const finish of openPhases) finish(completedAt);
+        recordTiming('total', completedAt - startedAt);
+        const elapsed = Number((completedAt - startedAt).toFixed(2));
         if (aborted) { metrics.aborted += 1; metrics.failed += 1; }
         else if (!responseFailed && res.statusCode < 400) metrics.ok += 1;
         else metrics.failed += 1;
-        if (!aborted && !responseFailed && res.statusCode < 400 && routeKind === 'external' && performanceSample && elapsed > 0) {
+        const minute = currentMinute();
+        pruneHistory(minute);
+        let history = monitoringHistory.get(minute);
+        if (!history) {
+          history = { completed: 0, ok: 0, failed: 0, aborted: 0, external: 0, plan: 0,
+            latencyMsSum: 0, tokenSamples: 0, outputTokens: 0, tokenElapsedMs: 0 };
+          monitoringHistory.set(minute, history);
+        }
+        history.completed += 1;
+        if (aborted) history.aborted += 1;
+        else if (!responseFailed && res.statusCode < 400) history.ok += 1;
+        else history.failed += 1;
+        if (routeKind) history[routeKind] += 1;
+        history.latencyMsSum += elapsed;
+        if (!aborted && !responseFailed && res.statusCode < 400 && routeKind === 'external' && performanceSample) {
+          const flow = tokenFlow[performanceSample.provider];
+          flow.responses += 1;
+          if (performanceSample.inputTokens !== null) {
+            flow.inputSamples += 1;
+            flow.inputTokens += performanceSample.inputTokens;
+          }
+          if (performanceSample.outputTokens !== null) {
+            flow.outputSamples += 1;
+            flow.outputTokens += performanceSample.outputTokens;
+          }
+        }
+        if (!aborted && !responseFailed && res.statusCode < 400 && routeKind === 'external' &&
+            performanceSample && performanceSample.outputTokens !== null && elapsed > 0) {
           const aggregate = modelPerformance[performanceSample.provider];
           aggregate.samples += 1;
           aggregate.outputTokens += performanceSample.outputTokens;
           aggregate.elapsedMs += elapsed;
+          history.tokenSamples += 1;
+          history.outputTokens += performanceSample.outputTokens;
+          history.tokenElapsedMs += elapsed;
         }
         if (routeKind) {
           const bucket = metrics.latency[routeKind];
@@ -1171,6 +1324,11 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           /^[a-z][a-z0-9-]{0,63}-20\d{2}-[01]\d-[0-3]\d$/.test(value) &&
           !/(?:^|-)(?:sk|key|token|secret|password|bearer)(?:-|$)/.test(value) ? value : '[redacted]');
         if (noPlan) {
+          if (reason === 'local_busy') {
+            logEvent({ event: 'local_mode_rejected', provider: 'local', reason, code: 'local_busy' });
+            return reject(503, '[local_busy] Local request queue is full or its wait expired. Retry shortly. Plan fallback disabled.',
+              { 'retry-after': '1' });
+          }
           let message = `${label}-only mode cannot route this request; Plan fallback disabled`;
           let code, retryAfterSeconds, previousErrorCode;
           if (reason === 'fallback' || reason === 'circuit_open') {
@@ -1230,13 +1388,21 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         let stall;
         const arm = ms => { clearTimeout(stall); stall = setTimeout(() => plan.abort('plan_timeout'), ms); };
         arm(planHeaderMs);
+        const finishPlan = startPhase('plan');
         try {
         metrics.attempts += 1;
+        attemptCounts.plan += 1;
         const upstream = await abortable(fetchImpl('https://api.anthropic.com' + req.url,
           { method: 'POST', headers, body: proBody, redirect: 'error', signal: plan.signal }), plan.signal);
         const responseHeaders = {};
         for (const [name, value] of upstream.headers)
           if (!['connection', 'transfer-encoding', 'content-length', 'content-encoding'].includes(name)) responseHeaders[name] = value;
+        // Claude's retry contract expects seconds, even when an upstream supplies a date.
+        const retryHint = responseHeaders['retry-after'];
+        if (retryHint && !/^\d+(?:\.\d+)?$/.test(retryHint.trim())) {
+          const retryAt = Date.parse(retryHint);
+          if (Number.isFinite(retryAt)) responseHeaders['retry-after'] = String(Math.max(0, Math.ceil((retryAt - now()) / 1000)));
+        }
         // An upstream error body is relayed only after the same redaction pass used for
         // logs; a successful response stays a stream so latency and framing are unchanged.
         // This is the one path where provider error text reaches the client verbatim.
@@ -1286,6 +1452,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         }
         res.end();
         } finally {
+          finishPlan();
           clearTimeout(stall);
           client.signal.removeEventListener('abort', cancelPlan);
         }
@@ -1294,7 +1461,10 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         compatExclusion(body, req.headers['anthropic-beta']) : isPro(model) ? 'plan_model' : externalExclusion(body, req.headers['anthropic-beta'], localOnly);
       // Preserve MCP/tool-search request shapes without disabling client integrations.
       // Ordinary thinking stays disabled so Local signatures never contaminate Plan fallback.
-      const localBody = provider !== 'openrouter' && !localOnly && !altRequested ? localInlineTools(body) : null;
+      // Eligible requests already use the original body; only build a compatibility copy
+      // when it could rescue a native-feature exclusion.
+      const localBody = provider !== 'openrouter' && !localOnly && !altRequested &&
+        nativeDetail && !['token_count', 'plan_model'].includes(nativeDetail) ? localInlineTools(body) : null;
       const localRequestCompat = localBody && provider !== 'openrouter' && !localOnly && !altRequested &&
         nativeDetail && !['token_count', 'plan_model'].includes(nativeDetail) &&
         !body.messages.some(message => Array.isArray(message.content) && message.content.some(block =>
@@ -1310,10 +1480,26 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         : { name: provider, model: provider !== 'openrouter' ? localModel : openrouterModel, url: externalUrl,
             key: provider !== 'openrouter' ? localKey : key, openrouter: provider === 'openrouter' };
       circuitState = circuits[target.name];
+      // Native-only requests never consume Local capacity. Queued turns recheck the breaker
+      // after admission, then claim the single recovery probe without an intervening await.
+      if (circuitState.openUntil && (now() < circuitState.openUntil || circuitState.probing)) return await sendPro('circuit_open');
+      let releaseLocal = () => {};
+      if (target.name === 'local') {
+        const finishQueue = startPhase('queueWait');
+        try { releaseLocal = await acquireLocal(client.signal); }
+        finally { finishQueue(); }
+      }
+      if (!releaseLocal) {
+        logEvent({ event: 'local_admission_rejected', provider: 'local', reason: 'local_busy' });
+        return await sendPro('local_busy');
+      }
       // An expired breaker admits exactly one half-open probe: the first request takes the
       // lease synchronously, everyone else falls back to Plan (or is told recovery is in
       // progress) until that probe settles. The generation snapshot fences late completions.
-      if (circuitState.openUntil && (now() < circuitState.openUntil || circuitState.probing)) return await sendPro('circuit_open');
+      if (circuitState.openUntil && (now() < circuitState.openUntil || circuitState.probing)) {
+        releaseLocal();
+        return await sendPro('circuit_open');
+      }
       const probe = Boolean(circuitState.openUntil);
       if (probe) circuitState.probing = true;
       const claimedGeneration = circuitState.generation;
@@ -1355,6 +1541,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         // Permanent 4xx will not change on retry; request-level ones must not open the provider-wide circuit.
         let requestRejected = false;
         for (let attempt = 0; attempt < attempts; attempt++) {
+          if (target.name === 'local') { failureStatus = null; retryAfterHintMs = null; }
           metrics.attempts += 1;
           if (attempt === 0) metrics.externalAttempts += 1;
           if (attempt > 0) metrics.retries += 1;
@@ -1368,9 +1555,11 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           const arm = () => { clearTimeout(timer); timer = setTimeout(() => controller.abort('attempt_timeout'), attemptTimeoutMs); };
           arm();
           const ceiling = noPlan ? undefined : setTimeout(() => controller.abort('attempt_timeout'), attemptCeilingMs);
-          let status, retryAfterMs = 0;
+          let status, retryAfterMs = 0, congested = false;
+          const finishAttempt = startPhase('externalAttempt');
           try {
             const operation = (async () => {
+              attemptCounts.external += 1;
               const response = await fetchImpl(target.url, { method: 'POST', headers,
                 body: externalPayload, redirect: 'error', signal: controller.signal });
               status = response.status;
@@ -1381,7 +1570,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
                 if (hint !== null) retryAfterHintMs = hint;
                 // Only a rate-limit answer changes the retry delay, as before; other failures
                 // keep their fixed delay even when the provider sends a Retry-After.
-                if (status === 429 || status === 503) {
+                if (status === 429 || status === 503 || (target.name === 'local' && status === 529)) {
                   if (hint !== null) retryAfterMs = hint;
                   // Fence the exposed observation: a stale request must not overwrite the
                   // rate-limit state a newer generation already established.
@@ -1446,14 +1635,16 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
                 throw new Error('Thinking response in ordinary mode');
               // Only complete JSON replies carry directly verifiable usage here; SSE and
               // CLI bridge placeholders do not imply measured output tokens.
-              let outputTokens = null;
+              let inputTokens = null, outputTokens = null;
               if (validated.contentType === 'application/json' &&
                   (target.name !== 'cli' || response.headers.get('x-cli-usage-measured') === 'true')) {
-                const count = JSON.parse(validated.text).usage?.output_tokens;
-                if (Number.isSafeInteger(count) && count >= 0) outputTokens = count;
+                const usage = JSON.parse(validated.text).usage;
+                if (Number.isSafeInteger(usage?.input_tokens) && usage.input_tokens >= 0) inputTokens = usage.input_tokens;
+                if (Number.isSafeInteger(usage?.output_tokens) && usage.output_tokens >= 0) outputTokens = usage.output_tokens;
               }
               const result = forceJson && body.stream === true ? jsonMessageStream(validated.text, !compatProfile) : validated;
               result.outputTokens = outputTokens;
+              result.inputTokens = inputTokens;
               if (provider === 'cli') {
                 result.cliReportedModel = response.headers.get('x-cli-reported-model');
                 result.cliUsageMeasured = response.headers.get('x-cli-usage-measured') === 'true';
@@ -1472,8 +1663,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               cliUsageMeasured = response.cliUsageMeasured === true;
             }
             logReplacement();
-            if (response.outputTokens !== null && response.outputTokens !== undefined)
-              performanceSample = { provider: target.name, outputTokens: response.outputTokens };
+            performanceSample = { provider: target.name, inputTokens: response.inputTokens ?? null,
+              outputTokens: response.outputTokens ?? null };
             if (response.streamed) { res.end(); return; }
             res.writeHead(200, { 'content-type': response.contentType, 'cache-control': 'no-store' });
             res.end(response.text);
@@ -1504,8 +1695,13 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               status === 401 || status === 403 ? 'authentication_failed' : status === 402 ? 'payment_required' : validation === 'empty_response' ? 'empty_response' : 'upstream_error';
             if (Number.isInteger(status)) failureStatus = status;
             failureClass = failureClassOf(status, controller.signal.reason === 'attempt_timeout');
+            congested = target.name === 'local' &&
+              ([429, 503, 529].includes(status) || controller.signal.reason === 'attempt_timeout');
             logEvent({ event: 'external_attempt_failed', provider: target.name, attempt: attempt + 1,
               ...(Number.isInteger(status) ? { status } : {}), ...(validation ? { validation } : {}),
+              ...(['missing_body', 'empty_body', 'empty_content', 'content_without_usable_output',
+                'stream_without_usable_content'].includes(error?.validationDetail) ? { validation_detail: error.validationDetail } : {}),
+              ...(emptyResponseDiagnostics.has(error) ? { response_diagnostic: emptyResponseDiagnostics.get(error) } : {}),
               ...(retryAfterMs ? { retry_after_ms: retryAfterMs } : {}),
               failure: failureClass,
               category: controller.signal.reason === 'attempt_timeout' ? 'timeout' : 'upstream' });
@@ -1516,16 +1712,26 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             if ([400, 404, 413, 422].includes(status) || error?.message === 'Thinking response in ordinary mode') requestRejected = true;
             if (requestRejected || [401, 402, 403, 404].includes(status)) break;
           } finally {
+            finishAttempt();
             clearTimeout(timer);
             clearTimeout(ceiling);
             client.signal.removeEventListener('abort', cancel);
           }
-          if (attempt + 1 < attempts) await abortable(new Promise(resolve => {
-            // A provider may ask for minutes; the turn should not sit that long, so the
-            // in-proxy wait is capped and the full hint is handed to the client instead.
-            const timeout = setTimeout(resolve, Math.min(Math.max(retryDelayMs, retryAfterMs), retryMaxWaitMs));
-            client.signal.addEventListener('abort', () => { clearTimeout(timeout); resolve(); }, { once: true });
-          }), client.signal);
+          // Do not hammer a shared Local server before its recovery hint expires. Long
+          // waits go directly to the existing breaker/fallback instead of freezing a turn.
+          if (target.name === 'local' && retryAfterMs > retryMaxWaitMs) break;
+          if (attempt + 1 < attempts) {
+            const backoff = congested ? retryDelayMs * (2 ** attempt) * (1 + Math.random() * 0.25) : retryDelayMs;
+            const waitMs = Math.min(Math.max(backoff, retryAfterMs), retryMaxWaitMs);
+            const finishWait = startPhase('retryWait');
+            try {
+              await abortable(new Promise(resolve => {
+                const done = () => { clearTimeout(timeout); client.signal.removeEventListener('abort', done); resolve(); };
+                const timeout = setTimeout(done, waitMs);
+                client.signal.addEventListener('abort', done, { once: true });
+              }), client.signal);
+            } finally { finishWait(); }
+          }
         }
         if (!requestRejected && failureClass !== 'request' && claimedGeneration === circuitState.generation) {
           circuitState.generation++;
@@ -1533,16 +1739,18 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           // A 429 states its own recovery window: honor the parsed Retry-After (bounded)
           // instead of the generic cooldown, so the provider is not hammered while it asked
           // to be left alone. Without a hint, the operator's cooldown still applies.
-          const cooldown = failureClass === 'rate_limit' && retryAfterHintMs !== null
+          const cooldown = (failureClass === 'rate_limit' || (target.name === 'local' && [503, 529].includes(failureStatus))) && retryAfterHintMs !== null
             ? Math.min(RATE_LIMIT_COOLDOWN_MAX_MS, retryAfterHintMs)
             : cooldownMs;
           circuitState.openUntil = now() + cooldown;
           metrics.circuitOpens += 1;
           logEvent({ event: 'circuit_open', provider: target.name, failure: failureClass,
-            ...(failureClass === 'rate_limit' ? { retry_after_ms: retryAfterHintMs, cooldown_ms: cooldown } : {}) });
+            ...(failureClass === 'rate_limit' || (target.name === 'local' && [503, 529].includes(failureStatus))
+              ? { retry_after_ms: retryAfterHintMs, cooldown_ms: cooldown } : {}) });
         }
       } finally {
         if (probe) circuitState.probing = false;
+        releaseLocal();
       }
       if (!succeeded) await sendPro('fallback', noPlan ? localFailure : undefined);
     } catch {

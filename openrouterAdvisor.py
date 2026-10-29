@@ -536,7 +536,17 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
         # Preserve client preferences, never inherited provider routing or credentials.
         for name in ("CLAUDE_CONFIG_DIR", "CLAUDE_CODE_EFFORT_LEVEL", "MAX_THINKING_TOKENS",
                      "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
-                     "CLAUDE_CODE_MAX_CONTEXT_TOKENS", "CLAUDE_CODE_AUTOCOMPACT_PCT_OVERRIDE"):
+                     "CLAUDE_CODE_MAX_CONTEXT_TOKENS", "CLAUDE_CODE_AUTOCOMPACT_PCT_OVERRIDE",
+                     "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "CLAUDE_CODE_FORK_SUBAGENT",
+                     "CLAUDE_CODE_FORWARD_SUBAGENT_TEXT", "CLAUDE_CODE_ENABLE_TASKS",
+                     "CLAUDE_CODE_ENABLE_TODO_TOOLS", "CLAUDE_CODE_TASK_LIST_ID",
+                     "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "CLAUDE_CODE_DISABLE_AGENT_VIEW",
+                     "CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND", "CLAUDE_CODE_AUTO_CONNECT_IDE",
+                     "CLAUDE_CODE_PLUGIN_CACHE_DIR", "CLAUDE_CODE_PLUGIN_DIRS",
+                     "CLAUDE_CODE_PLUGIN_DIR_WATCH", "CLAUDE_CODE_PLUGIN_SEED_DIR",
+                     "CLAUDE_CODE_SYNC_PLUGIN_INSTALL", "CLAUDE_CODE_SYNC_PLUGIN_INSTALL_TIMEOUT_MS",
+                     "CLAUDE_CODE_SYNC_SKILLS", "CLAUDE_CODE_SYNC_SKILLS_INSTALL_TIMEOUT_MS",
+                     "CLAUDE_CODE_SYNC_SKILLS_WAIT_TIMEOUT_MS"):
             if name in os.environ:
                 env[name] = os.environ[name]
         env.update(ANTHROPIC_DEFAULT_SONNET_MODEL="claude-sonnet-5-5", ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-5-5",
@@ -857,7 +867,8 @@ def takeover(provider: str = "auto", debug: bool = False) -> int:
             return 0
 
 
-_CLAUDE_MANAGEMENT = {"--help", "-h", "--version", "-v", "auth", "mcp", "plugin", "plugins", "agents", "doctor", "install", "update", "import", "ultrareview"}
+_CLAUDE_MANAGEMENT = {"--help", "-h", "--version", "-v", "auth", "mcp", "plugin", "plugins", "agents", "doctor", "install", "update", "upgrade", "import", "ultrareview",
+                      "attach", "logs", "respawn", "stop", "kill", "rm", "purge", "gateway", "setup-token"}
 
 
 def validate_claude_args(values, *, local_only=False, compat=False, print_prompt=None):

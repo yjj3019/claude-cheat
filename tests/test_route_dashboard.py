@@ -738,6 +738,32 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertNotIn("private", json.dumps(report))
         self.assertTrue(report["snapshot"]["refresh_failed"])
 
+    def test_timing_fields_are_allowlisted_and_invalid_values_are_not_exposed(self):
+        metrics = self.live_proxy()
+        metrics["attemptCounts"] = {"external": 5, "plan": -1, "secret": "private-attempt"}
+        metrics["routingTimingMs"] = {
+            "queueWait": {"count": 2, "p50": 10.5, "p95": 20, "max": 30, "secret": "private-timing"},
+            "externalAttempt": {"count": 1, "p50": float("nan"), "p95": 3, "max": 4},
+            "retryWait": {"count": 513, "p50": 0, "p95": 0, "max": 0},
+            "plan": {"count": 0, "p50": "private", "p95": 0, "max": 0},
+            "total": {"count": True, "p50": 1, "p95": 2, "max": 3},
+            "private-field": "private-data"}
+        report = dash.diagnostics_report()["metrics"]
+        self.assertEqual(report["attemptCounts"], {"external": 5, "plan": None})
+        timing = report["routingTimingMs"]
+        self.assertEqual(timing["queueWait"], {"count": 2, "p50": 10.5, "p95": 20, "max": 30})
+        self.assertIsNone(timing["externalAttempt"])
+        self.assertIsNone(timing["retryWait"])
+        self.assertEqual(timing["plan"], {"count": 0, "p50": None, "p95": None, "max": None})
+        self.assertIsNone(timing["total"])
+        self.assertNotIn("private", json.dumps(report))
+
+    def test_old_proxy_timing_and_attempts_are_unavailable(self):
+        self.live_proxy()
+        metrics = dash.diagnostics_report()["metrics"]
+        self.assertTrue(all(value is None for value in metrics["routingTimingMs"].values()))
+        self.assertEqual(metrics["attemptCounts"], {"external": None, "plan": None})
+
     def test_invalid_config_returns_a_code_without_source_values(self):
         self.path.write_text('routing:\n  default_provider: "private-invalid-value"\n', encoding="utf-8")
         report = dash.diagnostics_report()
@@ -2022,8 +2048,8 @@ class ModelCatalogTests(unittest.TestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-            # This class stores a fake key; the status report must not call out to OpenRouter with it.
-            with mock.patch.object(dash, "account_state", return_value={"ok": False, "error": "offline"}), \
+            # Header behavior is independent of the user's active proxy or account.
+            with mock.patch.object(dash, "status_report", return_value={"status": "fixture"}), \
                     opener.open(f"http://127.0.0.1:{port}/api/status", timeout=15) as response:
                 self.assertEqual(response.status, 200)
                 self.assertEqual(response.headers.get("x-content-type-options"), "nosniff")
@@ -2390,9 +2416,26 @@ class CliSettingsTests(unittest.TestCase):
             with self.assertRaises(ImportError):
                 dash._cli_detection({})
 
-    def test_a_cli_has_no_model_catalog(self):
-        catalog = dash.model_catalog("cli")
-        self.assertEqual((catalog["ok"], catalog["error"], catalog["models"]), (False, "not_supported", []))
+    def test_cli_catalog_reads_only_visible_valid_codex_slugs(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {"CODEX_HOME": directory}):
+            path = Path(directory) / "models_cache.json"
+            path.write_text(json.dumps({"identity": "PRIVATE", "models": [
+                {"slug": "gpt-test", "visibility": "list", "description": "PRIVATE"},
+                {"slug": "gpt-test", "visibility": "list"},
+                {"slug": "hidden", "visibility": "hide"},
+                {"slug": "bad model", "visibility": "list"}]}), encoding="utf-8")
+            catalog = dash.model_catalog("cli", kind="codex")
+            self.assertTrue(catalog["ok"])
+            self.assertEqual(catalog["models"], [{"id": "gpt-test", "name": "gpt-test"}])
+            self.assertEqual(catalog["source"], "codex_local_cache")
+            self.assertNotIn("PRIVATE", json.dumps(catalog))
+            path.write_text("not-json", encoding="utf-8")
+            self.assertEqual(dash.model_catalog("cli", kind="codex")["error"], "cache_invalid")
+            path.unlink()
+            self.assertEqual(dash.model_catalog("cli", kind="codex")["error"], "cache_unavailable")
+        self.assertEqual(dash.model_catalog("cli", kind="grok")["error"], "not_supported")
+        self.assertEqual(dash.model_catalog("cli", kind="unknown")["error"], "invalid_cli_kind")
 
     def test_the_detection_endpoint_needs_the_session_token(self):
         import threading
@@ -2686,6 +2729,37 @@ class ConfigEndpointAuthTests(unittest.TestCase):
         response = self.get([("x-dashboard-token", "\xff")])
         self.assertIn(b"403", response.split(b"\r\n", 1)[0])
         self.assertIn(b"token_required", response)
+
+    def test_reset_endpoint_requires_token_and_origin_and_checks_scope(self):
+        import urllib.request
+        import urllib.error
+        base = f"http://127.0.0.1:{self.port}/api/config-reset"
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        def send(payload, headers, body=True):
+            request = urllib.request.Request(base, data=json.dumps(payload).encode() if body else b"",
+                                             headers=headers, method="POST")
+            try:
+                with opener.open(request, timeout=10) as response:
+                    return response.status, json.load(response)
+            except urllib.error.HTTPError as error:
+                with error:
+                    return error.code, json.load(error)
+        good = {"x-dashboard-token": dash.TOKEN}
+        payload = {"provider": "local", "scope": "credential"}
+        store = mock.Mock()
+        with mock.patch.object(dash, "_store", return_value=store):
+            # Rejected requests are answered before their body is read. On Windows a
+            # socket close with unread bytes can reset the connection instead of delivering 403.
+            self.assertEqual(send(payload, {}, body=False)[0], 403)
+            self.assertEqual(send(payload, {**good, "Origin": "http://evil.invalid"}, body=False)[0], 403)
+            self.assertEqual(send({"provider": "cli", "scope": "service"}, good)[0], 400)
+            self.assertEqual(send({"provider": "local", "scope": "other"}, good)[0], 400)
+            status, result = send(payload, good)
+            self.assertEqual((status, result), (200, {"reset": True}))
+            store.reset_provider.assert_called_once_with("local", "credential")
+            store.reset_provider.side_effect = dash.routeConfig.ConfigError("reset_incomplete")
+            status, result = send(payload, good)
+            self.assertEqual((status, result), (409, {"error": "reset_incomplete"}))
 
 
 class ProviderSelectionDisplayTests(unittest.TestCase):

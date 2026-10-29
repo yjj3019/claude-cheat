@@ -1,5 +1,7 @@
 # Claude-Cheat · Claude Code Sonnet replacement with Plan fallback
 
+> **Compatibility status:** retaining the Claude Code frontend is not proof of full feature parity. Agent Teams, parallel subagents, Local admission/fallback, reasoning and streaming still need end-to-end validation. See the [DeepSeek Harness / OpenCode source review (Korean)](docs/HARNESS-COMPATIBILITY-REVIEW.ko.md) for evidence and proposed work; those proposals are not runtime changes.
+
 [한국어](README.md) | **English**
 
 [MIT License](LICENSE) · [License selection review](LICENSE-REVIEW.md)
@@ -135,8 +137,13 @@ Ordinary Local launches default to an 8,192-token output budget to reduce contex
 
 - OpenRouter uses the required `OPENROUTER_MODEL` setting, with no default model.
 - OpenRouter and Local are selected at launch; the router does not switch between them automatically. Select Sonnet in `/model` for eligible replacement requests.
-- HTTP providers receive the initial attempt plus three retries. CLI backends receive one attempt with their configured deadline. Each attempt has a 30-second limit, with a one-second delay between attempts. A provider `Retry-After` is parsed from seconds or any RFC 7231 HTTP-date and honored internally only up to 10 seconds (`ROUTE_RETRY_MAX_WAIT_MS`); a longer wait is returned to the client as a `Retry-After` header on the 429/529 failure instead of freezing the turn. A bare 429 invents no delay.
-- Four full timeouts plus retry delays can take approximately 123 seconds before the Plan request begins. Plan response time and the CLI's own retries may add further time. Cancelling stops router retries and fallback.
+- HTTP providers receive the initial attempt plus three retries. CLI backends receive one attempt with their configured deadline. Ordinary HTTP attempts have a 30-second header/idle timeout and a 300-second total ceiling while data keeps arriving. Local-only and compatibility modes retain their existing fixed deadlines.
+- OpenRouter keeps its one-second default retry delay. Local congestion responses (429/503/529) and timeouts use exponential backoff based on 1/2/4 seconds plus small positive jitter, bounded by `ROUTE_RETRY_MAX_WAIT_MS` (10 seconds by default). Empty replies are not assumed to mean congestion. Plan response time and the CLI's own retries add to the wait; cancellation stops retries and fallback.
+- `Retry-After` accepts seconds or HTTP-date, bounded at ten minutes. A Local hint longer than the internal wait cap ends retries rather than retrying early, and also extends the circuit recovery wait. Ordinary mode falls back to Plan; modes without Plan return an error.
+- The ordinary Local fast path keeps the original conversation. A compatibility copy is built only for potentially convertible native-feature exclusions, avoiding discarded history/tool copies. This reduces proxy work without changing model selection, token budgets or Plan eligibility; it does not repair empty server responses or speed up inference.
+- **Shared Local admission:** each proxy allows two active Local turns, eight queued turns, and at most 60 seconds in the queue. An active turn retains its slot across retries. Cancellation removes a queued turn. Queue overflow or timeout uses `local_busy`: ordinary mode routes to Plan, while modes without Plan return 503. Admission rejection does not count as an external attempt or open the circuit.
+- The dashboard shows Local active/queued turns and cumulative admission rejections. The existing authenticated `/api/metrics` exposes `localAdmission`: `active`, `queued`, `rejected`, `concurrency`, `queueLimit`, `queueWaitMs`. Rejections accumulate only during the current proxy process.
+- This limits only traffic from this proxy, not other users or server-wide GPU load. Long parallel tasks can exceed the queue wait and use Plan. Conversation, tools and output token budgets are not silently shortened, and no inference probes or server polling are added. Restart the proxy to load the changed source.
 - The circuit breaker distinguishes causes: transport failures, timeouts, 5xx, 408 and unusable 2xx answers open it as provider faults; 401/402/403 keep their provider-wide cooldown; a 429 uses the parsed `Retry-After` (bounded at ten minutes) as its cooldown, and a request-level 4xx never opens it. Exactly one half-open probe is admitted, and late completions from older generations cannot overwrite the newer circuit state.
 - A client that stalls mid-body is dropped after an idle timeout (30 seconds by default, `ROUTE_REQUEST_IDLE_TIMEOUT_MS`, `0` disables it), releasing its turn; slow but live uploads are not cut. A disconnected client's upstream read, timers and retry are released instead of retried.
 - After all four fail, the router forwards the original request to Plan Sonnet once. A Plan failure does not loop back to another provider or switch to an Anthropic API key.
@@ -152,6 +159,7 @@ Proxy behavior can be tuned with these environment variables (the defaults are e
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `ROUTE_REQUEST_IDLE_TIMEOUT_MS` | `30000` | Idle timeout for the request body and headers. `0` disables it. Slow but live uploads are unaffected |
+| `ROUTE_LOCAL_QUEUE_WAIT_MS` | `60000` | Local admission wait, 0–60000 ms; expiry uses existing Plan/error policy. This is not an end-to-end inference deadline |
 | `ROUTE_RETRY_MAX_WAIT_MS` | `10000` | Cap on one in-proxy retry wait; a longer `Retry-After` goes to the client as a header |
 | `ROUTE_HANDOVER_TIMEOUT_MS` | `120000` | How long a handover waits for in-flight turns before reverting to serving (409) |
 | `ROUTE_STREAM_PASSTHROUGH` | off | `1` forwards validated frames immediately to cut the first-token delay |
@@ -315,6 +323,8 @@ Every interactive launch now makes one minimal provider-only inference check bef
 
 ## Live dashboard
 
+The dashboard and settings share consistent colors, cards and controls with improved secondary-text contrast. On wide screens the dashboard places key metrics alongside the request flow, with four trend panels below. Runtime diagnostics and activity records expand on demand; refreshes preserve disclosure state and summary keyboard focus. Narrow screens stack the panels. The layout uses existing observed data and polling intervals, with no extra inference or polling.
+
 ```powershell
 .\OpenClaudeDashboard.ps1
 ```
@@ -325,7 +335,19 @@ Stopping a previous instance (including `python routeDashboard.py --stop`) happe
 
 The refresh interval follows the situation: two seconds while routing is active, ten seconds while idle, fifteen when the tab is hidden. The header shows a one-line summary (`오늘 43.8M토큰 · $1.42 · 남은 한도 $48.25 · 우선 확인: …`).
 
+**Recent request trends** use up to 60 minutes of in-memory, per-minute completion observations: counts, average response time, failure rate and reported output throughput. Missing intervals remain disconnected. Failure rate excludes cancellations; average latency includes them. The history starts with the new proxy and resets on restart.
+
+The **request flow** shows Claude Code → Claude-Cheat proxy → the selected model service or Plan. Its central reservoir shows this proxy's Local slot occupancy, including retry waits, with explicit active/queued counts; it is not shared-server or GPU load. Particle density follows reported input/output token increments from completed external responses, capped at 24 per direction. Each batch runs once within the existing refresh interval, without extra polling or inference.
+
+The first snapshot establishes a baseline. No completed response is shown separately from unreported usage; tokens can remain unavailable while work is active. Plan, failed, cancelled and usage-unreported replies are not estimated. Hidden/offscreen views suppress particles. System reduced-motion is respected by default; the flow card offers a page-session-only animation toggle without changing system settings. This is observed usage visualization, not live token streaming or per-request tracing.
+
+Observed input and output totals and reporting sample counts come from successful responses of the selected external provider during the refresh interval. Bars cap at 10,000 tokens; read the numeric value for exact totals. Input excludes separately reported cache tokens. Plan, failures, cancellations and responses without usage are excluded; unknown, awaiting measurement and a reported zero remain distinct. Existing snapshots are reused without extra inference or polling.
+
+The upper-right status indicator uses both color and text: red for Plan, green for external models, brown/amber for active warnings, and a neutral indication when idle or unknown.
+
 The performance card reuses proxy counters and sends no additional inference requests. Observed output tokens/second is the sum of reported output tokens divided by total request time for eligible successful responses. It includes queueing, network and retries; multiple models may share one provider bucket. Plan, direct streaming, cancellation, failures and unreported usage are excluded. GPU utilization and pure generation speed are unavailable. New token counters begin after restarting the proxy with the updated code.
+
+The summary at the top places the active service and key request metrics first. Charts immediately below show the last 60 minutes of external versus Plan routing and hourly token usage over the last 24 hours, with expandable hourly values. They reuse existing observations without sending additional model requests. Metrics wrap into multiple rows on narrow screens.
 
 The **insights** card ranks *what changed, why, and what to do next* instead of listing numbers, with the measurements it used as chips. A banner that shares an insight's cause is not repeated.
 
@@ -391,7 +413,15 @@ The picker lists an exact model ID only once per service, trimming surrounding w
 
 ### CLI model backends
 
-Choose **CLI** as the default execution service, select **Claude Code, Codex or Grok**, save its settings and the default, then run `OpenClaude.ps1`. A one-off override is `-Provider CLI`. Claude Code remains the front end and executes SSH/MCP tools, skills, plugins, hooks and permissions. The backend returns validated JSON text or tool-call proposals; it cannot execute its own tools.
+The OpenRouter and Local settings provide separate actions to delete the stored API credential or reset that service's managed settings. They sanitize the service's managed values in the active YAML, existing `.bak`, and its legacy `.env` while preserving other services and the default selection. If the reset service remains the default, configure it again or select another before the next launch.
+
+Deletion is irreversible and a failure across multiple files may leave some values behind. Running sessions can retain loaded credentials until stopped. Environment variables, external copies and backups, arbitrary comments outside managed fields, and provider-issued keys are not removed or revoked; revoke a key at its provider when necessary.
+
+Choose the CLI kind in its settings, save those settings, and then select **CLI** as the default execution service. Run `OpenClaude.ps1` for a new session; a one-off override is `-Provider CLI`. Claude Code remains the front end and executes SSH/MCP tools, skills, plugins, hooks and permissions. The backend returns validated JSON text or tool-call proposals; it cannot execute its own tools.
+
+For Codex, the CLI model picker reads its local model cache without running inference. The cache does not guarantee current account access or backend compatibility. If unavailable, enter a model ID manually. Claude Code and Grok currently have no verified catalog integration and require manual entry; the Grok backend is not yet enabled.
+
+Saved settings apply to the next session, not to requests already running. Finish work and subagents, exit Claude Code normally, restart, and check the active session and recent route in the dashboard. Plan is currently a fallback route, not a separately selectable default; there is no automatic Local-to-CLI switching. A started response is not replayed on another route. Saved settings do not prove connectivity: inference tests make real calls and may incur usage. CLI backends require their own login and a verified version; Grok is not currently enabled. Verify the model and executable after changing CLI kind.
 
 Verified versions are Claude Code **2.1.312** and Codex **0.165.0**. Other versions fail closed until validated. Grok is detected and selectable, but backend execution is currently refused with `backend_version_unverified` because its tool isolation has not been verified. Installed does not mean connected or supported.
 
@@ -657,3 +687,20 @@ The reviewed source uses Node.js and Python standard libraries and invokes a sep
 
 Claude Code, Node.js, Python, hosted services, and models are not distributed by this repository. Their own licenses and service terms continue to apply; this project's license does not grant service access or change usage limits and billing.
 
+
+### Feature-preservation fixes (2026-10-29)
+
+Compatibility launches retain explicitly set frontend agent/team/task/background/IDE/plugin/skill preferences, without enabling unset flags or inheriting provider credentials. Restricted LocalMode remains restricted; account synchronization still needs native authentication. Native management commands (`attach`, `logs`, `respawn`, `stop`, `kill`, `rm`, `purge`, `gateway`, `setup-token`, `upgrade`) pass directly to Claude without provider setup checks.
+
+Plan HTTP-date retry hints are converted to seconds. Capability-rejection errors and retry headers have regression coverage; credential redaction and the error-size cap remain. Empty-response logs add fixed `validation_detail` categories without recording response content.
+
+Remote Control is disabled by Claude Code for custom API base URLs. Detached `--bg` sessions still require a persistent proxy lifecycle design: management-command passthrough alone does not solve that. Full live Agent Teams/MCP/plugin parity is not established. See the [source review and verification status](docs/HARNESS-COMPATIBILITY-REVIEW.ko.md).
+
+The final section of the [routing compatibility review](docs/HARNESS-COMPATIBILITY-REVIEW.ko.md) studies performance and feature preservation using observed routing data. Retry-budget, end-to-end deadline and streaming changes are proposals, not deployed behavior.
+
+
+### Routing bottleneck diagnostics (P0)
+
+New proxies add `attemptCounts` (actual external/Plan calls) and `routingTimingMs` (Local admission wait, external fetch/read/validation, retry wait, Plan call, total). The runtime diagnostics panel and AI `/api/diagnostics` expose these observations. Missing fields from older proxies remain unavailable, not zero.
+
+Timing summaries retain at most 512 samples per stage, including failures/cancellation. Total starts after request body reading/validation; external timing is not pure inference time. Stage percentiles cannot be added. Existing `externalAttempts` remains the count of initial external request entries. Empty-response diagnostics allow only bounded shape metadata, approved stop reasons and safe usage numbers, never prompts, response text or tool arguments. No extra inference/polling or routing-policy changes are introduced. Restart the launcher to load new proxy instrumentation.

@@ -390,6 +390,93 @@ class Store:
                           for key, value in candidate.sections[provider]["values"].items() if value != ""})
             self._atomic_write(text, raw, original is not None and raw.startswith(b"\xef\xbb\xbf"))
 
+    def reset_provider(self, provider, scope):
+        """Clear a service's managed values from settings, its backup and legacy file.
+
+        Each file is replaced atomically, but the three replacements are not a single
+        transaction. A failure raises reset_incomplete; callers must not report success.
+        This does not remove environment variables, external copies or live process memory.
+        """
+        if provider not in ("openrouter", "local") or scope not in ("credential", "service"):
+            raise ConfigError("invalid_reset")
+        keys = SECTIONS[provider]["keys"]
+        selected = {"api_key"} if scope == "credential" else set(keys)
+        updates = {key: "" for key in selected}
+        legacy_names = {keys[key] for key in selected}
+
+        def clean_yaml(raw, primary=False):
+            text = self._decode(raw)
+            document = parse(text)
+            if document.errors or any(entry["errors"] for entry in document.sections.values()):
+                raise ConfigError("reset_invalid_file")
+            candidate_updates = dict(updates)
+            if primary and scope == "credential" and provider not in document.sections:
+                candidate_updates = {**self._legacy_values(provider), **candidate_updates}
+            cleaned = update_text(text, provider, candidate_updates)
+            # A credential may have been repeated in an inline comment on its own line.
+            lines = cleaned.splitlines(keepends=True)
+            in_section = False
+            for index, line in enumerate(lines):
+                body = line.rstrip("\r\n")
+                if body and not body.startswith((" ", "#")):
+                    in_section = bool(re.fullmatch(re.escape(provider) + r":\s*(#.*)?", body))
+                if in_section and re.match(r"  api_key:\s", body) and "api_key" in selected:
+                    ending = line[len(body):]
+                    lines[index] = '  api_key: ""' + ending
+            return "".join(lines).encode("utf-8-sig" if raw.startswith(b"\xef\xbb\xbf") else "utf-8")
+
+        def clean_legacy(path):
+            # Validate before modifying; never echo paths or contents on error.
+            read_legacy(path)
+            raw = path.read_bytes()
+            text = raw.decode("utf-8-sig")
+            lines = text.splitlines(keepends=True)
+            lines = [line for line in lines if not (match := re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", line))
+                     or match.group(1) not in legacy_names]
+            return "".join(lines).encode("utf-8-sig" if raw.startswith(b"\xef\xbb\xbf") else "utf-8")
+
+        def replace_without_backup(path, content):
+            descriptor, temporary = tempfile.mkstemp(prefix=".reset.", suffix=".tmp", dir=str(path.parent))
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(content)
+                if not _replace_with_retry(temporary, path):
+                    raise OSError("replace_failed")
+            finally:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
+
+        with _WRITE_LOCK, self._cross_process_lock():
+            backup = self.path.with_name(self.path.name + ".bak")
+            legacy = self._legacy(provider)
+            paths = (self.path, backup, legacy)
+            try:
+                for path in paths:
+                    if path is not None and (path.is_symlink() or (path.exists() and path.stat().st_nlink > 1)):
+                        raise ConfigError("reset_unsafe_path")
+                raw = self._read_bytes()
+                # Seed retains other services' existing legacy settings if YAML is absent.
+                primary = clean_yaml(raw if raw is not None else self._seed().encode("utf-8"), primary=True)
+                backup_data = clean_yaml(backup.read_bytes()) if backup.is_file() else None
+                legacy_data = clean_legacy(legacy) if legacy is not None and legacy.is_file() else None
+            except ConfigError as error:
+                if error.code == "reset_unsafe_path":
+                    raise
+                raise ConfigError("reset_invalid_file") from None
+            except (OSError, UnicodeDecodeError):
+                raise ConfigError("reset_invalid_file") from None
+            try:
+                # Never create a backup of the pre-reset content. Sanitise older copies first.
+                if backup_data is not None:
+                    replace_without_backup(backup, backup_data)
+                if legacy_data is not None:
+                    replace_without_backup(legacy, legacy_data)
+                replace_without_backup(self.path, primary)
+            except OSError:
+                raise ConfigError("reset_incomplete") from None
+
     def default_provider(self):
         """An explicit preference for new sessions; old files retain automatic selection."""
         provider = self.read_provider("routing").get("ROUTE_DEFAULT_PROVIDER", "auto")

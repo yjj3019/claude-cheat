@@ -37,8 +37,85 @@ class LauncherArgumentsTests(unittest.TestCase):
              mock.patch.object(route, "configured_provider", side_effect=AssertionError("provider not needed")), \
              mock.patch.object(route, "routed_session", side_effect=AssertionError("proxy not needed")), \
              mock.patch.object(route.subprocess, "call", return_value=0) as called:
-            self.assertEqual(route.launch(cli_args=["mcp", "list"]), 0)
-        self.assertEqual(called.call_args.args[0], ["node", "fixture.js", "mcp", "list"])
+            for args in (["mcp", "list"], ["attach", "session id"], ["logs", "session id"],
+                         ["respawn", "session id"], ["stop", "session id"], ["kill", "session id"],
+                         ["rm", "session id"], ["purge"], ["gateway", "--help"],
+                         ["setup-token"], ["upgrade"]):
+                with self.subTest(args=args):
+                    self.assertEqual(route.launch(cli_args=args), 0)
+                    self.assertEqual(called.call_args.args[0], ["node", "fixture.js"] + args)
+                    self.assertEqual(called.call_args.kwargs["env"], dict(os.environ))
+
+    def test_frontend_preferences_survive_ordinary_and_compat_only(self):
+        preferences = {
+            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1", "CLAUDE_CODE_FORK_SUBAGENT": "0",
+            "CLAUDE_CODE_FORWARD_SUBAGENT_TEXT": "1", "CLAUDE_CODE_ENABLE_TASKS": "0",
+            "CLAUDE_CODE_ENABLE_TODO_TOOLS": "1", "CLAUDE_CODE_TASK_LIST_ID": "shared-task-list",
+            "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "0", "CLAUDE_CODE_DISABLE_AGENT_VIEW": "0",
+            "CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND": "1", "CLAUDE_CODE_AUTO_CONNECT_IDE": "true",
+            "CLAUDE_CODE_PLUGIN_CACHE_DIR": "C:/fixture cache", "CLAUDE_CODE_PLUGIN_DIRS": "C:/one;C:/two",
+            "CLAUDE_CODE_PLUGIN_DIR_WATCH": "0", "CLAUDE_CODE_PLUGIN_SEED_DIR": "C:/seed",
+            "CLAUDE_CODE_SYNC_PLUGIN_INSTALL": "1", "CLAUDE_CODE_SYNC_PLUGIN_INSTALL_TIMEOUT_MS": "25000",
+            "CLAUDE_CODE_SYNC_SKILLS": "1", "CLAUDE_CODE_SYNC_SKILLS_INSTALL_TIMEOUT_MS": "12000",
+            "CLAUDE_CODE_SYNC_SKILLS_WAIT_TIMEOUT_MS": "15000",
+        }
+        auth = {"loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "pro"}
+        modes = [("local", {}), ("openrouter", {}), ("cli", {}),
+                 ("local", {"local_only": True, "local_compat": True}),
+                 ("openrouter", {"openrouter_compat": True}), ("local", {"local_only": True})]
+        for provider, flags in modes:
+            for explicit in (False, True):
+                with self.subTest(provider=provider, flags=flags, explicit=explicit):
+                    proxy = mock.Mock()
+                    proxy.stdout.readline.return_value = '{"port":12345}\n'
+                    inherited = dict(preferences) if explicit else {}
+                    inherited.update(ANTHROPIC_API_KEY="fixture-secret", CLAUDE_CODE_OAUTH_TOKEN="fixture-oauth",
+                                     CLAUDE_CODE_USE_BEDROCK="1")
+                    with tempfile.TemporaryDirectory() as directory, mock.patch.object(route, "ROOT", Path(directory)), \
+                         mock.patch.object(route.Path, "home", return_value=Path(directory)), \
+                         mock.patch.dict(os.environ, inherited, clear=True), \
+                         mock.patch.object(route.shutil, "which", return_value="fixture"), \
+                         mock.patch.object(route, "run_owned", return_value=auth), \
+                         mock.patch.object(route, "dual_provider_setup", return_value=None), \
+                         mock.patch.object(route, "check_connection", return_value=0), \
+                         mock.patch.object(route.subprocess, "Popen", return_value=proxy) as spawn:
+                        with route._routed_session(provider, _config={"OPENROUTER_MODEL": "fixture/model"}, **flags) as env:
+                            restricted = flags.get("local_only") and not flags.get("local_compat")
+                            for name, value in preferences.items():
+                                if restricted and name == "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS":
+                                    self.assertEqual(env[name], "1")
+                                elif restricted and name == "CLAUDE_CODE_AUTO_CONNECT_IDE":
+                                    self.assertEqual(env[name], "false")
+                                elif explicit and not restricted:
+                                    self.assertEqual(env[name], value)
+                                else:
+                                    self.assertNotIn(name, env)
+                                self.assertNotIn(name, spawn.call_args.kwargs["env"])
+                            self.assertNotIn("ANTHROPIC_API_KEY", env)
+                            self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
+                            if flags:
+                                self.assertNotIn("CLAUDE_CODE_USE_BEDROCK", env)
+
+    def test_native_agent_plugin_and_mcp_arguments_reach_compat_child(self):
+        args = ["--agent", "reviewer", "--plugin-dir", "C:/fixture plugins", "--mcp-config", "fixture-mcp.json"]
+        env = {"ANTHROPIC_BASE_URL": "http://127.0.0.1:12345", "ANTHROPIC_AUTH_TOKEN": "fixture-nonce",
+               "ANTHROPIC_CUSTOM_HEADERS": "X-Local-Route-Token: fixture-nonce"}
+        for provider, flags in (("local", {"local_only": True, "local_compat": True}),
+                                ("openrouter", {"openrouter_compat": True})):
+            with self.subTest(provider=provider), contextlib.redirect_stdout(io.StringIO()), \
+                 mock.patch.object(route.shutil, "which", return_value="fixture"), \
+                 mock.patch.object(route.routeCli, "resolve_command", return_value=["fixture"]), \
+                 mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.304")), \
+                 mock.patch.object(route, "routed_session", return_value=contextlib.nullcontext(env)), \
+                 mock.patch.object(route.subprocess, "call", return_value=0) as called:
+                self.assertEqual(route.launch(provider, cli_args=args, **flags), 0)
+                command = called.call_args.args[0]
+                self.assertEqual(command[-len(args):], args)
+                settings = json.loads(command[command.index("--settings") + 1])
+                for key in ("disableAllHooks", "autoMemoryEnabled", "enabledPlugins"):
+                    self.assertNotIn(key, settings)
+                self.assertNotIn("--safe-mode", command)
+                self.assertNotIn("--strict-mcp-config", command)
 
     def test_native_suffix_reaches_launcher_unchanged(self):
         values = ["--resume", "a b", "", '{"quoted":"value"}']
