@@ -22,6 +22,7 @@ SESSION_LOG.md
 .bench/
 .agent/
 .blackbox/
+.usage-stats/
 openclaude.config.yaml
 openclaude.config.yaml.*
 .openclaude.config.yaml.*

@@ -23,13 +23,23 @@ class LauncherArgumentsTests(unittest.TestCase):
             with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(route.Path, "cwd", return_value=root), \
                  mock.patch.object(route.shutil, "which", return_value="fixture"), \
                  mock.patch.object(route.routeCli, "resolve_command", return_value=["fixture"]), \
+                 mock.patch.object(route.routeCli, "probe_version", return_value={"ok": True, "version": "2.1.312"}), \
                  mock.patch.object(route, "prepare_blackbox_hook", return_value=None), \
                  mock.patch.object(route, "routed_session", side_effect=AssertionError("must not start proxy")), \
                  mock.patch.object(route.subprocess, "call", return_value=0) as called:
                 self.assertEqual(route.launch("sonnet", cli_args=["--resume", "fixture"]), 0)
-            self.assertEqual(called.call_args.args[0], ["fixture", "--model", "sonnet", "--resume", "fixture"])
+            self.assertEqual(called.call_args.args[0], ["fixture", "--model", "sonnet", "--advisor", "opus", "--resume", "fixture"])
             self.assertEqual(called.call_args.kwargs["env"], env)
             self.assertEqual(json.loads(config.read_text(encoding="utf-8"))["enabledPlugins"], {"fixture": True})
+
+    def test_original_advisor_respects_explicit_choice_and_detects_versions(self):
+        with mock.patch.object(route.routeCli, "probe_version", return_value={"ok": True, "version": "2.1.312"}) as probe:
+            self.assertEqual(route.original_sonnet_advisor(["fixture"], {}, ["--advisor", "off"]), [])
+            probe.assert_not_called()
+            self.assertEqual(route.original_sonnet_advisor(["fixture"], {}, []), ["--advisor", "opus"])
+        for result in ({"ok": False, "version": None}, {"ok": True, "version": "2.1.259"}):
+            with self.subTest(result=result), mock.patch.object(route.routeCli, "probe_version", return_value=result):
+                self.assertEqual(route.original_sonnet_advisor(["fixture"], {}, []), [])
 
     def test_original_sonnet_rejects_custom_routing_without_printing_values(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -90,7 +90,7 @@ test('CLI placeholder usage is unreported until bridge confirms measurement',asy
  assert.deepEqual([h.cliExternalSuccess,h.cliInputSamples,h.cliInputTokens,h.cliOutputSamples,h.cliOutputTokens],[2,1,3,1,7]);
 });
 
-test('successful directly streamed external replies have unknown token usage',async t=>{
+test('stream usage keeps the reported input without inventing final output',async t=>{
  const frame=(type,fields)=>`event: ${type}\ndata: ${JSON.stringify({type,...fields})}\n\n`;
  const payload=[frame('message_start',{message:{id:'msg_stream',role:'assistant',model:'fixture/model',usage:{input_tokens:5,output_tokens:2}}}),
    frame('content_block_start',{index:0,content_block:{type:'text',text:''}}),
@@ -106,7 +106,7 @@ test('successful directly streamed external replies have unknown token usage',as
  assert.equal(response.status,200);await response.text();
  const metrics=await(await fetch(base+'/api/metrics',{headers:{'x-local-route-token':token}})).json();
  assert.deepEqual(metrics.tokenFlow.openrouter,
-   {responses:1,inputSamples:0,inputTokens:0,outputSamples:0,outputTokens:0});
+   {responses:1,inputSamples:1,inputTokens:5,outputSamples:0,outputTokens:0});
 });
 
 test('history has at most 60 buckets even when the proxy runs longer',async t=>{

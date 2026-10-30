@@ -7,7 +7,7 @@ import vm from 'node:vm';
 
 // Run the exact scripts embedded in the served pages, including computed Python appends.
 const ASSETS = JSON.parse(execFileSync(process.env.PYTHON || 'python', ['-c',
-  'import json,re,routeDashboard as d; print(json.dumps({name:re.search(r"<script>(.*)</script>",page,re.S).group(1) for name,page in (("dashboard",d.PAGE),("settings",d.SETTINGS_PAGE),("blackbox",d.BLACKBOX_PAGE))} | {"settings_html":d.SETTINGS_PAGE}))'],
+  'import json,re,routeDashboard as d; print(json.dumps({name:re.search(r"<script>(.*)</script>",page,re.S).group(1) for name,page in (("dashboard",d.PAGE),("settings",d.SETTINGS_PAGE),("blackbox",d.BLACKBOX_PAGE),("usage",d.USAGE_PAGE))} | {"settings_html":d.SETTINGS_PAGE}))'],
 { cwd: new URL('..', import.meta.url), encoding: 'utf-8' }));
 
 function scriptBundle() {
@@ -89,6 +89,126 @@ function render(data) {
   sandbox.render(data);
   return context.nodes;
 }
+
+test('usage statistics distinguish unreported tokens and show observed session scope', () => {
+  const context=buildContext(); const sandbox={...context,globalThis:null}; sandbox.globalThis=sandbox;
+  vm.createContext(sandbox); vm.runInContext(ASSETS.usage,sandbox,{filename:'usage.js'});
+  sandbox.renderUsage({status:'ready',report:{collection_started:'2026-10-29T00:00:00Z',rows:[
+    {bucket:'2026-10-29',provider:'cli',requested_model:'model-a',reported_model:null,instance_id:'12345678-abcd',requests:2,failed:0,input_samples:1,input_tokens:0,output_samples:0,output_tokens:null,mean_elapsed_ms:120},
+  ]},sessions:[{instance_id:'12345678-abcd',provider:'cli',status:'active',inflight:1,queued:0,requests:2,failed:0,p95_ms:120,recording:{enabled:true,dropped:0,errors:0,pending:0}}]});
+  const html=context.nodes.get('usage-grid').innerHTML;
+  assert.match(html,/model-a/); assert.match(html,/미보고/); assert.match(html,/0 <small>\(1\/2\)/);
+  assert.match(html,/실행기별 현재 상태/); assert.match(html,/12345678/);
+  assert.match(context.nodes.get('usage-status').textContent,/첫 관측/);
+  sandbox.renderUsage({status:'ready',report:{coverage:'partial',rows:[]},sessions:[]});
+  assert.match(context.nodes.get('usage-status').textContent,/누락/);
+});
+
+test('usage warns about legacy unverified model provenance only when present', () => {
+  const context=buildContext(); const sandbox={...context,globalThis:null}; sandbox.globalThis=sandbox;
+  vm.createContext(sandbox); vm.runInContext(ASSETS.usage,sandbox,{filename:'usage.js'});
+  sandbox.renderUsage({status:'ready',report:{rows:[],model_provenance_unverified:3},sessions:[]});
+  assert.match(context.nodes.get('usage-status').textContent,/\uC774\uC804 \uC218\uC9D1 \uD615\uC2DD 3/);
+  sandbox.renderUsage({status:'ready',report:{rows:[],model_provenance_unverified:0},sessions:[]});
+  assert.doesNotMatch(context.nodes.get('usage-status').textContent,/\uC2E4\uC81C \uBAA8\uB378 \uCD9C\uCC98 \uBBF8\uD655\uC778/);
+});
+
+test('usage labels the fetch time without claiming it is collection time', async () => {
+  const context=buildContext(); const sandbox={...context,globalThis:null}; sandbox.globalThis=sandbox;
+  sandbox.fetch=async()=>({ok:true,json:async()=>({status:'ready',report:{rows:[]},sessions:[]})});
+  vm.createContext(sandbox); vm.runInContext(ASSETS.usage,sandbox,{filename:'usage.js'});
+  await sandbox.loadUsage();
+  assert.match(context.nodes.get('usage-status').textContent, /조회 시각 .*수집 완료 시각 아님/);
+});
+
+test('usage preserves same-period results when refresh fails but clears an old period', async () => {
+  const context=buildContext(); const sandbox={...context,globalThis:null}; sandbox.globalThis=sandbox;
+  sandbox.fetch=async()=>({ok:true,json:async()=>({status:'ready',report:{rows:[],collection_started:'2026-10-29T00:00:00Z'},sessions:[]})});
+  vm.createContext(sandbox); vm.runInContext(ASSETS.usage,sandbox,{filename:'usage.js'});
+  await sandbox.loadUsage(); const grid=context.nodes.get('usage-grid'); const previous=grid.innerHTML;
+  sandbox.fetch=async()=>{throw new Error('unavailable');};
+  await sandbox.loadUsage();
+  assert.equal(grid.innerHTML,previous);
+  assert.match(context.nodes.get('usage-status').textContent,/새 조회 실패 · 마지막 조회/);
+  context.nodes.get('usage-period').value='week';
+  await sandbox.loadUsage();
+  assert.equal(grid.innerHTML,'');
+  assert.match(context.nodes.get('usage-status').textContent,/불러오지 못했습니다/);
+});
+
+test('usage polling is bounded and pauses while the page is hidden', async () => {
+  const context=buildContext(), handlers={}, timers=[];
+  context.document.addEventListener=(event,handler)=>{handlers[event]=handler;};
+  context.setTimeout=(fn,delay)=>{timers.push({fn,delay});return timers.length;};
+  const sandbox={...context,globalThis:null}; sandbox.globalThis=sandbox;
+  let calls=0;
+  sandbox.fetch=async()=>{calls++;return {ok:true,json:async()=>({status:'ready',report:{rows:[]},sessions:[]})};};
+  vm.createContext(sandbox);vm.runInContext(ASSETS.usage,sandbox,{filename:'usage.js'});
+  await sandbox.pollUsage();
+  assert.equal(timers.at(-1).delay,30000);
+  context.document.hidden=true;handlers.visibilitychange();const before=calls;
+  await sandbox.pollUsage();assert.equal(calls,before);
+  context.document.hidden=false;handlers.visibilitychange();
+  await Promise.resolve();await Promise.resolve();
+  assert.equal(calls,before+1);
+});
+
+test('flow header and proxy share the observed state on the first snapshot', () => {
+  const context=buildContext(); const sandbox={...context,globalThis:null}; sandbox.globalThis=sandbox;
+  vm.createContext(sandbox); vm.runInContext(scriptBundle(),sandbox);
+  sandbox.render(fixture({active_session:{provider:'cli'},proxy_metrics:{startedAt:'session',requests:1,inflightRequests:1,configuration:{provider:'cli'}}}));
+  const html=context.nodes.get('grid').innerHTML;
+  assert.match(html, /class="flow-count">프록시 요청 진행 중/);
+  assert.match(html, /Claude-Cheat 프록시<\/b><span>프록시 요청 진행 중<\/span>/);
+});
+
+test('settings describe next-session effects without inventing CLI actual model', () => {
+  const context=buildContext(); const sandbox={...context,globalThis:null}; sandbox.globalThis=sandbox;
+  vm.createContext(sandbox); vm.runInContext(ASSETS.settings,sandbox,{filename:'settings.js'});
+  context.nodes.get('default-provider').value='local';
+  vm.runInContext("SESSION_DIAGNOSTICS = {session:{active:true,provider:'cli',requested_model:'model-a',loaded_model:null}}; DIRTY.add('local:LOCAL_LLM_MODEL');",sandbox);
+  sandbox.renderSessionImpact();
+  const message=context.nodes.get('default-session-impact').textContent;
+  assert.match(message,/프록시 세션: CLI/); assert.match(message,/요청 모델 model-a/);
+  assert.match(message,/실제 모델 미보고/); assert.match(message,/선택한 다음 실행: Local LLM/);
+  assert.match(message,/실행 중인 세션의 모델은 바뀌지/); assert.match(message,/이어가면 모델별 도구·문맥 해석/);
+  assert.match(context.nodes.get('impact-local').textContent,/저장하기 전/);
+  vm.runInContext('SESSION_DIAGNOSTICS = null;',sandbox); sandbox.renderSessionImpact();
+  assert.match(context.nodes.get('default-session-impact').textContent,/프록시 세션을 확인하지 못했습니다/);
+  assert.match(context.nodes.get('default-session-impact').textContent,/직접 실행한 Sonnet/);
+});
+
+test('settings distinguish connection checks from tool and Claude Code capability', () => {
+  assert.match(ASSETS.settings_html, /모델 확인과 단순 추론은 도구 왕복이나 Claude Code 기능을 검증하지 않습니다/);
+});
+
+test('tool probe uses saved settings and separates tool success from model mismatch', async () => {
+  const page = await settingsPage({config:{openrouter:READY_OPENROUTER, local:READY_LOCAL}});
+  const calls=[];
+  page.sandbox.fetch=async (url, options) => {
+    calls.push({url, payload:JSON.parse(options.body)});
+    return {json:async()=>({ok:true,reason:'passed',tool_proposal_valid:true,
+      first_model_matches_requested:false,second_model_matches_requested:null,
+      first_usage_reported:true,second_usage_reported:false})};
+  };
+  await vm.runInContext("runToolRoundtrip('local')", page.sandbox);
+  assert.deepEqual(calls, [{url:'/api/test',payload:{provider:'local',mode:'tool_roundtrip'}}]);
+  const html=page.nodes.get('res-local').innerHTML;
+  assert.match(html,/도구 왕복 통과/); assert.match(html,/첫 응답 불일치/);
+  assert.match(html,/두 번째 응답 미확인/); assert.match(html,/result-line warn/);
+  assert.match(html,/현재 Claude Code 세션과 원본 Sonnet 동등성은 검증하지 않습니다/);
+  vm.runInContext("renderResult('local')", page.sandbox);
+  assert.match(page.nodes.get('res-local').innerHTML,/도구 왕복 통과/);
+});
+
+test('tool probe refuses unsaved changes without calling the API', async () => {
+  const page = await settingsPage({config:{openrouter:READY_OPENROUTER, local:READY_LOCAL}});
+  vm.runInContext("DIRTY.add('local:LOCAL_LLM_MODEL')", page.sandbox);
+  const before=page.requests.length;
+  await vm.runInContext("runToolRoundtrip('local')", page.sandbox);
+  assert.equal(page.requests.length,before);
+  assert.match(page.nodes.get('res-local').innerHTML,/저장한 뒤 검사/);
+});
 
 test('blackbox distinguishes waiting, connected and unavailable without showing content', () => {
   const context = buildContext();
@@ -365,7 +485,8 @@ test('flow distinguishes measured token deltas from unavailable usage and preser
   const base={responses:2,inputSamples:2,inputTokens:100,outputSamples:1,outputTokens:20};
   sandbox.render(stats(5,base));
   let html=context.nodes.get('grid').innerHTML;
-  assert.match(html,/Claude-Cheat 프록시/); assert.match(html,/경로 선택 · 요청 처리/);
+  assert.match(html, /<svg class="flow-illustration"[^>]*aria-hidden="true"[^>]*focusable="false"/);
+  assert.match(html,/Claude-Cheat 프록시/); assert.match(html,/첫 관측 · 다음 갱신부터 비교/);
   assert.match(html,/Local LLM/); assert.match(html,/Claude Plan/);
   assert.match(html,/첫 관측 · 다음 갱신 대기/);
   sandbox.render(stats(7,{responses:3,inputSamples:3,inputTokens:100,outputSamples:2,outputTokens:520}));
@@ -899,38 +1020,126 @@ test('token flow scales bounded particles and exposes Local occupancy without in
   let html=context.nodes.get('grid').innerHTML;
   assert.equal((html.match(/class="flow-particle"/g)||[]).length,24);
   assert.equal((html.match(/class="flow-particle flow-response"/g)||[]).length,24);
+  assert.match(html,/class="flow-proxy flow-reacting flow-intensity-3"/);
   assert.match(html,/Local 실행 슬롯 2 \/ 2/);assert.match(html,/Local 대기 3건/);
-  assert.equal((html.match(/class="flow-ring occupied"/g)||[]).length,20);
+  assert.match(html,/class="flow-turbine unknown spinning batch-3 batch-heat"/);
+  assert.match(html,/flow-return-track flow-completed/);
+  assert.match(html,/--turbine-speed:3600ms/); assert.match(html,/--turbine-turns:3turn/);
   assert.match(html,/Local 작업 진행 중/);
   sandbox.render(data(1000000,1,0,0));html=context.nodes.get('grid').innerHTML;
   assert.doesNotMatch(html,/class="flow-particle/);assert.match(html,/새 응답 없음/);
-  assert.equal((html.match(/class="flow-ring occupied"/g)||[]).length,0);
+  assert.doesNotMatch(html,/flow-reacting/);
+  assert.doesNotMatch(html,/batch-heat|flow-completed/);
+  assert.match(html,/class="flow-turbine unknown"/);
+  assert.doesNotMatch(html,/flow-turbine unknown spinning/);
   context.window.matchMedia=()=>({matches:true});sandbox.render(data(2000000,2));
-  assert.doesNotMatch(context.nodes.get('grid').innerHTML,/class="flow-particle/);
+  assert.match(context.nodes.get('grid').innerHTML,/class="flow-particle/);
   assert.match(context.nodes.get('grid').innerHTML,/1,000,000 토큰/);
 });
 
+test('turbine uses common in-flight evidence, stops when idle or hidden, and never invents activity', () => {
+  for (const provider of ['local','openrouter','cli','plan']) {
+    const context=buildContext();context.window.innerHeight=900;context.window.matchMedia=()=>({matches:false});
+    context.document.getElementById('gateway-motion').getBoundingClientRect=()=>({top:100,bottom:200});
+    const sandbox={...context,globalThis:null};sandbox.globalThis=sandbox;vm.createContext(sandbox);vm.runInContext(scriptBundle(),sandbox);
+    const data=inflight=>fixture({active_session:{provider},proxy_metrics:{startedAt:'turbine',requests:1,inflightRequests:inflight,configuration:{provider}}});
+    sandbox.render(data(2));let html=context.nodes.get('grid').innerHTML;
+    assert.match(html,/class="flow-turbine active spinning"/,provider);
+    assert.match(html,/class="flow-track flow-live"/,provider);
+    assert.match(html,/프록시 진행 요청 2건/,provider);
+    sandbox.render(data(0));html=context.nodes.get('grid').innerHTML;
+    assert.match(html,/class="flow-turbine idle"/,provider);assert.doesNotMatch(html,/flow-turbine idle spinning/,provider);
+    assert.doesNotMatch(html,/flow-track flow-live/,provider);
+    sandbox.render(data(null));html=context.nodes.get('grid').innerHTML;
+    assert.match(html,/class="flow-turbine unknown"/,provider);assert.doesNotMatch(html,/flow-turbine unknown spinning/,provider);
+    context.document.hidden=true;sandbox.render(data(2));html=context.nodes.get('grid').innerHTML;
+    assert.match(html,/class="flow-turbine active"/,provider);assert.doesNotMatch(html,/flow-turbine active spinning/,provider);
+    assert.doesNotMatch(html,/flow-track flow-live/,provider);
+  }
+});
 
-test('flow motion respects system preference until explicit page-only opt-in, and can be paused', () => {
+test('in-flight turbine keeps its rotation phase across dashboard refreshes', () => {
+  let now=10000;
+  const context=buildContext(); context.Date=class extends Date { static now(){return now;} };
+  context.window.innerHeight=900;context.window.matchMedia=()=>({matches:false});
+  context.document.getElementById('gateway-motion').getBoundingClientRect=()=>({top:100,bottom:200});
+  const sandbox={...context,globalThis:null};sandbox.globalThis=sandbox;vm.createContext(sandbox);vm.runInContext(scriptBundle(),sandbox);
+  const data=fixture({active_session:{provider:'local'},proxy_metrics:{startedAt:'phase',requests:1,inflightRequests:1,configuration:{provider:'local'}}});
+  const phase=()=>Number(context.nodes.get('grid').innerHTML.match(/--turbine-offset:(-?\d+)ms/)[1]);
+  sandbox.render(data);const first=phase();now+=800;sandbox.render(data);const second=phase();
+  assert.equal((-second + first + 3600) % 3600,800);
+});
+
+test('processing bar pulses once when a new request is observed', () => {
+  const context=buildContext(); context.window.innerHeight=900; context.window.matchMedia=()=>({matches:false});
+  context.document.getElementById('gateway-motion').getBoundingClientRect=()=>({top:100,bottom:200});
+  const sandbox={...context,globalThis:null};sandbox.globalThis=sandbox;vm.createContext(sandbox);vm.runInContext(scriptBundle(),sandbox);
+  const data=requests=>fixture({active_session:{provider:'local'},proxy_metrics:{startedAt:'bar-pulse',requests,inflightRequests:1,configuration:{provider:'local'}}});
+  sandbox.render(data(1));assert.doesNotMatch(context.nodes.get('grid').innerHTML,/request-pulse/);
+  sandbox.render(data(2));assert.match(context.nodes.get('grid').innerHTML,/flow-turbine active spinning request-pulse/);
+  sandbox.render(data(2));assert.doesNotMatch(context.nodes.get('grid').innerHTML,/request-pulse/);
+  context.document.hidden=true;sandbox.render(data(3));assert.doesNotMatch(context.nodes.get('grid').innerHTML,/request-pulse/);
+});
+
+
+test('flow motion defaults on even with reduced motion and can be paused for this page', () => {
   const context=buildContext(), clicks=[];
   context.document.addEventListener=(type,handler)=>{if(type==='click')clicks.push(handler)};
   context.window.innerHeight=900;context.window.matchMedia=()=>({matches:true});
   context.document.getElementById('gateway-motion').getBoundingClientRect=()=>({top:100,bottom:200});
   const sandbox={...context,globalThis:null};sandbox.globalThis=sandbox;vm.createContext(sandbox);vm.runInContext(scriptBundle(),sandbox);
   const data=n=>fixture({active_session:{provider:'local'},proxy_metrics:{startedAt:'motion-test',requests:n,configuration:{provider:'local'},
-    tokenFlow:{local:{responses:n,inputSamples:n,inputTokens:n*100,outputSamples:n,outputTokens:n*10}}}});
+    tokenFlow:{local:{responses:n,inputSamples:n,inputTokens:n*10,outputSamples:n,outputTokens:n}}}});
   sandbox.render(data(1));sandbox.render(data(2));
-  assert.match(context.nodes.get('grid').innerHTML,/움직임 줄이기 적용 중/);
-  assert.doesNotMatch(context.nodes.get('grid').innerHTML,/class="flow-particle/);
+  assert.equal(sandbox.flowMotionAllowed(),true);
+  assert.match(context.nodes.get('grid').innerHTML,/움직임 끄기/);
+  assert.match(context.nodes.get('grid').innerHTML,/class="flow-particle/);
+  assert.match(context.nodes.get('grid').innerHTML,/flow-reacting flow-intensity-1/);
   const click=()=>clicks.forEach(fn=>fn({target:{closest:selector=>selector==='[data-flow-motion]'?{}:null}}));
   click();
-  assert.equal(sandbox.flowMotionAllowed(),true);
+  assert.equal(sandbox.flowMotionAllowed(),false);
   assert.doesNotMatch(context.nodes.get('grid').innerHTML,/class="flow-particle/);
+  assert.doesNotMatch(context.nodes.get('grid').innerHTML,/flow-turbine [^" ]* spinning/);
   sandbox.render(data(3));let html=context.nodes.get('grid').innerHTML;
-  assert.match(html,/flow-motion-enabled/);assert.match(html,/움직임 끄기/);assert.match(html,/class="flow-particle/);
+  assert.doesNotMatch(html,/class="flow-particle/);assert.doesNotMatch(html,/flow-reacting/);assert.match(html,/움직임 켜기/);
   click();sandbox.render(data(4));html=context.nodes.get('grid').innerHTML;
-  assert.equal(sandbox.flowMotionAllowed(),false);assert.doesNotMatch(html,/class="flow-particle/);
+  assert.equal(sandbox.flowMotionAllowed(),true);assert.match(html,/class="flow-particle/);
   assert.equal(context.window.matchMedia().matches,true);
+});
+
+test('gateway reacts only to observed token deltas equally for all external providers', () => {
+  for (const provider of ['local', 'openrouter', 'cli']) {
+    const context = buildContext();
+    context.window.innerHeight = 900;
+    context.window.matchMedia = () => ({matches:true});
+    context.document.getElementById('gateway-motion').getBoundingClientRect = () => ({top:100,bottom:200});
+    const sandbox = {...context, globalThis:null}; sandbox.globalThis = sandbox;
+    vm.createContext(sandbox); vm.runInContext(scriptBundle(), sandbox);
+    const data = (responses, samples, input, output, tokenFlow = true) => fixture({
+      active_session: {provider}, proxy_metrics: {startedAt:'same', requests:responses,
+        configuration:{provider}, ...(tokenFlow ? {tokenFlow:{[provider]:{responses,inputSamples:samples,
+          inputTokens:input,outputSamples:samples,outputTokens:output}}} : {})},
+    });
+    sandbox.render(data(0,0,0,0));
+    assert.doesNotMatch(context.nodes.get('grid').innerHTML, /flow-reacting/);
+    sandbox.render(data(1,1,10,1));
+    assert.match(context.nodes.get('grid').innerHTML, /flow-reacting flow-intensity-1/, provider);
+    assert.match(context.nodes.get('grid').innerHTML, /flow-return-track flow-completed/, provider);
+    assert.doesNotMatch(context.nodes.get('grid').innerHTML, /batch-heat/, provider);
+    assert.match(context.nodes.get('grid').innerHTML, /--turbine-turns:1turn/, provider);
+    sandbox.render(data(1,1,10,1));
+    assert.doesNotMatch(context.nodes.get('grid').innerHTML, /flow-reacting/, provider);
+    sandbox.render(data(2,1,10,1)); // successful response without reported usage
+    assert.doesNotMatch(context.nodes.get('grid').innerHTML, /flow-reacting/, provider);
+    assert.match(context.nodes.get('grid').innerHTML, /flow-return-track flow-completed/, provider);
+    assert.doesNotMatch(context.nodes.get('grid').innerHTML, /class="flow-particle/, provider);
+    context.document.hidden = true;
+    sandbox.render(data(3,2,20,2));
+    assert.doesNotMatch(context.nodes.get('grid').innerHTML, /flow-reacting/, provider);
+    context.document.hidden = false;
+    sandbox.render(data(4,2,20,2,false)); // older proxy: usage unavailable
+    assert.doesNotMatch(context.nodes.get('grid').innerHTML, /flow-reacting/, provider);
+  }
 });
 
 
@@ -949,4 +1158,117 @@ test('runtime timing breakdown distinguishes stage samples and actual attempts',
   const old = render(fixture({proxy_metrics:{requests:3}})).get('grid').innerHTML;
   assert.match(old, /Local 슬롯 대기/);
   assert.match(old, /미보고/);
+});
+
+
+test('flow combines independently observed providers and reports incomplete comparisons', () => {
+  const context=buildContext(); context.window.innerHeight=900; context.window.matchMedia=()=>({matches:false});
+  context.document.getElementById('gateway-motion').getBoundingClientRect=()=>({top:100,bottom:200});
+  const sandbox={...context,globalThis:null};sandbox.globalThis=sandbox;vm.createContext(sandbox);vm.runInContext(scriptBundle(),sandbox);
+  const row=(n,input,output)=>({responses:n,inputSamples:n,inputTokens:input,outputSamples:n,outputTokens:output});
+  const data=(tokenFlow,requests=3,inflightRequests=2,startedAt='session')=>fixture({active_session:{provider:'local'},
+    proxy_metrics:{startedAt,requests,inflightRequests,failed:2,configuration:{provider:'local'},tokenFlow}});
+  sandbox.render(data({local:row(0,0,0),cli:row(0,0,0),openrouter:row(0,0,0)}));
+  sandbox.render(data({local:row(1,10,1),cli:row(1,30,3),openrouter:row(0,0,0)},4));
+  let html=context.nodes.get('grid').innerHTML;
+  assert.match(html,/프록시 진행 요청 2건/);
+  assert.match(html,/최근 갱신 사이 성공한 외부 응답<\/span><strong>2건<\/strong><small>프록시 관측 기준 · 누적 실패 2건/);
+  assert.match(html,/관측 입력 토큰<\/span><strong>40 토큰 · 2건 보고/);
+  assert.match(html,/Local LLM · 입력 10 토큰 \/ 출력 1 토큰/);
+  assert.match(html,/CLI · 입력 30 토큰 \/ 출력 3 토큰/);
+  assert.match(html,/OpenRouter · 입력 새 응답 없음/);
+  assert.match(html,/flow-reacting/);
+  sandbox.render(data({local:row(2,20,2),cli:{responses:2},openrouter:row(0,0,0)},5,0));
+  html=context.nodes.get('grid').innerHTML;
+  assert.match(html,/프록시 진행 요청 0건/);assert.match(html,/비교 가능한 제공자만 합산/);
+  assert.match(html,/성공한 외부 응답<\/span><strong>1건<\/strong><small>일부 제공자만 관측/);
+  assert.match(html,/CLI · 입력 미확인/);assert.match(html,/관측 입력 토큰<\/span><strong>10 토큰 · 1건 보고/);
+  sandbox.render(data({local:row(2,20,2),cli:row(3,90,9),openrouter:row(0,0,0)},6));
+  html=context.nodes.get('grid').innerHTML;assert.match(html,/CLI · 입력 비교 대기/);assert.doesNotMatch(html,/flow-reacting/);
+  sandbox.render(data({local:row(3,30,3),cli:row(4,100,10),openrouter:row(0,0,0)},7,undefined,'new-session'));
+  html=context.nodes.get('grid').innerHTML;assert.doesNotMatch(html,/flow-reacting/);
+  assert.match(html,/첫 관측/);
+});
+
+test('flow shows common in-flight count for each provider and handles old or stale metrics', () => {
+  for (const provider of ['local','openrouter','cli']) {
+    const make=(inflightRequests,stale=false)=>fixture({active_session:{provider},proxy_metrics:{startedAt:'s',requests:1,
+      configuration:{provider},...(inflightRequests === undefined ? {} : {inflightRequests}),stale}});
+    assert.match(render(make(3)).get('grid').innerHTML,/프록시 진행 요청 3건/,provider);
+    assert.match(render(make(undefined)).get('grid').innerHTML,/프록시 진행 요청 미보고/,provider);
+    assert.match(render(make(3,true)).get('grid').innerHTML,/프록시 진행 요청 미보고/,provider);
+  }
+});
+
+test('flow statistics label missing counters rather than inventing zero', () => {
+  const html=render(fixture({active_session:{provider:'local'},proxy_metrics:{startedAt:'old',requests:1,configuration:{provider:'local'}}})).get('grid').innerHTML;
+  assert.match(html,/성공한 외부 응답<\/span><strong>미보고<\/strong>/);
+  assert.match(html,/누적 실패 미보고/);
+});
+
+
+test('flow sequences each observed batch from input through proxy to output without fabricated particles', () => {
+  const context=buildContext();context.window.innerHeight=900;context.window.matchMedia=()=>({matches:false});
+  context.document.getElementById('gateway-motion').getBoundingClientRect=()=>({top:100,bottom:200});
+  const sandbox={...context,globalThis:null};sandbox.globalThis=sandbox;vm.createContext(sandbox);vm.runInContext(scriptBundle(),sandbox);
+  const data=(n,input,output)=>fixture({refresh_ms:5000,active_session:{provider:'local'},proxy_metrics:{startedAt:'s',requests:n,
+    configuration:{provider:'local'},tokenFlow:{local:{responses:n,inputSamples:n,inputTokens:input,outputSamples:n,outputTokens:output}}}});
+  sandbox.render(data(0,0,0));sandbox.render(data(1,10,10));
+  let html=context.nodes.get('grid').innerHTML;
+  assert.match(html,/--pulse-delay:1600ms;--pulse-duration:900ms/);
+  assert.match(html,/--turbine-delay:1600ms;--turbine-duration:900ms;--turbine-turns:1turn/);
+  const input=[...html.matchAll(/class="flow-particle" style="--lane:\d+;--delay:(\d+)ms;--flight:(\d+)ms"/g)];
+  const output=[...html.matchAll(/class="flow-particle flow-response" style="--lane:\d+;--delay:(\d+)ms;--flight:(\d+)ms"/g)];
+  assert.ok(input.length && output.length);
+  assert.ok(Math.max(...input.map(x=>+x[1]+ +x[2]))<=1600);
+  assert.ok(Math.min(...output.map(x=>+x[1]))>=2500);
+  assert.ok(Math.max(...output.map(x=>+x[1]+ +x[2]))<=5000);
+  sandbox.render(data(2,10,20));html=context.nodes.get('grid').innerHTML;
+  assert.equal((html.match(/class="flow-particle"/g)||[]).length,0);
+  assert.match(html,/--pulse-delay:0ms;--pulse-duration:900ms/);
+  assert.match(html,/--turbine-delay:0ms;--turbine-duration:900ms/);
+  assert.match(html,/class="flow-particle flow-response" style="--lane:0;--delay:900ms/);
+  sandbox.render(data(3,10,20));html=context.nodes.get('grid').innerHTML;
+  assert.doesNotMatch(html,/flow-reacting/);assert.doesNotMatch(html,/class="flow-particle/);
+});
+
+test('Plan status occupies existing overview instead of inserting an alert banner', () => {
+  const plan={state:'plan',last:{provider:'plan',reason:'backend_unavailable'}};
+  const base={active_session:{provider:'local'},proxy_metrics:{startedAt:'s',requests:1,configuration:{provider:'local'}},
+    routing:plan,alerts:[{code:'plan_state',level:'info',title:'현재 Plan 경로',detail:'last reason'}]};
+  let nodes=render(fixture(base));
+  assert.doesNotMatch(nodes.get('alerts').innerHTML,/현재 Plan 경로/);
+  let html=nodes.get('grid').innerHTML;
+  assert.match(html,/class="overview-state" role="status" aria-live="polite"/);
+  assert.match(html,/마지막 Plan 경로 사유 · backend_unavailable/);
+  nodes=render(fixture({...base,routing:{state:'external',last:{provider:'local'}} ,alerts:[]}));
+  assert.doesNotMatch(nodes.get('grid').innerHTML,/마지막 Plan 경로 사유/);
+  nodes=render(fixture({...base,proxy_metrics:{...base.proxy_metrics,stale:true}}));
+  html=nodes.get('grid').innerHTML;
+  assert.match(html,/현재 상태 미확인/);assert.doesNotMatch(html,/마지막 Plan 경로 사유/);
+});
+
+
+test('usage chart places dates proportionally and breaks missing periods', () => {
+  const context=buildContext(), sandbox={...context,globalThis:null};sandbox.globalThis=sandbox;
+  vm.createContext(sandbox);vm.runInContext(ASSETS.usage,sandbox);
+  const row=bucket=>({bucket,input_tokens:10,input_samples:1,output_tokens:10,output_samples:1});
+  let html=sandbox.usageChart([row('2026-10-01'),row('2026-10-02'),row('2026-10-05')],'day');
+  assert.match(html,/M3.00 5.00 L26.50 5.00 M97.00 5.00/);
+  assert.match(html,/circle cx="97.00"/);
+  html=sandbox.usageChart([row('2026-10-05'),row('2026-10-12'),row('2026-10-26')],'week');
+  assert.match(html,/M3.00 5.00 L34.33 5.00 M97.00 5.00/);
+  html=sandbox.usageChart([row('2026-01'),row('2026-02'),row('2026-04')],'month');
+  assert.match(html,/M3.00 5.00 L34.33 5.00 M97.00 5.00/);
+});
+
+test('recording loss and unknown recording status are visible', () => {
+  const context=buildContext(), sandbox={...context,globalThis:null};sandbox.globalThis=sandbox;
+  vm.createContext(sandbox);vm.runInContext(ASSETS.usage,sandbox);
+  const payload=recording=>({status:'ready',report:{rows:[]},sessions:[{provider:'cli',status:'active',recording}]});
+  sandbox.renderUsage(payload({enabled:true,dropped:2,errors:1,pending:3}));
+  assert.match(context.nodes.get('usage-status').textContent,/누락/);
+  assert.match(context.nodes.get('usage-grid').innerHTML,/누락 2 · 오류 1 · 대기 3/);
+  sandbox.renderUsage(payload(null));assert.match(context.nodes.get('usage-status').textContent,/누락/);
+  assert.match(context.nodes.get('usage-grid').innerHTML,/기록 상태 미보고/);
 });

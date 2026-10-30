@@ -83,8 +83,61 @@ test('metrics endpoint requires the session token', async () => {
     assert.equal(allowed.status, 200);
     const payload = await allowed.json();
     assert.equal(payload.requests, 0);
+    assert.equal(payload.inflightRequests, 0);
     assert.deepEqual(payload.routes, { external: 0, plan: 0 });
   } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test('closing a proxy flushes pending metrics and removes its exit listener', async () => {
+  const dir=await mkdtemp(join(tmpdir(),'claude-cheat-metrics-close-'));
+  const path=join(dir,'metrics.json'), baseline=process.listenerCount('exit');
+  const {server,base}=await start({metricsPath:path});
+  try {
+    assert.equal(process.listenerCount('exit'),baseline+1);
+    assert.equal(await send(base),200);
+    server.closeAllConnections();await new Promise(resolve=>server.close(resolve));
+    assert.equal(process.listenerCount('exit'),baseline);
+    const snapshot=JSON.parse(await readFile(path,'utf8'));
+    assert.equal(snapshot.requests,1);assert.equal(snapshot.ok,1);
+  } finally {
+    server.closeAllConnections();if (server.listening) await new Promise(resolve=>server.close(resolve));
+    await rm(dir,{recursive:true,force:true});
+  }
+});
+
+test('inflight counts only message requests and releases once after client cancellation', async () => {
+  let upstreamStarted;
+  const started = new Promise(resolve => { upstreamStarted = resolve; });
+  const { server, base, metrics } = await start({ fetchImpl: async (_url, request) => {
+    upstreamStarted();
+    return await new Promise((resolve, reject) => {
+      if (request.signal.aborted) return reject(new Error('aborted'));
+      request.signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+    });
+  } });
+  const controller = new AbortController();
+  const pending = fetch(base, { method: 'POST', signal: controller.signal,
+    headers: { 'content-type': 'application/json', 'x-local-route-token': NONCE,
+      authorization: OAUTH, 'anthropic-beta': BETA },
+    body: JSON.stringify({ model: MODEL, max_tokens: 32, messages: [{ role: 'user', content: 'fixture' }] }) }).catch(() => null);
+  const snapshot = async () => (await fetch(metrics, { headers: { 'x-local-route-token': NONCE } })).json();
+  try {
+    await started;
+    assert.equal((await snapshot()).inflightRequests, 1);
+    assert.equal((await snapshot()).inflightRequests, 1);
+    controller.abort();
+    await pending;
+    const deadline = Date.now() + 3000;
+    while ((await snapshot()).inflightRequests !== 0) {
+      assert.ok(Date.now() < deadline, 'cancelled request should release its slot');
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.equal((await snapshot()).inflightRequests, 0);
+  } finally {
+    controller.abort();
     server.closeAllConnections();
     server.close();
   }
@@ -148,6 +201,7 @@ test('counters follow the routes the proxy takes', async () => {
     const payload = await (await fetch(metrics, { headers: { 'x-local-route-token': NONCE } })).json();
     assert.equal(payload.requests, 3);
     assert.equal(payload.ok, 3);
+    assert.equal(payload.inflightRequests, 0);
     assert.equal(payload.routes.external, 2);
     assert.equal(payload.routes.plan, 1);
     assert.ok(payload.reasons.replacement >= 2);

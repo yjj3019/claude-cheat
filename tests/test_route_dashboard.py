@@ -2150,6 +2150,173 @@ class ModelCatalogTests(unittest.TestCase):
             server.server_close()
 
 
+class UsageStatsTests(unittest.TestCase):
+    def test_live_instances_authenticate_and_never_expose_handoff_token(self):
+        import threading
+        import uuid
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        instance = str(uuid.uuid4())
+        secret = "synthetic-private-token"
+        class Proxy(BaseHTTPRequestHandler):
+            def log_message(self, *_): pass
+            def do_GET(self):
+                self.send_response(200 if self.headers.get("x-local-route-token") == secret else 403)
+                self.end_headers()
+                self.wfile.write(json.dumps({"instanceId": instance, "configuration": {"provider": "local", "model": "fixture"},
+                                             "requests": 7, "failed": 1, "inflightRequests": 2,
+                                             "localAdmission": {"queued": 1}, "routingTimingMs": {"total": {"p95": 50}}}).encode())
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                folder = Path(directory) / ".usage-stats" / "instances" / instance
+                folder.mkdir(parents=True)
+                (folder / "handoff.json").write_text(json.dumps({"instance_id": instance, "provider": "local", "port": server.server_address[1], "nonce": secret}), encoding="utf-8")
+                sessions, partial = dash._usage_live_sessions(Path(directory))
+                self.assertFalse(partial)
+                self.assertEqual(len(sessions), 1)
+                self.assertEqual((sessions[0]["status"], sessions[0]["inflight"], sessions[0]["queued"]), ("active", 2, 1))
+                self.assertEqual((sessions[0]["requested_model"], sessions[0]["reported_model"]), ("fixture", None))
+                self.assertNotIn(secret, json.dumps(sessions))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_live_instance_rotation_exposes_recording_and_reaches_later_entries(self):
+        import uuid
+        class Response:
+            status = 200
+            def __init__(self, instance): self.instance = instance
+            def read(self, _size):
+                return json.dumps({"instanceId": self.instance, "configuration": {"provider": "local"},
+                    "usageRecording": {"enabled": True, "dropped": 2, "errors": 1, "pending": 3}}).encode()
+        class Connection:
+            def __init__(self, *_args, **_kwargs): self.instance = None
+            def request(self, _method, _path, headers): self.instance = headers["x-local-route-token"]
+            def getresponse(self): return Response(self.instance)
+            def close(self): pass
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(dash.http.client, "HTTPConnection", Connection), \
+                mock.patch.object(dash, "_USAGE_SCAN_OFFSET", 0):
+            base = Path(directory) / ".usage-stats" / "instances"
+            ids = [str(uuid.UUID(int=i+1)) for i in range(33)]
+            for instance in ids:
+                folder = base / instance
+                folder.mkdir(parents=True)
+                (folder / "handoff.json").write_text(json.dumps({"instance_id": instance, "provider": "local",
+                    "port": 1234, "nonce": instance}), encoding="utf-8")
+            first, partial = dash._usage_live_sessions(Path(directory))
+            second, partial2 = dash._usage_live_sessions(Path(directory))
+            self.assertTrue(partial and partial2)
+            self.assertEqual(len(first), 32)
+            self.assertNotIn(ids[-1], [row["instance_id"] for row in first])
+            self.assertIn(ids[-1], [row["instance_id"] for row in second])
+            self.assertEqual(first[0]["recording"], {"enabled": True, "dropped": 2, "errors": 1, "pending": 3})
+
+    def test_empty_historical_instances_do_not_hide_active_instance(self):
+        import uuid
+        instance = str(uuid.UUID(int=100))
+        class Response:
+            status = 200
+            def read(self, _size):
+                return json.dumps({"instanceId": instance, "configuration": {"provider": "local"}}).encode()
+        class Connection:
+            def __init__(self, *_args, **_kwargs): pass
+            def request(self, *_args, **_kwargs): pass
+            def getresponse(self): return Response()
+            def close(self): pass
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(dash.http.client, "HTTPConnection", Connection), \
+                mock.patch.object(dash, "_USAGE_SCAN_OFFSET", 0):
+            base = Path(directory) / ".usage-stats" / "instances"
+            for number in range(1, 41):
+                (base / str(uuid.UUID(int=number))).mkdir(parents=True)
+            folder = base / instance
+            folder.mkdir()
+            (folder / "handoff.json").write_text(json.dumps({"instance_id": instance, "provider": "local",
+                "port": 1234, "nonce": "synthetic-token"}), encoding="utf-8")
+            sessions, partial = dash._usage_live_sessions(Path(directory))
+        self.assertFalse(partial)
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual((sessions[0]["instance_id"], sessions[0]["status"]), (instance, "active"))
+
+    def test_unsafe_handoff_marks_live_coverage_partial(self):
+        import uuid
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / ".usage-stats" / "instances" / str(uuid.uuid4())
+            folder.mkdir(parents=True)
+            source = root / "fixture.json"
+            source.write_text("{}", encoding="utf-8")
+            try:
+                os.link(source, folder / "handoff.json")
+            except OSError:
+                self.skipTest("hard links unavailable")
+            sessions, partial = dash._usage_live_sessions(root)
+        self.assertEqual(sessions, [])
+        self.assertTrue(partial)
+
+    def test_snapshot_refresh_does_not_run_usage_collector(self):
+        with mock.patch.object(dash, "snapshot", return_value={}), \
+                mock.patch.object(dash, "_refresh_usage_stats") as usage, \
+                mock.patch.object(dash.time, "sleep", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                dash._refresh_loop(1)
+            usage.assert_not_called()
+
+    def test_usage_page_and_authenticated_cached_api(self):
+        import threading
+        import urllib.error
+        import urllib.request
+        server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        base = f"http://127.0.0.1:{port}"
+        cached = {"at": 1, "reports": {"day": {"rows": [], "coverage": "collected_only"}},
+                  "sessions": [], "sessions_partial": False, "collection": None, "error": None}
+        try:
+            with opener.open(base + "/usage", timeout=10) as response:
+                page = response.read().decode("utf-8")
+            self.assertIn('id="usage-title"', page)
+            self.assertIn('aria-current="page">사용량', page)
+            with self.assertRaises(urllib.error.HTTPError) as denied:
+                opener.open(base + "/api/usage-stats?period=day", timeout=10)
+            self.assertEqual(denied.exception.code, 403)
+            denied.exception.close()
+            with mock.patch.object(dash, "_USAGE_STATS", cached):
+                request = urllib.request.Request(base + "/api/usage-stats?period=day", headers={"x-dashboard-token": dash.TOKEN})
+                with opener.open(request, timeout=10) as response:
+                    payload = json.loads(response.read())
+                self.assertEqual(payload["status"], "ready")
+                self.assertEqual(payload["report"]["rows"], [])
+                request = urllib.request.Request(base + "/api/usage-stats?period=bad", headers={"x-dashboard-token": dash.TOKEN})
+                with self.assertRaises(urllib.error.HTTPError) as invalid:
+                    opener.open(request, timeout=10)
+                self.assertEqual(invalid.exception.code, 400)
+                invalid.exception.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_refresh_is_throttled_and_keeps_collection_failures_visible(self):
+        import types
+        calls = []
+        class Ledger:
+            def __init__(self, _root): pass
+            def collect(self): calls.append("collect"); return {"pending": False, "errors": []}
+            def report(self, period): return {"period": period, "rows": []}
+        state = {"at": 0.0, "reports": {}, "sessions": [], "error": None, "collection": None, "sessions_partial": False}
+        with mock.patch.object(dash, "_USAGE_STATS", state), mock.patch.dict(sys.modules, {"usage_ledger": types.SimpleNamespace(UsageLedger=Ledger)}), \
+                mock.patch.object(dash, "_usage_live_sessions", return_value=([], False)):
+            dash._refresh_usage_stats(now=100)
+            dash._refresh_usage_stats(now=105)
+            self.assertEqual(calls, ["collect"])
+            self.assertEqual(set(state["reports"]), {"day", "week", "month"})
+            Ledger.collect = lambda self: (_ for _ in ()).throw(ValueError("private secret"))
+            dash._refresh_usage_stats(now=111)
+            self.assertEqual(state["error"], "collection_failed")
+            self.assertNotIn("private", json.dumps(state))
+
+
 class InsightTests(unittest.TestCase):
     NOW = datetime(2026, 10, 25, 12, 0)
 
@@ -2953,6 +3120,55 @@ class RequirementAuditRegressionTests(unittest.TestCase):
             account, pricing = dash._service_finances(provider, values, model)
         self.assertEqual(account["error"], "not_applicable")
         self.assertIsNone(pricing)
+
+
+class ToolRoundtripApiTests(unittest.TestCase):
+    def test_probe_limits_concurrency_and_redacts_unexpected_output(self):
+        import modelQualityProbe
+        with mock.patch.object(modelQualityProbe, "configured_call", return_value=(object(), "private-model")), \
+                mock.patch.object(modelQualityProbe, "evaluate", return_value={"ok": True, "reason": "passed", "raw": "private-secret", "first_model_matches_requested": False}):
+            result = dash.run_tool_roundtrip("local")
+        self.assertTrue(result["ok"])
+        self.assertIs(result["first_model_matches_requested"], False)
+        self.assertNotIn("private", json.dumps(result))
+        self.assertTrue(dash._TOOL_PROBE_LOCK.acquire(blocking=False))
+        try:
+            self.assertEqual(dash.run_tool_roundtrip("cli")["reason"], "probe_busy")
+        finally:
+            dash._TOOL_PROBE_LOCK.release()
+
+    def test_probe_error_does_not_leak_and_releases_slot(self):
+        import modelQualityProbe
+        with mock.patch.object(modelQualityProbe, "configured_call", side_effect=RuntimeError("private-secret")):
+            result = dash.run_tool_roundtrip("local")
+        self.assertEqual(result["reason"], "probe_failed")
+        self.assertNotIn("private-secret", json.dumps(result))
+        self.assertTrue(dash._TOOL_PROBE_LOCK.acquire(blocking=False))
+        dash._TOOL_PROBE_LOCK.release()
+
+    def test_endpoint_requires_auth_and_only_accepts_saved_settings(self):
+        import threading
+        server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        def request(payload, headers):
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+            try:
+                conn.request("POST", "/api/test", body=json.dumps(payload), headers=headers)
+                response = conn.getresponse()
+                return response.status, json.loads(response.read())
+            finally:
+                conn.close()
+        payload = {"provider": "local", "mode": "tool_roundtrip"}
+        auth = {"x-dashboard-token": dash.TOKEN, "content-type": "application/json"}
+        with mock.patch.object(dash, "_rate_ok", return_value=True), \
+                mock.patch.object(dash, "run_tool_roundtrip", return_value={"ok": True}) as run:
+            self.assertEqual(request(payload, {})[0], 403)
+            self.assertEqual(request({**payload, "values": {"LOCAL_LLM_URL": "http://untrusted"}}, auth), (400, {"error": "saved_settings_only"}))
+            self.assertEqual(request(payload, {**auth, "origin": "http://foreign.invalid"})[0], 403)
+            self.assertEqual(request(payload, auth), (200, {"ok": True}))
+        run.assert_called_once_with("local")
 
 
 if __name__ == "__main__":

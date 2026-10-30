@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { once } from 'node:events';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { appendFileSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { appendFile, appendFileSync, readFileSync, renameSync, statSync, writeFileSync, unlinkSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 // Diagnostics leave the process through one redaction pass: an upstream error body echoed
@@ -494,16 +494,19 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false)
   let started = false, delta = false, stopped = false, usable = false, stopReason;
   // Frames may only leave the proxy once the reply provably has usable content: until
   // then a failure must stay recoverable (retry, then Plan fallback).
-  let publishable = false, sawThinking = false;
+  let publishable = false, sawThinking = false, reportedModel = null;
   const blocks = new Map();
   const indices = new Set();
   const diagnosticCounts = {};
   let diagnosticUsage = {};
+  let measuredInput = null, measuredOutput = null;
   const thinking = block => ['thinking', 'redacted_thinking'].includes(block?.type);
   return {
     get started() { return started; },
     get stopped() { return stopped; },
     get publishable() { return publishable && started; },
+    get reportedModel() { return reportedModel; },
+    get usage() { return { input_tokens: measuredInput, output_tokens: measuredOutput }; },
     validate(frame) {
       const data = frame.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trim()).join('\n');
       if (!data) return frame + '\n\n';
@@ -518,8 +521,10 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false)
         if (strictMeta && !validMessageMeta(event.message)) throw new Error('Invalid stream metadata');
         if (event.message.content !== undefined && (!Array.isArray(event.message.content) || event.message.content.length))
           throw new Error('Nonempty stream start content');
+        reportedModel = event.message.model;
         started = true;
         diagnosticUsage = safeResponseUsage(event.message.usage);
+        measuredInput = diagnosticUsage.input_tokens ?? null;
         event.message.model = clientModel;
       } else if (event.type !== 'ping' && !started) throw new Error('Missing start');
       if (event.type === 'content_block_start') {
@@ -568,7 +573,9 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false)
         if (blocks.size || !STOP_REASONS.has(event.delta?.stop_reason)) throw new Error('Incomplete message');
         delta = true;
         stopReason = event.delta.stop_reason;
-        diagnosticUsage = { ...diagnosticUsage, ...safeResponseUsage(event.usage) };
+        const deltaUsage = safeResponseUsage(event.usage);
+        diagnosticUsage = { ...diagnosticUsage, ...deltaUsage };
+        measuredOutput = deltaUsage.output_tokens ?? null;
       }
       if (event.type === 'message_stop') {
         if (!started || !delta || blocks.size) throw new Error('Missing start or delta');
@@ -677,8 +684,9 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal, on
       throw emptyResponseError(response.content.length ? 'content_without_usable_output' : 'empty_content',
         'json', response.stop_reason, counts, response.usage);
     }
+    const reportedModel = response.model;
     response.model = clientModel;
-    return { contentType: 'application/json', text: JSON.stringify(response), streamed: false };
+    return { reportedModel, contentType: 'application/json', text: JSON.stringify(response), streamed: false };
   }
   const tail = eventPending;
   // A split [DONE] or ping after message_stop must not turn a valid answer into a retry,
@@ -687,8 +695,8 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal, on
   const benignTail = !tailText || tailText === 'event: ping' || /^data:\s*\[D?O?N?E?\]?$/.test(tailText);
   if (!benignTail) throw guarded(() => { throw new Error('Trailing incomplete event'); });
   guarded(() => validator.finish());
-  if (onFrame) return { contentType: 'text/event-stream', text: committed ? '' : pending.join(''), streamed: forwarded };
-  return { contentType: 'text/event-stream', text: output.join(''), streamed: false };
+  if (onFrame) return { reportedModel: validator.reportedModel, usage: validator.usage, contentType: 'text/event-stream', text: committed ? '' : pending.join(''), streamed: forwarded };
+  return { reportedModel: validator.reportedModel, usage: validator.usage, contentType: 'text/event-stream', text: output.join(''), streamed: false };
 }
 
 function jsonMessageStream(text, requireMeta = true) {
@@ -815,6 +823,9 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   localModel, localKey, localAllowRemote = false, localHttpUrl, cliKind = null, cliRequestedModel = null, localOnly = false, localCompat = false, openrouterCompat = false, fallbackModel = 'claude-sonnet-5-5', retryDelayMs = 1000,
   cooldownMs = 30000, attemptTimeoutMs = localOnly || openrouterCompat ? 120000 : 30000, planHeaderMs = 120000, planIdleMs = 300000, attemptCeilingMs = 300000, now = Date.now,
   metricsPath = process.env.ROUTE_METRICS_PATH,
+  instanceId = process.env.ROUTE_INSTANCE_ID,
+  instanceMetricsPath = process.env.ROUTE_INSTANCE_METRICS_PATH,
+  usageEventsPath = process.env.ROUTE_USAGE_EVENTS_PATH,
   streamPassthrough = process.env.ROUTE_STREAM_PASSTHROUGH === '1',
   handoverTimeoutMs = Number(process.env.ROUTE_HANDOVER_TIMEOUT_MS) || 120000,
   // Idle, not total: a client may send for minutes as long as it keeps sending. 0 disables it.
@@ -953,6 +964,38 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     retries: 0, externalAttempts: 0, aborted: 0, bytesIn: 0, bytesOut: 0, circuitOpens: 0,
     routes: { external: 0, plan: 0 },
     reasons: {}, latency: { external: [], plan: [] }, ttfb: [], last: null };
+  // Usage rows are tiny, contain no message content, and are buffered independently of
+  // response delivery. Each instance has one writer and monotonically increasing IDs.
+  const usageId = typeof instanceId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(instanceId) ? instanceId : null;
+  const usageState = { enabled: Boolean(usageId && usageEventsPath), written: 0, dropped: 0, errors: 0 };
+  let usageSeq = 0, usageQueue = [], usageWriting = false, usageScheduled = false, usageBatchSize = 0;
+  const scheduleUsage = () => {
+    if (!usageScheduled && !usageWriting && usageQueue.length) {
+      usageScheduled = true;
+      setImmediate(() => { usageScheduled = false; flushUsage(); });
+    }
+  };
+  const flushUsage = () => {
+    if (usageWriting || !usageQueue.length || !usageState.enabled) return;
+    const batch = usageQueue.splice(0, 128);
+    usageWriting = true;
+    usageBatchSize = batch.length;
+    appendFile(usageEventsPath, batch.join(''), { encoding: 'utf8', mode: 0o600 }, error => {
+      usageWriting = false;
+      usageBatchSize = 0;
+      if (error) { usageState.errors++; usageState.dropped += batch.length; }
+      else usageState.written += batch.length;
+      scheduleMetricsFlush();
+      scheduleUsage();
+    });
+  };
+  const appendUsage = row => {
+    if (!usageState.enabled) return;
+    usageSeq++;
+    if (usageQueue.length >= 1024) { usageState.dropped++; return; }
+    usageQueue.push(JSON.stringify({ schema_version: 2, instance_id: usageId, event_seq: usageSeq, ...row }) + '\n');
+    scheduleUsage();
+  };
   // Bounded lifetime aggregates for validated, usage-reporting external JSON responses.
   const modelPerformance = Object.fromEntries(['local', 'openrouter', 'cli'].map(name =>
     [name, { samples: 0, outputTokens: 0, elapsedMs: 0 }]));
@@ -988,9 +1031,14 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     return { count: sorted.length, p50: at(0.5), p95: at(0.95), max: at(1) };
   };
   const publicMetricModel = value => validOpenRouterModel(value) &&
-    !/^(?:sk-|xai-|Bearer\s)/i.test(value) &&
+    !/^(?:sk-|xai-|bearer)/i.test(value) &&
+    !/(?:^|\/)(?:gsk_[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{30,})(?:$|\/)/i.test(value) &&
     !/^[A-Za-z]:|:\/\/|\\/.test(value) &&
     ![nonce, key, localKey, altKey].some(secret => typeof secret === 'string' && secret.length > 0 && value.includes(secret)) ? value : null;
+  const usageModel = value => {
+    const safe = publicMetricModel(value);
+    return safe && !/^(?:ghp_|github_pat_)/i.test(safe) ? safe : null;
+  };
   const metricsSnapshot = () => ({
     configuration: {
       provider,
@@ -1003,8 +1051,12 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       planFallback: !noPlan,
     },
     startedAt: new Date(metrics.startedAt).toISOString(),
+    ...(usageId ? { instanceId: usageId, usageRecording: { ...usageState, enqueued: usageSeq,
+      pending: usageQueue.length + usageBatchSize } } : {}),
     uptimeMs: Date.now() - metrics.startedAt,
     requests: metrics.requests, ok: metrics.ok, failed: metrics.failed,
+    // Accepted message requests (including body upload), excluding diagnostics/metrics.
+    inflightRequests: inflight,
     streams: metrics.streams, attempts: metrics.attempts, retries: metrics.retries,
     routes: { ...metrics.routes }, externalAttempts: metrics.externalAttempts, aborted: metrics.aborted,
     reasons: { ...metrics.reasons },
@@ -1028,24 +1080,24 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   const flushMetrics = () => {
     flushTimer = null;
     lastFlushAt = Date.now();
-    if (!metricsDirty || !metricsPath) return;
+    if (!metricsDirty || (!metricsPath && !instanceMetricsPath)) return;
     metricsDirty = false;
-    try {
-      // Replace atomically: a reader must never see a half-written snapshot.
-      const temporary = `${metricsPath}.tmp`;
-      // The minute history is live-session only; keep the existing disk snapshot compact.
-      const { monitoringHistory: _liveHistory, tokenFlow: _liveTokenFlow, ...persisted } = metricsSnapshot();
-      writeFileSync(temporary, JSON.stringify(persisted));
-      renameSync(temporary, metricsPath);
-    } catch {}
+    // The minute history is live-session only; keep disk snapshots compact.
+    const { monitoringHistory: _liveHistory, tokenFlow: _liveTokenFlow, ...persisted } = metricsSnapshot();
+    for (const path of [metricsPath, instanceMetricsPath].filter(Boolean)) {
+      // Unique temp names prevent different sessions from racing on a shared legacy path.
+      const temporary = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+      try { writeFileSync(temporary, JSON.stringify(persisted), { mode: 0o600 }); renameSync(temporary, path); }
+      catch { try { unlinkSync(temporary); } catch {} }
+    }
   };
   const scheduleMetricsFlush = () => {
     metricsDirty = true;
-    if (!metricsPath || flushTimer) return;
+    if ((!metricsPath && !instanceMetricsPath) || flushTimer) return;
     flushTimer = setTimeout(flushMetrics, Math.max(0, 1000 - (Date.now() - lastFlushAt)));
     flushTimer.unref?.();
   };
-  if (metricsPath) process.once('exit', flushMetrics);
+  if (metricsPath || instanceMetricsPath) process.once('exit', flushMetrics);
   let inflight = 0;
   let drainState = 'serving'; // 'serving' → 'draining' → 'closed', or back to 'serving' on a revert
   let handoverRun = null;
@@ -1245,6 +1297,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         return originalEnd(chunk, encoding, callback);
       };
       let routeKind = null, routeReason = null, recorded = false, performanceSample = null;
+      let usageProvider = 'unknown', usageRequestedModel = null, usageReportedModel = null;
       const openPhases = new Set();
       const startPhase = phase => {
         const start = performance.now();
@@ -1342,6 +1395,21 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           // Exposed so a rate-limit answer stays visible to the dashboard (and to the circuit
           // work that will consume it); null means no usable Retry-After was seen.
           retryAfterMs: retryAfterHintMs };
+        // Count logical messages only; token counting is a different API operation.
+        if (!req.url.startsWith('/v1/messages/count_tokens')) {
+          const ok = !aborted && !responseFailed && res.statusCode < 400;
+          const validTokens = n => Number.isSafeInteger(n) && n >= 0 && n <= 2**31 - 1 ? n : null;
+          const inputTokens = ok && routeKind === 'external' ? validTokens(performanceSample?.inputTokens) : null;
+          const outputTokens = ok && routeKind === 'external' ? validTokens(performanceSample?.outputTokens) : null;
+          const measured = inputTokens !== null || outputTokens !== null;
+          appendUsage({ timestamp: new Date().toISOString(), provider: usageProvider,
+            requested_model: usageModel(usageRequestedModel),
+            reported_model: ok ? usageModel(usageReportedModel) : null,
+            usage_measured: Boolean(measured),
+            input_tokens: inputTokens,
+            output_tokens: outputTokens,
+            status: aborted ? 'aborted' : ok ? 'ok' : 'failed', elapsed_ms: elapsed });
+        }
         scheduleMetricsFlush();
       };
       res.on('finish', () => recordRequest(false));
@@ -1403,6 +1471,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         // The model that actually serves a Plan request may differ from the client alias.
         const planModel = model === DEEPSEEK || altRequested
           || (configuredAlias && !isPro(model) && !isSonnet(model)) ? fallbackModel : model;
+        usageProvider = 'plan'; usageRequestedModel = planModel; usageReportedModel = null;
         noteRoute('plan', reason);
         logEvent({ event: 'route_selected', provider: 'plan', reason, ...(detail ? { detail } : {}),
           model: planModel,
@@ -1567,6 +1636,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         const logReplacement = () => {
           if (routeLogged) return;
           routeLogged = true;
+          usageProvider = target.name;
+          usageRequestedModel = target.name === 'cli' ? cliRequestedModel : target.model;
           logEvent({ event: 'route_selected', provider: target.name, reason: 'replacement', model: provider === 'cli' ? cliReportedModel : externalModel });
           noteRoute('external', 'replacement');
         };
@@ -1681,16 +1752,16 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               // shortcut: textual match can false-positive on a tool_use input object containing this literal; refine if seen.
               if (!validated.streamed && !compatProfile && !localOnly && /"type"\s*:\s*"(?:redacted_thinking|thinking|thinking_delta|signature_delta)"/.test(validated.text))
                 throw new Error('Thinking response in ordinary mode');
-              // Only complete JSON replies carry directly verifiable usage here; SSE and
-              // CLI bridge placeholders do not imply measured output tokens.
+              // SSE usage is available only after the complete stream validates. CLI bridge
+              // placeholders are never measurements unless the bridge confirms them.
               let inputTokens = null, outputTokens = null;
-              if (validated.contentType === 'application/json' &&
-                  (target.name !== 'cli' || response.headers.get('x-cli-usage-measured') === 'true')) {
-                const usage = JSON.parse(validated.text).usage;
+              if (target.name !== 'cli' || response.headers.get('x-cli-usage-measured') === 'true') {
+                const usage = validated.contentType === 'application/json' ? JSON.parse(validated.text).usage : validated.usage;
                 if (Number.isSafeInteger(usage?.input_tokens) && usage.input_tokens >= 0) inputTokens = usage.input_tokens;
                 if (Number.isSafeInteger(usage?.output_tokens) && usage.output_tokens >= 0) outputTokens = usage.output_tokens;
               }
               const result = forceJson && body.stream === true ? jsonMessageStream(validated.text, !compatProfile) : validated;
+              result.reportedModel = validated.reportedModel;
               result.outputTokens = outputTokens;
               result.inputTokens = inputTokens;
               if (provider === 'cli') {
@@ -1713,6 +1784,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               cliReportedModel = publicMetricModel(response.cliReportedModel);
               cliUsageMeasured = response.cliUsageMeasured === true;
             }
+            usageReportedModel = target.name === 'cli' ? response.cliReportedModel : response.reportedModel;
             logReplacement();
             performanceSample = { provider: target.name, inputTokens: response.inputTokens ?? null,
               outputTokens: response.outputTokens ?? null, cliProcessMs: response.cliProcessMs ?? null };
@@ -1840,6 +1912,11 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     server.headersTimeout = requestIdleTimeoutMs;
     server.connectionsCheckingInterval = Math.min(requestIdleTimeoutMs, 1000);
   }
+  if (metricsPath || instanceMetricsPath) server.once('close', () => {
+    if (flushTimer) clearTimeout(flushTimer);
+    flushMetrics();
+    process.off('exit', flushMetrics);
+  });
   return server;
 }
 
@@ -1851,11 +1928,14 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     attemptTimeoutMs: process.env.SONNET_PROVIDER === 'cli' ? (Number(process.env.CLI_TIMEOUT_S) || 60) * 1000 : undefined,
     localOnly: process.env.LOCAL_ROUTE_ONLY === '1', localCompat: process.env.LOCAL_ROUTE_COMPAT === '1', openrouterCompat: process.env.OPENROUTER_ROUTE_COMPAT === '1', localHttpUrl: process.env.LOCAL_LLM_HTTP_URL, localAllowRemote: process.env.LOCAL_LLM_ALLOW_REMOTE === 'true',
     metricsPath: process.env.ROUTE_METRICS_PATH,
+    instanceId: process.env.ROUTE_INSTANCE_ID,
+    instanceMetricsPath: process.env.ROUTE_INSTANCE_METRICS_PATH,
+    usageEventsPath: process.env.ROUTE_USAGE_EVENTS_PATH,
     altProvider: process.env.ROUTE_ALT_PROVIDER || null, altModel: process.env.ROUTE_ALT_MODEL, altUrl: process.env.ROUTE_ALT_URL,
     altKey: process.env.ROUTE_ALT_KEY, altAllowRemote: process.env.ROUTE_ALT_ALLOW_REMOTE === 'true', altHttpUrl: process.env.ROUTE_ALT_HTTP_URL,
     altAlias: process.env.ROUTE_ALT_ALIAS };
   for (const name of ['OPENROUTER_API_KEY', 'OPENROUTER_MODEL', 'LOCAL_ROUTE_TOKEN', 'LOCAL_ROUTE_ONLY', 'LOCAL_ROUTE_COMPAT', 'OPENROUTER_ROUTE_COMPAT', 'SONNET_PROVIDER', 'LOCAL_LLM_URL',
-    'LOCAL_LLM_MODEL', 'LOCAL_LLM_API_KEY', 'LOCAL_LLM_ALLOW_REMOTE', 'LOCAL_LLM_HTTP_URL', 'LOCAL_LLM_MODELS_URL', 'ROUTE_METRICS_PATH', 'ROUTE_ALT_PROVIDER', 'ROUTE_ALT_MODEL', 'ROUTE_ALT_URL',
+    'LOCAL_LLM_MODEL', 'LOCAL_LLM_API_KEY', 'LOCAL_LLM_ALLOW_REMOTE', 'LOCAL_LLM_HTTP_URL', 'LOCAL_LLM_MODELS_URL', 'ROUTE_METRICS_PATH', 'ROUTE_INSTANCE_ID', 'ROUTE_INSTANCE_METRICS_PATH', 'ROUTE_USAGE_EVENTS_PATH', 'ROUTE_ALT_PROVIDER', 'ROUTE_ALT_MODEL', 'ROUTE_ALT_URL',
     'ROUTE_ALT_KEY', 'ROUTE_ALT_ALLOW_REMOTE', 'ROUTE_ALT_HTTP_URL', 'ROUTE_ALT_ALIAS', 'CLI_KIND', 'CLI_MODEL', 'CLI_TIMEOUT_S']) delete process.env[name];
   if (process.argv.slice(2).includes('--check-connection')) {
     try {

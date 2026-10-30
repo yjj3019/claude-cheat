@@ -354,9 +354,11 @@ def write_json_state(path: Path, payload: dict) -> bool:
     Returns False when the state could not be written at all; temp files never survive.
     """
     text = json.dumps(payload)
-    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary = None
     try:
-        with temporary.open("w", encoding="utf-8") as handle:
+        descriptor, name = tempfile.mkstemp(prefix="." + path.name + ".", suffix=".tmp", dir=str(path.parent))
+        temporary = Path(name)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
@@ -370,12 +372,13 @@ def write_json_state(path: Path, payload: dict) -> bool:
         return False
     finally:
         try:
-            temporary.unlink()
+            if temporary is not None:
+                temporary.unlink()
         except OSError:
             pass
 
 
-def write_handoff(*, port, nonce, proxy_pid, provider, cli_pid, mode, dual=None):
+def write_handoff(*, port, nonce, proxy_pid, provider, cli_pid, mode, dual=None, instance_id=None, instance_dir=None):
     """Record the live route so another terminal can take it over without changing the port.
 
     ``dual`` is the non-secret alternate topology ({provider, alias, model}) an ordinary
@@ -389,6 +392,10 @@ def write_handoff(*, port, nonce, proxy_pid, provider, cli_pid, mode, dual=None)
     if dual:
         payload["dual"] = {"provider": dual["ROUTE_ALT_PROVIDER"], "alias": dual["ROUTE_ALT_ALIAS"],
                            "model": dual["ROUTE_ALT_MODEL"]}
+    if instance_id and instance_dir:
+        payload["instance_id"] = instance_id
+        if not write_json_state(instance_dir / "handoff.json", payload):
+            print(json.dumps({"event": "instance_handoff_unavailable"}), file=sys.stderr, flush=True)
     write_json_state(HANDOFF_FILE, payload)
 
 
@@ -408,6 +415,32 @@ def clear_handoff(*, proxy_pid):
         if current.get("proxy_pid") == proxy_pid:
             HANDOFF_FILE.unlink()
     except (OSError, ValueError):
+        pass
+
+
+def instance_directory(root, instance_id):
+    """Create one private session directory; never follow user-supplied links."""
+    if str(uuid.UUID(instance_id)) != instance_id:
+        raise ValueError("invalid_instance_id")
+    current = Path(root)
+    for part in (".usage-stats", "instances", instance_id):
+        current = current / part
+        if current.is_symlink() or getattr(current, "is_junction", lambda: False)():
+            raise ValueError("unsafe_instance_directory")
+        current.mkdir(mode=0o700, exist_ok=True)
+        if current.is_symlink() or getattr(current, "is_junction", lambda: False)():
+            raise ValueError("unsafe_instance_directory")
+    return current
+
+
+def clear_instance_handoff(instance_dir, proxy_pid):
+    """Remove only this launcher's own live pointer; retain observed usage data."""
+    try:
+        path = instance_dir / "handoff.json"
+        current = json.loads(path.read_text(encoding="utf-8"))
+        if current.get("proxy_pid") == proxy_pid:
+            path.unlink()
+    except (OSError, ValueError, AttributeError):
         pass
 
 
@@ -633,6 +666,15 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
     proxy_env.update(config, LOCAL_ROUTE_TOKEN=nonce, LOCAL_ROUTE_ONLY="1" if local_only else "0")
     if dual:
         proxy_env.update(dual)
+    instance_id, instance_dir = str(uuid.uuid4()), None
+    try:
+        instance_dir = instance_directory(ROOT, instance_id)
+        proxy_env.update(ROUTE_INSTANCE_ID=instance_id,
+                         ROUTE_INSTANCE_METRICS_PATH=str(instance_dir / "metrics.json"),
+                         ROUTE_USAGE_EVENTS_PATH=str(instance_dir / "events.jsonl"))
+    except (OSError, ValueError):
+        # Monitoring must not prevent the original model session from starting.
+        print(json.dumps({"event": "instance_monitoring_unavailable"}), file=sys.stderr, flush=True)
     if provider in {"openrouter", "local", "cli"}:
         # Keep routing decisions for later diagnosis; -Debug only shows them live in the terminal.
         proxy_env["ROUTE_LOG_PATH"] = str(ROOT / ".route.log")
@@ -693,11 +735,14 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
         # Remember the live route so a second terminal can take it over without the CLI noticing.
         mode = "openrouter_compat" if openrouter_compat else "local_compat" if local_compat else "local_only" if local_only else "ordinary"
         write_handoff(port=port, nonce=nonce, proxy_pid=proxy.pid, provider=provider,
-                      cli_pid=os.getpid(), dual=dual, mode=mode)
+                      cli_pid=os.getpid(), dual=dual, mode=mode,
+                      instance_id=instance_id if instance_dir else None, instance_dir=instance_dir)
         yield env
     finally:
         log_route_marker(f"launcher exit pid={os.getpid()}")
         clear_handoff(proxy_pid=proxy.pid)
+        if instance_dir is not None:
+            clear_instance_handoff(instance_dir, proxy.pid)
         proxy.terminate()
         try:
             proxy.wait(timeout=5)
@@ -947,6 +992,27 @@ def validate_original_sonnet(env, native_args):
             raise LauncherArgumentsError("original_sonnet_settings_routing_conflict")
 
 
+def original_sonnet_advisor(command, env, native_args):
+    """Request Opus advisor only when the installed Claude version is known to support it."""
+    if any(value.split("=", 1)[0] == "--advisor" for value in native_args):
+        return []  # Explicit user selection (including off) takes precedence.
+    if env.get("CLAUDE_CODE_DISABLE_ADVISOR_TOOL") == "1":
+        print("[Claude-Cheat] Advisor is disabled by the existing environment setting.", file=sys.stderr)
+        return []
+    try:
+        result = routeCli.probe_version(command, routeCli.child_env("claude", env))
+        version = result.get("version") if result.get("ok") else None
+        if not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+", version):
+            raise ValueError("unknown_version")
+        if tuple(int(x) for x in version.split(".")) < (2, 1, 260):
+            raise ValueError("unsupported_version")
+    except (ValueError, TypeError, OSError, routeCli.CliError):
+        print("[Claude-Cheat] Opus advisor was not enabled: Claude Code version could not be verified as 2.1.260 or newer.", file=sys.stderr)
+        return []
+    print("[Claude-Cheat] Requesting Opus advisor; availability depends on Claude, account and policy and may use additional tokens.", file=sys.stderr)
+    return ["--advisor", "opus"]
+
+
 def validate_claude_args(values, *, local_only=False, compat=False, print_prompt=None):
     if not isinstance(values, (list, tuple)) or any(not isinstance(value, str) or "\0" in value for value in values):
         raise LauncherArgumentsError("invalid_cli_arguments")
@@ -1006,7 +1072,8 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
         env = os.environ.copy()
         validate_original_sonnet(env, native_args)
         print("Original Sonnet: direct Claude Code session; proxy metrics are not available.")
-        command = routeCli.resolve_command(claude) + ["--model", "sonnet"]
+        executable = routeCli.resolve_command(claude)
+        command = executable + ["--model", "sonnet"] + original_sonnet_advisor(executable, env, native_args)
         recording = prepare_blackbox_hook(env, native_args)
         if recording:
             session_id, hooks = recording
