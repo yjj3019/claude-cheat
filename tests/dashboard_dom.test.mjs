@@ -20,6 +20,7 @@ function fakeElement(id = '') {
     dataset: {}, style: {}, children: [],
     classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
     appendChild(child) { element.children.push(child); return child; },
+    prepend(child) { element.children.unshift(child); return child; },
     remove() {}, addEventListener() {}, removeEventListener() {},
     querySelectorAll: () => [], querySelector: () => null, closest: () => null,
     contains: () => false, dispatchEvent() {}, attributes: {},
@@ -28,7 +29,7 @@ function fakeElement(id = '') {
   return element;
 }
 
-function buildContext() {
+function buildContext(hash = '#token=test-token') {
   const nodes = new Map();
   const get = id => {
     if (!nodes.has(id)) nodes.set(id, fakeElement(id));
@@ -44,6 +45,8 @@ function buildContext() {
   };
   return {
     nodes, document, window: { addEventListener() {} },
+    location: { hash, pathname: '/', search: '' },
+    history: { replaceState() {} },
     fetch: async () => ({ ok: true, json: async () => ({}) }),
     setInterval: () => 0, clearInterval() {}, setTimeout: () => 0, clearTimeout() {},
     console, navigator: { clipboard: { writeText: async () => {} } }, Event: class {},
@@ -1316,4 +1319,37 @@ test('recording loss and unknown recording status are visible', () => {
   assert.match(context.nodes.get('usage-grid').innerHTML,/누락 2 · 오류 1 · 대기 3/);
   sandbox.renderUsage(payload(null));assert.match(context.nodes.get('usage-status').textContent,/누락/);
   assert.match(context.nodes.get('usage-grid').innerHTML,/기록 상태 미보고/);
+});
+
+test('write token is read from the URL fragment and removed from the address bar', () => {
+  const context = buildContext('#token=abc123_-X');
+  let replaced = 0;
+  context.history.replaceState = () => { replaced += 1; };
+  const sandbox = { ...context, globalThis: null };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(scriptBundle(), sandbox, { filename: 'dashboard.js' });
+  assert.equal(vm.runInContext('TOKEN', sandbox), 'abc123_-X');
+  assert.equal(replaced, 1);
+  const bare = buildContext('');
+  const bareSandbox = { ...bare, globalThis: null };
+  bareSandbox.globalThis = bareSandbox;
+  vm.createContext(bareSandbox);
+  vm.runInContext(scriptBundle(), bareSandbox, { filename: 'dashboard.js' });
+  assert.equal(vm.runInContext('TOKEN', bareSandbox), '');
+});
+
+test('a route-log model id is escaped before it reaches the connection summary', () => {
+  const nodes = render(fixture({
+    active_session: { provider: 'local', started: '2026-10-25T07:00:00+00:00' },
+    proxy_metrics: { startedAt: '2026-10-25T07:00:00+00:00', requests: 1, ok: 1, failed: 0,
+      routes: { external: 1, plan: 0 }, configuration: { provider: 'local' } },
+    routing: {
+      ...fixture().routing,
+      providers: { local: { requests: 1, failures: 0, last_model: '<img src=x onerror=alert(1)>' } },
+    },
+  }));
+  const html = nodes.get('grid').innerHTML;
+  assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  assert.doesNotMatch(html, /<img src=x onerror/);
 });

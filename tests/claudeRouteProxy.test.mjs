@@ -1789,3 +1789,76 @@ test('SSE frame whose event name differs from its JSON type is rejected', async 
   assert.equal(calls.filter(call => call.url === externalURL).length, 4);
   assert.equal(calls.at(-1).url, proURL);
 });
+
+test('requests above the configured concurrency limit are rejected with retry-after', async t => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  let called = 0;
+  const { server } = await fixture(t, async (url, options) => {
+    called += 1;
+    await gate;
+    return jsonResponse(url, options);
+  }, { maxConcurrentRequests: 1 });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const send = () => fetch(base + '/v1/messages', { method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-local-route-token': NONCE },
+    body: JSON.stringify(requestBody()) });
+  const first = send();
+  while (called === 0) await new Promise(resolve => setTimeout(resolve, 10));
+  const second = await send();
+  assert.equal(second.status, 429);
+  assert.equal(second.headers.get('retry-after'), '1');
+  assert.equal(second.headers.get('cache-control'), 'no-store');
+  assert.equal(second.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(second.headers.get('x-frame-options'), 'DENY');
+  assert.match((await second.json()).error.message, /route_busy/);
+  release();
+  const firstResponse = await first;
+  assert.equal(firstResponse.status, 200);
+  await firstResponse.text();
+});
+
+test('aggregate in-flight body bytes are bounded before buffering', async t => {
+  const { request } = await fixture(t, jsonResponse, { maxInflightBytes: 512 });
+  const raw = JSON.stringify({ ...requestBody(), padding: 'x'.repeat(2000) });
+  const response = await request(undefined, { raw });
+  assert.equal(response.status, 503);
+  assert.equal(response.headers.get('retry-after'), '1');
+  assert.match((await response.json()).error.message, /inflight_budget/);
+});
+
+test('an upload that never finishes is cut by the absolute body deadline', async t => {
+  const log = t.mock.method(console, 'error', () => {});
+  const { server } = await fixture(t, jsonResponse, { requestTotalTimeoutMs: 150, requestIdleTimeoutMs: 30000 });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('{"model":"x","messages":['));
+    },
+  });
+  const abort = new AbortController();
+  const pending = fetch(base + '/v1/messages', { method: 'POST', duplex: 'half', signal: abort.signal,
+    headers: { 'content-type': 'application/json', 'x-local-route-token': NONCE }, body });
+  await assert.rejects(pending);
+  abort.abort();
+  assert.ok(log.mock.calls.some(call => JSON.parse(call.arguments[0]).event === 'client_body_total_timeout'),
+    'the total deadline is observable in the route log');
+});
+
+test('the listener applies the configured connection and keep-alive limits', async t => {
+  const { server } = await fixture(t, jsonResponse, { maxConnections: 7 });
+  assert.equal(server.maxConnections, 7);
+  assert.equal(server.keepAliveTimeout, 5000);
+});
+
+test('rejected requests still carry the browser hardening headers', async t => {
+  const { server } = await fixture(t);
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/v1/messages`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-local-route-token': 'wrong' },
+    body: JSON.stringify(requestBody()) });
+  assert.equal(response.status, 403);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(response.headers.get('referrer-policy'), 'no-referrer');
+  assert.equal(response.headers.get('x-frame-options'), 'DENY');
+});

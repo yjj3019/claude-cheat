@@ -180,7 +180,9 @@ if (routeLogPath) {
     try {
       // Check before writing so the line that triggers the rotation lands in the new file.
       if (writes % 200 === 0) rotate();
-      appendFileSync(routeLogPath, `${new Date().toISOString()} ${args.join(' ')}\n`);
+      // stderr already received the redacted copy from the single sink; the mirror must not
+      // become the unredacted side channel, so it runs the same pass over the joined text.
+      appendFileSync(routeLogPath, `${new Date().toISOString()} ${redactDiagnostic(args.join(' '))}\n`);
       writes += 1;
     } catch {}
   };
@@ -282,6 +284,18 @@ function validContentBlock(block) {
 }
 
 const MAX_RESPONSE = 32 * 1024 * 1024;
+// Token counting carries a model and a prompt, not a full turn; a smaller per-request cap
+// keeps a burst of count_tokens calls from consuming the shared in-flight byte budget.
+const COUNT_TOKENS_MAX_RESPONSE = 4 * 1024 * 1024;
+// Every reject path and the two diagnostic endpoints answer with the same browser-hardening
+// headers. A routed response is never cacheable.
+const SECURITY_HEADERS = {
+  'cache-control': 'no-store',
+  'x-content-type-options': 'nosniff',
+  'referrer-policy': 'no-referrer',
+  'x-frame-options': 'DENY',
+};
+const KEEP_ALIVE_TIMEOUT_MS = 5000;
 const BASIC_FIELDS = new Set(['model', 'messages', 'max_tokens', 'system', 'stream', 'temperature',
   'top_p', 'top_k', 'stop_sequences', 'tools', 'tool_choice', 'metadata', 'thinking', 'output_config', 'safeguards', 'cache_control']);
 const CONTENT_FIELDS = {
@@ -858,6 +872,19 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   // Idle, not total: a client may send for minutes as long as it keeps sending. 0 disables it.
   requestIdleTimeoutMs = Number.isFinite(Number(process.env.ROUTE_REQUEST_IDLE_TIMEOUT_MS))
     ? Number(process.env.ROUTE_REQUEST_IDLE_TIMEOUT_MS) : 30000,
+  // Absolute cap on a request body upload. The idle timer bounds a stalled peer; this bounds
+  // a peer that keeps trickling bytes and would otherwise pin a turn indefinitely. It stays
+  // below the 120s handover cap so a trickling upload cannot cause a handover revert.
+  requestTotalTimeoutMs = Number.isFinite(Number(process.env.ROUTE_REQUEST_TOTAL_TIMEOUT_MS))
+    ? Number(process.env.ROUTE_REQUEST_TOTAL_TIMEOUT_MS) : 60000,
+  // Bounded admission before any message body is buffered: the semaphore bounds concurrent
+  // turns and the byte budget bounds their aggregate bodies.
+  maxConcurrentRequests = Number.isFinite(Number(process.env.ROUTE_MAX_CONCURRENT_REQUESTS))
+    ? Number(process.env.ROUTE_MAX_CONCURRENT_REQUESTS) : 8,
+  maxInflightBytes = Number.isFinite(Number(process.env.ROUTE_MAX_INFLIGHT_BYTES))
+    ? Number(process.env.ROUTE_MAX_INFLIGHT_BYTES) : 64 * 1024 * 1024,
+  maxConnections = Number.isFinite(Number(process.env.ROUTE_MAX_CONNECTIONS))
+    ? Number(process.env.ROUTE_MAX_CONNECTIONS) : 64,
   // A provider may ask for a long wait, but a CLI turn must not freeze for minutes: retries
   // wait at most this long and the full hint reaches the client as Retry-After instead.
   retryMaxWaitMs = Number.isFinite(Number(process.env.ROUTE_RETRY_MAX_WAIT_MS))
@@ -918,6 +945,17 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     if (!Number.isFinite(value) || value < 0) throw new Error('Invalid routing timeout');
   if (!Number.isFinite(requestIdleTimeoutMs) || requestIdleTimeoutMs < 0) throw new Error('Invalid request idle timeout');
   if (!Number.isFinite(retryMaxWaitMs) || retryMaxWaitMs < 0) throw new Error('Invalid retry wait');
+  // Env values are clamped so a typo cannot disable the limiter or exhaust the host. The
+  // upper bounds are deliberately generous: they are safety rails, not routing policy.
+  const boundedLimit = (value, min, max, name) => {
+    const number = Number(value);
+    if (!Number.isFinite(number)) throw new Error(`Invalid ${name}`);
+    return Math.min(Math.max(Math.trunc(number), min), max);
+  };
+  requestTotalTimeoutMs = boundedLimit(requestTotalTimeoutMs, 0, 10 * 60 * 1000, 'request total timeout');
+  maxConcurrentRequests = boundedLimit(maxConcurrentRequests, 1, 64, 'request concurrency limit');
+  maxInflightBytes = boundedLimit(maxInflightBytes, 1, 1024 * 1024 * 1024, 'in-flight byte limit');
+  maxConnections = boundedLimit(maxConnections, 1, 1024, 'connection limit');
   if (!Number.isSafeInteger(localConcurrency) || localConcurrency < 1 || localConcurrency > 64 ||
       !Number.isSafeInteger(localQueueLimit) || localQueueLimit < 0 || localQueueLimit > 256 ||
       !Number.isFinite(localQueueWaitMs) || localQueueWaitMs < 0 || localQueueWaitMs > 60000)
@@ -1085,6 +1123,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     requests: metrics.requests, ok: metrics.ok, failed: metrics.failed,
     // Accepted message requests (including body upload), excluding diagnostics/metrics.
     inflightRequests: inflight,
+    requestAdmission: { active: requestActive, max: maxConcurrentRequests, inflightBytes,
+      maxInflightBytes, rejected: requestAdmissionRejected },
     streams: metrics.streams, attempts: metrics.attempts, retries: metrics.retries,
     routes: { ...metrics.routes }, externalAttempts: metrics.externalAttempts, aborted: metrics.aborted,
     reasons: { ...metrics.reasons },
@@ -1127,6 +1167,30 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   };
   if (metricsPath || instanceMetricsPath) process.once('exit', flushMetrics);
   let inflight = 0;
+  // Admission is claimed before a message body is buffered: the semaphore bounds turns that
+  // are concurrently parsing/routing, and the byte budget bounds their combined bodies.
+  let requestActive = 0, inflightBytes = 0, requestAdmissionRejected = 0;
+  const acquireRequestAdmission = () => {
+    if (requestActive >= maxConcurrentRequests) { requestAdmissionRejected += 1; return null; }
+    requestActive += 1;
+    let bytes = 0, released = false;
+    return {
+      wouldExceed: amount => inflightBytes + amount > maxInflightBytes,
+      reserve: amount => {
+        if (inflightBytes + amount > maxInflightBytes) return false;
+        bytes += amount;
+        inflightBytes += amount;
+        return true;
+      },
+      release: () => {
+        if (released) return;
+        released = true;
+        requestActive -= 1;
+        inflightBytes -= bytes;
+        if (inflightBytes < 0) inflightBytes = 0;
+      },
+    };
+  };
   let drainState = 'serving'; // 'serving' → 'draining' → 'closed', or back to 'serving' on a revert
   let handoverRun = null;
   // Drain in-flight turns, then close the listener so a fresh proxy can bind the same
@@ -1178,17 +1242,20 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       } };
   };
   const server = http.createServer(async (req, res) => {
+    let releaseAdmission = null;
     const reject = (status, message, headers) => {
+      // Every reject path returns the admission permit, including a body-budget rejection.
+      releaseAdmission?.();
       if (res.destroyed) return;
       if (res.headersSent) return res.destroy();
-      res.writeHead(status, { 'content-type': 'application/json', ...headers });
+      res.writeHead(status, { ...SECURITY_HEADERS, 'content-type': 'application/json', ...headers });
       // Keep Anthropic's error vocabulary: a rate limit is not a generic API failure.
       const type = status === 429 ? 'rate_limit_error' : status === 529 ? 'overloaded_error' : 'api_error';
       // A message assembled from upstream text passes the same redaction as the logs.
       res.end(JSON.stringify({ type: 'error', error: { type, message: redactDiagnostic(String(message), secrets) } }));
     };
     if (!tokenMatches(req.headers['x-local-route-token'])) return reject(403, 'Local authorization required');
-    if (req.method === 'HEAD' && req.url === '/api/hello') { res.writeHead(200); res.end(); return; }
+    if (req.method === 'HEAD' && req.url === '/api/hello') { res.writeHead(200, SECURITY_HEADERS); res.end(); return; }
     if (req.method === 'POST' && req.url === '/api/handover') {
       // Older launchers do not preserve isolated-session flags. Never let them replace
       // a no-Plan proxy with an ordinary proxy that could route to Plan.
@@ -1222,11 +1289,20 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       return res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'Proxy is handing over' } }));
     }
     if (req.method === 'GET' && /^\/api\/metrics(?:\?.*)?$/.test(req.url)) {
-      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+      res.writeHead(200, { ...SECURITY_HEADERS, 'content-type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify(metricsSnapshot()));
       return;
     }
     if (req.method !== 'POST' || !/^\/v1\/messages(?:\/count_tokens)?(?:\?beta=true)?$/.test(req.url)) return reject(403, 'Endpoint blocked');
+    // Claim admission before a single body byte is buffered. Diagnostics and handover above
+    // stay outside the limiter so a full route cannot hide the proxy's own health endpoints.
+    const admission = acquireRequestAdmission();
+    if (!admission) {
+      return reject(429, '[route_busy] Proxy request concurrency limit reached. Retry shortly.', { 'retry-after': '1' });
+    }
+    releaseAdmission = admission.release;
+    const countTokens = req.url.startsWith('/v1/messages/count_tokens');
+    const bodyCap = countTokens ? COUNT_TOKENS_MAX_RESPONSE : MAX_RESPONSE;
     const client = new AbortController();
     let recordRequest = () => {}, responseFailed = false;
     // A request owns one inflight slot until it is released. An early rejection (bad JSON,
@@ -1240,6 +1316,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       if (inflight > 0) inflight -= 1;
     };
     res.on('close', () => {
+      releaseAdmission?.();
       if (!res.writableFinished) {
         recordRequest(true);
         client.abort('client_close');
@@ -1261,15 +1338,17 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       const chunks = [];
       let size = 0;
       // A client that stalls mid-body must not hold its turn: Node's default requestTimeout
-      // (300s) is longer than the handover cap, so a drain could never finish. The timer is
-      // idle-based and re-armed per chunk, so a slow but live upload is never cut short.
-      let idleTimer = null, bodyTimedOut = false;
+      // (300s) is longer than the handover cap, so a drain could never finish. The idle timer
+      // is re-armed per chunk, so a slow but live upload is never cut short.
+      let idleTimer = null, totalTimer = null, bodyTimedOut = false;
       const clearIdle = () => { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; } };
+      const clearTotal = () => { if (totalTimer) { clearTimeout(totalTimer); totalTimer = null; } };
       const armIdle = () => {
         if (!requestIdleTimeoutMs) return;
         clearTimeout(idleTimer);
         idleTimer = setTimeout(() => {
           idleTimer = null;
+          clearTotal();
           bodyTimedOut = true;
           // A self-timeout is not peer interference, so it gets its own event and is
           // counted as an aborted request instead of vanishing with the socket.
@@ -1282,16 +1361,45 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         }, requestIdleTimeoutMs);
         idleTimer.unref?.();
       };
+      // The idle timer alone lets a peer trickle one byte before every deadline and pin the
+      // turn forever. This absolute deadline bounds the whole upload regardless of progress.
+      const armTotal = () => {
+        if (!requestTotalTimeoutMs) return;
+        totalTimer = setTimeout(() => {
+          totalTimer = null;
+          clearIdle();
+          bodyTimedOut = true;
+          metrics.aborted += 1;
+          metrics.failed += 1;
+          scheduleMetricsFlush();
+          logEvent({ event: 'client_body_total_timeout', provider, total_ms: requestTotalTimeoutMs });
+          client.abort('client_body_total_timeout');
+          req.destroy();
+        }, requestTotalTimeoutMs);
+        totalTimer.unref?.();
+      };
       armIdle();
+      armTotal();
       try {
+        const declaredLength = Number(req.headers['content-length']);
+        // Reject an oversized declaration before reading a byte; the per-chunk checks below
+        // remain the authority for chunked bodies and for a lying Content-Length.
+        if (Number.isFinite(declaredLength) && declaredLength > bodyCap) return reject(413, 'Request too large');
+        if (Number.isFinite(declaredLength) && declaredLength > 0 && admission.wouldExceed(declaredLength))
+          return reject(503, '[inflight_budget] Proxy in-flight request byte budget is exhausted. Retry shortly.',
+            { 'retry-after': '1' });
         for await (const chunk of req) {
           armIdle();
           size += chunk.length;
-          if (size > MAX_RESPONSE) return reject(413, 'Request too large');
+          if (size > bodyCap) return reject(413, 'Request too large');
+          if (!admission.reserve(chunk.length))
+            return reject(503, '[inflight_budget] Proxy in-flight request byte budget is exhausted. Retry shortly.',
+              { 'retry-after': '1' });
           chunks.push(chunk);
         }
       } finally {
         clearIdle();
+        clearTotal();
       }
       // A destroyed request may still end the iterator cleanly; never route a partial body.
       if (bodyTimedOut) return;
@@ -1441,7 +1549,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         }
         scheduleMetricsFlush();
       };
-      res.on('finish', () => recordRequest(false));
+      res.on('finish', () => { releaseAdmission?.(); recordRequest(false); });
       const compatAlias = compatProfile && ['sonnet', 'opus', 'haiku', 'fable'].includes(model);
       const configuredAlias = provider === 'openrouter' && model === openrouterModel;
       const altRequested = altExternalUrl !== null && model === altAlias;
@@ -1545,11 +1653,11 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           const scrubbed = redactDiagnostic(errorBody, secrets);
           const redacted = scrubbed !== errorBody;
           if (truncated || redacted) {
+            // Only size metadata is logged: the provider body never reaches the sink, even
+            // after scrubbing, so a future redaction gap cannot leak upstream text.
             logEvent({ event: truncated ? 'upstream_error_truncated' : 'upstream_error_redacted',
               provider: 'plan', status: upstream.status,
-              ...(truncated ? { truncated: true, bytes: MAX_ERROR_BODY } : {}),
-              // The excerpt goes to the logging sink raw; the sink performs the redaction.
-              ...(redacted ? { excerpt: errorBody.slice(0, 512) } : {}) });
+              ...(truncated ? { truncated: true, bytes: MAX_ERROR_BODY } : { bytes: Buffer.byteLength(errorBody) }) });
           }
           res.writeHead(upstream.status, responseHeaders);
           res.end(scrubbed);
@@ -1939,6 +2047,12 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       }
     }
   });
+  // Bound the listener itself: one client cannot open an unbounded number of sockets, and
+  // idle keep-alive sockets are reclaimed quickly so a handover can close the listener and a
+  // replacement bind the same port. Node drops sockets beyond maxConnections before they
+  // reach the request handler, so an over-cap connection is torn down rather than queued.
+  server.maxConnections = maxConnections;
+  server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
   // A stalled header never reaches the request handler, so it is bounded by the server's
   // own header timeout; Node checks it on a coarse interval, which must shrink with the cap.
   if (requestIdleTimeoutMs > 0) {
@@ -1966,12 +2080,17 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     instanceId: process.env.ROUTE_INSTANCE_ID,
     instanceMetricsPath: process.env.ROUTE_INSTANCE_METRICS_PATH,
     usageEventsPath: process.env.ROUTE_USAGE_EVENTS_PATH,
+    maxConcurrentRequests: process.env.ROUTE_MAX_CONCURRENT_REQUESTS || undefined,
+    maxInflightBytes: process.env.ROUTE_MAX_INFLIGHT_BYTES || undefined,
+    requestTotalTimeoutMs: process.env.ROUTE_REQUEST_TOTAL_TIMEOUT_MS || undefined,
+    maxConnections: process.env.ROUTE_MAX_CONNECTIONS || undefined,
     altProvider: process.env.ROUTE_ALT_PROVIDER || null, altModel: process.env.ROUTE_ALT_MODEL, altUrl: process.env.ROUTE_ALT_URL,
     altKey: process.env.ROUTE_ALT_KEY, altAllowRemote: process.env.ROUTE_ALT_ALLOW_REMOTE === 'true', altHttpUrl: process.env.ROUTE_ALT_HTTP_URL,
     altAlias: process.env.ROUTE_ALT_ALIAS };
   for (const name of ['OPENROUTER_API_KEY', 'OPENROUTER_MODEL', 'OPENROUTER_UPSTREAM_PROVIDER', 'LOCAL_ROUTE_TOKEN', 'LOCAL_ROUTE_ONLY', 'LOCAL_ROUTE_COMPAT', 'OPENROUTER_ROUTE_COMPAT', 'SONNET_PROVIDER', 'LOCAL_LLM_URL',
     'LOCAL_LLM_MODEL', 'LOCAL_LLM_API_KEY', 'LOCAL_LLM_ALLOW_REMOTE', 'LOCAL_LLM_HTTP_URL', 'LOCAL_LLM_MODELS_URL', 'ROUTE_METRICS_PATH', 'ROUTE_INSTANCE_ID', 'ROUTE_INSTANCE_METRICS_PATH', 'ROUTE_USAGE_EVENTS_PATH', 'ROUTE_ALT_PROVIDER', 'ROUTE_ALT_MODEL', 'ROUTE_ALT_URL',
-    'ROUTE_ALT_KEY', 'ROUTE_ALT_ALLOW_REMOTE', 'ROUTE_ALT_HTTP_URL', 'ROUTE_ALT_ALIAS', 'ROUTE_ALT_UPSTREAM_PROVIDER', 'CLI_KIND', 'CLI_MODEL', 'CLI_TIMEOUT_S']) delete process.env[name];
+    'ROUTE_ALT_KEY', 'ROUTE_ALT_ALLOW_REMOTE', 'ROUTE_ALT_HTTP_URL', 'ROUTE_ALT_ALIAS', 'ROUTE_ALT_UPSTREAM_PROVIDER', 'CLI_KIND', 'CLI_MODEL', 'CLI_TIMEOUT_S',
+    'ROUTE_MAX_CONCURRENT_REQUESTS', 'ROUTE_MAX_INFLIGHT_BYTES', 'ROUTE_REQUEST_TOTAL_TIMEOUT_MS', 'ROUTE_MAX_CONNECTIONS']) delete process.env[name];
   if (process.argv.slice(2).includes('--check-connection')) {
     try {
       const result = await checkConnection(config);

@@ -204,12 +204,13 @@ test('a credential in an upstream error body is redacted in the client body and 
     const allLogs = logs.lines.join('\n');
     for (const secret of [bearerSecret, bodySecret, CONFIGURED_KEY])
       assert.equal(allLogs.includes(secret), false, `a log line leaked ${secret}`);
-    assert.match(allLogs, /\[redacted:(?:bearer-token|api-key|provider-key)\]/);
-    // The scrubbed excerpt passes the sink again; a tag already present must not be masked twice.
+    // The upstream body is no longer logged, even scrubbed: only byte metadata survives.
     assert.equal(allLogs.includes('[redacted:bearer-token]]'), false, 'no double-masking artifact in logs');
     assert.equal(allLogs.includes('[[redacted'), false);
-    assert.ok(logs.entries().some(entry => entry.event === 'upstream_error_redacted'),
-      'the scrubbed excerpt is logged for triage');
+    const redactedEvent = logs.entries().find(entry => entry.event === 'upstream_error_redacted');
+    assert.ok(redactedEvent, 'the scrubbed error is logged for triage');
+    assert.equal(redactedEvent.excerpt, undefined, 'the raw upstream excerpt is never logged');
+    assert.ok(Number.isInteger(redactedEvent.bytes) && redactedEvent.bytes > 0, 'only byte metadata is logged');
     // Non-secret context survives so the log stays useful.
     assert.match(clientBody, /rate_limit_error/);
   });
@@ -254,7 +255,7 @@ test('mixed secret and pre-tagged text keeps a single stable tag per value',
     assert.equal(text.includes('[[redacted'), false);
   });
 
-test('the logging sink redacts an unscrubbed excerpt before it is written',
+test('an upstream error is logged as size metadata, never as a raw excerpt',
   { timeout: 15000 }, async t => {
     const logs = captureConsole(t);
     const secret = 'sk-or-v1-SINK-SECRET';
@@ -267,15 +268,15 @@ test('the logging sink redacts an unscrubbed excerpt before it is written',
     const response = await proxy.send();
     assert.equal(response.status, 429);
     await response.text();
-    // The proxy hands the raw excerpt to the sink; only the sink may scrub the written line.
+    // The body is scrubbed for the client but only its size reaches the log.
     const line = logs.lines.find(text => text.includes('"upstream_error_redacted"'));
-    assert.ok(line, 'the scrubbed excerpt is logged');
-    assert.equal(line.includes(secret), false, 'the sink removed the raw credential');
-    assert.match(line, /\[redacted:api-key\]/);
-    assert.equal(line.includes('[[redacted'), false);
+    assert.ok(line, 'the redacted error is logged');
+    assert.equal(line.includes(secret), false, 'the raw credential is not logged');
+    assert.equal(line.includes('excerpt'), false, 'no raw excerpt field is logged');
     const entry = JSON.parse(line);
     assert.match(entry.traceId, TRACE_ID);
-    assert.equal(entry.excerpt.includes(secret), false);
+    assert.equal(entry.excerpt, undefined);
+    assert.ok(Number.isInteger(entry.bytes) && entry.bytes > 0);
   });
 
 test('an oversized upstream error body is truncated and cancelled, never buffered in full',

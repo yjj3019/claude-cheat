@@ -112,7 +112,7 @@ If you install a global launcher separately, configuration is read beside its ta
 Configure OpenRouter once in the web console — it runs without a routing session and shows setup guidance while the settings are empty:
 
 ```powershell
-.\OpenClaudeDashboard.ps1        # http://127.0.0.1:8787/ (fixed port)
+.\OpenClaudeDashboard.ps1        # http://127.0.0.1:8787/ (use the printed write_url for writes)
 .\OpenClaude.ps1 -Setup           # starts the same dashboard and opens its settings page in the browser
 ```
 
@@ -329,7 +329,7 @@ The dashboard and settings share consistent colors, cards and controls with impr
 .\OpenClaudeDashboard.ps1
 ```
 
-A **loopback dashboard** bound to `127.0.0.1`. `GET` state reads are read-only; only authenticated `POST` actions (settings save, connection tests, black-box recording) mutate state. The port is **fixed at 8787**; an older dashboard instance is stopped automatically so the same port is reused. If another program holds that port the server fails with a message instead of silently moving; pass `--allow-port-fallback` to pick a free port instead.
+A **loopback dashboard** bound to `127.0.0.1`. `GET` state reads are read-only; only authenticated `POST` actions (settings save, connection tests, black-box recording) mutate state. The write token is never embedded in the page: it is handed out only through the `write_url` printed at startup (`http://127.0.0.1:8787/#token=…`), read from the fragment, and stripped from the address bar. A page opened without it stays read-only and shows a banner. The port is **fixed at 8787**; an older dashboard instance is stopped automatically so the same port is reused. If another program holds that port the server fails with a message instead of silently moving; pass `--allow-port-fallback` to pick a free port instead.
 
 Stopping a previous instance (including `python routeDashboard.py --stop`) happens **only when both the pid and the process creation time stored in `.dashboard.pid` match**. A recycled pid, our own or an ancestor process, or a legacy record without identity is refused with one line (`identity_mismatch` / `own_tree_pid` / `identity_unverifiable`) and the stale record is overwritten on the next start. Right after an upgrade, stop an older dashboard manually once (`Ctrl+C`) before starting. Non-Windows has no creation-time primitive, so the documented behavior is to refuse rather than signal a bare pid.
 
@@ -394,7 +394,7 @@ The page shows no key, prompt or request body. It writes only `openclaude.config
 
 ### Editing settings and testing connections
 
-Settings live on a **separate page** (`http://127.0.0.1:8787/settings`) reached from the top navigation; both pages share one server and session token.
+Settings live on a **separate page** (`http://127.0.0.1:8787/settings`) reached from the top navigation; both pages share one server and the write token from `write_url`.
 
 | Behaviour | Detail |
 | --- | --- |
@@ -403,8 +403,8 @@ Settings live on a **separate page** (`http://127.0.0.1:8787/settings`) reached 
 | Server addresses | The Messages, HTTP-exception and model-list URLs are masked like keys (`http://12•••••.1:11434/v1/messages`: only the first and last two host characters, `user:pass@` and queries hidden; a non-standard custom path becomes `/•••`). The original is never sent to the browser; empty keeps it |
 | Clear | Optional addresses (HTTP exception, model list) are erased with the **Clear** button (the `clear` list of `POST /api/config`). Required fields and keys cannot be cleared |
 | Validation | Model ID shape, key shape and Local URL rules (loopback, HTTPS, same origin) are checked before writing; a failure leaves the file untouched |
-| Protection | Both reading settings (`GET /api/config`) and saving them require the session token embedded in the page; POST also requires a same-origin request, so other sites cannot call it |
-| Tests | **Model check** reads the model list only; **inference test** sends one request with a 16-token OpenRouter or 512-token Local output limit (may incur costs or use server resources). Local verifies the selected model ID, exact `OK` reply, and normal completion |
+| Protection | Both reading settings (`GET /api/config`) and saving them require the write token delivered only via `write_url`, never embedded in the page; POST also requires a same-origin request, so other sites cannot call it |
+| Tests | **Model check** reads the model list only; **inference test** sends one request with a 16-token OpenRouter or 512-token Local output limit (may incur costs or use server resources). Local verifies the selected model ID, exact `OK` reply, and normal completion. Unsaved form values only contribute the model ID and timeout; addresses, API keys and CLI binaries always come from saved settings, and concurrent tests return `test_busy` |
 | Model picker | **목록** opens a searchable list with context length and price and fills the field. `GET /api/models?provider=openrouter\|local` (session token required, 10 minute cache) |
 | When it applies | Saved settings take effect in the **next** session; restart a running one |
 

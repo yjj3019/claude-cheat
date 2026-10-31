@@ -2205,6 +2205,25 @@ def _effective_values(provider, values=None, clear=(), strict=False):
     return merged
 
 
+# /api/test may check an unsaved form field, but only fields that cannot change where the
+# request goes or which executable runs. Addresses, binaries and stored secrets stay saved-only:
+# combining a posted address with a stored key is exactly how a key leaves the machine.
+_TEST_POST_FIELDS = {
+    "openrouter": {"OPENROUTER_MODEL", "OPENROUTER_UPSTREAM_PROVIDER", "ANTHROPIC_AUTH_TOKEN"},
+    "local": {"LOCAL_LLM_MODEL"},
+    "cli": {"CLI_MODEL", "CLI_TIMEOUT_S"},
+}
+
+
+def _posted_test_values(provider, values):
+    """Posted values are filtered to model/timing fields; destination and binaries stay saved."""
+    if not isinstance(values, dict):
+        return None
+    allowed = _TEST_POST_FIELDS.get(provider, set())
+    return {name: value for name, value in values.items()
+            if name in allowed and isinstance(value, str)}
+
+
 def save_config(provider, values, clear=()):
     """Validate and persist one provider's settings; an empty secret keeps the stored value.
 
@@ -3411,7 +3430,7 @@ JS_DASHBOARD = JS_DASHBOARD.replace(
     return Object.keys(connectionLabels).map(name => {
       const row = rows[name] || {};
       const failures = metricNumber(row.failures) || 0;
-      const lastModel = typeof row.last_model === 'string' && row.last_model ? ` ${row.last_model}` : '';
+      const lastModel = typeof row.last_model === 'string' && row.last_model ? ` ${esc(row.last_model)}` : '';
       return `${connectionLabels[name]} ${num(row.requests || 0)}건${failures ? `(시도 실패 ${num(failures)})` : ''}${lastModel}`;
     }).join(' · ');
   };
@@ -3671,6 +3690,25 @@ JS_BLACKBOX = JS_BLACKBOX.replace(
     " + (data.started_at ? ' · 시작 ' + new Date(data.started_at).toLocaleString('ko-KR') : '')"
     " + (Number.isSafeInteger(data.discarded) && data.discarded > 0 ? ' · 폐기 ' + data.discarded + '건' : '') : '기록 꺼짐';", 1)
 
+# The write token is handed out by the launcher as a URL fragment, never in the page itself.
+# A fragment is not sent to the server, is not in Referer and disappears from the address bar
+# after the first read, so another local process cannot harvest it from a public GET.
+_TOKEN_SCRIPT = '''const TOKEN = (() => {
+  const match = /[#&]token=([A-Za-z0-9_-]+)/.exec(location.hash || '');
+  if (!match) return '';
+  try { history.replaceState(null, '', location.pathname + location.search); } catch (error) {}
+  return match[1];
+})();
+if (!TOKEN) document.addEventListener('DOMContentLoaded', () => {
+  const notice = document.createElement('div');
+  notice.className = 'token-notice';
+  notice.setAttribute('role', 'status');
+  notice.textContent = '쓰기 토큰이 없습니다. 런처가 출력한 #token=… 주소로 접속하세요.';
+  document.body.prepend(notice);
+});'''
+JS_SHARED = JS_SHARED.replace('const TOKEN = "__DASHBOARD_TOKEN__";', _TOKEN_SCRIPT, 1)
+PAGE_CSS += "\n.token-notice{padding:10px 18px;background:#4a3413;color:#f2b95e;border-bottom:1px solid #7a5a1f;font-size:13px}\n"
+
 PAGE = _page("dashboard")
 SETTINGS_PAGE = _page("settings")
 BLACKBOX_PAGE = _page("blackbox")
@@ -3681,6 +3719,9 @@ USAGE_PAGE = _page("usage")
 
 
 class Handler(BaseHTTPRequestHandler):
+    # A local client that opens a socket and trickles headers must not hold a thread forever.
+    timeout = 15
+
     def _send(self, status, content_type, payload):
         body = payload.encode("utf-8")
         self.send_response(status)
@@ -3709,13 +3750,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(403, "application/json; charset=utf-8", json.dumps({"error": "host_rejected"}))
         path = self.path.split("?")[0]
         if path in ("/", "/index.html", "/dashboard"):
-            self._send(200, "text/html; charset=utf-8", PAGE.replace("__DASHBOARD_TOKEN__", TOKEN))
+            self._send(200, "text/html; charset=utf-8", PAGE)
         elif path == "/settings":
-            self._send(200, "text/html; charset=utf-8", SETTINGS_PAGE.replace("__DASHBOARD_TOKEN__", TOKEN))
+            self._send(200, "text/html; charset=utf-8", SETTINGS_PAGE)
         elif path == "/blackbox":
-            self._send(200, "text/html; charset=utf-8", BLACKBOX_PAGE.replace("__DASHBOARD_TOKEN__", TOKEN))
+            self._send(200, "text/html; charset=utf-8", BLACKBOX_PAGE)
         elif path == "/usage":
-            self._send(200, "text/html; charset=utf-8", USAGE_PAGE.replace("__DASHBOARD_TOKEN__", TOKEN))
+            self._send(200, "text/html; charset=utf-8", USAGE_PAGE)
         elif path == "/api/config":
             if not self._authorized():
                 # Settings (even masked) belong to the session, exactly like /api/cli.
@@ -3740,6 +3781,11 @@ class Handler(BaseHTTPRequestHandler):
             if provider not in CONFIG_FILES:
                 return self._send(400, "application/json; charset=utf-8",
                                   json.dumps({"error": "unknown_provider"}))
+            # A refresh bypasses the catalog cache and fetches upstream; keep that from becoming
+            # an unthrottled, token-gated way to burn bandwidth and threads.
+            if refresh and not _rate_ok(self.client_address[0], limit=6, state=_MODEL_RATE):
+                return self._send(429, "application/json; charset=utf-8",
+                                  json.dumps({"error": "rate_limited", "limit_per_minute": 6}))
             try:
                 kind = (query.get("kind") or [None])[0] if provider == "cli" else None
                 catalog = model_catalog(provider, refresh=refresh, kind=kind) if provider == "cli" else model_catalog(provider, refresh=refresh)
@@ -3925,11 +3971,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(400, "application/json; charset=utf-8", json.dumps({"error": "saved_settings_only"}))
             return self._send(200, "application/json; charset=utf-8",
                               json.dumps(run_tool_roundtrip(provider), ensure_ascii=False))
-        test_values = payload.get("values")
-        if test_values is not None and not isinstance(test_values, dict):
-            return self._send(400, "application/json; charset=utf-8", json.dumps({"error": "invalid_values"}))
+        test_values = _posted_test_values(provider, payload.get("values"))
+        if not _TEST_RUN_LOCK.acquire(blocking=False):
+            return self._send(429, "application/json; charset=utf-8",
+                              json.dumps({"error": "test_busy", "retry_after_seconds": 1}))
+        try:
+            result = run_connection_test(provider, mode, test_values)
+        finally:
+            _TEST_RUN_LOCK.release()
         return self._send(200, "application/json; charset=utf-8",
-                          json.dumps(run_connection_test(provider, mode, test_values), ensure_ascii=False))
+                          json.dumps(result, ensure_ascii=False))
 
     def log_message(self, *args):
         pass
@@ -3939,6 +3990,9 @@ class DashboardServer(ThreadingHTTPServer):
     """Exclusive loopback listener: a stale instance must never share the port on Windows."""
 
     allow_reuse_address = False
+    daemon_threads = True
+    block_on_close = False
+    request_queue_size = 64
 
     def server_bind(self):
         if os.name == "nt":
@@ -3947,18 +4001,23 @@ class DashboardServer(ThreadingHTTPServer):
 
 
 RATE_LIMIT_PER_MINUTE = 30
+# Only one connectivity/probe run at a time: an authenticated page can otherwise fan out
+# thirty concurrent CLI probes or provider inference tests.
+_TEST_RUN_LOCK = threading.Lock()
 _RATE = {"window": -1, "counts": {}}
+_MODEL_RATE = {"window": -1, "counts": {}}
 
 
-def _rate_ok(client, now=None, limit=RATE_LIMIT_PER_MINUTE):
+def _rate_ok(client, now=None, limit=RATE_LIMIT_PER_MINUTE, state=None):
     """Sliding minute window per client; a local user never needs a burst above this."""
+    state = _RATE if state is None else state
     now = time.monotonic() if now is None else now
     window = int(now // 60)
-    if _RATE["window"] != window:
-        _RATE["window"] = window
-        _RATE["counts"].clear()
-    count = _RATE["counts"].get(client, 0) + 1
-    _RATE["counts"][client] = count
+    if state["window"] != window:
+        state["window"] = window
+        state["counts"].clear()
+    count = state["counts"].get(client, 0) + 1
+    state["counts"][client] = count
     return count <= limit
 
 
@@ -4096,13 +4155,15 @@ def serve(host="127.0.0.1", port=DEFAULT_PORT, refresh=3, allow_fallback=False, 
         fallback = "requested_port_unavailable"
     _write_pid_record(server.server_address[1])
     url = f"http://{_display_host(host)}:{server.server_address[1]}/"
-    print(json.dumps({"dashboard": url, "route_log": str(ROUTE_LOG),
+    from urllib.parse import quote
+    write_url = f"{url}#token={quote(TOKEN, safe='')}"
+    print(json.dumps({"dashboard": url, "write_url": write_url, "route_log": str(ROUTE_LOG),
                       "config_writes": True, "mode": "local_operator",
                       **({"port_fallback": fallback} if fallback else {})}), flush=True)
     if open_page:
         # The socket is already listening, so the browser request waits for serve_forever().
         try:
-            webbrowser.open(url + open_page.lstrip("/"))
+            webbrowser.open(f"{url}{open_page.lstrip('/')}#token={quote(TOKEN, safe='')}")
         except webbrowser.Error:
             pass
     try:

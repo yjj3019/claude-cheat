@@ -1082,7 +1082,9 @@ class PageTests(unittest.TestCase):
         self.assertIn("saveSettings", settings)
         self.assertNotIn("renderGrid", settings)
         for page in (dash.PAGE, dash.SETTINGS_PAGE, dash.BLACKBOX_PAGE):
-            self.assertIn('const TOKEN = "__DASHBOARD_TOKEN__"', page)
+            self.assertIn("location.hash", page)
+            self.assertNotIn("__DASHBOARD_TOKEN__", page)
+            self.assertNotIn(dash.TOKEN, page)
             self.assertIn('href="/"', page)
             self.assertIn('href="/settings"', page)
             self.assertIn('href="/blackbox"', page)
@@ -2943,8 +2945,10 @@ class OpenPageTests(unittest.TestCase):
         return opener
 
     def test_open_page_launches_the_browser_on_that_page(self):
+        from urllib.parse import quote
         opener = self.run_serve(open_page="settings")
-        opener.assert_called_once_with("http://127.0.0.1:8787/settings")
+        opener.assert_called_once_with(
+            "http://127.0.0.1:8787/settings#token=" + quote(dash.TOKEN, safe=""))
 
     def test_default_serve_does_not_open_a_browser(self):
         self.run_serve().assert_not_called()
@@ -3366,6 +3370,57 @@ class ToolRoundtripApiTests(unittest.TestCase):
             self.assertEqual(request(payload, {**auth, "origin": "http://foreign.invalid"})[0], 403)
             self.assertEqual(request(payload, auth), (200, {"ok": True}))
         run.assert_called_once_with("local")
+
+    def test_test_endpoint_keeps_destination_and_binary_saved_only(self):
+        import threading
+        server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        def request(payload, headers):
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+            try:
+                conn.request("POST", "/api/test", body=json.dumps(payload), headers=headers)
+                response = conn.getresponse()
+                return response.status, json.loads(response.read())
+            finally:
+                conn.close()
+
+        auth = {"x-dashboard-token": dash.TOKEN, "content-type": "application/json"}
+        posted = {"LOCAL_LLM_URL": "http://attacker.invalid/v1/messages",
+                  "LOCAL_LLM_HTTP_URL": "http://attacker.invalid/v1/messages",
+                  "LOCAL_LLM_API_KEY": "sk-evil",
+                  "LOCAL_LLM_MODEL": "posted-model"}
+        with mock.patch.object(dash, "_rate_ok", return_value=True), \
+                mock.patch.object(dash, "run_connection_test", return_value={"ok": True}) as run:
+            self.assertEqual(request({"provider": "local", "mode": "inference", "values": posted}, auth)[0], 200)
+        run.assert_called_once_with("local", "inference", {"LOCAL_LLM_MODEL": "posted-model"})
+
+    def test_models_refresh_is_throttled_per_minute(self):
+        import threading
+        server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        def request():
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+            try:
+                conn.request("GET", "/api/models?provider=openrouter&refresh=1",
+                             headers={"x-dashboard-token": dash.TOKEN})
+                return conn.getresponse().status
+            finally:
+                conn.close()
+
+        with mock.patch.object(dash, "model_catalog", return_value={"models": []}), \
+                mock.patch.object(dash, "_rate_ok", side_effect=[True] * 6 + [False]):
+            self.assertEqual([request() for _ in range(7)], [200] * 6 + [429])
+
+    def test_server_socket_limits_are_bounded(self):
+        self.assertEqual(dash.Handler.timeout, 15)
+        self.assertEqual(dash.DashboardServer.request_queue_size, 64)
+        self.assertTrue(dash.DashboardServer.daemon_threads)
 
 
 class MonitoringParityTests(unittest.TestCase):
