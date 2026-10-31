@@ -114,7 +114,7 @@ class RouteLogTests(unittest.TestCase):
         events = [{"ts": (now - timedelta(minutes=minutes)).isoformat(), "event": "route_selected",
                    "provider": "local", "reason": "replacement"} for minutes in (0, 10, 11, 60, 61)]
         events += [{"ts": "invalid", "event": "circuit_open"},
-                   {"ts": (now + timedelta(seconds=10)).isoformat(), "event": "request_shape", "family": "sonnet"}]
+                   {"ts": (now - timedelta(seconds=1)).isoformat(), "event": "request_shape", "family": "sonnet"}]
         original = dash._age_seconds
         with mock.patch.object(dash, "_age_seconds", wraps=original) as age:
             state = dash.routing_state(events, now=now)
@@ -757,7 +757,8 @@ class DiagnosticsTests(unittest.TestCase):
 
     def test_model_paths_urls_tokens_and_unexpected_nested_fields_are_redacted(self):
         for value in ("https://user:pw@private.example/model", "C:/private/model.gguf", "/private/model",
-                      "\\\\host\\models", "private-api-key-fixture", "sk-or-private", "bad\nmodel", "m" * 257):
+                      "\\\\host\\models", "~/private/model", "file:/private/model",
+                      "private-api-key-fixture", "sk-or-private", "bad\nmodel", "m" * 257):
             with self.subTest(value=value):
                 model, state = dash._diagnostic_model(value, ["private-api-key-fixture"])
                 self.assertIsNone(model)
@@ -1296,6 +1297,18 @@ class ConfigTests(unittest.TestCase):
 
     def put_openrouter(self, model="vendor/a", key="sk-or-v1-abcdefghijkl"):
         self.put("openrouter", OPENROUTER_MODEL=model, ANTHROPIC_AUTH_TOKEN=key)
+
+    def test_openrouter_upstream_selection_save_clear_and_validation(self):
+        self.files["openrouter"]["fields"] = ("OPENROUTER_MODEL", "OPENROUTER_UPSTREAM_PROVIDER", "ANTHROPIC_AUTH_TOKEN")
+        self.put_openrouter()
+        dash.save_config("openrouter", {"OPENROUTER_UPSTREAM_PROVIDER": "open-inference/fp4"})
+        self.assertEqual(dash.read_settings("openrouter")["OPENROUTER_UPSTREAM_PROVIDER"], "open-inference/fp4")
+        self.assertEqual(dash.config_snapshot()["openrouter"]["fields"]["OPENROUTER_UPSTREAM_PROVIDER"]["value"], "open-inference/fp4")
+        for invalid in ("https://evil", "a//b", "a b", "x" * 129):
+            with self.assertRaises(ValueError):
+                dash.save_config("openrouter", {"OPENROUTER_UPSTREAM_PROVIDER": invalid})
+        dash.save_config("openrouter", {"OPENROUTER_UPSTREAM_PROVIDER": ""})
+        self.assertFalse(dash.read_settings("openrouter").get("OPENROUTER_UPSTREAM_PROVIDER"))
 
     def test_default_selection_is_saved_without_changing_service_settings(self):
         self.put_openrouter()
@@ -2043,6 +2056,19 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual(catalog["status"], 401)
         self.assertNotIn("sk-or", json.dumps(catalog))
 
+    def test_openrouter_inference_uses_selection_but_metadata_does_not_claim_it(self):
+        values = {"ANTHROPIC_AUTH_TOKEN": "sk-or-fixture", "OPENROUTER_MODEL": "vendor/a",
+                  "OPENROUTER_UPSTREAM_PROVIDER": "open-inference/fp4"}
+        with mock.patch.object(dash, "_effective_values", return_value=values), \
+                mock.patch.object(dash, "_http_json", return_value=(200, {"model": "vendor/a", "content": [{"type": "text", "text": "OK"}]})) as request:
+            dash.run_connection_test("openrouter", mode="inference")
+        self.assertEqual(request.call_args.args[2]["provider"], {"only": ["open-inference/fp4"], "allow_fallbacks": False})
+        values["OPENROUTER_UPSTREAM_PROVIDER"] = ""
+        with mock.patch.object(dash, "_effective_values", return_value=values), \
+                mock.patch.object(dash, "_http_json", return_value=(200, {"model": "vendor/a", "content": [{"type": "text", "text": "OK"}]})) as request:
+            dash.run_connection_test("openrouter", mode="inference")
+        self.assertEqual(request.call_args.args[2]["provider"], {"allow_fallbacks": False})
+
     def test_connection_check_closes_redirect_response(self):
         import urllib.error
         body = io.BytesIO(b"credential must not be returned")
@@ -2482,7 +2508,7 @@ class SnapshotTests(unittest.TestCase):
             data = dash.snapshot()
         self.assertEqual(sorted(data),
                          ["account", "active_session", "alerts", "configured", "generated_at", "help",
-                          "insights", "model", "pricing", "providers", "proxy_metrics",
+                          "insights", "model", "pricing", "provider", "providers", "proxy_metrics",
                           "proxy_modified_at", "proxy_stale", "refresh_ms", "routing", "summary", "usage"])
         self.assertEqual(data["model"], "vendor/model")
         self.assertEqual(data["routing"]["state"], "unknown")
@@ -2495,10 +2521,34 @@ class SnapshotTests(unittest.TestCase):
 
     def test_cached_snapshot_serves_without_rebuilding(self):
         built = {"generated_at": "2026-10-25T03:00:00+00:00", "routing": {}, "usage": {}, "account": {},
-                 "model": None}
+                 "model": None, "alerts": []}
         with mock.patch.object(dash, "_SNAPSHOT", {"at": 1.0, "data": built}), \
              mock.patch.object(dash, "snapshot", side_effect=AssertionError("must not rebuild")):
-            self.assertIs(dash.cached_snapshot(), built)
+            served = dash.cached_snapshot()
+        # The cached body is served when it is fresh; the wrapper only adds freshness facts.
+        self.assertEqual(served["routing"], built["routing"])
+        self.assertGreater(served["snapshot_age_seconds"], dash.SNAPSHOT_STALE_SECONDS)
+        self.assertEqual([alert["code"] for alert in served["alerts"]], ["snapshot_stale"])
+
+    def test_cached_snapshot_reports_fresh_age_without_alerts(self):
+        built = {"generated_at": "2026-10-25T03:00:00+00:00", "routing": {}, "usage": {}, "account": {},
+                 "model": None, "alerts": []}
+        with mock.patch.object(dash, "_SNAPSHOT", {"at": time.monotonic(), "data": built}), \
+             mock.patch.object(dash, "snapshot", side_effect=AssertionError("must not rebuild")):
+            served = dash.cached_snapshot()
+        self.assertLess(served["snapshot_age_seconds"], 5)
+        self.assertEqual(served["alerts"], [])
+
+    def test_cached_snapshot_surfaces_a_failed_refresh(self):
+        built = {"generated_at": "2026-10-25T03:00:00+00:00", "routing": {}, "usage": {}, "account": {},
+                 "model": None, "alerts": []}
+        with mock.patch.object(dash, "_SNAPSHOT",
+                               {"at": time.monotonic(), "data": built, "error": "transcript_scan_failed"}), \
+             mock.patch.object(dash, "snapshot", side_effect=AssertionError("must not rebuild")):
+            served = dash.cached_snapshot()
+        self.assertEqual(served["snapshot_error"], "transcript_scan_failed")
+        self.assertEqual([alert["code"] for alert in served["alerts"]], ["snapshot_refresh_failed"])
+        self.assertEqual(dash.status_exit_code(served), 3)
 
     def test_empty_usage_has_stable_shape(self):
         usage = dash._empty_usage()
@@ -3061,7 +3111,7 @@ class ProviderSelectionDisplayTests(unittest.TestCase):
                                side_effect=lambda name: name == "local"):
             self.assertEqual(dash.provider_states(), {"openrouter": False, "local": True, "cli": False})
 
-    def test_active_session_exposes_only_provider_and_started(self):
+    def test_active_session_exposes_provider_started_and_verified_identity(self):
         self.handoff({"provider": "local", "started": "2026-10-26T00:00:00+00:00",
                       "nonce": "private-token", "port": 48432, "proxy_pid": 1})
         connection = mock.Mock()
@@ -3069,11 +3119,42 @@ class ProviderSelectionDisplayTests(unittest.TestCase):
         connection.getresponse.return_value.read.return_value = b'{"startedAt":"2026-10-26T00:00:00Z","requests":4}'
         with mock.patch.object(dash.http.client, "HTTPConnection", return_value=connection) as connect:
             self.assertEqual(dash.active_session(),
-                             {"provider": "local", "started": "2026-10-26T00:00:00+00:00"})
+                             {"provider": "local", "started": "2026-10-26T00:00:00+00:00",
+                              "instance_id": None, "pid_verified": False})
         connect.assert_called_once_with("127.0.0.1", 48432, timeout=0.5)
         connection.request.assert_called_once_with("GET", "/api/metrics",
                                                    headers={"x-local-route-token": "private-token"})
         connection.close.assert_called_once()
+
+    def test_active_session_keeps_a_validated_instance_id_and_rejects_a_foreign_one(self):
+        instance = "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+        self.handoff({"provider": "local", "started": "2026-10-26T00:00:00+00:00",
+                      "nonce": "private-token", "port": 48432, "instance_id": instance})
+        connection = mock.Mock()
+        connection.getresponse.return_value.status = 200
+        connection.getresponse.return_value.read.return_value = (
+            json.dumps({"startedAt": "2026-10-26T00:00:00Z", "instanceId": instance}).encode())
+        with mock.patch.object(dash.http.client, "HTTPConnection", return_value=connection):
+            session = dash.active_session()
+        self.assertEqual(session["instance_id"], instance)
+
+        connection = mock.Mock()
+        connection.getresponse.return_value.status = 200
+        connection.getresponse.return_value.read.return_value = (
+            json.dumps({"startedAt": "2026-10-26T00:00:00Z",
+                        "instanceId": "3f2504e0-4f89-41d3-9a0c-0305e82c3399"}).encode())
+        with mock.patch.object(dash.http.client, "HTTPConnection", return_value=connection):
+            self.assertIsNone(dash.active_session())
+
+    def test_active_session_rejects_a_non_uuid_instance(self):
+        self.handoff({"provider": "local", "started": "2026-10-26T00:00:00+00:00",
+                      "nonce": "private-token", "port": 48432, "instance_id": "../../etc/passwd"})
+        connection = mock.Mock()
+        connection.getresponse.return_value.status = 200
+        connection.getresponse.return_value.read.return_value = b'{"startedAt":"2026-10-26T00:00:00Z"}'
+        with mock.patch.object(dash.http.client, "HTTPConnection", return_value=connection):
+            session = dash.active_session()
+        self.assertIsNone(session["instance_id"])
 
     def test_active_session_ignores_missing_malformed_or_foreign_records(self):
         self.assertIsNone(dash.active_session())
@@ -3285,6 +3366,239 @@ class ToolRoundtripApiTests(unittest.TestCase):
             self.assertEqual(request(payload, {**auth, "origin": "http://foreign.invalid"})[0], 403)
             self.assertEqual(request(payload, auth), (200, {"ok": True}))
         run.assert_called_once_with("local")
+
+
+class MonitoringParityTests(unittest.TestCase):
+    """Every connection point and freshness fact is monitored with the same evidence."""
+
+    def stamp(self, seconds_ago):
+        return (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).isoformat()
+
+    def test_each_connection_is_counted_separately_and_scoped_to_its_instance(self):
+        first = "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+        second = "3f2504e0-4f89-41d3-9a0c-0305e82c3302"
+        events = [
+            {"ts": self.stamp(300), "event": "proxy_start", "code": "c1", "instance": first},
+            {"ts": self.stamp(290), "event": "route_selected", "provider": "local",
+             "model": "qwen3", "instanceId": first},
+            {"ts": self.stamp(280), "event": "external_attempt_failed", "provider": "local",
+             "status": 500, "instanceId": first},
+            {"ts": self.stamp(120), "event": "proxy_start", "code": "c2", "instance": second,
+             "continued": True},
+            {"ts": self.stamp(110), "event": "route_selected", "provider": "openrouter",
+             "model": "vendor/model", "instanceId": second},
+            {"ts": self.stamp(100), "event": "route_selected", "provider": "cli", "instanceId": second},
+            {"ts": self.stamp(90), "event": "route_selected", "provider": "plan", "reason": "fallback",
+             "model": "claude-sonnet-4-6", "instanceId": second},
+        ]
+        now = datetime.now(timezone.utc)
+        state = dash.routing_state(events, now=now)
+        # The newest start marker owns the default view, exactly like a live dashboard.
+        self.assertEqual(state["instance"], second)
+        self.assertEqual(state["counts"], {"external": 2, "plan": 1})
+        self.assertEqual(state["providers"]["openrouter"]["requests"], 1)
+        self.assertEqual(state["providers"]["openrouter"]["last_model"], "vendor/model")
+        self.assertEqual(state["providers"]["cli"]["requests"], 1)
+        self.assertEqual(state["providers"]["plan"]["requests"], 1)
+        self.assertEqual(state["providers"]["plan"]["last_model"], "claude-sonnet-4-6")
+        self.assertNotIn("local", state["providers"])
+        self.assertEqual([row["instance"] for row in state["instances"]], [second, first])
+        self.assertFalse(state["truncated"])
+
+        scoped = dash.routing_state(events, now=now, instance=first)
+        self.assertEqual(scoped["counts"], {"external": 1, "plan": 0})
+        self.assertEqual(scoped["providers"]["local"]["requests"], 1)
+        self.assertEqual(scoped["providers"]["local"]["failures"], 1)
+        self.assertEqual(scoped["proxy_code"], "c1")
+
+    def test_future_timestamped_evidence_is_unconfirmed_not_fresh(self):
+        now = datetime.now(timezone.utc)
+        future = (now + timedelta(seconds=30)).isoformat()
+        state = dash.routing_state([{"ts": future, "event": "route_selected",
+                                     "provider": "openrouter"}], now=now)
+        self.assertEqual(state["state"], "unknown")
+        self.assertIsNone(state["last"]["age_seconds"])
+
+    def test_log_rotation_keeps_the_session_start_identity(self):
+        instance = "3f2504e0-4f89-41d3-9a0c-0305e82c3303"
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        log = root / ".route.log"
+        log.write_text(route_line(self.stamp(600), {"event": "proxy_start", "code": "code-1",
+                                                    "instance": instance})
+                       + route_line(self.stamp(590), {"event": "route_selected", "provider": "local"}),
+                       encoding="utf-8")
+        self.assertEqual(len(dash.parse_route_log(log)), 2)
+        # A rotated file starts with a continuation marker; the head is beyond the tail window.
+        samples = [route_line(self.stamp(500 - index), {"event": "route_selected",
+                                                        "provider": "openrouter",
+                                                        "model": "vendor/model"}) for index in range(8)]
+        log.write_text(route_line(self.stamp(550), {"event": "proxy_start", "code": "code-2",
+                                                    "instance": instance, "continued": True})
+                       + "".join(samples), encoding="utf-8")
+        with mock.patch.object(dash, "ROUTE_TAIL_BYTES", 200):
+            events = dash.parse_route_log(log)
+        markers = [event for event in events if event["event"] == "proxy_start"]
+        self.assertEqual([event["code"] for event in markers], ["code-1", "code-2"])
+        state = dash.routing_state(events, now=datetime.now(timezone.utc))
+        self.assertEqual(state["proxy_instance"], instance)
+        self.assertFalse(state["truncated"])
+
+    def test_snapshot_counts_cli_usage_instead_of_hiding_the_usage_panel(self):
+        usage = dash._empty_usage()
+        usage["today"]["external"] = [7, 3, 0, 0]
+        with mock.patch.object(dash, "_live_session", return_value=(None, None)), \
+                mock.patch.object(dash, "parse_route_log", return_value=[]), \
+                mock.patch.object(dash, "_display_service", return_value=("cli", {}, "cli-model")), \
+                mock.patch.object(dash, "_service_finances",
+                                  return_value=({"ok": False, "error": "not_applicable"}, None)), \
+                mock.patch.object(dash, "scan_sessions", return_value=usage) as scan:
+            data = dash.snapshot()
+        scan.assert_called_once()
+        self.assertEqual(data["provider"], "cli")
+        self.assertEqual(data["usage"]["today"]["external"][0], 7)
+
+    def test_status_report_exposes_connection_counts_and_the_display_service(self):
+        now = datetime.now(timezone.utc)
+        events = [
+            {"ts": (now - timedelta(seconds=120)).isoformat(), "event": "proxy_start",
+             "code": "c1", "instance": "3f2504e0-4f89-41d3-9a0c-0305e82c3304"},
+            {"ts": (now - timedelta(seconds=60)).isoformat(), "event": "route_selected",
+             "provider": "local", "model": "qwen3",
+             "instanceId": "3f2504e0-4f89-41d3-9a0c-0305e82c3304"},
+        ]
+        with mock.patch.object(dash, "_live_session", return_value=(None, None)), \
+                mock.patch.object(dash, "parse_route_log", return_value=events), \
+                mock.patch.object(dash, "_display_service", return_value=("local", {}, "qwen3")):
+            report = dash.status_report(offline=True)
+        self.assertEqual(report["provider_service"], "local")
+        self.assertEqual(report["connection_counts"]["local"]["requests"], 1)
+        self.assertFalse(report["window_truncated"])
+
+    def test_snapshot_freshness_alerts_are_added_codes(self):
+        self.assertEqual(dash._snapshot_health_alerts(1.0, None), [])
+        stale = dash._snapshot_health_alerts(dash.SNAPSHOT_STALE_SECONDS + 1, None)
+        self.assertEqual(stale[0]["code"], "snapshot_stale")
+        self.assertEqual(stale[0]["level"], "warn")
+        failed = dash._snapshot_health_alerts(None, "transcript_scan_failed")
+        self.assertEqual(failed[0]["code"], "snapshot_refresh_failed")
+        self.assertEqual(failed[0]["level"], "critical")
+        self.assertEqual(dash.ALERT_CODES["스냅샷 갱신 실패"], "snapshot_refresh_failed")
+
+    def test_plan_and_circuit_alerts_distinguish_current_from_past_events(self):
+        usage = dash._empty_usage()
+        now = datetime.now(timezone.utc)
+        stamp = lambda seconds: (now - timedelta(seconds=seconds)).isoformat()
+
+        def alerts_for(events):
+            routing = dash.routing_state(events, now=now)
+            return {alert["title"]: alert for alert in
+                    dash.build_alerts(routing, usage, {"ok": False, "error": "not_applicable"}, None)}
+
+        external = alerts_for([{"ts": stamp(60), "event": "route_selected", "provider": "openrouter"},
+                               {"ts": stamp(30), "event": "circuit_open"}])
+        self.assertEqual(external["외부 회로 차단"]["level"], "warn")
+        self.assertIn("지난 발생 기록", external["외부 회로 차단"]["detail"])
+
+        plan = alerts_for([{"ts": stamp(30), "event": "circuit_open"},
+                           {"ts": stamp(10), "event": "route_selected", "provider": "plan",
+                            "reason": "fallback"}])
+        self.assertEqual(plan["외부 회로 차단"]["level"], "critical")
+
+        single = alerts_for([{"ts": stamp(10), "event": "route_selected", "provider": "plan",
+                              "reason": "fallback"}])
+        self.assertEqual(single["Plan 우회 발생"]["level"], "info")
+        self.assertNotIn("Plan 우회 급증", single)
+        spike = alerts_for([{"ts": stamp(20), "event": "route_selected", "provider": "plan",
+                             "reason": "fallback"},
+                            {"ts": stamp(10), "event": "route_selected", "provider": "plan",
+                             "reason": "fallback"}])
+        self.assertEqual(spike["Plan 우회 급증"]["level"], "warn")
+        self.assertIn("결정은 요청과 다를 수 있습니다", spike["Plan 우회 급증"]["detail"])
+
+    def test_help_covers_every_connection_and_endpoint(self):
+        states = dict(dash.HELP_SECTION["states"])
+        for name in ("Local", "OpenRouter", "CLI"):
+            self.assertIn(name, states["external"])
+        endpoints = " ".join(row[0] for row in dash.HELP_SECTION["endpoints"])
+        for path in ("/api/status", "/api/diagnostics", "/api/snapshot", "/api/config", "/api/models",
+                     "/api/cli", "/api/usage-stats", "/api/blackbox", "/api/default-provider",
+                     "/api/test", "/api/config-reset", "/api/metrics"):
+            self.assertIn(path, endpoints)
+        config_row = next(row for row in dash.HELP_SECTION["endpoints"] if row[0] == "GET /api/config")
+        self.assertIn("세 서비스", config_row[1])
+
+    def test_connection_summary_labels_missing_events_instead_of_zero(self):
+        # The browser helper is served from the bundle; assert the source contract directly.
+        self.assertIn("최근 60분 이벤트 없음", dash.JS_DASHBOARD)
+        self.assertIn("외부 모델 사용 중", dash.JS_SHARED)
+        self.assertIn("backend_version_unverified", dash.JS_SHARED)
+
+
+class CredentialSafetyTests(unittest.TestCase):
+    def test_redirects_never_forward_a_provider_credential(self):
+        self.assertIsNone(dash._NoRedirect().redirect_request(
+            None, None, 302, "Found", {}, "https://elsewhere.invalid/collect"))
+
+    def test_account_cache_is_keyed_by_the_credential(self):
+        class Response:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self, _size):
+                return json.dumps(self.payload).encode()
+
+        class Opener:
+            def __init__(self):
+                self.calls = 0
+
+            def open(self, request, timeout=0):
+                self.calls += 1
+                return Response({"data": {"limit": 10, "limit_remaining": 9}})
+
+        opener = Opener()
+        cache = {}
+        with mock.patch.object(dash.urllib.request, "build_opener", return_value=opener):
+            dash.account_state("key-one", cache=cache, now=1000.0)
+            dash.account_state("key-one", cache=cache, now=1001.0)
+            self.assertEqual(opener.calls, 1)
+            dash.account_state("key-two", cache=cache, now=1002.0)
+            self.assertEqual(opener.calls, 2)
+        self.assertEqual(cache["key"], "key-two")
+
+    def test_failed_pricing_lookup_is_retried_after_a_minute(self):
+        class OfflineOpener:
+            def __init__(self):
+                self.calls = 0
+
+            def open(self, request, timeout=0):
+                self.calls += 1
+                raise OSError("offline")
+
+        opener = OfflineOpener()
+        with mock.patch.object(dash, "_PRICING", {"at": 0.0, "data": None, "model": None}), \
+                mock.patch.object(dash.urllib.request, "build_opener", return_value=opener):
+            first = dash.model_pricing("key", "vendor/model", now=1000.0)
+            self.assertFalse(first["ok"])
+            dash.model_pricing("key", "vendor/model", now=1010.0)
+            self.assertEqual(opener.calls, 1)
+            dash.model_pricing("key", "vendor/model", now=1000.0 + dash.PRICING_ERROR_TTL + 1)
+            self.assertEqual(opener.calls, 2)
+
+    def test_model_catalog_never_sends_the_local_key_to_a_foreign_origin(self):
+        values = {"LOCAL_LLM_URL": "http://127.0.0.1:8080/v1/messages",
+                  "LOCAL_LLM_MODELS_URL": "http://127.0.0.1:9090/v1/models"}
+        with self.assertRaises(ValueError) as raised:
+            dash._models_endpoint("local", values)
+        self.assertEqual(str(raised.exception), "models_url_origin_mismatch")
+        values["LOCAL_LLM_MODELS_URL"] = "http://127.0.0.1:8080/v1/models"
+        self.assertEqual(dash._models_endpoint("local", values)[0],
+                         "http://127.0.0.1:8080/v1/models")
 
 
 if __name__ == "__main__":

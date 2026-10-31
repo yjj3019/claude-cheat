@@ -272,6 +272,14 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(store.read_provider("local")["LOCAL_LLM_URL"], "http://127.0.0.1:11434/v1/messages")
         self.assertEqual(store.source("local"), "yaml")
 
+    def test_upstream_provider_round_trip_and_clear(self):
+        store = make_store(self.tmp, **{"openclaude.config.yaml": VALID})
+        store.write_provider("openrouter", {"OPENROUTER_UPSTREAM_PROVIDER": "open-inference/fp4"})
+        self.assertEqual(store.read_provider("openrouter")["OPENROUTER_UPSTREAM_PROVIDER"], "open-inference/fp4")
+        self.assertIn('provider: "open-inference/fp4"', store.path.read_text(encoding="utf-8"))
+        store.write_provider("openrouter", {"OPENROUTER_UPSTREAM_PROVIDER": ""})
+        self.assertNotIn("OPENROUTER_UPSTREAM_PROVIDER", store.read_provider("openrouter"))
+
     def test_nothing_configured_reads_as_empty(self):
         store = make_store(self.tmp)
         self.assertEqual(store.read_provider("openrouter"), {})
@@ -305,7 +313,8 @@ class StoreTests(unittest.TestCase):
         for name in cfg.SECTIONS:
             self.assertEqual(doc.sections[name]["errors"], [], name)
             # every documented key is present, so users see all of them
-            self.assertEqual(set(doc.sections[name]["values"]), set(cfg.SECTIONS[name]["keys"]), name)
+            expected = set(cfg.SECTIONS[name]["keys"])
+            self.assertEqual(set(doc.sections[name]["values"]), expected, name)
         # seeding a first save from it must not make an unconfigured service look configured
         shutil_target = Path(self.tmp) / "openclaude.config.example.yaml"
         shutil_target.write_bytes(example.read_bytes())

@@ -143,7 +143,15 @@ def provider_config(provider: str, require_model: bool = True) -> dict:
             model = values.get("OPENROUTER_MODEL", "").strip()
             if not re.fullmatch(r"[A-Za-z0-9~@][A-Za-z0-9._:/@+~-]{0,255}", model) or model.startswith(("REPLACE_WITH_", "YOUR_")):
                 raise ValueError("Invalid OpenRouter model")
-            return {"SONNET_PROVIDER": provider, "OPENROUTER_API_KEY": read_key(values), "OPENROUTER_MODEL": model}
+            upstream = values.get("OPENROUTER_UPSTREAM_PROVIDER", "")
+            if not isinstance(upstream, str) or (upstream and
+                    (len(upstream) > 128 or not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", upstream)
+                     or any(part in (".", "..") for part in upstream.split("/")))):
+                raise ValueError("Invalid OpenRouter upstream provider")
+            result = {"SONNET_PROVIDER": provider, "OPENROUTER_API_KEY": read_key(values), "OPENROUTER_MODEL": model}
+            if upstream:
+                result["OPENROUTER_UPSTREAM_PROVIDER"] = upstream
+            return result
         except (OSError, ValueError):
             raise OpenRouterConfigError() from None
     if provider != "local":
@@ -236,6 +244,8 @@ def dual_provider_setup(provider: str) -> dict | None:
     fragment = {"ROUTE_ALT_PROVIDER": other, "ROUTE_ALT_ALIAS": DUAL_ALIASES[other]}
     if other == "openrouter":
         fragment.update(ROUTE_ALT_MODEL=config["OPENROUTER_MODEL"], ROUTE_ALT_KEY=config["OPENROUTER_API_KEY"])
+        if config.get("OPENROUTER_UPSTREAM_PROVIDER"):
+            fragment["ROUTE_ALT_UPSTREAM_PROVIDER"] = config["OPENROUTER_UPSTREAM_PROVIDER"]
     else:
         fragment.update(ROUTE_ALT_URL=config["LOCAL_LLM_URL"], ROUTE_ALT_MODEL=config["LOCAL_LLM_MODEL"],
                         ROUTE_ALT_KEY=config.get("LOCAL_LLM_API_KEY", ""),
@@ -260,6 +270,7 @@ def dual_cli_env(fragment: dict) -> dict:
 # probe, which otherwise rebuilds the caller's environment and would inherit a stale export.
 _CLI_ENV_STRIP = ("ROUTE_ALT_PROVIDER", "ROUTE_ALT_MODEL", "ROUTE_ALT_URL", "ROUTE_ALT_KEY",
                   "ROUTE_ALT_ALLOW_REMOTE", "ROUTE_ALT_HTTP_URL", "ROUTE_ALT_ALIAS",
+                  "ROUTE_ALT_UPSTREAM_PROVIDER", "OPENROUTER_UPSTREAM_PROVIDER",
                   "ANTHROPIC_CUSTOM_MODEL_OPTION", "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME",
                   "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION")
 
@@ -501,7 +512,7 @@ def clean_env() -> dict:
     # Keep OS execution variables; never inherit another provider's auth or model routing.
     return {k: v for k, v in os.environ.items()
             if not k.upper().startswith(("ANTHROPIC_", "CLAUDE_CODE_", "OPENROUTER_"))
-            and k.upper() not in {"CLAUDE_CONFIG_DIR", "CLAUDECODE", PRO_SESSION_GATE}}
+            and k.upper() not in {"CLAUDE_CONFIG_DIR", "CLAUDECODE", PRO_SESSION_GATE, "ROUTE_ALT_UPSTREAM_PROVIDER"}}
 
 
 def run_owned(args: list, env: dict, cwd: str, prompt: str = "", timeout: int = 120) -> dict:
@@ -644,7 +655,7 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
     nonce = nonce or secrets.token_urlsafe(32)
     proxy_env = clean_env()
     for name in ("LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY", "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER",
-                 "ROUTE_ALT_PROVIDER", "ROUTE_ALT_MODEL", "ROUTE_ALT_URL", "ROUTE_ALT_KEY", "ROUTE_ALT_ALLOW_REMOTE", "ROUTE_ALT_HTTP_URL", "ROUTE_ALT_ALIAS"):
+                 "ROUTE_ALT_PROVIDER", "ROUTE_ALT_MODEL", "ROUTE_ALT_URL", "ROUTE_ALT_KEY", "ROUTE_ALT_ALLOW_REMOTE", "ROUTE_ALT_HTTP_URL", "ROUTE_ALT_ALIAS", "ROUTE_ALT_UPSTREAM_PROVIDER"):
         proxy_env.pop(name, None)
     try:
         config = _config if _config is not None else provider_config(provider)
@@ -1048,7 +1059,10 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
         claude = shutil.which("claude")
         if not claude:
             raise FileNotFoundError("Claude Code executable not found")
-        return subprocess.call(routeCli.resolve_command(claude) + native_args, env=os.environ.copy())
+        env = os.environ.copy()
+        for name in ("OPENROUTER_UPSTREAM_PROVIDER", "ROUTE_ALT_UPSTREAM_PROVIDER"):
+            env.pop(name, None)
+        return subprocess.call(routeCli.resolve_command(claude) + native_args, env=env)
     if provider == "auto":
         provider = configured_provider()
     if (local_only and provider != "local") or (local_compat and not local_only):
@@ -1070,6 +1084,8 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
         raise FileNotFoundError("Claude Code executable not found")
     if provider == "sonnet":
         env = os.environ.copy()
+        for name in ("OPENROUTER_UPSTREAM_PROVIDER", "ROUTE_ALT_UPSTREAM_PROVIDER"):
+            env.pop(name, None)
         validate_original_sonnet(env, native_args)
         print("Original Sonnet: direct Claude Code session; proxy metrics are not available.")
         executable = routeCli.resolve_command(claude)
@@ -1114,7 +1130,7 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
                          "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"):
                 if name in env:
                     settings["env"][name] = env[name]
-            for name in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "OPENROUTER_ROUTE_COMPAT",
+            for name in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "OPENROUTER_ROUTE_COMPAT", "OPENROUTER_UPSTREAM_PROVIDER", "ROUTE_ALT_UPSTREAM_PROVIDER",
                          "ANTHROPIC_MODEL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
                          "CLAUDE_CODE_USE_FOUNDRY", "LOCAL_LLM_URL", "LOCAL_LLM_MODEL", "LOCAL_LLM_API_KEY",
                          "LOCAL_LLM_ALLOW_REMOTE", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL", "SONNET_PROVIDER", PRO_SESSION_GATE):

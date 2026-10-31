@@ -532,6 +532,37 @@ const complete = model => frame('message_start', { message: { ...META, model } }
   frame('content_block_stop', { index: 0 }) + frame('message_delta') + frame('message_stop');
 const native = (url, options) => url.startsWith('https://api.anthropic.com') ? jsonResponse(url, options) : null;
 
+test('upstream provider pins ordinary OpenRouter attempts without affecting Plan', async t => {
+  const { calls, request } = await fixture(t, (url, options) => native(url, options) || new Response('failure', { status: 500 }),
+    { openrouterUpstreamProvider: 'open-inference/fp4' });
+  assert.equal((await request(requestBody(SONNET), { headers: proHeaders })).status, 200);
+  assert.equal(calls.length, 5);
+  for (const call of calls.slice(0, 4)) assert.deepEqual(call.parsedBody.provider, { only: ['open-inference/fp4'], allow_fallbacks: false });
+  assert.equal(calls.at(-1).parsedBody.provider, undefined);
+});
+
+test('alternate OpenRouter applies the same upstream pin while Local does not', async t => {
+  const { calls, request } = await fixture(t, jsonResponse, { provider: 'local', localUrl: 'http://127.0.0.1:11434/v1/messages',
+    localModel: 'local-fixture', altProvider: 'openrouter', altModel: 'vendor/model', altKey: 'sk-or-synthetic',
+    altAlias: 'alternate', openrouterUpstreamProvider: 'open-inference/fp4' });
+  assert.equal((await request(requestBody(SONNET))).status, 200);
+  assert.equal((await request(requestBody('alternate'))).status, 200);
+  assert.equal(calls[0].parsedBody.provider, undefined);
+  assert.deepEqual(calls[1].parsedBody.provider, { only: ['open-inference/fp4'], allow_fallbacks: false });
+});
+
+for (const slug of [' ', 'a\n', 'a b', 'https://example.com', '/a', 'a/', 'a//b', '.', '..', 'a/../b', 'a?b', 'é', 'a'.repeat(129), null, 1]) {
+  test(`invalid upstream provider is rejected: ${JSON.stringify(slug)}`, () => {
+    assert.throws(() => createProxy({ key: KEY, nonce: NONCE, openrouterModel: DEEPSEEK, openrouterUpstreamProvider: slug }), /Invalid OpenRouter upstream provider/);
+  });
+}
+for (const slug of ['', 'a', 'A_b-1.x/fp4', 'a'.repeat(128)]) {
+  test(`valid upstream provider is accepted: ${JSON.stringify(slug)}`, () => {
+    const server = createProxy({ key: KEY, nonce: NONCE, openrouterModel: DEEPSEEK, openrouterUpstreamProvider: slug });
+    server.close();
+  });
+}
+
 for (const openrouterModel of ['vendor-a/model-a', 'vendor-b/model-b:free', '~vendor-c/latest']) {
   test(`explicit OpenRouter model routes and validates independently of DeepSeek: ${openrouterModel}`, async t => {
     const { calls, request } = await fixture(t, jsonResponse, { openrouterModel });

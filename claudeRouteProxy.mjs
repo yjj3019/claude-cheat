@@ -142,16 +142,37 @@ function stabilizeSystem(system) {
 // The launcher sets ROUTE_LOG_PATH for Local and OpenRouter sessions; without it nothing is written.
 const routeLogPath = process.env.ROUTE_LOG_PATH;
 const ROUTE_LOG_LIMIT = 8 * 1024 * 1024;
+// One shared log receives every launcher instance, so each line states which instance wrote
+// it. The dashboard can then attribute decisions to the session it is actually displaying.
+const routeInstanceId = typeof process.env.ROUTE_INSTANCE_ID === 'string' &&
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(process.env.ROUTE_INSTANCE_ID)
+  ? process.env.ROUTE_INSTANCE_ID : null;
 if (routeLogPath) {
   delete process.env.ROUTE_LOG_PATH;
   const emit = console.error.bind(console);
   let writes = 0;
+  // Record which source revision this process loaded so a stale run is visible afterwards.
+  const codeStamp = (() => {
+    try { return statSync(fileURLToPath(import.meta.url)).mtime.toISOString(); } catch { return null; }
+  })();
+  // A content digest tells the dashboard whether the code really differs, not just the mtime.
+  const codeHash = (() => {
+    try {
+      return createHash('sha256').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex').slice(0, 12);
+    } catch { return null; }
+  })();
+  const startLine = continued => `${new Date().toISOString()} --- proxy start` +
+    `${continued ? ' continued=1' : ''}${routeInstanceId ? ` instance=${routeInstanceId}` : ''}` +
+    `${codeStamp ? ` code=${codeStamp}` : ''}${codeHash ? ` hash=${codeHash}` : ''} ---\n`;
   // The log is diagnostic, not a journal: rotate it so a long-running session cannot
   // fill the disk. The dashboard notices the new file through its prefix fingerprint.
   const rotate = () => {
     try {
       if (statSync(routeLogPath).size < ROUTE_LOG_LIMIT) return;
       renameSync(routeLogPath, `${routeLogPath}.1`);
+      // A rotated file has no start marker of its own. Re-state this session's identity so
+      // stale-code detection still works after the rotation without reading the old file.
+      appendFileSync(routeLogPath, startLine(true));
     } catch {}
   };
   console.error = (...args) => {
@@ -163,19 +184,8 @@ if (routeLogPath) {
       writes += 1;
     } catch {}
   };
-  // Record which source revision this process loaded so a stale run is visible afterwards.
-  const codeStamp = (() => {
-    try { return statSync(fileURLToPath(import.meta.url)).mtime.toISOString(); } catch { return null; }
-  })();
-  // A content digest tells the dashboard whether the code really differs, not just the mtime.
-  const codeHash = (() => {
-    try {
-      return createHash('sha256').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex').slice(0, 12);
-    } catch { return null; }
-  })();
   try {
-    appendFileSync(routeLogPath, `${new Date().toISOString()} --- proxy start` +
-      `${codeStamp ? ` code=${codeStamp}` : ''}${codeHash ? ` hash=${codeHash}` : ''} ---\n`);
+    appendFileSync(routeLogPath, startLine(false));
   } catch {}
 }
 
@@ -199,6 +209,10 @@ function requestShape(body) {
   return { tool_blocks, media };
 }
 const validOpenRouterModel = model => typeof model === 'string' && /^[A-Za-z0-9~@][A-Za-z0-9._:/@+~-]{0,255}$/.test(model) && !/^(REPLACE_WITH_|YOUR_)/.test(model);
+const validUpstreamProvider = value => typeof value === 'string' && value.length <= 128 &&
+  (value === '' || (/^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*(?![\s\S])/.test(value) &&
+    value.split('/').every(segment => segment !== '.' && segment !== '..')));
+const openrouterProvider = slug => slug ? { only: [slug], allow_fallbacks: false } : { allow_fallbacks: false };
 const SEGMENT = String.raw`(?:[A-Za-z0-9_\-~:@+][A-Za-z0-9_\-.~:@+]{0,199}|\.[A-Za-z0-9_\-~:@+][A-Za-z0-9_\-.~:@+]{0,198}|\.\.[A-Za-z0-9_\-.~:@+]{1,198})`;
 const PATTERNS = new Map([
   [String.raw`^(?!\.\.?(?:\/|$))[A-Za-z0-9_\-.~:@+]{1,200}$`, `^${SEGMENT}$`],
@@ -758,7 +772,7 @@ export async function diagnoseLocal({ localUrl, localModel, localKey, localHttpU
   return diagnoseEndpoint({ url, model: localModel, key: localKey, fetchImpl, timeoutMs });
 }
 
-async function diagnoseEndpoint({ url, model, key, fetchImpl, timeoutMs, openrouter = false }) {
+async function diagnoseEndpoint({ url, model, key, fetchImpl, timeoutMs, openrouter = false, openrouterUpstreamProvider = '' }) {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 60000) throw new Error('Invalid diagnostic timeout');
   const headers = { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' };
   if (key) headers.authorization = `Bearer ${key}`;
@@ -768,7 +782,7 @@ async function diagnoseEndpoint({ url, model, key, fetchImpl, timeoutMs, openrou
   let received = false;
   try {
     const response = await abortable(fetchImpl(url, { method: 'POST', headers, redirect: 'error', signal,
-      body: JSON.stringify({ model, max_tokens: 512, stream: false, ...(openrouter ? { provider: { allow_fallbacks: false } } : {}),
+      body: JSON.stringify({ model, max_tokens: 512, stream: false, ...(openrouter ? { provider: openrouterProvider(openrouterUpstreamProvider) } : {}),
         messages: [{ role: 'user', content: 'Reply with exactly LOCAL_DIAGNOSTIC_OK. Do not use tools.' }] }) }), signal);
     received = true;
     if (!response.ok) {
@@ -790,12 +804,13 @@ async function diagnoseEndpoint({ url, model, key, fetchImpl, timeoutMs, openrou
   }
 }
 
-export async function checkConnection({ provider, key, openrouterModel, fetchImpl = fetch, timeoutMs = 15000, ...config }) {
+export async function checkConnection({ provider, key, openrouterModel, openrouterUpstreamProvider = '', fetchImpl = fetch, timeoutMs = 15000, ...config }) {
+  if (!validUpstreamProvider(openrouterUpstreamProvider)) throw new Error('Invalid OpenRouter upstream provider');
   if (!['local', 'openrouter'].includes(provider)) throw new Error('Unsupported connection provider');
   if (provider === 'openrouter' && (!validOpenRouterModel(openrouterModel) || typeof key !== 'string' || !/^sk-or-[A-Za-z0-9_-]+$/.test(key)))
     throw new Error('Invalid OpenRouter connection configuration');
   const result = await (provider === 'local' ? diagnoseLocal({ ...config, timeoutMs, fetchImpl }) :
-    diagnoseEndpoint({ url: 'https://openrouter.ai/api/v1/messages', model: openrouterModel, key, fetchImpl, timeoutMs, openrouter: true }));
+    diagnoseEndpoint({ url: 'https://openrouter.ai/api/v1/messages', model: openrouterModel, key, fetchImpl, timeoutMs, openrouter: true, openrouterUpstreamProvider }));
   return { connection_check: result.local_diagnostic, provider, inference_checked: result.inference_checked,
     model_confirmed: result.model_confirmed === true, reply_confirmed: result.reply_confirmed === true,
     reason: result.local_diagnostic ? 'ready' : [401, 403].includes(result.status) ? 'authentication_failed' : result.reason,
@@ -831,7 +846,7 @@ export function parseRetryAfter(value, nowMs = Date.now()) {
   return Math.min(Math.max(at - reference, 0), RETRY_AFTER_MAX_MS);
 }
 
-export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrouter', openrouterModel, localUrl,
+export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrouter', openrouterModel, openrouterUpstreamProvider = '', localUrl,
   localModel, localKey, localAllowRemote = false, localHttpUrl, cliKind = null, cliRequestedModel = null, localOnly = false, localCompat = false, openrouterCompat = false, fallbackModel = 'claude-sonnet-5-5', retryDelayMs = 1000,
   cooldownMs = 30000, attemptTimeoutMs = localOnly || openrouterCompat ? 120000 : 30000, planHeaderMs = 120000, planIdleMs = 300000, attemptCeilingMs = 300000, now = Date.now,
   metricsPath = process.env.ROUTE_METRICS_PATH,
@@ -857,6 +872,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   // Optional second provider for ordinary sessions: a request whose model equals altAlias
   // goes to that provider instead of the session's primary one. Absent = single provider.
   altProvider = null, altModel, altUrl, altKey, altAllowRemote = false, altHttpUrl = '', altAlias }) {
+  if (!validUpstreamProvider(openrouterUpstreamProvider)) throw new Error('Invalid OpenRouter upstream provider');
   if (typeof localOnly !== 'boolean' || (localOnly && provider !== 'local')) throw new Error('Local-only mode requires local provider');
   if (typeof localCompat !== 'boolean' || (localCompat && (!localOnly || provider !== 'local')))
     throw new Error('Local compatibility requires Local-only mode');
@@ -1239,7 +1255,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     // A short correlation id ties every diagnostic line of this turn together. It is an
     // additive correlation key, not request data, so logs stay parseable and greppable.
     const traceId = randomBytes(4).toString('hex');
-    const logEvent = fields => diagnostics(JSON.stringify({ traceId, ...fields }));
+    const logEvent = fields => diagnostics(JSON.stringify({ traceId,
+      ...(routeInstanceId ? { instanceId: routeInstanceId } : {}), ...fields }));
     try {
       const chunks = [];
       let size = 0;
@@ -1631,7 +1648,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         // Ordinary mode: external thinking blocks would pin the next turn to Plan (unsigned history), so never request them.
         if (!compatProfile) externalBody.thinking = { type: 'disabled' };
         if (externalBody.tools) externalBody.tools = externalBody.tools.map(tool => ({ ...tool, input_schema: compatibleSchema(tool.input_schema) }));
-        if (target.openrouter) externalBody.provider = { allow_fallbacks: false };
+        if (target.openrouter) externalBody.provider = openrouterProvider(openrouterUpstreamProvider);
         // Opt-in prefix-cache stabilization: only the very last system text block may lose a
         // trailing, unfenced token-count footer. User/assistant content is never touched.
         if (stabilizePromptCache && externalBody.system !== undefined) {
@@ -1937,7 +1954,9 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const config = { key: process.env.OPENROUTER_API_KEY, openrouterModel: process.env.OPENROUTER_MODEL, nonce: process.env.LOCAL_ROUTE_TOKEN,
+  const config = { key: process.env.OPENROUTER_API_KEY, openrouterModel: process.env.OPENROUTER_MODEL,
+    openrouterUpstreamProvider: process.env.SONNET_PROVIDER === 'local' && process.env.ROUTE_ALT_PROVIDER === 'openrouter'
+      ? process.env.ROUTE_ALT_UPSTREAM_PROVIDER : process.env.OPENROUTER_UPSTREAM_PROVIDER, nonce: process.env.LOCAL_ROUTE_TOKEN,
     provider: process.env.SONNET_PROVIDER || 'openrouter', localUrl: process.env.LOCAL_LLM_URL,
     localModel: process.env.LOCAL_LLM_MODEL, localKey: process.env.LOCAL_LLM_API_KEY,
     cliKind: process.env.CLI_KIND, cliRequestedModel: process.env.CLI_MODEL,
@@ -1950,9 +1969,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     altProvider: process.env.ROUTE_ALT_PROVIDER || null, altModel: process.env.ROUTE_ALT_MODEL, altUrl: process.env.ROUTE_ALT_URL,
     altKey: process.env.ROUTE_ALT_KEY, altAllowRemote: process.env.ROUTE_ALT_ALLOW_REMOTE === 'true', altHttpUrl: process.env.ROUTE_ALT_HTTP_URL,
     altAlias: process.env.ROUTE_ALT_ALIAS };
-  for (const name of ['OPENROUTER_API_KEY', 'OPENROUTER_MODEL', 'LOCAL_ROUTE_TOKEN', 'LOCAL_ROUTE_ONLY', 'LOCAL_ROUTE_COMPAT', 'OPENROUTER_ROUTE_COMPAT', 'SONNET_PROVIDER', 'LOCAL_LLM_URL',
+  for (const name of ['OPENROUTER_API_KEY', 'OPENROUTER_MODEL', 'OPENROUTER_UPSTREAM_PROVIDER', 'LOCAL_ROUTE_TOKEN', 'LOCAL_ROUTE_ONLY', 'LOCAL_ROUTE_COMPAT', 'OPENROUTER_ROUTE_COMPAT', 'SONNET_PROVIDER', 'LOCAL_LLM_URL',
     'LOCAL_LLM_MODEL', 'LOCAL_LLM_API_KEY', 'LOCAL_LLM_ALLOW_REMOTE', 'LOCAL_LLM_HTTP_URL', 'LOCAL_LLM_MODELS_URL', 'ROUTE_METRICS_PATH', 'ROUTE_INSTANCE_ID', 'ROUTE_INSTANCE_METRICS_PATH', 'ROUTE_USAGE_EVENTS_PATH', 'ROUTE_ALT_PROVIDER', 'ROUTE_ALT_MODEL', 'ROUTE_ALT_URL',
-    'ROUTE_ALT_KEY', 'ROUTE_ALT_ALLOW_REMOTE', 'ROUTE_ALT_HTTP_URL', 'ROUTE_ALT_ALIAS', 'CLI_KIND', 'CLI_MODEL', 'CLI_TIMEOUT_S']) delete process.env[name];
+    'ROUTE_ALT_KEY', 'ROUTE_ALT_ALLOW_REMOTE', 'ROUTE_ALT_HTTP_URL', 'ROUTE_ALT_ALIAS', 'ROUTE_ALT_UPSTREAM_PROVIDER', 'CLI_KIND', 'CLI_MODEL', 'CLI_TIMEOUT_S']) delete process.env[name];
   if (process.argv.slice(2).includes('--check-connection')) {
     try {
       const result = await checkConnection(config);

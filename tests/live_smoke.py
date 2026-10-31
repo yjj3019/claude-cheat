@@ -42,6 +42,10 @@ def check_openrouter(values):
     model = values.get("OPENROUTER_MODEL", "")
     if not key or not model:
         return {"ok": False, "reason": "configuration_missing", "provider": "openrouter"}
+    try:
+        dash._validate_config("openrouter", values)
+    except ValueError:
+        return {"ok": False, "reason": "invalid_configuration", "provider": "openrouter"}
     result = {"provider": "openrouter", "model": model}
     try:
         status, data, ms = call("https://openrouter.ai/api/v1/key", key)
@@ -54,6 +58,7 @@ def check_openrouter(values):
     try:
         status, data, _ = call("https://openrouter.ai/api/v1/messages", key, {
             "model": model, "max_tokens": 16, "stream": False,
+            "provider": dash._openrouter_provider_policy(values),
             "messages": [{"role": "user", "content": "Reply with exactly OK"}]})
         text = "".join(block.get("text", "") for block in (data.get("content") or [])
                        if isinstance(block, dict) and block.get("type") == "text").strip()

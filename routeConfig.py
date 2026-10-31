@@ -35,7 +35,8 @@ CONFIG_PATH = ROOT / CONFIG_NAME
 
 SECTIONS = {
     "openrouter": {"legacy": ".env.openrouter",
-                   "keys": {"model": "OPENROUTER_MODEL", "api_key": "ANTHROPIC_AUTH_TOKEN"}},
+                   "keys": {"model": "OPENROUTER_MODEL", "api_key": "ANTHROPIC_AUTH_TOKEN",
+                            "provider": "OPENROUTER_UPSTREAM_PROVIDER"}},
     "local": {"legacy": ".env.local-llm",
               "keys": {"url": "LOCAL_LLM_URL", "model": "LOCAL_LLM_MODEL", "api_key": "LOCAL_LLM_API_KEY",
                        "allow_remote": "LOCAL_LLM_ALLOW_REMOTE", "http_url": "LOCAL_LLM_HTTP_URL",

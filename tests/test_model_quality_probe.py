@@ -96,6 +96,14 @@ class ModelQualityProbeTest(unittest.TestCase):
         self.assertEqual(backend.call_args.args[0], cli_values)
         self.assertIsNot(backend.call_args.args[0], cli_values)
 
+    def test_openrouter_probe_uses_saved_upstream_policy(self):
+        values = {"OPENROUTER_MODEL": "vendor/model", "ANTHROPIC_AUTH_TOKEN": "sk-or-synthetic",
+                  "OPENROUTER_UPSTREAM_PROVIDER": "open-inference/fp4"}
+        with patch.object(dashboard, "_http_json", return_value=(200, {"model": "vendor/model"})) as request:
+            call, model = probe.configured_call("openrouter", dashboard=dashboard, values=values)
+            call({"model": model})
+        self.assertEqual(request.call_args.args[2]["provider"], {"only": ["open-inference/fp4"], "allow_fallbacks": False})
+
     def test_cli_adapter_accepts_both_probe_turns(self):
         class FakeBackend:
             protocol_model = "cli/codex"

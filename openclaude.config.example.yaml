@@ -15,6 +15,9 @@ openrouter:
   # Required: the exact OpenRouter model ID (provider/model). There is no default model.
   # Copy a concrete ID from https://openrouter.ai/models and confirm Messages/tool support.
   model: ""
+  # Optional upstream provider slug (e.g. open-inference/fp4); empty = Auto.
+  # A selection is strict: other OpenRouter providers are not used.
+  provider: ""
   # Required: an OpenRouter API key (sk-or-...), not an Anthropic or Local server key.
   api_key: ""
 

@@ -242,6 +242,90 @@ test('a slow client is respected instead of buffering the whole reply in the pro
   }
 });
 
+// A reply can mix text and a tool call. The client relies on content-block order and on a
+// complete tool input, so both properties are pinned here instead of being assumed.
+const MIXED = [
+  frame('message_start', { message: { ...META, model: 'stream/model' } }),
+  frame('content_block_start', { index: 0, content_block: { type: 'text', text: '' } }),
+  frame('content_block_delta', { index: 0, delta: { type: 'text_delta', text: 'reading the file' } }),
+  frame('content_block_stop', { index: 0 }),
+  frame('content_block_start', { index: 1, content_block: { type: 'tool_use', id: 'toolu_mixed', name: 'Read', input: {} } }),
+  frame('content_block_delta', { index: 1, delta: { type: 'input_json_delta', partial_json: '{"path":"a.txt"}' } }),
+  frame('content_block_stop', { index: 1 }),
+  frame('message_delta', { delta: { stop_reason: 'tool_use' } }),
+  frame('message_stop', {}),
+];
+const TRUNCATED_TOOL = [
+  frame('message_start', { message: { ...META, model: 'stream/model' } }),
+  frame('content_block_start', { index: 0, content_block: { type: 'text', text: '' } }),
+  frame('content_block_delta', { index: 0, delta: { type: 'text_delta', text: 'reading the file' } }),
+  frame('content_block_stop', { index: 0 }),
+  frame('content_block_start', { index: 1, content_block: { type: 'tool_use', id: 'toolu_truncated', name: 'Read', input: {} } }),
+  // Incomplete JSON: the provider stopped mid-input.
+  frame('content_block_delta', { index: 1, delta: { type: 'input_json_delta', partial_json: '{"path":' } }),
+  frame('content_block_stop', { index: 1 }),
+  frame('message_delta', { delta: { stop_reason: 'tool_use' } }),
+  frame('message_stop', {}),
+];
+
+function assertMixedOrder(body) {
+  const textAt = body.indexOf('"content_block":{"type":"text"');
+  const toolAt = body.indexOf('"content_block":{"type":"tool_use"');
+  assert.ok(textAt >= 0 && toolAt > textAt, 'text block must precede the tool block');
+  assert.match(body, /reading the file/);
+  assert.match(body, /toolu_mixed/);
+  assert.match(body, /a\.txt/);
+  assert.match(body, /"stop_reason":"tool_use"/);
+}
+
+test('passthrough forwards a mixed text and tool stream in block order', async () => {
+  const planCalls = [];
+  const { server, base } = await start({ passthrough: true, chunks: MIXED, planCalls });
+  try {
+    const result = await request(base);
+    assert.equal(result.status, 200);
+    assertMixedOrder(result.body);
+    assert.equal(planCalls.length, 0);
+  } finally { server.closeAllConnections(); server.close(); }
+});
+
+test('buffered mode accepts a mixed text and tool stream and keeps block order', async () => {
+  const { server, base } = await start({ chunks: MIXED });
+  try {
+    const result = await request(base);
+    assert.equal(result.status, 200);
+    assertMixedOrder(result.body);
+    assert.match(result.body, /message_stop/);
+  } finally { server.closeAllConnections(); server.close(); }
+});
+
+test('truncated tool JSON fails closed instead of publishing a partial tool call', async () => {
+  // Nothing was sent while buffering, so the normal retry and Plan fallback still apply.
+  const planCalls = [];
+  const { server, base } = await start({ chunks: TRUNCATED_TOOL, planCalls });
+  try {
+    const result = await request(base);
+    assert.equal(result.status, 200);
+    assert.match(result.body, /plan ok/);
+    assert.doesNotMatch(result.body, /a\.txt|tool_use/);
+    assert.equal(planCalls.length, 1);
+  } finally { server.closeAllConnections(); server.close(); }
+});
+
+test('passthrough ends the stream on truncated tool JSON after text was sent', async () => {
+  const planCalls = [];
+  const { server, base } = await start({ passthrough: true, chunks: TRUNCATED_TOOL, planCalls });
+  try {
+    const result = await request(base);
+    assert.equal(result.status, 200);
+    assert.match(result.body, /reading the file/);
+    assert.match(result.body, /upstream stream failed/);
+    // A partial tool frame may already be on the wire, but the reply must not look complete.
+    assert.doesNotMatch(result.body, /message_stop/);
+    assert.equal(planCalls.length, 0);
+  } finally { server.closeAllConnections(); server.close(); }
+});
+
 test('passthrough still delivers a control-stop reply that has no content', async () => {
   // A refusal carries no usable text, so nothing may be forwarded early; the client must
   // still receive the whole stream instead of an empty 200.

@@ -226,6 +226,10 @@ test('blackbox distinguishes waiting, connected and unavailable without showing 
   assert.doesNotMatch(status.textContent, /PRIVATE/);
   sandbox.renderBlackbox({active:true, mode:'detailed', detail_status:'unavailable', incidents:1});
   assert.match(status.textContent, /상세 수집 불가/);
+  sandbox.renderBlackbox({active:true, mode:'metadata', incidents:2, discarded:3, started_at:'2026-10-25T07:00:00+00:00'});
+  assert.match(status.textContent, /기록 중/);
+  assert.match(status.textContent, /시작/);
+  assert.match(status.textContent, /폐기 3건/);
 });
 
 test('separate blackbox page uses existing authenticated recording actions', async () => {
@@ -263,7 +267,7 @@ test('dashboard renders the insights card with its evidence and copy action', ()
 
 test('performance card shows measured throughput and completed-request failure rate', () => {
   const data = fixture({proxy_metrics: {
-    startedAt: '2026-10-25T07:00:00+00:00', uptimeMs: 3600000, requests: 60, ok: 45, failed: 5, aborted: 10,
+    startedAt: '2026-10-25T07:00:00+00:00', uptimeMs: 3600000, requests: 60, ok: 45, failed: 15, aborted: 10,
     configuration: {provider: 'local'}, routes: {external: 40, plan: 20},
     latencyMs: {external: {p50: 100, p95: 500, count: 40}, plan: {p50: 200, p95: 600, count: 20}, ttfb: {p50: 80, p95: 400, count: 40}},
     modelPerformance: {local: {samples: 2, outputTokens: 40, elapsedMs: 4000}},
@@ -313,7 +317,7 @@ test('routing share and time-series charts use actual data and expose accessible
     {hour:'2026-10-25T08', external:{tokens:[0,0,0,0]}, plan:{tokens:[10,0,0,0]}}
   ];
   const html = render(base).get('grid').innerHTML;
-  assert.match(html, /aria-label="외부 서비스 3건 75%, Plan 1건 25%"/);
+  assert.match(html, /aria-label="외부 모델 3건 75%, Plan 1건 25%"/);
   assert.match(html, /시간당 최대 170 토큰/);
   assert.match(html, /시간별 상세 보기/);
   assert.match(html, /2026-10-25T07/);
@@ -972,15 +976,18 @@ test('CLI launch default saves only the service and preserves the existing CLI c
   assert.equal(vm.runInContext('CONFIG.cli.fields.CLI_BINARY.value', page.sandbox), 'old-binary');
 });
 
-test('CLI live status does not invent a model or token cost', () => {
+test('CLI live status shows recorded usage with a truthful provenance note', () => {
   const base = fixture();
   const nodes = render(fixture({active_session:{provider:'cli'},account:{ok:false,error:'not_applicable'},
     routing:{...base.routing,last:{provider:'cli',model:null}},
     proxy_metrics:{configuration:{provider:'cli',cliKind:'codex',model:null,requestedModel:'requested-x',usageMeasured:false}}}));
   const html = nodes.get('grid').innerHTML;
   assert.match(html, /CLI/);
-  assert.match(html, /CLI 토큰 사용량과 비용의 일일 합계는 집계되지 않습니다/);
-  assert.doesNotMatch(html, /토큰과 추정 비용/);
+  // The card still reports zero/unreported tokens instead of hiding the panel, and says why.
+  assert.match(html, /토큰과 추정 비용/);
+  assert.match(html, /CLI 응답의 토큰은 CLI가 보고한 경우에만/);
+  assert.match(html, /미보고 값은 0으로 추정하지 않으며/);
+  assert.doesNotMatch(html, /CLI 보고 여부/);
 });
 
 
@@ -1152,7 +1159,7 @@ test('runtime timing breakdown distinguishes stage samples and actual attempts',
   assert.match(html, /라우팅 단계별 시간/);
   assert.match(html, /10 \/ 20 \/ 30 ms \(2건\)/);
   assert.match(html, /측정 없음 \(0건\)/);
-  assert.match(html, /외부 실제 시도/);
+  assert.match(html, /외부 모델 실제 시도/);
   assert.match(html, /Plan 실제 시도/);
   assert.match(html, /백분위는 단계별로 계산하므로 합산할 수 없습니다/);
   const old = render(fixture({proxy_metrics:{requests:3}})).get('grid').innerHTML;
@@ -1172,7 +1179,7 @@ test('flow combines independently observed providers and reports incomplete comp
   sandbox.render(data({local:row(1,10,1),cli:row(1,30,3),openrouter:row(0,0,0)},4));
   let html=context.nodes.get('grid').innerHTML;
   assert.match(html,/프록시 진행 요청 2건/);
-  assert.match(html,/최근 갱신 사이 성공한 외부 응답<\/span><strong>2건<\/strong><small>프록시 관측 기준 · 누적 실패 2건/);
+  assert.match(html,/최근 갱신 사이 성공한 외부 응답<\/span><strong>2건<\/strong><small>프록시 관측 기준 · 누적 실패\(취소 제외\) 2건/);
   assert.match(html,/관측 입력 토큰<\/span><strong>40 토큰 · 2건 보고/);
   assert.match(html,/Local LLM · 입력 10 토큰 \/ 출력 1 토큰/);
   assert.match(html,/CLI · 입력 30 토큰 \/ 출력 3 토큰/);
@@ -1203,7 +1210,45 @@ test('flow shows common in-flight count for each provider and handles old or sta
 test('flow statistics label missing counters rather than inventing zero', () => {
   const html=render(fixture({active_session:{provider:'local'},proxy_metrics:{startedAt:'old',requests:1,configuration:{provider:'local'}}})).get('grid').innerHTML;
   assert.match(html,/성공한 외부 응답<\/span><strong>미보고<\/strong>/);
-  assert.match(html,/누적 실패 미보고/);
+  assert.match(html,/누적 실패\(취소 제외\) 미보고/);
+});
+
+
+test('cancelled requests are excluded from the failure rate and each connection is listed', () => {
+  const data = fixture({provider: 'cli', active_session: {provider: 'cli'},
+    proxy_metrics: {startedAt: 's', requests: 6, ok: 3, failed: 3, aborted: 1,
+      routes: {external: 4, plan: 2}}});
+  data.routing.providers = {
+    local: {requests: 2, failures: 1, last_model: 'qwen3', last_ts: '2026-10-25T07:50:00+00:00'},
+    openrouter: {requests: 1, failures: 0, last_model: null, last_ts: null},
+    cli: {requests: 3, failures: 0, last_model: null, last_ts: null},
+    plan: {requests: 2, failures: 0, last_model: null, last_ts: null},
+  };
+  const html = render(data).get('grid').innerHTML;
+  // 3 successes, 3 failures of which 1 was cancelled: completed = 3 + 2, rate = 2/5.
+  assert.match(html, /실패율 · 완료 응답 기준\(취소 제외\)/);
+  assert.match(html, /40\.0% \(2 \/ 5건\)/);
+  assert.match(html, /연결점별 결정 · 최근 60분/);
+  assert.match(html, /Local 2건\(시도 실패 1\) qwen3 · OpenRouter 1건 · CLI 3건 · Plan 2건/);
+  // A CLI display provider must not hide token usage or the normal usage card.
+  assert.match(html, /토큰과 추정 비용/);
+  assert.match(html, /CLI 응답의 토큰은/);
+  assert.doesNotMatch(html, /CLI 보고 여부/);
+});
+
+test('connection summary says no events were recorded instead of printing zeros', () => {
+  const data = fixture({active_session: {provider: 'local'},
+    proxy_metrics: {startedAt: 's', requests: 1, ok: 1, failed: 0, aborted: 0, configuration: {provider: 'local'}}});
+  const html = render(data).get('grid').innerHTML;
+  assert.match(html, /연결점별 결정 · 최근 60분/);
+  assert.match(html, /최근 60분 이벤트 없음/);
+  assert.doesNotMatch(html, /Local 0건/);
+});
+
+test('shared error and test text cover backend failures and store rate limits', () => {
+  assert.match(ASSETS.settings, /rate_limited:'저장 요청이 많습니다/);
+  assert.match(ASSETS.settings, /backend_version_unverified:'CLI 버전이 검증 목록에 없어/);
+  assert.match(ASSETS.settings, /grok \(미검증 · 실행 불가\)/);
 });
 
 

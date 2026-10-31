@@ -84,6 +84,10 @@ def configured_call(provider, dashboard=None, deadline=None, values=None):
     if key:
         headers["authorization"] = "Bearer " + key
     def call(body):
+        if provider == "openrouter":
+            upstream = values.get("OPENROUTER_UPSTREAM_PROVIDER") or ""
+            policy = {"only": [upstream], "allow_fallbacks": False} if upstream else {"allow_fallbacks": False}
+            body = {**body, "provider": policy}
         status, message = dashboard._http_json(url, headers, body, timeout=60)
         if status != 200 or not isinstance(message, dict):
             raise ValueError("invalid_response")

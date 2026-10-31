@@ -82,6 +82,42 @@ class OpenRouterConfigTests(unittest.TestCase):
         self.assertEqual(route.provider_config("openrouter"), {"SONNET_PROVIDER": "openrouter",
             "OPENROUTER_API_KEY": "sk-or-synthetic-key", "OPENROUTER_MODEL": "vendor/yaml-model"})
 
+    def test_upstream_provider_validation_and_auto(self):
+        base = 'openrouter:\n  model: "vendor/model"\n  api_key: "sk-or-synthetic-key"\n'
+        for value in ("a", "open-inference/fp4", "A_1.x/B-2", "x" * 128):
+            with self.subTest(value=value):
+                self.write_yaml(base + f'  provider: "{value}"\n')
+                self.assertEqual(route.provider_config("openrouter")["OPENROUTER_UPSTREAM_PROVIDER"], value)
+        for value in ("/a", "a/", "a//b", "a b", "é", "a:b", "x" * 129, " a"):
+            with self.subTest(value=value):
+                self.write_yaml(base + f'  provider: "{value}"\n')
+                with self.assertRaises(route.OpenRouterConfigError) as caught:
+                    route.provider_config("openrouter")
+                self.assertNotIn("sk-or-synthetic-key", str(caught.exception))
+        for suffix in ("", '  provider: ""\n'):
+            self.write_yaml(base + suffix)
+            self.assertNotIn("OPENROUTER_UPSTREAM_PROVIDER", route.provider_config("openrouter"))
+
+    def test_upstream_passes_only_to_proxy_and_alternate(self):
+        self.write_yaml('openrouter:\n  model: "vendor/model"\n  api_key: "sk-or-synthetic-key"\n  provider: "open-inference/fp4"\nlocal:\n  model: "local-model"\nrouting:\n  dual_provider: true\n')
+        os.environ.update(OPENROUTER_UPSTREAM_PROVIDER="ambient", ROUTE_ALT_UPSTREAM_PROVIDER="ambient")
+        auth = {"loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "pro"}
+        for provider, expected in (("openrouter", "OPENROUTER_UPSTREAM_PROVIDER"), ("local", "ROUTE_ALT_UPSTREAM_PROVIDER")):
+            proxy = mock.Mock()
+            proxy.stdout.readline.return_value = '{"port":12345}\n'
+            with self.subTest(provider=provider), mock.patch.object(route, "run_owned", return_value=auth) as probe, \
+                 mock.patch.object(route, "check_connection", return_value=0), \
+                 mock.patch.object(route.shutil, "which", return_value="synthetic"), \
+                 mock.patch.object(route.subprocess, "Popen", return_value=proxy) as spawn:
+                with route.routed_session(provider) as env:
+                    child = spawn.call_args.kwargs["env"]
+                    self.assertEqual(child[expected], "open-inference/fp4")
+                    for name in ("OPENROUTER_UPSTREAM_PROVIDER", "ROUTE_ALT_UPSTREAM_PROVIDER"):
+                        self.assertNotIn(name, env)
+                        self.assertNotIn(name, probe.call_args.args[1])
+                        if name != expected:
+                            self.assertNotIn(name, child)
+
     def test_the_unified_file_wins_over_a_legacy_file_for_the_same_service(self):
         self.write("vendor/legacy-model")
         self.write_yaml('openrouter:\n  model: "vendor/yaml-model"\n  api_key: "sk-or-synthetic-key"\n')

@@ -35,6 +35,19 @@ for (const model of ['sonnet', 'opus', 'haiku', 'fable', 'claude-sonnet-5-5', 'c
     assert.deepEqual(c.parsed.thinking, { type: 'adaptive' }); assert.deepEqual(c.parsed.output_config, { effort: 'high' });
   });
 }
+test('OpenRouter compatibility and connection diagnostic honor an explicit upstream provider', async t => {
+  const slug = 'open-inference/fp4';
+  const s = await session(t, () => reply(), { openrouterUpstreamProvider: slug });
+  assert.equal((await s.send()).status, 200);
+  assert.deepEqual(s.calls[0].parsed.provider, { only: [slug], allow_fallbacks: false });
+  const calls = [];
+  const result = await checkConnection({ provider: 'openrouter', key: KEY, openrouterModel: MODEL, openrouterUpstreamProvider: slug,
+    fetchImpl: async (_url, request) => { calls.push(JSON.parse(request.body)); return reply({ content: [{ type: 'text', text: 'LOCAL_DIAGNOSTIC_OK' }] }); } });
+  assert.equal(result.connection_check, true);
+  assert.deepEqual(calls[0].provider, { only: [slug], allow_fallbacks: false });
+  await assert.rejects(checkConnection({ provider: 'openrouter', key: KEY, openrouterModel: MODEL, openrouterUpstreamProvider: 'invalid slug' }), /Invalid OpenRouter upstream provider/);
+});
+
 test('OpenRouter compatibility keeps extensions and opaque metadata while dropping signed reasoning', async t => {
   const s = await session(t);
   const fields = { context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }] },

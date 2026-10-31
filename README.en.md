@@ -1,6 +1,6 @@
 # Claude-Cheat · Claude Code Sonnet replacement with Plan fallback
 
-> **Compatibility status:** retaining the Claude Code frontend is not proof of full feature parity. Agent Teams, parallel subagents, Local admission/fallback, reasoning and streaming still need end-to-end validation. See the [DeepSeek Harness / OpenCode source review (Korean)](docs/HARNESS-COMPATIBILITY-REVIEW.ko.md) for evidence and proposed work; those proposals are not runtime changes.
+> **Compatibility status:** retaining the Claude Code frontend is not proof of full feature parity. Agent Teams, parallel subagents, Local admission/fallback, reasoning and streaming still need end-to-end validation. See the [DeepSeek Harness / OpenCode source review (Korean)](docs/HARNESS-COMPATIBILITY-REVIEW.ko.md) for evidence and proposed work; those proposals are not runtime changes. For the Claude Code version baseline and release checklist, see the [compatibility baseline (Korean)](docs/CLAUDE-CODE-COMPATIBILITY.ko.md).
 
 [한국어](README.md) | **English**
 
@@ -38,7 +38,7 @@ Replace the placeholder with a real OpenRouter key. The file is read next to `op
 
 The old `.env.openrouter` / `.env.local-llm` files are **deprecated**. They are read, read-only, only for a service that has no section in the new file; the first save from the settings page moves both services' values into the new file and leaves the old files untouched. When the new file has a section for a service, only the new file is used for it.
 
-Set `model` to a concrete ID from the [OpenRouter model list](https://openrouter.ai/models). Existing key-only files must add it. Missing, empty, malformed or placeholder models fail startup without default-model selection or Plan fallback. Both file settings are proxy-only; inherited OpenRouter environment values do not override this file.
+Set `model` to a concrete ID from the [OpenRouter model list](https://openrouter.ai/models). Existing key-only files must add it. Missing, empty, malformed or placeholder models fail startup without default-model selection or Plan fallback. Optionally set `provider` to an upstream slug such as `open-inference/fp4`; blank means Auto. A specified slug uses `only` and disables fallback to other OpenRouter providers. An unavailable or unsupported provider may fail; the existing Claude Plan fallback remains separate. Changes apply to new sessions or takeover. Model-list checks do not verify provider availability, and this setting does not enable reasoning. File settings are proxy-only; inherited OpenRouter environment values do not override this file.
 
 The selected model must support the [Messages API](https://openrouter.ai/docs/api/api-reference/anthropic-messages/create-messages?explorer=true) and the tools you need. Model selection does not guarantee every model or native feature is compatible. Response model identity remains strict; dynamic aliases or presets returning another ID can fail and are unverified. Endpoint and retry policy remain fixed as documented in the example.
 
@@ -329,7 +329,7 @@ The dashboard and settings share consistent colors, cards and controls with impr
 .\OpenClaudeDashboard.ps1
 ```
 
-A **read-only** page bound to `127.0.0.1`. The port is **fixed at 8787**; an older dashboard instance is stopped automatically so the same port is reused. If another program holds that port the server fails with a message instead of silently moving; pass `--allow-port-fallback` to pick a free port instead.
+A **loopback dashboard** bound to `127.0.0.1`. `GET` state reads are read-only; only authenticated `POST` actions (settings save, connection tests, black-box recording) mutate state. The port is **fixed at 8787**; an older dashboard instance is stopped automatically so the same port is reused. If another program holds that port the server fails with a message instead of silently moving; pass `--allow-port-fallback` to pick a free port instead.
 
 Stopping a previous instance (including `python routeDashboard.py --stop`) happens **only when both the pid and the process creation time stored in `.dashboard.pid` match**. A recycled pid, our own or an ancestor process, or a legacy record without identity is refused with one line (`identity_mismatch` / `own_tree_pid` / `identity_unverifiable`) and the stale record is overwritten on the next start. Right after an upgrade, stop an older dashboard manually once (`Ctrl+C`) before starting. Non-Windows has no creation-time primitive, so the documented behavior is to refuse rather than signal a bare pid.
 
@@ -347,7 +347,12 @@ Observed input and output totals and reporting sample counts come from successfu
 
 The upper-right status indicator uses both color and text: red for Plan, green for external models, brown/amber for active warnings, and a neutral indication when idle or unknown.
 
-The performance card reuses proxy counters and sends no additional inference requests. Observed output tokens/second is the sum of reported output tokens divided by total request time for eligible successful responses. It includes queueing, network and retries; multiple models may share one provider bucket. Reported usage from fully validated streams is included; Plan, cancellation, failures and unreported usage are excluded. GPU utilization and pure generation speed are unavailable. New token counters begin after restarting the proxy with the updated code; older omissions are not recovered.
+The performance card reuses proxy counters and sends no additional inference requests. It reports **per-connection decisions for the last 60 minutes (Local, OpenRouter, CLI and Plan: requests, failed attempts, last model)** in addition to external/Plan route counts. The failure rate subtracts cancellations (`aborted`) from the proxy's `failed` counter, matching the documented completed-response definition. Observed output tokens/second is the sum of reported output tokens divided by total request time for eligible successful responses. It includes queueing, network and retries; multiple models may share one provider bucket. Reported usage from fully validated streams is included; Plan, cancellation, failures and unreported usage are excluded. GPU utilization and pure generation speed are unavailable. New token counters begin after restarting the proxy with the updated code; older omissions are not recovered.
+
+**Every connection point is monitored the same way.** Local LLM, OpenRouter and CLI all count tokens from session records and route decisions/failed attempts from the route log. Selecting CLI no longer hides the usage card; unreported CLI tokens are labeled unreported with their provenance instead of being estimated as zero. Route-log events are scoped to the launcher instance, and a rotated log keeps the same session through a `--- proxy start … continued=1 … ---` marker.
+
+**The monitor watches itself.** A server snapshot older than 30 seconds, or a failed refresh, raises `snapshot_stale` / `snapshot_refresh_failed` banners and makes `/api/status` exit with code 3. Failed pricing lookups retry after a minute (successful rates stay cached for an hour), account-limit caches are keyed by the API key, redirects are never followed (so a provider key cannot leak to another origin), and the Local models URL only receives the local key when it has the same origin as the inference URL. When the routing event cap (2,000) is reached, the event-window field says only part of the window was aggregated.
+
 
 The summary at the top places the active service and key request metrics first. Charts immediately below show the last 60 minutes of external versus Plan routing and hourly token usage over the last 24 hours, with expandable hourly values. They reuse existing observations without sending additional model requests. Metrics wrap into multiple rows on narrow screens.
 

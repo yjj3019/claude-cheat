@@ -73,7 +73,7 @@ CONFIG_FILES = {
     "openrouter": {"path": routeConfig.CONFIG_PATH,
                    "secret": {"ANTHROPIC_AUTH_TOKEN"},
                    "required": ("ANTHROPIC_AUTH_TOKEN", "OPENROUTER_MODEL"),
-                   "fields": ("OPENROUTER_MODEL", "ANTHROPIC_AUTH_TOKEN")},
+                   "fields": ("OPENROUTER_MODEL", "OPENROUTER_UPSTREAM_PROVIDER", "ANTHROPIC_AUTH_TOKEN")},
     "local": {"path": routeConfig.CONFIG_PATH,
               # Server addresses can carry credentials (user:pass@, ?token=), so they are masked like keys.
               "secret": {"LOCAL_LLM_API_KEY", "LOCAL_LLM_URL", "LOCAL_LLM_HTTP_URL", "LOCAL_LLM_MODELS_URL"},
@@ -97,6 +97,8 @@ _ACCOUNT = {"at": 0.0, "data": None}
 _PRICING = {"at": 0.0, "data": None}
 _SNAPSHOT = {"at": 0.0, "data": None}
 PRICING_TTL = 3600
+# A failed lookup is retried soon: one DNS blip must not freeze cost estimates for an hour.
+PRICING_ERROR_TTL = 60
 
 # Why a request left the replacement route, in one line, plus what the reader can do about it.
 REASON_HELP = {
@@ -130,12 +132,19 @@ HELP_SECTION = {
         ["GET /api/status", "위와 같은 요약 JSON"],
         ["GET /api/diagnostics", "AI용 읽기 전용 진단 JSON; 외부 API·추론 호출 없음"],
         ["GET /api/snapshot", "이 페이지가 쓰는 전체 데이터"],
-        ["POST /api/default-provider", "기본 실행 서비스 저장 (auto/openrouter/local/cli); 세션 토큰 필요"],
-        ["GET /api/config", "두 제공자 설정(비밀값은 마스킹)"],
+        ["GET /api/config", "세 서비스 설정(비밀값은 마스킹)"],
+        ["GET /api/models", "모델 목록 (CLI는 ?kind=codex|grok|claude)"],
+        ["GET /api/cli", "감지된 CLI 종류·버전·경로"],
+        ["GET /api/usage-stats", "기간별 사용량 (?period=day|week|month)"],
+        ["GET·POST /api/blackbox", "블랙박스 상태 조회와 시작·문제 표시·종료"],
+        ["POST /api/default-provider", "기본 실행 서비스 저장 (auto/openrouter/local/cli/sonnet)"],
+        ["POST /api/config", "서비스 설정 저장·삭제(clear)"],
+        ["POST /api/test", "연결 검사 (metadata·inference·tool_roundtrip)"],
+        ["POST /api/config-reset", "OpenRouter·Local 인증 정보 삭제·초기화"],
         ["GET /api/metrics (프록시)", "프록시 카운터. 같은 세션 토큰 필요, 127.0.0.1 전용"],
     ],
-    "states": [["external", "OpenRouter 사용 중"], ["plan", "Plan 우회 중"], ["idle", "유휴(5분 이상 결정 없음)"],
-               ["unknown", "기록 없음"]],
+    "states": [["external", "외부 모델 사용 중 (Local·OpenRouter·CLI)"], ["plan", "Plan 우회 중"],
+               ["idle", "유휴(5분 이상 결정 없음)"], ["unknown", "기록 없음"]],
     "exit_codes": [["0", "정상"], ["2", "현재 Plan 경로"], ["3", "심각 경고"], ["4", "라우팅 기록 없음"]],
     "sources": [["라우팅 결정", "실행기 폴더의 .route.log (프록시가 기록)"],
                 ["토큰·모델", "Claude Code 세션 기록 (~/.claude/projects)"],
@@ -143,6 +152,12 @@ HELP_SECTION = {
                 ["상태 JSON", "GET /api/status 또는 python routeDashboard.py --status"]],
 }
 ROUTE_TAIL_BYTES = 4 * 1024 * 1024
+# A cold read reads the head too: a long session's start marker can be many megabytes
+# behind the tail, and without it stale-code detection silently disappears.
+ROUTE_HEAD_BYTES = 64 * 1024
+ROUTE_START = re.compile(r"^--- proxy start\b(.*?)---$")
+# Tolerated clock disagreement before a timestamp is treated as unknown instead of "now".
+CLOCK_SKEW_TOLERANCE = 5.0
 
 
 SCAN_DAYS = 7
@@ -169,11 +184,16 @@ _ROUTE_TAIL = {"path": None, "events": [], "offset": 0, "digest": None}
 def _parse_route_line(line):
     stamp, _, rest = line.partition(" ")
     rest = rest.strip()
-    start = re.fullmatch(r"--- proxy start(?: code=(\S+))?(?: hash=([0-9a-f]+))? ---", rest)
+    start = ROUTE_START.match(rest)
     if start:
-        return {"ts": stamp, "event": "proxy_start",
-                **({"code": start.group(1)} if start.group(1) else {}),
-                **({"hash": start.group(2)} if start.group(2) else {})}
+        attrs = dict(re.findall(r"([A-Za-z_]+)=([^\s]+)", start.group(1)))
+        event = {"ts": stamp, "event": "proxy_start"}
+        for name in ("code", "hash", "instance"):
+            if attrs.get(name):
+                event[name] = attrs[name]
+        if attrs.get("continued") == "1":
+            event["continued"] = True
+        return event
     if not rest.startswith("{"):
         return None
     try:
@@ -185,13 +205,37 @@ def _parse_route_line(line):
     return {"ts": stamp, **payload}
 
 
+def _route_instance(event):
+    """Which launcher instance wrote an event; None for logs from an older proxy."""
+    value = event.get("instanceId") or event.get("instance")
+    return value if isinstance(value, str) and value else None
+
+
+def _read_route_head(handle, size):
+    """Start markers from the first bytes of the file: only they identify a long session."""
+    if size <= 0:
+        return []
+    handle.seek(0)
+    head = handle.read(min(ROUTE_HEAD_BYTES, size))
+    markers = []
+    lines = head.split(b"\n")[:-1] if b"\n" in head else []
+    for raw in lines:
+        parsed = _parse_route_line(raw.decode("utf-8", errors="replace"))
+        if parsed and parsed.get("event") == "proxy_start":
+            markers.append(parsed)
+    # Only the newest marker in the head is the session that owns this file so far.
+    return markers[-1:]
+
+
 def _parse_route_log_unlocked(path=None, limit=5000, incremental=True):
     """Return the tail of the route log as events with a UTC timestamp.
 
     The log only grows during a session, so a parked byte offset keeps each refresh to
     the lines appended since the previous one. A truncated or replaced file falls back
     to a full read, a trailing partial line waits for its newline, and
-    `incremental=False` always reads everything.
+    `incremental=False` always reads everything. Cold reads re-read the head marker and
+    carry over the previous session's marker, so rotation and long files keep the
+    stale-code identity the dashboard depends on.
     """
     path = Path(path or ROUTE_LOG)
     try:
@@ -201,6 +245,7 @@ def _parse_route_log_unlocked(path=None, limit=5000, incremental=True):
         return []
     path_key = str(path.resolve())
     state = _ROUTE_TAIL
+    cold_markers = []
     try:
         with path.open("rb") as handle:
             info = os.fstat(handle.fileno())
@@ -216,13 +261,26 @@ def _parse_route_log_unlocked(path=None, limit=5000, incremental=True):
                 skip_partial = False
             else:
                 # A cold read only needs the tail: a log that grew for weeks must not be
-                # parsed in full on every dashboard start.
+                # parsed in full on every dashboard start. The head is read separately so
+                # a start marker megabytes behind the tail survives.
                 start = max(0, info.st_size - ROUTE_TAIL_BYTES) if info.st_size > ROUTE_TAIL_BYTES else 0
+                cold_markers = _read_route_head(handle, start) if start > 0 else []
+                # A replaced log keeps no identity unless its own head says it continues
+                # the rotated file; otherwise an unrelated older session would leak in.
+                continuation = any(event.get("continued") for event in cold_markers)
+                carried = ([e for e in state["events"] if e.get("event") == "proxy_start"][-1:]
+                           if continuation else [])
+                markers = []
+                # The carried marker belongs to the file that was rotated away; a
+                # continuation marker in the new file is newer and must stay last.
+                for event in carried + cold_markers:
+                    if event not in markers:
+                        markers.append(event)
                 skip_partial = start > 0
                 if skip_partial:
                     handle.seek(start - 1)
                     skip_partial = handle.read(1) != b"\n"
-                state["events"] = []
+                state["events"] = markers
                 state["offset"] = start
             handle.seek(start)
             chunk = handle.read()
@@ -247,7 +305,14 @@ def _parse_route_log_unlocked(path=None, limit=5000, incremental=True):
             parsed = _parse_route_line(raw.decode("utf-8", errors="replace"))
             if parsed:
                 state["events"].append(parsed)
-        state["events"] = state["events"][-limit:]
+        if len(state["events"]) > limit:
+            dropped = state["events"][:-limit]
+            kept = state["events"][-limit:]
+            # The session's identity marker must survive the event cap; without it
+            # stale-code detection disappears exactly for long, busy sessions.
+            marker = next((event for event in reversed(dropped)
+                           if event.get("event") == "proxy_start"), None)
+            state["events"] = ([marker] + kept) if marker else kept
         start += len(complete)
     state.update({"path": path_key, "digest": digest, "identity": identity, "offset": start})
     return list(state["events"])
@@ -269,7 +334,12 @@ def _age_seconds(stamp, now):
         return None
     if then.tzinfo is None:
         then = then.replace(tzinfo=timezone.utc)
-    return max(0.0, (now - then).total_seconds())
+    delta = (now - then).total_seconds()
+    # A future timestamp means the clocks disagree (VM resume, NTP step). It is not
+    # "0 seconds ago": treat it as unknown so a dead proxy cannot look freshly active.
+    if delta < -CLOCK_SKEW_TOLERANCE:
+        return None
+    return max(0.0, delta)
 
 
 def _local_hour(stamp):
@@ -350,14 +420,52 @@ def _count_shape(shapes, event):
         shapes["text_only"][family] = shapes["text_only"].get(family, 0) + 1
 
 
-def routing_state(events, now=None, idle_after=300):
+def _scope_events(events, instance):
+    """Keep one launcher instance's events; a log from an older proxy has no ids."""
+    if not instance:
+        return events
+    tagged = [event for event in events if _route_instance(event)]
+    if not tagged:
+        return events
+    return [event for event in events if _route_instance(event) == instance]
+
+
+def _instance_summary(events):
+    """Per-launcher totals so two concurrent sessions are visible instead of merged."""
+    found = {}
+    for event in events:
+        name = _route_instance(event)
+        if not name:
+            continue
+        row = found.setdefault(name, {"instance": name, "requests": 0, "failures": 0,
+                                      "last_ts": None, "provider": None})
+        if event.get("event") == "route_selected":
+            row["requests"] += 1
+            row["provider"] = event.get("provider") if event.get("provider") in ROUTING_PROVIDERS else "plan"
+        elif event.get("event") == "external_attempt_failed":
+            row["failures"] += 1
+        if event.get("ts"):
+            row["last_ts"] = event["ts"]
+    return sorted(found.values(), key=lambda row: row["last_ts"] or "", reverse=True)
+
+
+def routing_state(events, now=None, idle_after=300, instance=None):
     """Summarise the newest decisions: what is serving traffic right now."""
+    now = now or datetime.now(timezone.utc)
+    instances = _instance_summary(events)
+    # A shared log holds every session; default to the instance that started most recently.
+    if instance is None:
+        for event in reversed(events):
+            if event.get("event") == "proxy_start" and _route_instance(event):
+                instance = _route_instance(event)
+                break
+    events = _scope_events(events, instance)
     # Bound the per-refresh work: one CLI session keeps far fewer events in a 60 minute
     # window, while a pathological log still renders in a few milliseconds.
+    truncated = len(events) > ROUTING_EVENTS_CAP or len(events) >= 5000
     if len(events) > ROUTING_EVENTS_CAP:
         events = events[-ROUTING_EVENTS_CAP:]
-    now = now or datetime.now(timezone.utc)
-    # Log append order is the session boundary; wall clocks can move backwards.
+        truncated = True
     start_index = next((i for i in range(len(events) - 1, -1, -1)
                         if events[i].get("event") == "proxy_start"), -1)
     selected = [e for e in events[start_index + 1:] if e.get("event") == "route_selected"]
@@ -365,7 +473,10 @@ def routing_state(events, now=None, idle_after=300):
     age = _age_seconds(last["ts"], now) if last else None
     if last is None:
         state = "unknown"
-    elif age is not None and age > idle_after:
+    elif age is None:
+        # A future timestamp (clock skew) is not evidence of a current route.
+        state = "unknown"
+    elif age > idle_after:
         state = "idle"
     elif last.get("provider") in ROUTING_PROVIDERS:
         state = "external"
@@ -377,25 +488,37 @@ def routing_state(events, now=None, idle_after=300):
 
     def aggregate(minutes):
         counts = {"external": 0, "plan": 0}
+        providers = {}
         plan_reasons = {}
         failures = {}
         models = {}
         circuits = 0
         shapes = {"total": 0, "by_family": {}, "text_only": {}}
         kept = []
+
+        def provider_row(name):
+            return providers.setdefault(name, {"requests": 0, "failures": 0,
+                                               "last_ts": None, "last_model": None})
+
         for event, age_sec in aged_events:
             if age_sec is None or age_sec > minutes * 60:
                 continue
             name = event.get("event")
             if name == "route_selected":
+                provider = event.get("provider") if event.get("provider") in ROUTING_PROVIDERS else "plan"
                 key = "external" if event.get("provider") in ROUTING_PROVIDERS else "plan"
                 counts[key] += 1
+                row = provider_row(provider)
+                row["requests"] += 1
+                row["last_ts"] = event.get("ts")
+                served = event.get("model")
+                if isinstance(served, str) and served and len(served) <= 200:
+                    row["last_model"] = served
                 if key == "plan":
                     reason = event.get("reason") or "unknown"
                     detail = event.get("detail")
                     label = f"{reason}:{detail}" if detail and reason != "fallback" else reason
                     plan_reasons[label] = plan_reasons.get(label, 0) + 1
-                served = event.get("model")
                 if isinstance(served, str) and served and len(served) <= 200:
                     models[f"{key}:{served}"] = models.get(f"{key}:{served}", 0) + 1
             elif name == "external_attempt_failed":
@@ -404,6 +527,10 @@ def routing_state(events, now=None, idle_after=300):
                 if event.get("validation"):
                     label = f"{label}:{event['validation']}"
                 failures[label] = failures.get(label, 0) + 1
+                row = provider_row(event.get("provider") if event.get("provider") in ROUTING_PROVIDERS
+                                   else "external")
+                row["failures"] += 1
+                row["last_ts"] = event.get("ts")
             elif name == "circuit_open":
                 circuits += 1
             elif name == "request_shape":
@@ -412,6 +539,7 @@ def routing_state(events, now=None, idle_after=300):
                 continue
             kept.append(event)
         return {"counts": counts,
+                "providers": {name: row for name, row in sorted(providers.items())},
                 "plan_reasons": sorted(plan_reasons.items(), key=lambda item: -item[1])[:6],
                 "failures": sorted(failures.items(), key=lambda item: -item[1])[:6],
                 "models": sorted(models.items(), key=lambda item: -item[1])[:6],
@@ -422,22 +550,28 @@ def routing_state(events, now=None, idle_after=300):
     last_model = last.get("model") if last and isinstance(last.get("model"), str) and 0 < len(last["model"]) <= 200 else None
     return {
         "state": state,
+        "instance": instance,
+        "instances": instances,
+        "truncated": truncated,
         "last": {"ts": last["ts"], "provider": last.get("provider"), "reason": last.get("reason"),
                  "detail": last.get("detail"), "model": last_model,
                  "age_seconds": round(age, 1) if age is not None else None} if last else None,
         "window_minutes": ROUTE_WINDOW,
         "counts": wide["counts"],
+        "providers": wide["providers"],
         "plan_reasons": wide["plan_reasons"],
         "failures": wide["failures"],
         "models": wide["models"],
         "circuit_opens": wide["circuit_opens"],
         "shapes": wide["shapes"],
-        "short": {"minutes": SHORT_WINDOW, "counts": short["counts"], "plan_reasons": short["plan_reasons"],
+        "short": {"minutes": SHORT_WINDOW, "counts": short["counts"], "providers": short["providers"],
+                  "plan_reasons": short["plan_reasons"],
                   "failures": short["failures"], "models": short["models"],
                   "circuit_opens": short["circuit_opens"]},
         "proxy_started_at": starts[-1]["ts"] if starts else None,
         "proxy_code": starts[-1].get("code") if starts else None,
         "proxy_hash": starts[-1].get("hash") if starts else None,
+        "proxy_instance": _route_instance(starts[-1]) if starts else None,
         "transitions": route_transitions(events),
         "recent": [{"ts": e["ts"], "event": e.get("event"), "provider": e.get("provider"),
                     "reason": e.get("reason"), "detail": e.get("detail"),
@@ -1181,7 +1315,9 @@ def scan_sessions(projects=None, max_files=SCAN_FILES, now=None, pricing=None):
         usage = {"totals": totals, "today": hour_totals, "current_hour": current_hour,
                  "cache_write_1h": totals_1h, "today_cache_write_1h": hour_totals_1h,
                  "timeline": timeline,
-                 # cost_usd is the retained window (7 days); today_cost_usd is today's spend.
+                 # cost_usd aggregates every turn in the session files still inside the
+                 # retention folder, so an old turn inside a recently modified file is
+                 # included; today_cost_usd is filtered by each row's own timestamp.
                  "cost_usd": round(total_cost, 6) if priced else None,
                  "today_cost_usd": round(today_cost, 6) if today_cost is not None else None,
                  "cost": {"status": cost_status,
@@ -1227,18 +1363,26 @@ def usage_snapshot(pricing=None, signature=None, ttl=60):
     return data
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A provider credential must never follow a redirect to another origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def account_state(key, cache=None, now=None):
     """Monthly key limit and spend from OpenRouter, cached for a minute."""
     now = time.monotonic() if now is None else now
     cache = _ACCOUNT if cache is None else cache
     cached = cache.get("data")
-    if cached and now - cache.get("at", 0) < ACCOUNT_TTL:
+    # A saved key change must not keep serving the previous key's limits for a minute.
+    if cached and cache.get("key") == key and now - cache.get("at", 0) < ACCOUNT_TTL:
         return cached
     result = {"ok": False, "error": None}
     if not key:
         result["error"] = "configuration_missing"
     else:
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
         try:
             request = urllib.request.Request("https://openrouter.ai/api/v1/key",
                                              headers={"authorization": "Bearer " + key})
@@ -1266,7 +1410,7 @@ def account_state(key, cache=None, now=None):
             result["error"] = "connection_failed"
         except ValueError:
             result["error"] = "invalid_response"
-    cache["data"], cache["at"] = result, now
+    cache["data"], cache["at"], cache["key"] = result, now, key
     return result
 
 
@@ -1345,13 +1489,15 @@ def model_pricing(key, model, cache=None, now=None):
     cache = _PRICING if cache is None else cache
     cached = cache.get("data")
     # Switching OPENROUTER_MODEL must not reuse the previous model's rates.
-    if cached and cache.get("model") == model and now - cache.get("at", 0) < PRICING_TTL:
-        return cached
+    if cached and cache.get("model") == model:
+        ttl = PRICING_TTL if cached.get("ok") else PRICING_ERROR_TTL
+        if now - cache.get("at", 0) < ttl:
+            return cached
     result = {"ok": False, "error": None}
     if not key or not model:
         result["error"] = "configuration_missing"
     else:
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
         try:
             request = urllib.request.Request("https://openrouter.ai/api/v1/models",
                                              headers={"authorization": "Bearer " + key})
@@ -1441,14 +1587,23 @@ def build_alerts(routing, usage, account, pricing):
     total = (counts.get("external") or 0) + (counts.get("plan") or 0)
     minutes = short.get("minutes") or SHORT_WINDOW
     if short.get("circuit_opens"):
-        alerts.append({"level": "critical", "title": "외부 회로 차단",
-                       "detail": f"최근 {minutes}분에 회로가 {short['circuit_opens']}회 열렸습니다. 외부 시도가 실패해 Plan으로 우회 중입니다."})
+        opened = short["circuit_opens"]
+        current_plan = routing.get("state") == "plan"
+        alerts.append({"level": "critical" if current_plan else "warn",
+                       "title": "외부 회로 차단",
+                       "detail": (f"최근 {minutes}분에 회로가 {opened}회 열렸습니다. 지금은 Plan으로 우회 중입니다."
+                                  if current_plan else
+                                  f"최근 {minutes}분에 회로가 {opened}회 열렸습니다. 현재 경로는 {routing.get('state') or 'unknown'}이며, 이는 지난 발생 기록입니다.")})
     if total and (counts.get("plan") or 0) / total >= 0.5:
+        plan_count = counts.get("plan") or 0
         top = (short.get("plan_reasons") or [[None, 0]])[0]
-        detail = f"최근 {minutes}분 결정 {total}건 중 {counts['plan']}건이 Plan입니다."
+        detail = f"최근 {minutes}분 결정 {total}건 중 {plan_count}건이 Plan입니다."
+        detail += " 결정은 요청과 다를 수 있습니다(재시도·우회 시 한 요청이 여러 결정을 만듭니다)."
         if top[0]:
             detail += f" 주요 사유: {top[0]}"
-        alerts.append({"level": "warn", "title": "Plan 우회 급증", "detail": detail})
+        alerts.append({"level": "warn" if plan_count >= 2 else "info",
+                       "title": "Plan 우회 급증" if plan_count >= 2 else "Plan 우회 발생",
+                       "detail": detail})
     rejected = [(label, count) for label, count in short.get("failures") or []
                 if str(label).startswith(("400", "413", "422"))]
     if rejected:
@@ -1484,10 +1639,12 @@ def build_alerts(routing, usage, account, pricing):
 
 
 ALERT_CODES = {
-    "외부 회로 차단": "circuit_open", "Plan 우회 급증": "plan_spike", "외부 요청 거부": "rejected",
+    "외부 회로 차단": "circuit_open", "Plan 우회 급증": "plan_spike", "Plan 우회 발생": "plan_incident",
+    "외부 요청 거부": "rejected",
     "현재 Plan 경로": "plan_state", "실행기 재시작 필요": "proxy_stale",
     "OpenRouter 잔액 부족": "low_balance", "크레딧 확인 실패": "account_error",
     "단가 조회 실패": "pricing_error",
+    "스냅샷 갱신 실패": "snapshot_refresh_failed", "스냅샷 오래됨": "snapshot_stale",
 }
 INSIGHT_CODES = {
     "실행기 코드가 오래됨": "proxy_stale", "외부 회로 차단": "circuit_open",
@@ -1612,9 +1769,12 @@ def build_insights(routing, usage, account, pricing, metrics=None, now=None):
                     f"이 세션 외부 응답 p95가 {p95 / 1000:.1f}초입니다. 회로 차단·재시도가 늘기 전에 확인하세요.",
                     evidence=[f"p95 {p95 / 1000:.1f}s"], score=60)
         failed = metrics.get("failed")
+        aborted = metrics.get("aborted")
+        failed = (max(0, failed - aborted) if isinstance(failed, int) and isinstance(aborted, int)
+                  else failed)
         if isinstance(failed, int) and failed > 0:
             add("info", "실패 응답 누적",
-                f"이 세션에서 실패로 끝난 요청이 {failed}건 있습니다.",
+                f"이 세션에서 실패로 끝난 요청이 {failed}건 있습니다. 사용자가 취소한 요청은 제외했습니다.",
                 evidence=[f"실패 {failed} / 요청 {metrics.get('requests')}"], score=40)
 
     last = routing.get("last") or {}
@@ -1687,7 +1847,22 @@ def _live_session(offline=False):
     finally:
         connection.close()
     started = record.get("started")
-    session = {"provider": record["provider"], "started": started if isinstance(started, str) else None}
+    instance = record.get("instance_id")
+    instance = instance if isinstance(instance, str) and re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", instance) else None
+    proxy_pid = record.get("proxy_pid")
+    proxy_pid = proxy_pid if type(proxy_pid) is int and proxy_pid > 0 else None
+    # The handoff's instance must be the one that answered with this nonce: a singleton
+    # handoff can otherwise point at a different launcher than the live proxy.
+    reported = metrics.get("instanceId")
+    if instance and isinstance(reported, str) and reported != instance:
+        return None, None
+    identity = process_identity(proxy_pid) if proxy_pid is not None else None
+    session = {"provider": record["provider"],
+               "started": started if isinstance(started, str) else None,
+               "instance_id": instance,
+               # True only when the recorded proxy pid still exists with that pid value.
+               "pid_verified": bool(identity is not None and identity[0] == proxy_pid)}
     return session, {**metrics, "age_seconds": 0, "stale": False}
 
 
@@ -1991,6 +2166,10 @@ def _validate_config(provider, values):
         if (not re.fullmatch(r"[A-Za-z0-9~@][A-Za-z0-9._:/@+~-]{0,255}", model)
                 or model.startswith(("REPLACE_WITH_", "YOUR_"))):
             raise ValueError("invalid_model")
+        upstream = values.get("OPENROUTER_UPSTREAM_PROVIDER") or ""
+        if (len(upstream) > 128 or (upstream and (not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", upstream)
+                or any(part in (".", "..") for part in upstream.split("/"))))):
+            raise ValueError("invalid_openrouter_provider")
         token = values.get("ANTHROPIC_AUTH_TOKEN")
         if token and not re.fullmatch(r"sk-or-[A-Za-z0-9_-]+", token):
             raise ValueError("invalid_key")
@@ -1999,6 +2178,11 @@ def _validate_config(provider, values):
         _validate_cli(values)
         return
     _validate_local(values)
+
+
+def _openrouter_provider_policy(values):
+    upstream = values.get("OPENROUTER_UPSTREAM_PROVIDER") or ""
+    return {"only": [upstream], "allow_fallbacks": False} if upstream else {"allow_fallbacks": False}
 
 
 def _effective_values(provider, values=None, clear=(), strict=False):
@@ -2081,8 +2265,26 @@ def _models_endpoint(provider, values):
     explicit = (values.get("LOCAL_LLM_MODELS_URL") or "").strip()
     if explicit:
         target = urlsplit(explicit)
-        if target.scheme not in ("http", "https") or not target.hostname:
+        if (target.scheme not in ("http", "https") or not target.hostname
+                or target.username is not None or target.password is not None
+                or target.query or target.fragment):
             raise ValueError("invalid_models_url")
+        base = urlsplit((values.get("LOCAL_LLM_URL") or "").strip())
+        if base.scheme not in ("http", "https") or not base.hostname:
+            raise ValueError("invalid_local_url")
+
+        def origin(parsed, error_code):
+            try:
+                port = parsed.port
+            except ValueError:
+                raise ValueError(error_code) from None
+            return (parsed.scheme, (parsed.hostname or "").lower(),
+                    port if port is not None else (443 if parsed.scheme == "https" else 80))
+
+        # The local key may only go to the configured inference origin: a hand-edited
+        # MODELS_URL must not be able to exfiltrate it from the authenticated models API.
+        if origin(target, "invalid_models_url") != origin(base, "invalid_local_url"):
+            raise ValueError("models_url_origin_mismatch")
         return explicit, {}
     base = urlsplit((values.get("LOCAL_LLM_URL") or "").strip())
     if base.scheme not in ("http", "https") or not base.hostname:
@@ -2220,7 +2422,7 @@ def _http_json(url, headers, body=None, timeout=12):
             # Only the configured endpoint is authorized to receive provider credentials.
             return None
 
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
     data = json.dumps(body).encode("utf-8") if body is not None else None
     request = urllib.request.Request(url, data=data, headers=headers,
                                      method="POST" if body is not None else "GET")
@@ -2332,6 +2534,10 @@ def run_connection_test(provider, mode="metadata", values=None):
             if (not re.fullmatch(r"sk-or-[A-Za-z0-9_-]+", key)
                     or not re.fullmatch(r"[A-Za-z0-9~@][A-Za-z0-9._:/@+~-]{0,255}", model)):
                 return {**base, "reason": "invalid_configuration"}
+            try:
+                _validate_config(provider, values)
+            except ValueError:
+                return {**base, "reason": "invalid_configuration"}
             headers["authorization"] = "Bearer " + key
             if mode == "metadata":
                 status, data = _http_json("https://openrouter.ai/api/v1/models",
@@ -2343,6 +2549,7 @@ def run_connection_test(provider, mode="metadata", values=None):
                         "model": model, "model_count": len(ids)}
             status, data = _http_json("https://openrouter.ai/api/v1/messages", headers,
                                       {"model": model, "max_tokens": 16, "stream": False,
+                                       "provider": _openrouter_provider_policy(values),
                                        "messages": [{"role": "user", "content": "Reply with exactly OK"}]})
             text = _connection_reply_text(data)
             if data.get("model") != model:
@@ -2399,6 +2606,7 @@ def _current_routing(events, session, metrics, now=None, idle_after=300):
     now = now or datetime.now(timezone.utc)
     if not session or not metrics:
         return routing_state(events, now=now, idle_after=idle_after)
+    instance = session.get("instance_id")
     started = metrics.get("startedAt") or session.get("started")
     current_events = []
     for event in events:
@@ -2410,7 +2618,7 @@ def _current_routing(events, session, metrics, now=None, idle_after=300):
                          and _in_session(started, started, now))
         if in_current or current_start:
             current_events.append(event)
-    routing = routing_state(current_events, now=now, idle_after=idle_after)
+    routing = routing_state(current_events, now=now, idle_after=idle_after, instance=instance)
     routing["proxy_started_at"] = started if _in_session(started, started, now) else None
     last = metrics.get("last")
     if not isinstance(last, dict) or last.get("route") not in ("external", "plan"):
@@ -2434,11 +2642,23 @@ def _current_routing(events, session, metrics, now=None, idle_after=300):
         detail = candidate if candidate in ("request", "provider", "rate_limit", "transient") else None
     else:
         detail = detail if "native_feature:" + str(detail) in REASON_HELP else None
+    # metrics.last carries neither the route log's detail nor the Plan/dual-provider model,
+    # so fall back to the authoritative decision line for the same request.
+    if logged and logged.get("reason") == last.get("reason"):
+        if detail is None:
+            detail = logged.get("detail")
+        if provider is None and logged.get("provider") in ROUTING_PROVIDERS:
+            provider = logged.get("provider")
+        if model is None:
+            logged_model = logged.get("model")
+            model = logged_model if isinstance(logged_model, str) and 0 < len(logged_model) <= 200 else None
     age = _age_seconds(last["ts"], now)
     routing["last"] = {"ts": last["ts"], "provider": provider, "model": model,
                        "reason": last.get("reason"), "detail": detail, "age_seconds": age,
                        "status": last.get("status"), "outcome": last.get("outcome")}
-    routing["state"] = "idle" if age is not None and age > idle_after else "external" if last["route"] == "external" else "plan"
+    routing["state"] = ("unknown" if age is None else
+                        "idle" if age > idle_after else
+                        "external" if last["route"] == "external" else "plan")
     return routing
 
 
@@ -2467,7 +2687,9 @@ def snapshot():
     if provider == "cli":
         model = ((live_metrics or {}).get("configuration") or {}).get("model")
     signature = (provider, model, (pricing or {}).get("pricing_version"), routing_signature(routing))
-    usage = _empty_usage() if provider == "cli" else usage_snapshot(pricing=pricing, signature=signature)
+    # Tokens are counted from session records for every connection, not only OpenRouter:
+    # a CLI display provider must not hide an earlier Local/OpenRouter session's usage.
+    usage = usage_snapshot(pricing=pricing, signature=signature)
     historical_metrics = proxy_metrics() if live_metrics is None else None
     metrics = live_metrics or ({**historical_metrics, "stale": True} if historical_metrics else None)
     insights = build_insights(routing, usage, account, pricing, metrics=metrics)
@@ -2483,6 +2705,7 @@ def snapshot():
         "configured": any_provider_configured(),
         "providers": provider_states(),
         "active_session": session,
+        "provider": provider,
         "refresh_ms": refresh_interval_ms(routing),
         "proxy_stale": proxy_stale(routing),
         "proxy_metrics": metrics,
@@ -2492,12 +2715,36 @@ def snapshot():
     }
 
 
+SNAPSHOT_STALE_SECONDS = 30
+
+
+def _snapshot_health_alerts(age, error):
+    """Surface a stalled or failed refresher; the page used to show empty codes for this."""
+    if error:
+        return [{"level": "critical", "title": "스냅샷 갱신 실패",
+                 "detail": "서버가 상태를 새로 계산하지 못했습니다. 마지막으로 성공한 스냅샷을 표시하고 있으므로 실시간 상태가 아닙니다.",
+                 "code": "snapshot_refresh_failed"}]
+    if age is not None and age > SNAPSHOT_STALE_SECONDS:
+        return [{"level": "warn", "title": "스냅샷 오래됨",
+                 "detail": f"마지막 성공 갱신이 {round(age)}초 전입니다. 표시된 상태가 지연됐을 수 있습니다.",
+                 "code": "snapshot_stale"}]
+    return []
+
+
 def cached_snapshot():
     """Serve the last completed snapshot so a slow first scan never blocks the page."""
     data = _SNAPSHOT.get("data")
     error = _SNAPSHOT.get("error")
+    at = _SNAPSHOT.get("at")
+    age = max(0.0, round(time.monotonic() - at, 1)) if data is not None and at else None
+    health = _snapshot_health_alerts(age, error)
     if data is not None:
-        return {**data, "snapshot_error": error} if error else data
+        alerts = [alert for alert in data.get("alerts") or []
+                  if alert.get("code") not in ("snapshot_stale", "snapshot_refresh_failed")]
+        payload = {**data, "snapshot_age_seconds": age, "alerts": health + alerts}
+        if error:
+            payload["snapshot_error"] = error
+        return payload
     now = datetime.now(timezone.utc)
     session, metrics = _live_session()
     routing = _current_routing(parse_route_log(), session, metrics, now=now)
@@ -2512,12 +2759,14 @@ def cached_snapshot():
         "usage": usage,
         "account": account,
         "pricing": None,
-        "alerts": build_alerts(routing, usage, account, None),
+        "alerts": health + build_alerts(routing, usage, account, None),
         "insights": [],
         "summary": summary_line(routing, usage, account, [], live=bool(session)),
         "configured": any_provider_configured(),
         "providers": provider_states(),
         "active_session": session,
+        "provider": provider,
+        "snapshot_age_seconds": None,
         "refresh_ms": refresh_interval_ms(routing),
         "proxy_stale": proxy_stale(routing),
         "help": {"reasons": REASON_HELP, **HELP_SECTION},
@@ -2688,7 +2937,7 @@ def _usage_refresh_loop():
 # Shared page assets; one shell renders the dashboard and the settings page.
 PAGE_CSS = "\n:root{\n color-scheme:dark;\n --bg:#070b12; --bg-soft:#0b1119; --panel:#0f1622; --panel-2:#121a28; --panel-3:#162031;\n --line:#1d2739; --line-2:#27344b; --line-3:#33465f;\n --fg:#e9eff8; --fg-2:#b6c2d4; --fg-3:#8391a7; --fg-4:#5f6d83;\n --accent:#5b9dff; --accent-soft:rgba(91,157,255,.16); --accent-line:rgba(91,157,255,.45);\n --ok:#43d9a3; --ok-soft:rgba(67,217,163,.14); --ok-line:rgba(67,217,163,.4);\n --warn:#f2b95e; --warn-soft:rgba(242,185,94,.14); --warn-line:rgba(242,185,94,.4);\n --bad:#ff7089; --bad-soft:rgba(255,112,137,.14); --bad-line:rgba(255,112,137,.4);\n --radius:8px; --radius-sm:8px; --radius-xs:6px;\n --shadow:none;\n --mono:ui-monospace,\"Cascadia Mono\",\"JetBrains Mono\",Consolas,monospace;\n --sans:\"Segoe UI Variable Text\",\"Segoe UI\",system-ui,-apple-system,\"Malgun Gothic\",sans-serif;\n}\n*{box-sizing:border-box}\nhtml,body{height:100%}\nbody{margin:0;background:var(--bg);\n color:var(--fg);font:14px/1.55 var(--sans);-webkit-font-smoothing:antialiased}\na{color:var(--accent);text-decoration:none}\na:hover{text-decoration:underline}\nh1,h2,h3,p{margin:0}\n.wrap{max-width:1460px;margin:0 auto;padding:0 28px}\n.mono{font-family:var(--mono);font-size:12px;letter-spacing:-.1px}\n.muted{color:var(--fg-3)}\n\n/* top bar */\n.topbar{position:sticky;top:0;z-index:40;background:rgba(7,11,18,.82);\n backdrop-filter:blur(14px) saturate(140%);border-bottom:1px solid var(--line)}\n.topbar-in{display:flex;align-items:center;justify-content:space-between;gap:20px;height:66px}\n.brand{display:flex;align-items:center;gap:13px;min-width:0}\n.logo{width:34px;height:34px;border-radius:11px;flex:0 0 auto;\n background:linear-gradient(145deg,#5b9dff,#2f6bd6);box-shadow:0 6px 18px -6px rgba(91,157,255,.8);\n position:relative}\n.logo::after{content:\"\";position:absolute;inset:9px;border-radius:50%;\n border:2px solid rgba(255,255,255,.9);border-right-color:transparent;border-bottom-color:transparent;\n transform:rotate(35deg)}\n.brand h1{font-size:15px;font-weight:650;letter-spacing:-.2px}\n.brand p{font-size:11.5px;color:var(--fg-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}\n.top-actions{display:flex;align-items:center;gap:10px;flex:0 0 auto}\n\n/* pills + chips */\n.pill{display:inline-flex;align-items:center;gap:8px;height:30px;padding:0 12px;border-radius:999px;\n font-size:12px;font-weight:600;border:1px solid var(--line-2);background:var(--panel-2);color:var(--fg-2);\n white-space:nowrap}\n.pill .dot{width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 0 3px rgba(255,255,255,.04)}\n.pill-ok{color:var(--ok);border-color:var(--ok-line);background:var(--ok-soft)}\n.pill-warn{color:var(--warn);border-color:var(--warn-line);background:var(--warn-soft)}\n.pill-bad{color:var(--bad);border-color:var(--bad-line);background:var(--bad-soft)}\n.pill-mute{color:var(--fg-3)}\n.chip{display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 9px;border-radius:7px;\n font-size:11px;font-family:var(--mono);color:var(--fg-2);background:var(--panel-3);border:1px solid var(--line)}\n\n/* layout */\nmain{padding:26px 0 80px}\n.grid{display:grid;grid-template-columns:repeat(12,minmax(0,1fr));gap:18px}\n.col-3{grid-column:span 3}.col-4{grid-column:span 4}.col-5{grid-column:span 5}\n.col-6{grid-column:span 6}.col-7{grid-column:span 7}.col-8{grid-column:span 8}\n.col-12{grid-column:span 12}\n@media(max-width:1180px){.col-3{grid-column:span 6}.col-4,.col-5,.col-7,.col-8{grid-column:span 12}\n .col-6{grid-column:span 12}}\n@media(max-width:720px){.col-3{grid-column:span 12}.wrap{padding:0 16px}}\n\n/* cards */\n.card{background:var(--panel);border:1px solid var(--line);\n border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden;display:flex;flex-direction:column}\n.card-h{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;\n padding:16px 18px 13px;border-bottom:1px solid var(--line)}\n.card-h h2{font-size:13px;font-weight:650;letter-spacing:-.1px}\n.card-h .sub{font-size:11.5px;color:var(--fg-4);font-family:var(--mono);margin-top:2px}\n.card-b{padding:16px 18px 18px;flex:1;display:flex;flex-direction:column}\n.card-b.tight{padding:12px 18px 16px}\n\n/* buttons */\n.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;height:34px;padding:0 14px;\n border-radius:var(--radius-xs);border:1px solid var(--line-2);background:var(--panel-3);color:var(--fg);\n font:600 12.5px/1 var(--sans);cursor:pointer;transition:.16s ease;white-space:nowrap}\n.btn:hover:not(:disabled){border-color:var(--line-3);background:#1a2436;transform:translateY(-1px)}\n.btn:active:not(:disabled){transform:none}\n.btn:focus-visible{outline:2px solid var(--accent-line);outline-offset:2px}\n.btn:disabled{opacity:.5;cursor:not-allowed}\n.btn-primary{background:linear-gradient(180deg,#5b9dff,#3b78e8);border-color:#6ba8ff;color:#fff;\n box-shadow:0 8px 18px -10px rgba(91,157,255,.9)}\n.btn-primary:hover:not(:disabled){background:linear-gradient(180deg,#6ba8ff,#4482f0)}\n.btn-ghost{background:transparent}\n.btn-sm{height:28px;padding:0 10px;font-size:11.5px}\n.btn.loading::before{content:\"\";width:11px;height:11px;border-radius:50%;\n border:2px solid rgba(255,255,255,.35);border-top-color:#fff;animation:spin .7s linear infinite}\n@keyframes spin{to{transform:rotate(360deg)}}\n\n/* metrics */\n.metric{display:flex;flex-direction:column;gap:2px}\n.metric .k{font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--fg-4);font-weight:600}\n.metric .v{font-size:23px;font-weight:680;letter-spacing:-.6px;font-variant-numeric:tabular-nums}\n.metric .v small{font-size:12px;font-weight:600;color:var(--fg-3);letter-spacing:0}\n.metric-list{display:flex;flex-direction:column;gap:7px;margin-top:4px}\n.row-kv{display:flex;align-items:baseline;justify-content:space-between;gap:12px;font-size:12.5px}\n.row-kv .k{color:var(--fg-3);flex-shrink:0;white-space:nowrap}\n.row-kv .v{min-width:0;overflow-wrap:anywhere;color:var(--fg);font-variant-numeric:tabular-nums;text-align:right}\n.bar{height:7px;border-radius:999px;background:#0a1119;border:1px solid var(--line);overflow:hidden;margin:12px 0 10px}\n.bar>i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,#3b78e8,#43d9a3)}\n.hairline{height:1px;background:var(--line);margin:12px 0}\n\n/* tables */\ntable{width:100%;border-collapse:collapse;font-size:12.5px}\nthead th{font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--fg-4);font-weight:650;\n text-align:left;padding:0 10px 8px 0;border-bottom:1px solid var(--line)}\ntbody td{padding:9px 10px 9px 0;border-bottom:1px solid rgba(255,255,255,.035);vertical-align:middle}\ntbody tr:last-child td{border-bottom:0}\ntbody tr:hover td{background:rgba(91,157,255,.04)}\ntd.num,th.num{text-align:right;font-variant-numeric:tabular-nums}\ntd.id{font-family:var(--mono);font-size:11.5px;color:var(--fg-2)}\n\n/* alerts */\n.alerts{display:flex;flex-direction:column;gap:10px;margin-bottom:18px}\n.alert{display:flex;gap:12px;align-items:flex-start;padding:12px 15px;border-radius:var(--radius-sm);\n border:1px solid var(--line-2);background:var(--panel-2);font-size:12.5px}\n.alert .icon{width:18px;height:18px;border-radius:50%;flex:0 0 auto;margin-top:1px;\n display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700}\n.alert b{display:block;font-size:12.5px;margin-bottom:1px}\n.alert .txt b{display:inline;font-size:inherit;margin:0;color:var(--fg);font-weight:650}\n.alert .txt{color:var(--fg-2)}\n.alert.critical{border-color:var(--bad-line);background:var(--bad-soft)}\n.alert.critical .icon{background:var(--bad);color:#3a0a13}\n.alert.warn{border-color:var(--warn-line);background:var(--warn-soft)}\n.alert.warn .icon{background:var(--warn);color:#3a2606}\n.alert.info{border-color:var(--accent-line);background:var(--accent-soft)}\n.alert.info .icon{background:var(--accent);color:#06152e}\n.alert code{font-family:var(--mono);font-size:11.5px;background:#080d15;border:1px solid var(--line);\n padding:1px 5px;border-radius:5px;color:var(--fg-2)}\n.notice{border:1px solid var(--accent-line);background:var(--accent-soft);border-radius:var(--radius-sm);\n padding:11px 13px;margin-bottom:14px;font-size:12.5px;color:var(--fg-2)}\n.notice b{color:var(--fg)}\n\n/* settings form */\n.setting-form{display:flex;flex-direction:column}\n.field{padding:11px 0;border-bottom:1px dashed rgba(255,255,255,.05)}\n.field:last-of-type{border-bottom:0}\n.field label{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600;color:var(--fg-2);margin-bottom:6px}\n.req{font-size:10px;font-weight:700;letter-spacing:.04em;color:var(--fg-4);text-transform:uppercase}\n.input{width:100%;height:38px;padding:0 12px;border-radius:var(--radius-xs);border:1px solid var(--line-2);\n background:#0a111c;color:var(--fg);font:12.5px var(--mono);transition:.15s ease}\n.input::placeholder{color:var(--fg-4);font-family:var(--sans)}\n.input:hover{border-color:var(--line-3)}\n.input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}\n.input[readonly]{opacity:.85}\n.input-group{display:flex;gap:8px}\n.input-group .input{flex:1}\n.hint{font-size:11.5px;color:var(--fg-4);margin-top:6px;line-height:1.5}\n.hint b{color:var(--fg-3)}\n.field.invalid .input{border-color:var(--bad-line);box-shadow:0 0 0 3px var(--bad-soft)}\n.switch{display:inline-flex;align-items:center;gap:10px;cursor:pointer;user-select:none;font-size:12.5px;\n color:var(--fg-2);font-weight:600}\n.switch input{position:absolute;opacity:0;width:0;height:0}\n.switch .track{width:38px;height:22px;border-radius:999px;background:#0a111c;border:1px solid var(--line-2);\n position:relative;transition:.18s ease;flex:0 0 auto}\n.switch .track::after{content:\"\";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;\n background:var(--fg-3);transition:.18s ease}\n.switch input:checked+.track{background:var(--accent-soft);border-color:var(--accent-line)}\n.switch input:checked+.track::after{left:18px;background:var(--accent)}\n.switch input:focus-visible+.track{box-shadow:0 0 0 3px var(--accent-soft)}\n.actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}\n.save-state{font-size:11px;font-weight:600;color:var(--fg-4)}\n.save-state.dirty{color:var(--warn)}\n.result{margin-top:14px;border-top:1px solid var(--line);padding-top:12px;min-height:34px}\n.result-line{display:flex;align-items:center;gap:9px;font-size:12.5px;font-weight:600}\n.result-line .dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto}\n.result-line.ok{color:var(--ok)} .result-line.ok .dot{background:var(--ok);box-shadow:0 0 0 3px var(--ok-soft)}\n.result-line.bad{color:var(--bad)} .result-line.bad .dot{background:var(--bad);box-shadow:0 0 0 3px var(--bad-soft)}\n.result-meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}\n.empty{color:var(--fg-4);font-size:12px}\n.stored{display:flex;flex-direction:column;gap:6px;margin-top:auto;padding-top:12px}\n.stored-title{font-size:10.5px;text-transform:uppercase;letter-spacing:.09em;color:var(--fg-4);font-weight:650;\n margin-bottom:2px}\n.stored .row-kv{font-size:12px}\n\n/* timeline */\n.timeline{display:flex;align-items:flex-end;gap:4px;height:132px;padding-top:6px}\n.tl-col{flex:1;display:flex;flex-direction:column;justify-content:flex-end;min-width:0;position:relative;height:100%}\n.tl-ext{background:linear-gradient(180deg,#43d9a3,#2fb383);border-radius:3px 3px 0 0}\n.tl-plan{background:linear-gradient(180deg,#f2b95e,#c98f36);border-radius:3px 3px 0 0}\n.tl-col:hover .tl-ext,.tl-col:hover .tl-plan{filter:brightness(1.15)}\n.tl-labels{display:flex;gap:4px;margin-top:7px}\n.tl-labels span{flex:1;font-size:9.5px;color:var(--fg-4);text-align:center;font-family:var(--mono)}\n.legend{display:flex;gap:16px;font-size:11.5px;color:var(--fg-3);margin-top:10px}\n.legend i{display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:6px}\n\n/* help */\ndetails{border-top:1px solid var(--line);padding:10px 0}\ndetails:first-of-type{border-top:0}\nsummary{cursor:pointer;font-size:12.5px;font-weight:600;color:var(--fg-2);list-style:none;\n display:flex;align-items:center;justify-content:space-between}\nsummary::-webkit-details-marker{display:none}\nsummary::after{content:\"+\";color:var(--fg-4);font-weight:700}\ndetails[open] summary::after{content:\"\u2013\"}\ndetails .card-b{padding-top:10px}\n.code{background:#080d15;border:1px solid var(--line);border-radius:var(--radius-sm);padding:12px 14px;\n font:12px/1.85 var(--mono);color:var(--fg-2);white-space:pre;overflow-x:auto;margin:10px 0 4px}\n\n/* toasts */\n.toasts{position:fixed;right:22px;bottom:22px;z-index:80;display:flex;flex-direction:column;gap:9px}\n.toast{display:flex;align-items:center;gap:10px;min-width:230px;max-width:380px;padding:12px 14px;\n border-radius:var(--radius-sm);border:1px solid var(--line-2);background:#0d1522;color:var(--fg);\n font-size:12.5px;box-shadow:var(--shadow);animation:in .18s ease}\n.toast .dot{width:8px;height:8px;border-radius:50%}\n.toast.ok{border-color:var(--ok-line)} .toast.ok .dot{background:var(--ok)}\n.toast.warn{border-color:var(--warn-line)} .toast.warn .dot{background:var(--warn)}\n.toast.bad{border-color:var(--bad-line)} .toast.bad .dot{background:var(--bad)}\n.toast.out{opacity:0;transform:translateY(6px);transition:.25s ease}\n@keyframes in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}\n\n.provider-pick{display:flex;align-items:center;gap:12px;margin:0 0 14px}.provider-pick label{font-size:12px;font-weight:600;color:var(--fg-2);white-space:nowrap}.provider-pick .input{max-width:320px;cursor:pointer}.card[hidden]{display:none}\n.section-title{display:flex;align-items:center;gap:10px;margin:30px 0 14px}\n.section-title h2{font-size:12px;text-transform:uppercase;letter-spacing:.1em;color:var(--fg-4);font-weight:650}\n.section-title .line{flex:1;height:1px;background:var(--line)}\n\n.top-nav{display:flex;align-items:center;gap:4px;margin-left:auto}\n.nav-link{display:inline-flex;align-items:center;height:30px;padding:0 12px;border-radius:9px;\n font-size:12.5px;font-weight:600;color:var(--fg-3);border:1px solid transparent}\n.nav-link:hover{color:var(--fg);background:var(--panel-2);text-decoration:none}\n.nav-link.active{color:var(--fg);background:var(--panel-3);border-color:var(--line-2)}\n@media(max-width:720px){.top-nav{display:none}}\n\n.steps{margin:0;padding-left:20px;color:var(--fg-2);font-size:12.5px;line-height:2}\n.steps li::marker{color:var(--fg-4);font-weight:700}\n.meta-line{display:flex;gap:12px;font-size:12.5px;color:var(--fg-2);padding:4px 0}\n.meta-line .k{min-width:52px;color:var(--fg-4);font-weight:650}\n\n.metrics-strip{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:18px}\n.metrics-strip .m{display:flex;flex-direction:column;gap:3px;min-width:0}\n.metrics-strip .k{font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--fg-4);font-weight:650}\n.metrics-strip .v{font-size:15px;font-weight:650;font-variant-numeric:tabular-nums;white-space:nowrap;\n overflow:hidden;text-overflow:ellipsis}\n\n.modal-backdrop{position:fixed;inset:0;z-index:90;display:flex;align-items:center;justify-content:center;\n padding:24px;background:rgba(4,7,12,.72);backdrop-filter:blur(4px)}\n.modal{width:min(760px,100%);max-height:min(72vh,760px);display:flex;flex-direction:column;\n background:var(--panel);border:1px solid var(--line-2);\n border-radius:var(--radius);box-shadow:var(--shadow)}\n.modal-h{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;\n padding:16px 18px 13px;border-bottom:1px solid var(--line)}\n.modal-h h3{font-size:13px;font-weight:650}\n.modal-b{padding:14px 18px 18px;overflow:auto;display:flex;flex-direction:column;gap:10px}\n.model-list{display:flex;flex-direction:column;gap:4px;min-height:60px}\n.model-row{display:flex;align-items:baseline;justify-content:space-between;gap:14px;width:100%;\n padding:9px 11px;border-radius:9px;border:1px solid transparent;background:var(--panel);color:var(--fg);\n font-size:12px;cursor:pointer;text-align:left;transition:.14s ease}\n.model-row:hover{border-color:var(--accent-line);background:var(--accent-soft)}\n.model-row .meta{color:var(--fg-4);font-size:11.5px;white-space:nowrap}\n\n.insights{display:flex;flex-direction:column;gap:10px}\n.insight{border:1px solid var(--line);border-radius:10px;padding:12px 14px;background:var(--panel)}\n.insight.critical{border-color:var(--bad-line);background:var(--bad-soft)}\n.insight.warn{border-color:var(--warn-line);background:var(--warn-soft)}\n.insight.info{border-color:var(--accent-line);background:var(--accent-soft)}\n.insight-head{display:flex;align-items:center;gap:9px;font-size:12.5px;color:var(--fg)}\n.insight-head .dot{width:7px;height:7px;border-radius:50%;background:var(--fg-3);flex:0 0 auto}\n.insight.critical .dot{background:var(--bad)}\n.insight.warn .dot{background:var(--warn)}\n.insight.info .dot{background:var(--accent)}\n.insight-head b{font-weight:650}\n.insight-head .btn{margin-left:auto}\n.insight p{margin:6px 0 0;font-size:12.5px;line-height:1.65;color:var(--fg-2)}\n.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}\n\n/* High-visibility dashboard and settings */\n:root{--fg-2:#cbd6e6;--fg-3:#aabbd0;--fg-4:#9baec5;--line:#304058;--line-2:#3a4e69}\nbody{font-size:15px;line-height:1.6}\n.brand h1{font-size:16px}.brand p,.card-h .sub,.hint,.empty{font-size:13px}\n.card-h h2{font-size:15px}.section-title h2{font-size:13px}.row-kv{font-size:13.5px}\n.metric .k,.metrics-strip .k{font-size:12px;letter-spacing:.02em;text-transform:none}\n.metrics-strip{grid-template-columns:repeat(auto-fit,minmax(min(100%,190px),1fr));gap:10px}\n.metrics-strip .m{padding:12px;border:1px solid var(--line);border-radius:10px;background:rgba(5,12,22,.35)}\n.metrics-strip .v{font-size:15px;white-space:normal;overflow-wrap:anywhere;overflow:visible}\n.overview{background:var(--panel);border-color:var(--line-2)}\n.overview-top{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;flex-wrap:wrap;margin-bottom:18px}\n.overview-state{font-size:24px;font-weight:750;line-height:1.25;overflow-wrap:anywhere}\n.overview-model{font-size:13px;color:var(--fg-2);overflow-wrap:anywhere;margin-top:5px}\n.overview-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}\n.overview-tile{padding:14px 16px;border:1px solid #38506b;border-radius:11px;background:rgba(5,12,22,.55);min-width:0}\n.overview-tile .label{display:block;color:var(--fg-2);font-size:13px;font-weight:600}\n.overview-tile .value{display:block;font-size:22px;font-weight:750;line-height:1.25;margin-top:5px;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}\n.overview-tile .context{display:block;color:var(--fg-3);font-size:12px;margin-top:5px}\n.insights{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));gap:10px}\n.insight p{font-size:13px}.insight-head{font-size:14px}.card-b{min-width:0;overflow-x:auto}\n.input{font-size:14px;min-height:42px}.field label,.provider-pick label{font-size:14px}\n.btn{min-height:38px;font-size:13px}.btn-sm{min-height:32px}\na:focus-visible,button:focus-visible,summary:focus-visible,select:focus-visible,input:focus-visible{outline:3px solid #93c5ff;outline-offset:3px}\n@media(max-width:900px){.overview-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}\n@media(max-width:720px){.topbar-in{height:auto;min-height:66px;flex-wrap:wrap;gap:8px;padding:10px 0}.top-nav{display:flex;order:3;flex-basis:100%;margin:0}.top-actions{gap:5px;flex-wrap:wrap}.brand{flex:1}.brand p{white-space:normal}.overview-top{gap:10px}.overview-state{font-size:20px}.overview-tile .value{font-size:18px}.provider-pick{flex-wrap:wrap}.provider-pick .input{max-width:none}.row-kv .k{white-space:normal}}\n@media(max-width:720px){.topbar{position:relative}.brand{flex:1 0 100%;min-width:0}.top-actions{flex:1 1 100%;justify-content:flex-start}.brand p{overflow:visible;text-overflow:clip}.topbar-in{align-items:flex-start}}\n@media(max-width:420px){.overview-grid{grid-template-columns:1fr}.overview-tile{padding:12px}}\n@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}\n\n/* Readable charts: only actual routing and transcript data */\n.route-chart{display:flex;height:24px;border-radius:7px;overflow:hidden;background:#22344a;margin:4px 0 16px}\n.route-external,.key-external{background:#43d9a3}.route-plan,.key-plan{background:#ff7089}\n.route-legend,.chart-summary{display:flex;flex-wrap:wrap;gap:10px 22px;color:var(--fg-2);font-size:13px}\n.route-legend span,.chart-summary span{display:flex;align-items:center;gap:7px}.route-legend b,.chart-summary b{color:var(--fg)}\n.route-legend i,.chart-summary i{width:11px;height:11px;border-radius:3px;flex:none}\n.route-legend{flex-direction:column;margin-bottom:8px}\n.chart-axis{color:var(--fg-2);font-size:12px;margin-top:14px}\n.tl-plan{background:linear-gradient(180deg,#ff9bab,#ed5a73)}\n.timeline{height:160px;border-bottom:1px solid var(--fg-4);background:repeating-linear-gradient(to top,transparent 0,transparent calc(25% - 1px),rgba(155,174,197,.20) calc(25% - 1px),rgba(155,174,197,.20) 25%)}\n.tl-labels span{font-size:11px}.chart-details{margin-top:12px}.chart-table{overflow-x:auto;max-height:300px}\n@media(max-width:720px){.timeline{gap:2px;height:130px}.tl-labels span{font-size:10px}.route-chart{height:20px}}\n\n/* A text label accompanies the lights. */\n.signal-lamps{display:inline-flex;gap:4px;align-items:center}\n.signal-lamps i{width:9px;height:9px;border-radius:50%;background:#46546a;border:1px solid #718097}\n.signal-red .signal-red-lamp{background:#ff7089;border-color:#ff9bab;box-shadow:0 0 7px #ff7089}\n.signal-warn .signal-warn-lamp{background:#d89b47;border-color:#f2c177;box-shadow:0 0 7px #d89b47}\n.signal-green .signal-green-lamp{background:#43d9a3;border-color:#8aefd0;box-shadow:0 0 7px #43d9a3}\n.signal-red{color:#ff9bab;border-color:var(--bad-line);background:var(--bad-soft)}\n.signal-warn{color:#f2c177;border-color:var(--warn-line);background:var(--warn-soft)}\n.signal-green{color:#8aefd0;border-color:var(--ok-line);background:var(--ok-soft)}\n.signal-neutral{color:var(--fg-2)}\n\n/* Live observations: bounded SVG and transient request particles */\n.flow-card{background:var(--panel);border-color:var(--line)}.flow-count{font-size:13px;color:#b7d9ea;font-weight:700}\n.gateway-scene{display:flex;align-items:center;gap:10px;min-height:82px;overflow:hidden}.flow-label,.flow-gateway,.flow-out{border:1px solid #456783;border-radius:10px;padding:10px 14px;color:#d9e9f6;font-size:13px;font-weight:700;white-space:nowrap}.flow-gateway{background:#173e4c;border-color:#45cfa0;box-shadow:0 0 24px #36d6a024}.flow-out{border:0;color:#afc4d7}.flow-track{flex:1;position:relative;min-width:40px;height:46px;background:linear-gradient(90deg,transparent,#376b79 50%,transparent) center/100% 2px no-repeat}.flow-particle{position:absolute;left:0;top:calc(9px + var(--lane)*12px);width:7px;height:7px;background:#55e2bb;border-radius:50%;box-shadow:0 0 8px #55e2bb;animation:request-flight 1.4s ease-out both;animation-delay:calc(var(--n)*70ms)}@keyframes request-flight{from{left:0;opacity:0}20%{opacity:1}to{left:100%;opacity:0}}\n.trend-panels{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.trend-panel{min-width:0;padding:16px;background:#0b1725;border:1px solid #304b62;border-radius:12px}.trend-panel h3{font-size:15px}.trend-panel p,.trend-scale,.trend-axis{font-size:12px;color:#b5c8d8}.trend-scale{margin-top:12px}.trend-svg{width:100%;height:115px;overflow:visible}.trend-grid{fill:none;stroke:#385066;stroke-width:1;opacity:.65}.trend-line{fill:none;stroke-width:3;vector-effect:non-scaling-stroke}.trend-line circle{stroke:none;fill:currentColor}.line-cyan{color:#51dfc2;stroke:#51dfc2}.line-violet{color:#9caaff;stroke:#9caaff}.line-coral{color:#ff879b;stroke:#ff879b}.line-amber{color:#efc67b;stroke:#efc67b}.trend-axis{display:flex;justify-content:space-between}.trend-panels + .hint{margin-top:12px}#monitor-history-details{margin-top:12px}\n@media(max-width:900px){.trend-panels{grid-template-columns:1fr}.flow-out{display:none}}@media(max-width:480px){.flow-label,.flow-gateway{font-size:12px;padding:8px}.gateway-scene{gap:6px}.flow-track{min-width:24px}}\n@media(prefers-reduced-motion:reduce){.flow-particle{display:none}}\n\n.flow-proxy{display:flex;flex-direction:column;gap:2px;border:1px solid #45cfa0;border-radius:10px;padding:9px 14px;background:#173e4c;color:#e3f5f1;min-width:180px}.flow-proxy b{font-size:13px}.flow-proxy span{font-size:11px;color:#b6d9d0}.flow-branches{display:flex;flex-direction:column;gap:7px;font-size:12px;color:#c4d7e6;min-width:180px}.flow-branches span{padding:4px 9px;border-left:2px solid #79a8c0}.flow-branches span:last-child{border-color:#ff879b}.flow-direction{display:flex;flex-wrap:wrap;gap:16px;color:#b5c8d8;font-size:12px;margin:0 0 12px}.flow-amounts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-bottom:12px}.flow-amount{background:#0b1725;border:1px solid #304b62;border-radius:10px;padding:10px 12px;min-width:0}.flow-amount span,.flow-amount strong{display:block;font-size:12px}.flow-amount strong{color:#e9f4ff;font-size:14px;margin-top:3px;overflow-wrap:anywhere}.flow-meter{height:4px;background:#24394b;border-radius:4px;margin-top:7px;overflow:hidden}.flow-meter i{display:block;height:100%;background:#51dfc2}.flow-amount:last-child .flow-meter i{background:#9caaff}.flow-response{background:#9caaff;box-shadow:0 0 8px #9caaff;animation-name:response-flight;top:calc(26px + var(--lane)*6px)}@keyframes response-flight{from{left:100%;opacity:0}20%{opacity:1}to{left:0;opacity:0}}@media(max-width:720px){.gateway-scene{flex-wrap:wrap;gap:8px}.flow-proxy{min-width:0;flex:1 1 180px}.flow-branches{flex:1 0 100%;flex-direction:row;flex-wrap:wrap}.flow-label{white-space:normal}.flow-amounts{grid-template-columns:1fr}.flow-track{min-width:30px;flex:1 1 45px}}\n\n/* Monitoring hierarchy: summary, live traffic, trends, then optional diagnostics. */\n:root{--bg:#0c1119;--panel:#121a25;--panel-2:#17212e;--line:#2b394b;--line-2:#3a4b61}\n.wrap{max-width:1440px}.grid{gap:16px}.card-h{padding:14px 20px 10px}.card-b{padding:16px 20px}\n.card-h .sub{font-family:var(--sans);font-size:12px;color:var(--fg-3)}\n.logo,.btn-primary,.signal-lamps i,.flow-particle,.flow-response{box-shadow:none}\n.logo,.btn-primary{background:#356eb4}.topbar{background:#0c1119;backdrop-filter:none}\n.overview .card-h{padding-bottom:0;border:0}.overview .card-b{padding-top:10px;padding-bottom:14px}\n.overview-top{margin-bottom:12px}.overview-state{font-size:20px}.overview-model{font-size:12px}\n.overview-grid{gap:0;border-top:1px solid var(--line);padding-top:12px}\n.overview-tile{padding:0 16px;border:0;border-right:1px solid var(--line);border-radius:0;background:none}\n.overview-tile:first-child{padding-left:0}.overview-tile:last-child{border-right:0}\n.overview-tile .value{font-size:21px;margin-top:4px}.overview-tile .context{font-size:11px}\n.overview .hint{margin-top:10px;font-size:11px;color:var(--fg-3)}\n.gateway-scene{min-height:64px}.flow-proxy{background:var(--panel-2);border-color:var(--line-2);border-radius:6px}\n.flow-label{border-radius:6px;border-color:var(--line-2)}.flow-direction{margin-bottom:10px}\n.flow-amounts{margin-bottom:8px;gap:24px}.flow-amount{border:0;border-radius:0;background:none;padding:0}\n.flow-amount span{font-size:11px;color:var(--fg-3)}.flow-amount strong{font-size:13px}\n.flow-meter{height:3px}.flow-count{font-size:12px;color:var(--fg-2)}\n.trend-panels{grid-template-columns:repeat(4,minmax(0,1fr));gap:20px}\n.trend-panel{padding:0 0 0 20px;border:0;border-left:1px solid var(--line);border-radius:0;background:none}\n.trend-panel:first-child{padding-left:0;border-left:0}.trend-panel h3{font-size:13px}.trend-panel p{font-size:11px;min-height:18px}\n.trend-svg{height:90px}.trend-scale,.trend-axis{font-size:11px}.trend-scale{margin-top:10px}\n.line-cyan{color:#76b5df;stroke:#76b5df}.line-violet{color:#9caec9;stroke:#9caec9}\n.line-coral{color:#ee8698;stroke:#ee8698}.line-amber{color:#b7c9dc;stroke:#b7c9dc}\n.measurement-notes{border:0;margin-top:8px}.measurement-notes summary{padding:2px 0;font-size:11px;color:var(--fg-3);cursor:pointer}\n.measurement-notes .hint{padding-top:6px;font-size:12px}.dashboard-section{display:flex;align-items:baseline;gap:16px;margin-top:10px}\n.dashboard-section h2{font-size:14px;font-weight:650}.dashboard-section span{font-size:12px;color:var(--fg-3)}\n.dashboard-details{background:var(--panel);border:1px solid var(--line);border-radius:8px;min-width:0}\n.dashboard-details>summary{padding:16px 20px;cursor:pointer;color:var(--fg);font-size:14px;font-weight:650}\n.dashboard-details>summary small{margin-left:16px;font-size:12px;font-weight:400;color:var(--fg-3)}\n.dashboard-details[open]>summary{border-bottom:1px solid var(--line)}\n.diagnostic-grid{padding:16px;align-items:start}.diagnostic-grid>.card{grid-column:span 6;background:var(--bg);min-width:0}\n.diagnostic-grid>.col-12{grid-column:span 12}.diagnostic-grid .metrics-strip .m{background:none;border:0;border-bottom:1px solid var(--line);border-radius:0;padding:10px 0}\n.insight{background:var(--panel);border-radius:6px}.insight.info{background:var(--panel);border-color:var(--line)}\n@media(max-width:1050px){.trend-panels{grid-template-columns:repeat(2,minmax(0,1fr))}.trend-panel:nth-child(3){border-left:0;padding-left:0}}\n@media(max-width:720px){.wrap{padding-left:16px;padding-right:16px}.card-h,.card-b{padding-left:16px;padding-right:16px}.overview-grid{gap:12px 0}.overview-tile{padding:0 12px}.overview-tile:nth-child(odd){padding-left:0}.overview-tile:nth-child(even){border-right:0}.overview-tile .value{font-size:18px}.overview-tile .context{min-height:28px}.trend-panels{gap:16px}.trend-panel{padding-left:12px}.trend-svg{height:80px}.dashboard-section{display:block}.dashboard-section span{display:block;margin-top:2px}.dashboard-details>summary small{display:block;margin:4px 0 0 18px}.diagnostic-grid>.card{grid-column:span 12}.diagnostic-grid{padding:10px}.flow-amounts{grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}}\n@media(max-width:420px){.overview-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.overview-tile{padding-top:0;padding-bottom:0}.trend-panels{grid-template-columns:1fr}.trend-panel{border-left:0;padding-left:0}.trend-svg{height:100px}}\n\n/* Wide, bounded token stream and a reservoir of observed Local execution slots. */\n.overview,.flow-card{grid-column:span 12}\n.flow-card .gateway-scene{display:grid;grid-template-columns:minmax(110px,.8fr) minmax(70px,1fr) minmax(240px,2fr) minmax(70px,1fr) minmax(140px,1fr);gap:0;min-height:166px;overflow:hidden}\n.flow-endpoint{display:flex;flex-direction:column;gap:8px;min-width:0;padding:12px 6px}\n.flow-endpoint b{font-size:15px}.flow-endpoint small{font-size:11px;color:var(--fg-3);overflow-wrap:anywhere}\n.flow-step{font-size:10px!important;color:var(--fg-3)!important;letter-spacing:.08em}\n.flow-card .flow-proxy{position:relative;min-width:0;align-items:center;gap:4px;padding:14px 10px;background:linear-gradient(180deg,#152d37,#13232e);border:1px solid #315d64;border-radius:12px;text-align:center}\n.flow-card .flow-proxy b{font-size:16px}.flow-card .flow-proxy>span{font-size:11px}\n.flow-reservoir{display:flex;justify-content:center;gap:2px;width:100%;height:42px;margin:6px 0 2px;overflow:hidden;border-radius:24px;background:#0e1b25}\n.flow-ring{flex:1;max-width:12px;height:40px;border:1px solid #2d4758;border-radius:50%;background:#172b36}\n.flow-ring.occupied{border-color:#60dcb7;background:#2e9e87;box-shadow:inset 2px 0 #a0ecd2}\n.flow-active{font-size:15px;color:#daeee8;font-variant-numeric:tabular-nums}.flow-queue{color:var(--fg-3)!important}.flow-queue.waiting{color:#dfac6b!important}\n.flow-card .flow-track{position:relative;min-width:0;width:100%;height:78px;overflow:hidden;background:none}\n.flow-rail{position:absolute;inset:10px 0;background:repeating-linear-gradient(180deg,transparent 0,transparent 11px,#24413d 11px,#24413d 12px);opacity:.65;clip-path:polygon(0 0,100% 22%,100% 78%,0 100%)}\n.flow-return-track .flow-rail{background:repeating-linear-gradient(180deg,transparent 0,transparent 11px,#373d57 11px,#373d57 12px);transform:scaleX(-1)}\n.flow-card .flow-particle{left:0;top:calc(12px + var(--lane)*11px);width:16px;height:5px;border-radius:8px;background:linear-gradient(90deg,transparent,#61e4ba);box-shadow:none;opacity:0;animation:token-arrival var(--flight) linear both;animation-delay:var(--delay)}\n.flow-card .flow-response{left:auto;right:0;background:linear-gradient(90deg,#b8baff,transparent);animation-name:token-return}\n@keyframes token-arrival{0%{left:0;opacity:0}12%{opacity:1}88%{opacity:1}100%{left:calc(100% - 16px);opacity:0}}\n@keyframes token-return{0%{right:0;opacity:0}12%{opacity:1}88%{opacity:1}100%{right:calc(100% - 16px);opacity:0}}\n.flow-destinations{padding-left:14px}.flow-destinations .flow-provider,.flow-destinations .flow-plan{font-size:13px;border-left:3px solid #344957;padding:6px 10px;border-radius:0 5px 5px 0;color:var(--fg-3)}\n.flow-destinations .flow-provider.selected{color:#6be0b6;border-color:#4fcea4;background:#17322d}.flow-destinations .flow-plan.selected{color:#ff8d9f;border-color:#ed7084;background:#35232c}\n.flow-key{display:inline-block;width:16px;height:4px;border-radius:4px;margin:0 6px 2px 0}.flow-key-input{background:#61e4ba}.flow-key-output{background:#b8baff}\n.flow-card .flow-direction{margin:14px 0 12px;align-items:center;font-size:11px}.flow-direction span:last-child{margin-left:auto;color:var(--fg-3)}\n.flow-card .flow-amounts{border-top:1px solid var(--line);padding-top:12px}.flow-card .flow-amount strong{font-size:16px}\n@media(max-width:800px){.flow-card .gateway-scene{grid-template-columns:minmax(75px,1fr) minmax(20px,.4fr) minmax(175px,2fr) minmax(20px,.4fr) minmax(95px,1fr)}.flow-endpoint b{font-size:12px}.flow-card .flow-proxy b{font-size:14px}.flow-destinations{padding-left:6px}.flow-destinations .flow-provider,.flow-destinations .flow-plan{padding:6px;font-size:11px}.flow-direction span:last-child{margin-left:0}}\n@media(max-width:560px){.flow-card .gateway-scene{grid-template-columns:1fr 1fr 1fr;row-gap:12px}.flow-endpoint:first-child{grid-column:1}.flow-card .flow-track{grid-column:2/4;height:48px}.flow-card .flow-proxy{grid-column:1/-1;grid-row:2}.flow-card .flow-return-track{grid-column:1/3;grid-row:3}.flow-destinations{grid-column:3;grid-row:3;padding:0}.flow-ring{max-width:16px}.flow-card .flow-amount strong{font-size:13px}.flow-count{max-width:45%;text-align:right}.flow-direction{gap:8px}}\n@media(prefers-reduced-motion:reduce){.flow-card .flow-particle{display:none}}\n\n.flow-controls{display:flex;align-items:center;justify-content:flex-end;gap:10px;flex-wrap:wrap}.flow-controls small{flex-basis:100%;text-align:right;color:var(--fg-3);font-size:11px}.flow-controls .flow-count{max-width:none}.flow-card:not(.flow-motion-enabled) .flow-particle{display:none}\n@media(prefers-reduced-motion:reduce){.flow-card.flow-motion-enabled .flow-particle{display:block;animation-duration:var(--flight)!important;animation-iteration-count:1}}\n"
 
-JS_SHARED = "\nconst TOKEN = \"__DASHBOARD_TOKEN__\";\nconst esc = value => String(value ?? '').replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));\nconst num = value => value === null || value === undefined || value === '' ? '\u2014' : Number(value).toLocaleString('ko-KR');\nconst usd = (value, digits = 3) => value === null || value === undefined ? '\u2014' : '$' + Number(value).toFixed(digits);\nconst tokens = row => row ? row.reduce((sum, value) => sum + value, 0) : 0;\nconst stateText = {external:'\uc678\ubd80 \uc11c\ube44\uc2a4 \uc0ac\uc6a9 \uc911', plan:'Plan \uc6b0\ud68c \uc911', idle:'\uc720\ud734', unknown:'\uae30\ub85d \uc5c6\uc74c'};\nconst statePill = {external:'pill-ok', plan:'pill-warn', idle:'pill-mute', unknown:'pill-mute'};\nconst PROVIDERS = {\n  openrouter: {title:'OpenRouter', file:'openclaude.config.yaml \u203a openrouter', fields:[\n    ['OPENROUTER_MODEL','\ubaa8\ub378 ID','text','vendor/model','OpenRouter \ubaa8\ub378 \ubaa9\ub85d\uc758 \uc815\ud655\ud55c ID','\ud544\uc218'],\n    ['ANTHROPIC_AUTH_TOKEN','API \ud0a4','password','sk-or-...','\ube44\uc6cc \ub450\uba74 \uc800\uc7a5\ub41c \ud0a4\ub97c \uc720\uc9c0\ud569\ub2c8\ub2e4','\ud544\uc218']]},\n  local: {title:'Local LLM', file:'openclaude.config.yaml \u203a local', fields:[\n    ['LOCAL_LLM_URL','Messages URL','text','http://127.0.0.1:11434/v1/messages','Anthropic \ud638\ud658 /v1/messages \uc8fc\uc18c. \uc800\uc7a5\ub41c \uc8fc\uc18c\ub294 \uc77c\ubd80\ub9cc \ud45c\uc2dc\ub418\uba70 \ubc14\uafc0 \ub54c\ub9cc \uc804\uccb4\ub97c \uc785\ub825\ud569\ub2c8\ub2e4','\ud544\uc218'],\n    ['LOCAL_LLM_MODEL','\ubaa8\ub378 ID','text','\uc124\uce58\ub41c \ubaa8\ub378 ID','\uc11c\ubc84\uc5d0 \uc2e4\uc81c\ub85c \uc788\ub294 \ubaa8\ub378 \uc774\ub984','\ud544\uc218'],\n    ['LOCAL_LLM_API_KEY','\uc11c\ubc84 \ud0a4','password','\uc120\ud0dd \uc0ac\ud56d','\ube44\uc6cc \ub450\uba74 \uc800\uc7a5\ub41c \ud0a4\ub97c \uc720\uc9c0\ud569\ub2c8\ub2e4','\uc120\ud0dd'],\n    ['LOCAL_LLM_ALLOW_REMOTE','\uc6d0\uaca9 HTTPS \ud5c8\uc6a9','switch','','\ub8e8\ud504\ubc31\uc774 \uc544\ub2cc HTTPS \uc11c\ubc84\ub97c \ud5c8\uc6a9\ud569\ub2c8\ub2e4','\uc120\ud0dd'],\n    ['LOCAL_LLM_HTTP_URL','\ub0b4\ubd80 HTTP \uc608\uc678','text','http://host/v1/messages','\uc0ac\ub0b4 \uc11c\ubc84\uc6a9 \uc608\uc678 \uc8fc\uc18c (\uc120\ud0dd). \uc800\uc7a5\ub41c \uc8fc\uc18c\ub294 \uc77c\ubd80\ub9cc \ud45c\uc2dc\ub429\ub2c8\ub2e4','\uc120\ud0dd'],\n    ['LOCAL_LLM_MODELS_URL','\ubaa8\ub378 \ubaa9\ub85d URL','text','\uae30\ubcf8: /v1/models','\ubaa8\ub378 \ud655\uc778\uc5d0 \uc0ac\uc6a9\ud560 \uac19\uc740 \ucd9c\ucc98 \uc8fc\uc18c (\uc120\ud0dd). \uc800\uc7a5\ub41c \uc8fc\uc18c\ub294 \uc77c\ubd80\ub9cc \ud45c\uc2dc\ub429\ub2c8\ub2e4','\uc120\ud0dd']]},\n  cli: {title:'CLI \ubaa8\ub378 \ubc31\uc5d4\ub4dc', file:'openclaude.config.yaml \u203a cli', fields:[\n    ['CLI_KIND','CLI \uc885\ub958','select','','Claude Code\uac00 \ud638\ucd9c\ud560 \ubaa8\ub378 \ubc31\uc5d4\ub4dc. \uc124\uce58\u00b7\ubc84\uc804 \uc9c0\uc6d0 \uc5ec\ubd80\ub97c \ud655\uc778\ud558\uc138\uc694','\ud544\uc218',['codex','grok','claude']],\n    ['CLI_MODEL','\ubaa8\ub378','text','\ube44\uc6cc \ub450\uba74 CLI \uae30\ubcf8\uac12','CLI\uc5d0 \ub118\uae38 \ubaa8\ub378 \uc774\ub984 (\uc120\ud0dd)','\uc120\ud0dd'],\n    ['CLI_BINARY','\uc2e4\ud589 \ud30c\uc77c \uacbd\ub85c','text','\uc790\ub3d9 \uac10\uc9c0','\uc808\ub300 \uacbd\ub85c\ub85c \uace0\uc815\ud558\ub824\uba74 \uc785\ub825\ud569\ub2c8\ub2e4. \ud30c\uc77c \uc774\ub984\uc774 CLI \uc885\ub958\uc640 \uc815\ud655\ud788 \uac19\uc544\uc57c \ud569\ub2c8\ub2e4 (\uc120\ud0dd)','\uc120\ud0dd'],\n    ['CLI_TIMEOUT_S','\uc81c\ud55c \uc2dc\uac04(\ucd08)','text','60','\ubaa8\ub378 \uc751\ub2f5 \uc81c\ud55c \uc2dc\uac04 10~120 (\uc120\ud0dd)','\uc120\ud0dd']]},\n};\nconst ERROR_TEXT = {\n  unknown_provider:'\uc54c \uc218 \uc5c6\ub294 \uc81c\uacf5\uc790', invalid_values:'\uc785\ub825 \ud615\uc2dd \uc624\ub958', invalid_value:'\uac12 \ud615\uc2dd \uc624\ub958',\n  invalid_model:'\ubaa8\ub378 ID \ud615\uc2dd\uc774 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4', invalid_key:'API \ud0a4 \ud615\uc2dd\uc774 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4 (sk-or-...)',\n  missing_anthropic_auth_token:'API \ud0a4\uac00 \ud544\uc694\ud569\ub2c8\ub2e4', missing_openrouter_model:'\ubaa8\ub378 ID\uac00 \ud544\uc694\ud569\ub2c8\ub2e4',\n  missing_local_llm_url:'Messages URL\uc774 \ud544\uc694\ud569\ub2c8\ub2e4', missing_local_llm_model:'\ubaa8\ub378 ID\uac00 \ud544\uc694\ud569\ub2c8\ub2e4',\n  invalid_local_url:'Local URL \uaddc\uce59 \uc704\ubc18 (http(s), /v1/messages, \ub8e8\ud504\ubc31 \ub610\ub294 \ud5c8\uc6a9\ub41c HTTPS)',\n  invalid_local_model:'\ubaa8\ub378 ID\uac00 \ube44\uc5b4 \uc788\uac70\ub098 \uc798\ubabb\ub418\uc5c8\uc2b5\ub2c8\ub2e4', invalid_local_key:'\uc11c\ubc84 \ud0a4\uc5d0 \uc81c\uc5b4 \ubb38\uc790\uac00 \uc788\uc2b5\ub2c8\ub2e4',\n  invalid_allow_remote:'\uc6d0\uaca9 \ud5c8\uc6a9 \uac12\uc740 true/false\uc5ec\uc57c \ud569\ub2c8\ub2e4', invalid_models_url:'\ubaa8\ub378 \ubaa9\ub85d URL\uc774 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4',\n  invalid_configuration:'\uc124\uc815\uc774 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4', invalid_clear:'\uc9c0\uc6b8 \uc218 \uc5c6\ub294 \ud56d\ubaa9\uc785\ub2c8\ub2e4', invalid_cli_kind:'\uc9c0\uc6d0\ud558\uc9c0 \uc54a\ub294 CLI \uc885\ub958\uc785\ub2c8\ub2e4', invalid_cli_model:'\ubaa8\ub378 \uc774\ub984 \ud615\uc2dd\uc774 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4', invalid_cli_binary:'\uc2e4\ud589 \ud30c\uc77c \uacbd\ub85c\uac00 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4 (\uc808\ub300 \uacbd\ub85c, \uc874\uc7ac\ud558\ub294 \ud30c\uc77c, \uc774\ub984\uc774 CLI \uc885\ub958\uc640 \uac19\uc544\uc57c \ud569\ub2c8\ub2e4)', invalid_cli_timeout:'\uc81c\ud55c \uc2dc\uac04\uc740 10~120\ucd08\uc5ec\uc57c \ud569\ub2c8\ub2e4', missing_cli_kind:'CLI \uc885\ub958\uac00 \ud544\uc694\ud569\ub2c8\ub2e4', config_invalid:'\uc124\uc815 \ud30c\uc77c\uc744 \uc77d\uac70\ub098 \uc62e\uae38 \uc218 \uc5c6\uc2b5\ub2c8\ub2e4. \ud30c\uc77c \ud615\uc2dd\uc744 \ud655\uc778\ud558\uc138\uc694', write_failed:'\ud30c\uc77c\uc744 \uc4f0\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4',\n  token_required:'\uc138\uc158 \ud1a0\ud070\uc774 \uc5c6\uc2b5\ub2c8\ub2e4 (\ud398\uc774\uc9c0 \uc0c8\ub85c\uace0\uce68 \ud6c4 \ub2e4\uc2dc \uc2dc\ub3c4)', origin_rejected:'\ub2e4\ub978 \ucd9c\ucc98\uc758 \uc694\uccad\uc785\ub2c8\ub2e4',\n  request_too_large:'\uc694\uccad\uc774 \ub108\ubb34 \ud07d\ub2c8\ub2e4', invalid_json:'JSON \ud615\uc2dd \uc624\ub958', invalid_payload:'\uc694\uccad \ud615\uc2dd \uc624\ub958',\n  invalid_mode:'\uc54c \uc218 \uc5c6\ub294 \ud14c\uc2a4\ud2b8 \ubaa8\ub4dc',\n  empty_catalog:'\ubaa8\ub378 \ubaa9\ub85d\uc774 \ube44\uc5b4 \uc788\uc2b5\ub2c8\ub2e4', http_error:'HTTP \uc624\ub958',\n  models_failed:'\ubaa9\ub85d\uc744 \uac00\uc838\uc624\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4', invalid_length:'\uc694\uccad \uae38\uc774 \uc624\ub958',\n};\nconst TEST_TEXT = {\n  ready:'\uc5f0\uacb0\uacfc \ucd94\ub860\uc774 \uc815\uc0c1\uc785\ub2c8\ub2e4', model_found:'\ubaa8\ub378\uc744 \ucc3e\uc558\uc2b5\ub2c8\ub2e4', model_not_found:'\uc124\uc815\ud55c \ubaa8\ub378\uc774 \ubaa9\ub85d\uc5d0 \uc5c6\uc2b5\ub2c8\ub2e4',\n  wrong_model:'\ub2e4\ub978 \ubaa8\ub378\uc774 \uc751\ub2f5\ud588\uc2b5\ub2c8\ub2e4', empty_reply:'\uc751\ub2f5 \ubcf8\ubb38\uc774 \ube44\uc5b4 \uc788\uc2b5\ub2c8\ub2e4', http_error:'HTTP \uc624\ub958',\n  connection_failed:'\uc5f0\uacb0 \uc2e4\ud328', invalid_response:'\uc751\ub2f5 \ud615\uc2dd \uc624\ub958', configuration_missing:'\uc124\uc815\uc774 \uba3c\uc800 \ud544\uc694\ud569\ub2c8\ub2e4', detected:'\uc124\uce58\ub418\uc5b4 \uc788\uc2b5\ub2c8\ub2e4', not_found:'\uc124\uce58\ub41c CLI\ub97c \ucc3e\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4', unsupported_shim:'\uc778\uc2dd\ud560 \uc218 \uc5c6\ub294 \uc2e4\ud589 \ub798\ud37c\uc785\ub2c8\ub2e4. \uc2e4\ud589 \ud30c\uc77c \uacbd\ub85c\ub97c \uc9c1\uc811 \uc9c0\uc815\ud558\uc138\uc694', node_not_found:'Node.js\ub97c \ucc3e\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4', binary_not_found:'\uc9c0\uc815\ud55c \uc2e4\ud589 \ud30c\uc77c\uc774 \uc5c6\uc2b5\ub2c8\ub2e4', binary_not_absolute:'\uc808\ub300 \uacbd\ub85c\uac00 \uc544\ub2d9\ub2c8\ub2e4', binary_name_mismatch:'\ud30c\uc77c \uc774\ub984\uc774 CLI \uc885\ub958\uc640 \ub2e4\ub985\ub2c8\ub2e4', version_failed:'\ubc84\uc804\uc744 \ud655\uc778\ud558\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4', spawn_failed:'CLI\ub97c \uc2dc\uc791\ud558\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4', timeout:'\uc2dc\uac04 \ucd08\uacfc \u2014 \ubc29\ud654\ubcbd\u00b7\ud504\ub85d\uc2dc\uac00 CLI\uc758 \uc678\ubd80 \ud1b5\uc2e0\uc744 \ub9c9\uace0 \uc788\uc744 \uc218 \uc788\uc2b5\ub2c8\ub2e4', unsupported_flag:'\uc774 \ubc84\uc804\uc758 CLI\uac00 \uc635\uc158\uc744 \uac70\ubd80\ud588\uc2b5\ub2c8\ub2e4 (\ubc84\uc804\uc744 \ud655\uc778\ud558\uc138\uc694)', not_logged_in:'\ub85c\uadf8\uc778\uc774 \ud544\uc694\ud574 \ubcf4\uc785\ub2c8\ub2e4 (CLI\uc5d0\uc11c \uba3c\uc800 \ub85c\uadf8\uc778\ud558\uc138\uc694)', nonzero_exit:'CLI\uac00 \uc624\ub958\ub85c \uc885\ub8cc\ud588\uc2b5\ub2c8\ub2e4', unexpected_reply:'\uc751\ub2f5\uc774 \uc608\uc0c1\uacfc \ub2e4\ub985\ub2c8\ub2e4', busy:'\ub2e4\ub978 \uc5f0\uacb0 \ud14c\uc2a4\ud2b8\uac00 \uc2e4\ud589 \uc911\uc785\ub2c8\ub2e4', invalid_model:'\ubaa8\ub378 \uc774\ub984 \ud615\uc2dd\uc774 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4', invalid_kind:'\uc9c0\uc6d0\ud558\uc9c0 \uc54a\ub294 CLI \uc885\ub958\uc785\ub2c8\ub2e4', cli_module_missing:'CLI \ubaa8\ub4c8\uc744 \ucc3e\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4',\n  invalid_configuration:'\uc800\uc7a5\ub41c \uc124\uc815\uc774 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4',\n};\n\nlet CONFIG = null, SNAP = null;\nconst DIRTY = new Set(), BUSY = new Set(), CLEAR = new Set(), RESULTS = {};\n\nfunction toast(kind, text) {\n  const host = document.getElementById('toasts');\n  const node = document.createElement('div');\n  node.className = 'toast ' + kind;\n  node.innerHTML = `<span class=\"dot\"></span><span>${esc(text)}</span>`;\n  host.appendChild(node);\n  setTimeout(() => { node.classList.add('out'); setTimeout(() => node.remove(), 260); }, 3400);\n}\n\nfunction card(title, subtitle, body, span) {\n  return `<section class=\"card ${span || 'col-12'}\">\n    <header class=\"card-h\"><div><h2>${esc(title)}</h2>${subtitle ? `<p class=\"sub\">${esc(subtitle)}</p>` : ''}</div></header>\n    <div class=\"card-b\">${body}</div></section>`;\n}\n\nfunction kv(label, value, mono) {\n  return `<div class=\"row-kv\"><span class=\"k\">${esc(label)}</span><span class=\"v${mono ? ' mono' : ''}\">${value}</span></div>`;\n}\n\nasync function loadConfig() {\n  try {\n    CONFIG = await (await fetch('/api/config', {cache:'no-store'})).json();\n    if (typeof renderSettings === 'function') renderSettings(true);\n  } catch (error) { /* keep the previous view */ }\n}\n\nfunction providerReady(provider) {\n  const fields = (CONFIG && CONFIG[provider] && CONFIG[provider].fields) || {};\n  return PROVIDERS[provider].fields\n    .filter(([, , , , , badge]) => badge === '\ud544\uc218')\n    .every(([name]) => {\n      const field = fields[name] || {};\n      return field.set || field.value;\n    });\n}\n\nwindow.addEventListener('error', event => {\n  const stamp = document.getElementById('stamp');\n  if (stamp) stamp.textContent = '\uc2a4\ud06c\ub9bd\ud2b8 \uc624\ub958: ' + (event.message || 'unknown');\n});\n\ndocument.addEventListener('click', event => {\n  const button = event.target.closest('[data-copy]');\n  if (!button) return;\n  const text = button.dataset.copy;\n  if (navigator.clipboard && navigator.clipboard.writeText) {\n    navigator.clipboard.writeText(text).then(() => toast('ok', '\ubcf5\uc0ac\ud588\uc2b5\ub2c8\ub2e4: ' + text))\n      .catch(() => toast('warn', '\ubcf5\uc0ac\ud560 \uc218 \uc5c6\uc2b5\ub2c8\ub2e4: ' + text));\n  } else {\n    toast('warn', '\ubcf5\uc0ac\ud560 \uc218 \uc5c6\uc2b5\ub2c8\ub2e4: ' + text);\n  }\n});\n"
+JS_SHARED = "\nconst TOKEN = \"__DASHBOARD_TOKEN__\";\nconst esc = value => String(value ?? '').replace(/[&<>\"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));\nconst num = value => value === null || value === undefined || value === '' ? '\u2014' : Number(value).toLocaleString('ko-KR');\nconst usd = (value, digits = 3) => value === null || value === undefined ? '\u2014' : '$' + Number(value).toFixed(digits);\nconst tokens = row => row ? row.reduce((sum, value) => sum + value, 0) : 0;\nconst stateText = {external:'\uc678\ubd80 \uc11c\ube44\uc2a4 \uc0ac\uc6a9 \uc911', plan:'Plan \uc6b0\ud68c \uc911', idle:'\uc720\ud734', unknown:'\uae30\ub85d \uc5c6\uc74c'};\nconst statePill = {external:'pill-ok', plan:'pill-warn', idle:'pill-mute', unknown:'pill-mute'};\nconst PROVIDERS = {\n  openrouter: {title:'OpenRouter', file:'openclaude.config.yaml \u203a openrouter', fields:[\n    ['OPENROUTER_MODEL','\ubaa8\ub378 ID','text','vendor/model','OpenRouter \ubaa8\ub378 \ubaa9\ub85d\uc758 \uc815\ud655\ud55c ID','\ud544\uc218'],\n    ['OPENROUTER_UPSTREAM_PROVIDER','OpenRouter \uc0c1\ub958 \uacf5\uae09\uc790','text','Auto','\ube44\uc6b0\uba74 Auto. \uc9c0\uc815\ud558\ub824\uba74 open-inference/fp4 \uac19\uc740 slug\ub97c \uc785\ub825\ud558\uc138\uc694. \ub2e4\ub978 OpenRouter \uacf5\uae09\uc790\ub85c \uc790\ub3d9 \uc804\ud658\ud558\uc9c0 \uc54a\uc73c\uba70 \ub2e4\uc74c \uc138\uc158\ubd80\ud130 \uc801\uc6a9\ub429\ub2c8\ub2e4.','\uc120\ud0dd'],\n    ['ANTHROPIC_AUTH_TOKEN','API \ud0a4','password','sk-or-...','\ube44\uc6cc \ub450\uba74 \uc800\uc7a5\ub41c \ud0a4\ub97c \uc720\uc9c0\ud569\ub2c8\ub2e4','\ud544\uc218']]},\n  local: {title:'Local LLM', file:'openclaude.config.yaml \u203a local', fields:[\n    ['LOCAL_LLM_URL','Messages URL','text','http://127.0.0.1:11434/v1/messages','Anthropic \ud638\ud658 /v1/messages \uc8fc\uc18c. \uc800\uc7a5\ub41c \uc8fc\uc18c\ub294 \uc77c\ubd80\ub9cc \ud45c\uc2dc\ub418\uba70 \ubc14\uafc0 \ub54c\ub9cc \uc804\uccb4\ub97c \uc785\ub825\ud569\ub2c8\ub2e4','\ud544\uc218'],\n    ['LOCAL_LLM_MODEL','\ubaa8\ub378 ID','text','\uc124\uce58\ub41c \ubaa8\ub378 ID','\uc11c\ubc84\uc5d0 \uc2e4\uc81c\ub85c \uc788\ub294 \ubaa8\ub378 \uc774\ub984','\ud544\uc218'],\n    ['LOCAL_LLM_API_KEY','\uc11c\ubc84 \ud0a4','password','\uc120\ud0dd \uc0ac\ud56d','\ube44\uc6cc \ub450\uba74 \uc800\uc7a5\ub41c \ud0a4\ub97c \uc720\uc9c0\ud569\ub2c8\ub2e4','\uc120\ud0dd'],\n    ['LOCAL_LLM_ALLOW_REMOTE','\uc6d0\uaca9 HTTPS \ud5c8\uc6a9','switch','','\ub8e8\ud504\ubc31\uc774 \uc544\ub2cc HTTPS \uc11c\ubc84\ub97c \ud5c8\uc6a9\ud569\ub2c8\ub2e4','\uc120\ud0dd'],\n    ['LOCAL_LLM_HTTP_URL','\ub0b4\ubd80 HTTP \uc608\uc678','text','http://host/v1/messages','\uc0ac\ub0b4 \uc11c\ubc84\uc6a9 \uc608\uc678 \uc8fc\uc18c (\uc120\ud0dd). \uc800\uc7a5\ub41c \uc8fc\uc18c\ub294 \uc77c\ubd80\ub9cc \ud45c\uc2dc\ub429\ub2c8\ub2e4','\uc120\ud0dd'],\n    ['LOCAL_LLM_MODELS_URL','\ubaa8\ub378 \ubaa9\ub85d URL','text','\uae30\ubcf8: /v1/models','\ubaa8\ub378 \ud655\uc778\uc5d0 \uc0ac\uc6a9\ud560 \uac19\uc740 \ucd9c\ucc98 \uc8fc\uc18c (\uc120\ud0dd). \uc800\uc7a5\ub41c \uc8fc\uc18c\ub294 \uc77c\ubd80\ub9cc \ud45c\uc2dc\ub429\ub2c8\ub2e4','\uc120\ud0dd']]},\n  cli: {title:'CLI \ubaa8\ub378 \ubc31\uc5d4\ub4dc', file:'openclaude.config.yaml \u203a cli', fields:[\n    ['CLI_KIND','CLI \uc885\ub958','select','','Claude Code\uac00 \ud638\ucd9c\ud560 \ubaa8\ub378 \ubc31\uc5d4\ub4dc. \uc124\uce58\u00b7\ubc84\uc804 \uc9c0\uc6d0 \uc5ec\ubd80\ub97c \ud655\uc778\ud558\uc138\uc694','\ud544\uc218',['codex','grok','claude']],\n    ['CLI_MODEL','\ubaa8\ub378','text','\ube44\uc6cc \ub450\uba74 CLI \uae30\ubcf8\uac12','CLI\uc5d0 \ub118\uae38 \ubaa8\ub378 \uc774\ub984 (\uc120\ud0dd)','\uc120\ud0dd'],\n    ['CLI_BINARY','\uc2e4\ud589 \ud30c\uc77c \uacbd\ub85c','text','\uc790\ub3d9 \uac10\uc9c0','\uc808\ub300 \uacbd\ub85c\ub85c \uace0\uc815\ud558\ub824\uba74 \uc785\ub825\ud569\ub2c8\ub2e4. \ud30c\uc77c \uc774\ub984\uc774 CLI \uc885\ub958\uc640 \uc815\ud655\ud788 \uac19\uc544\uc57c \ud569\ub2c8\ub2e4 (\uc120\ud0dd)','\uc120\ud0dd'],\n    ['CLI_TIMEOUT_S','\uc81c\ud55c \uc2dc\uac04(\ucd08)','text','60','\ubaa8\ub378 \uc751\ub2f5 \uc81c\ud55c \uc2dc\uac04 10~120 (\uc120\ud0dd)','\uc120\ud0dd']]},\n};\nconst ERROR_TEXT = {\n  unknown_provider:'\uc54c \uc218 \uc5c6\ub294 \uc81c\uacf5\uc790', invalid_values:'\uc785\ub825 \ud615\uc2dd \uc624\ub958', invalid_value:'\uac12 \ud615\uc2dd \uc624\ub958',\n  invalid_openrouter_provider:'\uacf5\uae09\uc790 slug\ub294 \uc601\ubb38\uc790, \uc22b\uc790, _, -, ., /\ub85c \uc785\ub825\ud558\uc138\uc694 (128\uc790 \uc774\ud558).',\n  invalid_model:'\ubaa8\ub378 ID \ud615\uc2dd\uc774 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4', invalid_key:'API \ud0a4 \ud615\uc2dd\uc774 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4 (sk-or-...)',\n  missing_anthropic_auth_token:'API \ud0a4\uac00 \ud544\uc694\ud569\ub2c8\ub2e4', missing_openrouter_model:'\ubaa8\ub378 ID\uac00 \ud544\uc694\ud569\ub2c8\ub2e4',\n  missing_local_llm_url:'Messages URL\uc774 \ud544\uc694\ud569\ub2c8\ub2e4', missing_local_llm_model:'\ubaa8\ub378 ID\uac00 \ud544\uc694\ud569\ub2c8\ub2e4',\n  invalid_local_url:'Local URL \uaddc\uce59 \uc704\ubc18 (http(s), /v1/messages, \ub8e8\ud504\ubc31 \ub610\ub294 \ud5c8\uc6a9\ub41c HTTPS)',\n  invalid_local_model:'\ubaa8\ub378 ID\uac00 \ube44\uc5b4 \uc788\uac70\ub098 \uc798\ubabb\ub418\uc5c8\uc2b5\ub2c8\ub2e4', invalid_local_key:'\uc11c\ubc84 \ud0a4\uc5d0 \uc81c\uc5b4 \ubb38\uc790\uac00 \uc788\uc2b5\ub2c8\ub2e4',\n  invalid_allow_remote:'\uc6d0\uaca9 \ud5c8\uc6a9 \uac12\uc740 true/false\uc5ec\uc57c \ud569\ub2c8\ub2e4', invalid_models_url:'\ubaa8\ub378 \ubaa9\ub85d URL\uc774 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4',\n  invalid_configuration:'\uc124\uc815\uc774 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4', invalid_clear:'\uc9c0\uc6b8 \uc218 \uc5c6\ub294 \ud56d\ubaa9\uc785\ub2c8\ub2e4', invalid_cli_kind:'\uc9c0\uc6d0\ud558\uc9c0 \uc54a\ub294 CLI \uc885\ub958\uc785\ub2c8\ub2e4', invalid_cli_model:'\ubaa8\ub378 \uc774\ub984 \ud615\uc2dd\uc774 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4', invalid_cli_binary:'\uc2e4\ud589 \ud30c\uc77c \uacbd\ub85c\uac00 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4 (\uc808\ub300 \uacbd\ub85c, \uc874\uc7ac\ud558\ub294 \ud30c\uc77c, \uc774\ub984\uc774 CLI \uc885\ub958\uc640 \uac19\uc544\uc57c \ud569\ub2c8\ub2e4)', invalid_cli_timeout:'\uc81c\ud55c \uc2dc\uac04\uc740 10~120\ucd08\uc5ec\uc57c \ud569\ub2c8\ub2e4', missing_cli_kind:'CLI \uc885\ub958\uac00 \ud544\uc694\ud569\ub2c8\ub2e4', config_invalid:'\uc124\uc815 \ud30c\uc77c\uc744 \uc77d\uac70\ub098 \uc62e\uae38 \uc218 \uc5c6\uc2b5\ub2c8\ub2e4. \ud30c\uc77c \ud615\uc2dd\uc744 \ud655\uc778\ud558\uc138\uc694', write_failed:'\ud30c\uc77c\uc744 \uc4f0\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4',\n  token_required:'\uc138\uc158 \ud1a0\ud070\uc774 \uc5c6\uc2b5\ub2c8\ub2e4 (\ud398\uc774\uc9c0 \uc0c8\ub85c\uace0\uce68 \ud6c4 \ub2e4\uc2dc \uc2dc\ub3c4)', origin_rejected:'\ub2e4\ub978 \ucd9c\ucc98\uc758 \uc694\uccad\uc785\ub2c8\ub2e4',\n  request_too_large:'\uc694\uccad\uc774 \ub108\ubb34 \ud07d\ub2c8\ub2e4', invalid_json:'JSON \ud615\uc2dd \uc624\ub958', invalid_payload:'\uc694\uccad \ud615\uc2dd \uc624\ub958',\n  invalid_mode:'\uc54c \uc218 \uc5c6\ub294 \ud14c\uc2a4\ud2b8 \ubaa8\ub4dc',\n  empty_catalog:'\ubaa8\ub378 \ubaa9\ub85d\uc774 \ube44\uc5b4 \uc788\uc2b5\ub2c8\ub2e4', http_error:'HTTP \uc624\ub958',\n  models_failed:'\ubaa9\ub85d\uc744 \uac00\uc838\uc624\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4', invalid_length:'\uc694\uccad \uae38\uc774 \uc624\ub958',\n};\nconst TEST_TEXT = {\n  ready:'\uc5f0\uacb0\uacfc \ucd94\ub860\uc774 \uc815\uc0c1\uc785\ub2c8\ub2e4', model_found:'\ubaa8\ub378\uc744 \ucc3e\uc558\uc2b5\ub2c8\ub2e4', model_not_found:'\uc124\uc815\ud55c \ubaa8\ub378\uc774 \ubaa9\ub85d\uc5d0 \uc5c6\uc2b5\ub2c8\ub2e4',\n  wrong_model:'\ub2e4\ub978 \ubaa8\ub378\uc774 \uc751\ub2f5\ud588\uc2b5\ub2c8\ub2e4', empty_reply:'\uc751\ub2f5 \ubcf8\ubb38\uc774 \ube44\uc5b4 \uc788\uc2b5\ub2c8\ub2e4', http_error:'HTTP \uc624\ub958',\n  connection_failed:'\uc5f0\uacb0 \uc2e4\ud328', invalid_response:'\uc751\ub2f5 \ud615\uc2dd \uc624\ub958', configuration_missing:'\uc124\uc815\uc774 \uba3c\uc800 \ud544\uc694\ud569\ub2c8\ub2e4', detected:'\uc124\uce58\ub418\uc5b4 \uc788\uc2b5\ub2c8\ub2e4', not_found:'\uc124\uce58\ub41c CLI\ub97c \ucc3e\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4', unsupported_shim:'\uc778\uc2dd\ud560 \uc218 \uc5c6\ub294 \uc2e4\ud589 \ub798\ud37c\uc785\ub2c8\ub2e4. \uc2e4\ud589 \ud30c\uc77c \uacbd\ub85c\ub97c \uc9c1\uc811 \uc9c0\uc815\ud558\uc138\uc694', node_not_found:'Node.js\ub97c \ucc3e\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4', binary_not_found:'\uc9c0\uc815\ud55c \uc2e4\ud589 \ud30c\uc77c\uc774 \uc5c6\uc2b5\ub2c8\ub2e4', binary_not_absolute:'\uc808\ub300 \uacbd\ub85c\uac00 \uc544\ub2d9\ub2c8\ub2e4', binary_name_mismatch:'\ud30c\uc77c \uc774\ub984\uc774 CLI \uc885\ub958\uc640 \ub2e4\ub985\ub2c8\ub2e4', version_failed:'\ubc84\uc804\uc744 \ud655\uc778\ud558\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4', spawn_failed:'CLI\ub97c \uc2dc\uc791\ud558\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4', timeout:'\uc2dc\uac04 \ucd08\uacfc \u2014 \ubc29\ud654\ubcbd\u00b7\ud504\ub85d\uc2dc\uac00 CLI\uc758 \uc678\ubd80 \ud1b5\uc2e0\uc744 \ub9c9\uace0 \uc788\uc744 \uc218 \uc788\uc2b5\ub2c8\ub2e4', unsupported_flag:'\uc774 \ubc84\uc804\uc758 CLI\uac00 \uc635\uc158\uc744 \uac70\ubd80\ud588\uc2b5\ub2c8\ub2e4 (\ubc84\uc804\uc744 \ud655\uc778\ud558\uc138\uc694)', not_logged_in:'\ub85c\uadf8\uc778\uc774 \ud544\uc694\ud574 \ubcf4\uc785\ub2c8\ub2e4 (CLI\uc5d0\uc11c \uba3c\uc800 \ub85c\uadf8\uc778\ud558\uc138\uc694)', nonzero_exit:'CLI\uac00 \uc624\ub958\ub85c \uc885\ub8cc\ud588\uc2b5\ub2c8\ub2e4', unexpected_reply:'\uc751\ub2f5\uc774 \uc608\uc0c1\uacfc \ub2e4\ub985\ub2c8\ub2e4', busy:'\ub2e4\ub978 \uc5f0\uacb0 \ud14c\uc2a4\ud2b8\uac00 \uc2e4\ud589 \uc911\uc785\ub2c8\ub2e4', invalid_model:'\ubaa8\ub378 \uc774\ub984 \ud615\uc2dd\uc774 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4', invalid_kind:'\uc9c0\uc6d0\ud558\uc9c0 \uc54a\ub294 CLI \uc885\ub958\uc785\ub2c8\ub2e4', cli_module_missing:'CLI \ubaa8\ub4c8\uc744 \ucc3e\uc9c0 \ubabb\ud588\uc2b5\ub2c8\ub2e4',\n  invalid_configuration:'\uc800\uc7a5\ub41c \uc124\uc815\uc774 \uc62c\ubc14\ub974\uc9c0 \uc54a\uc2b5\ub2c8\ub2e4',\n};\n\nlet CONFIG = null, SNAP = null;\nconst DIRTY = new Set(), BUSY = new Set(), CLEAR = new Set(), RESULTS = {};\n\nfunction toast(kind, text) {\n  const host = document.getElementById('toasts');\n  const node = document.createElement('div');\n  node.className = 'toast ' + kind;\n  node.innerHTML = `<span class=\"dot\"></span><span>${esc(text)}</span>`;\n  host.appendChild(node);\n  setTimeout(() => { node.classList.add('out'); setTimeout(() => node.remove(), 260); }, 3400);\n}\n\nfunction card(title, subtitle, body, span) {\n  return `<section class=\"card ${span || 'col-12'}\">\n    <header class=\"card-h\"><div><h2>${esc(title)}</h2>${subtitle ? `<p class=\"sub\">${esc(subtitle)}</p>` : ''}</div></header>\n    <div class=\"card-b\">${body}</div></section>`;\n}\n\nfunction kv(label, value, mono) {\n  return `<div class=\"row-kv\"><span class=\"k\">${esc(label)}</span><span class=\"v${mono ? ' mono' : ''}\">${value}</span></div>`;\n}\n\nasync function loadConfig() {\n  try {\n    CONFIG = await (await fetch('/api/config', {cache:'no-store'})).json();\n    if (typeof renderSettings === 'function') renderSettings(true);\n  } catch (error) { /* keep the previous view */ }\n}\n\nfunction providerReady(provider) {\n  const fields = (CONFIG && CONFIG[provider] && CONFIG[provider].fields) || {};\n  return PROVIDERS[provider].fields\n    .filter(([, , , , , badge]) => badge === '\ud544\uc218')\n    .every(([name]) => {\n      const field = fields[name] || {};\n      return field.set || field.value;\n    });\n}\n\nwindow.addEventListener('error', event => {\n  const stamp = document.getElementById('stamp');\n  if (stamp) stamp.textContent = '\uc2a4\ud06c\ub9bd\ud2b8 \uc624\ub958: ' + (event.message || 'unknown');\n});\n\ndocument.addEventListener('click', event => {\n  const button = event.target.closest('[data-copy]');\n  if (!button) return;\n  const text = button.dataset.copy;\n  if (navigator.clipboard && navigator.clipboard.writeText) {\n    navigator.clipboard.writeText(text).then(() => toast('ok', '\ubcf5\uc0ac\ud588\uc2b5\ub2c8\ub2e4: ' + text))\n      .catch(() => toast('warn', '\ubcf5\uc0ac\ud560 \uc218 \uc5c6\uc2b5\ub2c8\ub2e4: ' + text));\n  } else {\n    toast('warn', '\ubcf5\uc0ac\ud560 \uc218 \uc5c6\uc2b5\ub2c8\ub2e4: ' + text);\n  }\n});\n"
 
 JS_SHARED += "\n// Cost provenance labels: never leave an unpriced model looking like $0.\nconst COST_STATUS_TEXT = {estimated:'\ucd94\uc815', included:'Plan \ud3ec\ud568', unknown:'\ub2e8\uac00 \ubbf8\ud655\uc778'};\nfunction costStatusSuffix(status) { return status && status !== 'estimated' ? ` (${COST_STATUS_TEXT[status] || status})` : ''; }\nfunction costProvenanceTip(cost) { if (!cost) return ''; const parts = []; if (cost.normalized_model) parts.push(cost.normalized_model); if (cost.pricing_version) parts.push('pricing ' + cost.pricing_version); if (cost.fetched_at) parts.push('fetched ' + cost.fetched_at); if (cost.cache_write_1h_rate) parts.push('cache 1h ' + cost.cache_write_1h_rate); return parts.join(' / '); }\n"
 
@@ -3112,11 +3361,69 @@ JS_DASHBOARD = JS_DASHBOARD.replace(
     "${pulseLevel ? ` batch-${pulseLevel}` : ''}\" style=\"--turbine-speed:",
     "${pulseLevel ? ` batch-${pulseLevel}` : ''}${animate && Math.max(flowDelta?.inputSamples > 0 ? flowDelta.inputTokens : 0, flowDelta?.outputSamples > 0 ? flowDelta.outputTokens : 0) >= 10000 ? ' batch-heat' : ''}\" style=\"--turbine-speed:", 1)
 JS_DASHBOARD = JS_DASHBOARD.replace(
+    "const tokensCard = data.active_session?.provider === 'cli' ? card('오늘 사용량', 'CLI 보고 여부', '<p class=\"hint\">CLI 토큰 사용량과 비용의 일일 합계는 집계되지 않습니다. 미보고 값을 0으로 추정하지 않습니다.</p>', 'col-3') : card('오늘 사용량', '토큰과 추정 비용',\n",
+    """const cliUsageNote = (data.provider === 'cli' || data.active_session?.provider === 'cli')
+    ? '<p class="hint">CLI 응답의 토큰은 CLI가 보고한 경우에만 세션 기록에 남습니다. 미보고 값은 0으로 추정하지 않으며, CLI 비용은 표시하지 않습니다.</p>' : '';
+  const tokensCard = card('오늘 사용량', '토큰과 추정 비용',\n""", 1)
+JS_DASHBOARD = JS_DASHBOARD.replace(
+    "     </div>`, 'col-3');\n\n  const pm = data.proxy_metrics;",
+    "     </div>${cliUsageNote}`, 'col-3');\n\n  const pm = data.proxy_metrics;", 1)
+JS_DASHBOARD = JS_DASHBOARD.replace("<span class=\"k\">외부 서비스 토큰</span>",
+                                    "<span class=\"k\">외부·Local·CLI 토큰</span>", 1)
+JS_DASHBOARD = JS_DASHBOARD.replace(
     '회전 속도는 실시간 토큰 생성 속도가 아닙니다.',
     '진행 요청 표시와 외부 완료 응답 표시는 토큰 입자와 별도입니다. 열광 효과는 갱신 구간의 입력 또는 출력 토큰이 10,000 이상일 때 나타나며 실제 온도나 서버 과열을 뜻하지 않습니다. 회전 속도는 실시간 토큰 생성 속도가 아닙니다.', 1)
 JS_DASHBOARD = JS_DASHBOARD.replace(
     '완료 응답에서 보고된 토큰 묶음 · 실시간 생성 속도 아님',
     '진행 요청 · 외부 완료 응답 표시 / 토큰 입자는 완료 응답 기준', 1)
+
+JS_DASHBOARD = JS_DASHBOARD.replace(
+    "stamp.title = `${data.model || '모델 미설정'} · 마지막 결정 ${ageText} · 갱신 ${new Date(data.generated_at).toLocaleTimeString('ko-KR')}`;",
+    "stamp.title = `${data.model || '모델 미설정'} · 마지막 결정 ${ageText} · 갱신 ${new Date(data.generated_at).toLocaleTimeString('ko-KR')}` +\n    (data.snapshot_age_seconds === null || data.snapshot_age_seconds === undefined ? '' : ` · 서버 스냅샷 ${Math.round(data.snapshot_age_seconds)}초 전${data.snapshot_error ? ' · 갱신 실패' : ''}`);", 1)
+
+# A cancellation is not a failed response: the proxy increments both counters, but the
+# card label, the trend card and the README all define the rate as completed responses
+# only. Subtract aborted for display and keep it as its own metric.
+JS_DASHBOARD = JS_DASHBOARD.replace(
+    """  const requestCount = metricNumber(pm?.requests), successCount = metricNumber(pm?.ok), failureCount = metricNumber(pm?.failed);
+  const completed = successCount === null || failureCount === null ? null : successCount + failureCount;""",
+    """  const requestCount = metricNumber(pm?.requests), successCount = metricNumber(pm?.ok), failureCount = metricNumber(pm?.failed);
+  const abortedCount = metricNumber(pm?.aborted);
+  const completedFailureCount = failureCount === null ? null : Math.max(0, failureCount - (abortedCount || 0));
+  const completed = successCount === null || completedFailureCount === null ? null : successCount + completedFailureCount;""", 1)
+JS_DASHBOARD = JS_DASHBOARD.replace(
+    "  const errorRate = completed === null || completed === 0 ? '—' : `${(failureCount * 100 / completed).toFixed(1)}% (${num(failureCount)} / ${num(completed)}건)`;",
+    "  const errorRate = completed === null || completed === 0 ? '—' : `${(completedFailureCount * 100 / completed).toFixed(1)}% (${num(completedFailureCount)} / ${num(completed)}건)`;", 1)
+JS_DASHBOARD = JS_DASHBOARD.replace('실패율 · 완료 요청 기준', '실패율 · 완료 응답 기준(취소 제외)', 1)
+JS_DASHBOARD = JS_DASHBOARD.replace('실패율은 완료된 성공·실패 응답 기준이고 취소는 별도입니다.',
+                                    '실패율은 완료된 성공·실패 응답 기준이며 취소는 제외하고 따로 표시합니다.', 1)
+JS_DASHBOARD = JS_DASHBOARD.replace('실패율 / 완료된 성공·실패 요청 기준', '실패율 / 완료 응답 기준 · 취소 제외', 1)
+JS_DASHBOARD = JS_DASHBOARD.replace(
+    "누적 실패 ${counter(currentMetrics?.failed) === null ? '미보고' : `${num(currentMetrics.failed)}건`}",
+    "누적 실패(취소 제외) ${counter(currentMetrics?.failed) === null ? '미보고' : `${num(Math.max(0, currentMetrics.failed - (counter(currentMetrics.aborted) || 0)))}건`}", 1)
+# Every connection is shown with the same request/failure accounting, not split into a
+# single opaque "external" bucket.
+JS_DASHBOARD = JS_DASHBOARD.replace(
+    "  const proxyCard = card('프록시 처리량',",
+    """  const connectionLabels = {local: 'Local', openrouter: 'OpenRouter', cli: 'CLI', plan: 'Plan'};
+  const connectionSummary = routing => {
+    const rows = (routing && routing.providers) || {};
+    return Object.keys(connectionLabels).map(name => {
+      const row = rows[name] || {};
+      const failures = metricNumber(row.failures) || 0;
+      const lastModel = typeof row.last_model === 'string' && row.last_model ? ` ${row.last_model}` : '';
+      return `${connectionLabels[name]} ${num(row.requests || 0)}건${failures ? `(시도 실패 ${num(failures)})` : ''}${lastModel}`;
+    }).join(' · ');
+  };
+  const proxyCard = card('프록시 처리량',""", 1)
+JS_DASHBOARD = JS_DASHBOARD.replace(
+    "      ['외부 / Plan 경로', `${metricValue(pm.routes?.external)} / ${metricValue(pm.routes?.plan)}`],",
+    """      ['외부 / Plan 경로', `${metricValue(pm.routes?.external)} / ${metricValue(pm.routes?.plan)}`],
+      ['연결점별 결정 · 최근 60분', connectionSummary(data.routing)],
+      ['이벤트 창', data.routing?.truncated ? '상한 도달 · 일부만 집계' : '전체 표시'],
+      ['스냅샷 갱신', data.snapshot_age_seconds === null || data.snapshot_age_seconds === undefined ? '첫 계산 중' : `${Math.round(data.snapshot_age_seconds)}초 전${data.snapshot_error ? ' · 갱신 실패' : ''}`],""", 1)
+JS_DASHBOARD = JS_DASHBOARD.replace("kv('외부 실패', '없음')",
+                                    "kv('외부 시도 실패(재시도 포함)', '없음')", 1)
 
 # The flow is one instrument: endpoint labels, two conduits and a shared rotor.
 PAGE_CSS += """
@@ -3317,6 +3624,52 @@ pollUsage();
 '''
 
 PAGE_CSS += '''\n.usage-plot{width:100%;height:180px;border-bottom:1px solid var(--line);padding:8px 0}.usage-plot svg{display:block;width:100%;height:100%;overflow:visible}.table-scroll{width:100%;overflow:auto}.table-scroll table{min-width:820px}.table-scroll small{color:var(--fg-3);white-space:nowrap}#usage-grid{margin-top:18px}.usage-plot + .hint{margin-top:10px}'''
+
+# Menu audit fixes: labels that still implied OpenRouter-only monitoring after Local/CLI parity,
+# and gaps where a value was shown as a measured zero even though no event ever carried it.
+JS_SHARED = JS_SHARED.replace(
+    "const stateText = {external:'외부 서비스 사용 중',",
+    "const stateText = {external:'외부 모델 사용 중',", 1)
+JS_DASHBOARD = JS_DASHBOARD.replace(
+    'aria-label="외부 서비스 ${num(counts.external)}건', 'aria-label="외부 모델 ${num(counts.external)}건', 1)
+JS_DASHBOARD = JS_DASHBOARD.replace('</i>외부 서비스 <b>', '</i>외부 모델 <b>', 1)
+JS_DASHBOARD = JS_DASHBOARD.replace('`외부 ${num(short.counts.external)} / Plan',
+                                    '`외부 모델 ${num(short.counts.external)} / Plan', 1)
+JS_DASHBOARD = JS_DASHBOARD.replace("['외부 최종 경로 p95',", "['외부 모델 p95',", 1)
+JS_DASHBOARD = JS_DASHBOARD.replace("['실패율', currentMetrics ? errorRate : '—', '완료된 성공·실패 요청 기준'],",
+                                    "['실패율', currentMetrics ? errorRate : '—', '완료 응답 기준 · 취소 제외'],", 1)
+JS_DASHBOARD = JS_DASHBOARD.replace("['외부 / Plan 경로',", "['외부 모델 / Plan 경로',", 1)
+JS_DASHBOARD = JS_DASHBOARD.replace("['외부 최종 경로 p50 / p95',", "['외부 모델 p50 / p95',", 1)
+JS_DASHBOARD = JS_DASHBOARD.replace("['외부 초기 진입',", "['외부 모델 초기 진입',", 1)
+JS_DASHBOARD = JS_DASHBOARD.replace("['외부 실제 시도',", "['외부 모델 실제 시도',", 1)
+JS_DASHBOARD = JS_DASHBOARD.replace(
+    "    const rows = (routing && routing.providers) || {};\n    return Object.keys(connectionLabels)",
+    "    const rows = (routing && routing.providers) || {};\n"
+    "    if (!Object.keys(rows).length) return '최근 60분 이벤트 없음';\n"
+    "    return Object.keys(connectionLabels)", 1)
+JS_SHARED = JS_SHARED.replace(
+    "const ERROR_TEXT = {\n  unknown_provider:",
+    "const ERROR_TEXT = {\n  rate_limited:'저장 요청이 많습니다. 잠시 후 다시 시도하세요.',\n  unknown_provider:", 1)
+JS_SHARED = JS_SHARED.replace(
+    "  invalid_configuration:'저장된 설정이 올바르지 않습니다',",
+    "  invalid_configuration:'저장된 설정이 올바르지 않습니다',\n"
+    "  backend_version_unverified:'CLI 버전이 검증 목록에 없어 실행할 수 없습니다 (다른 버전을 설치하거나 검증 후 사용하세요)',\n"
+    "  backend_protocol_error:'CLI 응답 형식이 예상과 다릅니다', backend_failed:'CLI 백엔드가 실패했습니다',\n"
+    "  backend_timeout:'CLI 응답 시간 초과', backend_cancelled:'CLI 호출이 취소되었습니다', backend_not_found:'CLI 백엔드를 찾지 못했습니다',\n"
+    "  cli_not_found:'CLI를 찾지 못했습니다', cli_timeout:'CLI 시간 초과', cli_failed:'CLI 실행 실패', cancelled:'요청이 취소되었습니다',\n"
+    "  incomplete_response:'응답이 중간에 끊겼습니다', invalid_tool_call:'도구 호출 형식 오류', invalid_tool_choice:'도구 선택 형식 오류',\n"
+    "  invalid_usage:'사용량 보고 형식 오류', unsupported_request:'이 CLI가 지원하지 않는 요청입니다',\n"
+    "  process_tracking_unavailable:'자식 프로세스 추적을 사용할 수 없습니다', output_too_large:'CLI 출력이 너무 큽니다',\n"
+    "  native_tool_execution_detected:'CLI가 도구를 직접 실행하려 했습니다 (안전하게 중단됨)', unexpected_response:'응답이 예상과 다릅니다',\n"
+    "  cli_backend_failed:'CLI 백엔드 오류', authentication_failed:'인증에 실패했습니다', invalid_provider:'알 수 없는 제공자입니다',\n"
+    "  probe_busy:'다른 검사가 실행 중입니다', probe_failed:'검사에 실패했습니다', probe_timeout:'검사 시간 초과', no_record:'기록이 없습니다', stale_record:'기록이 오래되었습니다',", 1)
+JS_SETTINGS = JS_SETTINGS.replace(
+    "<option value=\"${esc(option)}\"${option === current ? ' selected' : ''}>${esc(option)}</option>",
+    "<option value=\"${esc(option)}\"${option === current ? ' selected' : ''}>${option === 'grok' ? 'grok (미검증 · 실행 불가)' : esc(option)}</option>", 1)
+JS_BLACKBOX = JS_BLACKBOX.replace(
+    " : '기록 꺼짐';",
+    " + (data.started_at ? ' · 시작 ' + new Date(data.started_at).toLocaleString('ko-KR') : '')"
+    " + (Number.isSafeInteger(data.discarded) && data.discarded > 0 ? ' · 폐기 ' + data.discarded + '건' : '') : '기록 꺼짐';", 1)
 
 PAGE = _page("dashboard")
 SETTINGS_PAGE = _page("settings")
@@ -3743,7 +4096,8 @@ def serve(host="127.0.0.1", port=DEFAULT_PORT, refresh=3, allow_fallback=False, 
         fallback = "requested_port_unavailable"
     _write_pid_record(server.server_address[1])
     url = f"http://{_display_host(host)}:{server.server_address[1]}/"
-    print(json.dumps({"dashboard": url, "route_log": str(ROUTE_LOG), "read_only": True,
+    print(json.dumps({"dashboard": url, "route_log": str(ROUTE_LOG),
+                      "config_writes": True, "mode": "local_operator",
                       **({"port_fallback": fallback} if fallback else {})}), flush=True)
     if open_page:
         # The socket is already listening, so the browser request waits for serve_forever().
@@ -3771,6 +4125,8 @@ def _diagnostic_model(value, sensitive):
     if (not isinstance(value, str)
             or not re.fullmatch(r"[A-Za-z0-9~@][A-Za-z0-9._:/@+~-]{0,255}", value)
             or re.search(r"^[A-Za-z]:|://|\\", value)
+            or value.startswith("~") or "~/" in value or "~\\" in value
+            or re.search(r"^[A-Za-z][A-Za-z0-9+.-]*:(?!//)", value)
             or value.startswith(("sk-", "ghp_", "github_pat_"))
             or any(secret and secret in value for secret in sensitive)):
         return None, "redacted"
@@ -3947,8 +4303,8 @@ def diagnostics_report():
     else:
         check("snapshot", "ok", "snapshot_available")
     counters = {key: metrics.get(key) if metrics and type(metrics.get(key)) is int and 0 <= metrics[key] <= 2**53 - 1 else None
-                for key in ("requests", "failed", "externalAttempts", "retries", "circuitOpens")}
-    if counters["failed"]:
+                for key in ("requests", "failed", "aborted", "externalAttempts", "retries", "circuitOpens")}
+    if counters["failed"] and counters["failed"] - (counters["aborted"] or 0) > 0:
         check("requests", "warning", "request_failures_recorded", "inspect_last_route")
     timing_report, attempt_report = _diagnostic_timing(metrics)
     status = "error" if any(item["status"] == "error" for item in checks) else "degraded" if any(item["status"] == "warning" for item in checks) else "ok"
@@ -4000,7 +4356,8 @@ def status_report(include_usage=False, offline=False):
     usage = _empty_usage()
     if provider == "cli":
         model = ((metrics or {}).get("configuration") or {}).get("model")
-    if include_usage and provider != "cli":
+    if include_usage:
+        # Every connection's tokens come from session records; cost provenance stays per model.
         usage = scan_sessions(pricing=pricing)
     alerts = build_alerts(routing, usage, account, pricing)
     insights = build_insights(routing, usage, account, pricing, metrics=metrics)
@@ -4012,6 +4369,7 @@ def status_report(include_usage=False, offline=False):
         "state": routing["state"],
         "proxy_stale": stale,
         "provider": last.get("provider"),
+        "provider_service": provider,
         "reason": last.get("reason"),
         "detail": last.get("detail"),
         "model": last.get("model"),
@@ -4019,6 +4377,8 @@ def status_report(include_usage=False, offline=False):
         "proxy_started_at": routing.get("proxy_started_at"),
         "window_minutes": routing.get("window_minutes"),
         "window_counts": routing.get("counts"),
+        "connection_counts": routing.get("providers"),
+        "window_truncated": routing.get("truncated"),
         "plan_reasons": routing.get("plan_reasons"),
         "failures": routing.get("failures"),
         "models": routing.get("models"),
