@@ -48,7 +48,7 @@ async function startProxy(t, config = {}) {
   return { send, sendOk, metrics };
 }
 
-for (const status of [400, 404, 413, 422]) {
+for (const status of [400, 404, 405, 413, 415, 422]) {
   test(`request-level HTTP ${status} never opens the breaker`, { timeout: 15000 }, async t => {
     let time = 1000;
     const externalCalls = [];
@@ -70,6 +70,18 @@ for (const status of [400, 404, 413, 422]) {
     assert.equal(payload.circuitOpens, 0, 'the breaker must stay closed');
   });
 }
+
+test('a 409 conflict retains bounded retries without opening the breaker', async t => {
+  let attempts = 0;
+  const proxy = await startProxy(t, { fetchImpl: async url => {
+    if (url === PLAN) return planReply();
+    attempts++;
+    return attempts === 1 ? new Response('conflict', { status: 409 }) : externalReply();
+  } });
+  assert.match((await proxy.sendOk()).text, /external-ok/);
+  assert.equal(attempts, 2);
+  assert.equal((await proxy.metrics()).circuitOpens, 0);
+});
 
 test('client-side request validation and a blocked model never open the provider circuit',
   { timeout: 15000 }, async t => {
@@ -138,6 +150,21 @@ test('a 5xx opens the breaker and a later 4xx neither extends nor reopens it',
     const payload = await proxy.metrics();
     assert.equal(payload.circuitOpens, 1, 'the 4xx must not open the breaker a second time');
   });
+
+test('a 408 remains transient and is retried', { timeout: 15000 }, async t => {
+  let externalCalls = 0;
+  const proxy = await startProxy(t, { fetchImpl: async url => {
+    if (url === PLAN) return planReply();
+    assert.equal(url, EXTERNAL);
+    externalCalls++;
+    return new Response('timeout', { status: 408 });
+  } });
+  const first = await proxy.sendOk();
+  assert.match(first.text, /plan-ok/);
+  assert.equal(externalCalls, 4);
+  const payload = await proxy.metrics();
+  assert.equal(payload.circuitOpens, 1);
+});
 
 test('a 429 honors its Retry-After window for the cooldown', { timeout: 15000 }, async t => {
   let time = 1000, healthy = false;

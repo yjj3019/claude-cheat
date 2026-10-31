@@ -307,18 +307,24 @@ const COMPAT_BETAS = new Set(['interleaved-thinking-2025-05-14', 'redact-thinkin
   'extended-cache-ttl-2025-04-11', 'fallback-credit-2026-06-01', 'thinking-token-count-2026-05-13']);
 function withoutNullToolMetadata(body) {
   if (!Array.isArray(body.messages)) return body;
-  let changed = false;
-  const messages = body.messages.map(message => {
-    if (!Array.isArray(message?.content)) return message;
-    const content = message.content.map(block => {
-      if (block?.type !== 'tool_use' || block.provider_specific_fields !== null) return block;
-      changed = true;
+  let messages = body.messages;
+  for (let i = 0; i < body.messages.length; i++) {
+    const message = body.messages[i];
+    if (!Array.isArray(message?.content)) continue;
+    let content = message.content;
+    for (let j = 0; j < message.content.length; j++) {
+      const block = message.content[j];
+      if (block?.type !== 'tool_use' || block.provider_specific_fields !== null) continue;
+      if (content === message.content) content = message.content.slice();
       const copy = { ...block }; delete copy.provider_specific_fields;
-      return copy;
-    });
-    return { ...message, content };
-  });
-  return changed ? { ...body, messages } : body;
+      content[j] = copy;
+    }
+    if (content !== message.content) {
+      if (messages === body.messages) messages = body.messages.slice();
+      messages[i] = { ...message, content };
+    }
+  }
+  return messages === body.messages ? body : { ...body, messages };
 }
 
 function localInlineTools(body) {
@@ -469,9 +475,15 @@ function externalExclusion(body, beta, localOnly = false, localCompat = false) {
 
 function localEndpoint(value, allowRemote, httpUrl) {
   if (typeof value !== 'string' || /[\x00-\x20\x7f]/.test(value)) throw new Error('Invalid Local Messages URL');
+  // Check the original authority and path before WHATWG URL normalization can
+  // erase userinfo or turn alternate addresses and dot segments into accepted forms.
+  const raw = /^(https?):\/\/([^/?#]+)(\/[^?#]*)(?:\?[^#]*)?(?:#.*)?$/i.exec(value);
+  if (!raw || raw[2].includes('@') || raw[2].includes('\\') || raw[3] !== '/v1/messages')
+    throw new Error('Invalid Local Messages URL');
+  const host = raw[2].startsWith('[') ? raw[2].slice(0, raw[2].indexOf(']') + 1) : raw[2].split(':')[0];
   let url;
   try { url = new URL(value); } catch { throw new Error('Local Messages URL required'); }
-  const loopback = ['127.0.0.1', '[::1]'].includes(url.hostname);
+  const loopback = ['127.0.0.1', '[::1]'].includes(host.toLowerCase());
   const internalHttp = url.protocol === 'http:' && value === httpUrl;
   if (!['http:', 'https:'].includes(url.protocol) || url.port === '0' || (!loopback && !internalHttp && (!allowRemote || url.protocol !== 'https:')) ||
       url.username || url.password || url.search || url.hash || url.pathname !== '/v1/messages')
@@ -1296,7 +1308,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         if (chunk) metrics.bytesOut += Buffer.byteLength(chunk);
         return originalEnd(chunk, encoding, callback);
       };
-      let routeKind = null, routeReason = null, recorded = false, performanceSample = null;
+      let routeKind = null, routeReason = null, fallbackFailure = null, recorded = false, performanceSample = null;
       let usageProvider = 'unknown', usageRequestedModel = null, usageReportedModel = null;
       const openPhases = new Set();
       const startPhase = phase => {
@@ -1394,7 +1406,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           outcome: aborted ? 'aborted' : responseFailed || res.statusCode >= 400 ? 'failed' : 'ok',
           // Exposed so a rate-limit answer stays visible to the dashboard (and to the circuit
           // work that will consume it); null means no usable Retry-After was seen.
-          retryAfterMs: retryAfterHintMs };
+          retryAfterMs: retryAfterHintMs, fallbackFailure };
         // Count logical messages only; token counting is a different API operation.
         if (!req.url.startsWith('/v1/messages/count_tokens')) {
           const ok = !aborted && !responseFailed && res.statusCode < 400;
@@ -1839,7 +1851,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             firstByteMs = null;
             // 404 is request-level too: a renamed model must not open the provider circuit.
             if ([400, 404, 413, 422].includes(status) || error?.message === 'Thinking response in ordinary mode') requestRejected = true;
-            if (requestRejected || [401, 402, 403, 404].includes(status)) break;
+            if (requestRejected || [401, 402, 403, 404, 405, 415].includes(status)) break;
           } finally {
             finishCli();
             finishAttempt();
@@ -1882,7 +1894,11 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         if (probe) circuitState.probing = false;
         releaseLocal();
       }
-      if (!succeeded) await sendPro('fallback', noPlan ? localFailure : undefined);
+      if (!succeeded) {
+        if (!noPlan && ['request', 'provider', 'rate_limit', 'transient'].includes(failureClass))
+          fallbackFailure = failureClass;
+        await sendPro('fallback', noPlan ? localFailure : fallbackFailure || undefined);
+      }
     } catch {
       if (!client.signal.aborted) {
         responseFailed = true;

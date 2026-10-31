@@ -172,8 +172,8 @@ export function fixtureSse(model = CLIENT_MODEL) {
     frame('message_stop');
 }
 
-// Mirror of the proxy's external rewrite for the fixed benchmark payloads (plain messages,
-// no native thinking, no metadata, no unsupported fields). The hash of this body must equal
+// Independent fixture for the proxy's OpenRouter rewrite for the fixed benchmark payloads
+// (plain messages, no native thinking, compatible tool schemas). The hash of this body must equal
 // what the fake upstream observed in every child. Accepts the client request as a JSON
 // string or an already-parsed object.
 export function expectedExternalBody(clientBody, { upstreamModel = UPSTREAM_MODEL } = {}) {
@@ -183,6 +183,12 @@ export function expectedExternalBody(clientBody, { upstreamModel = UPSTREAM_MODE
   external.thinking = { type: 'disabled' };
   if (client.tools) external.tools = client.tools.map(tool => ({ ...tool, input_schema: tool.input_schema }));
   external.provider = { allow_fallbacks: false };
+  // Deliberately duplicated contract text: importing the production rewrite would make the
+  // expected hash change along with a regression in that rewrite.
+  const guidance = 'Host tool access: Determine workspace access from the host-provided environment, applicable system and project instructions, and actual tool results. Do not infer that the host workspace is read-only merely from a separate model runtime or sandbox. Respect any explicit read-only restriction and all host permission decisions; do not bypass them. If appropriate tools are available, use them within those limits. Report an access restriction only when supported by the host instructions, environment, or tool results.';
+  if (client.system === undefined) external.system = guidance;
+  else if (typeof client.system === 'string') external.system = `${client.system}\n\n${guidance}`;
+  else external.system = [...client.system, { type: 'text', text: guidance }];
   return external;
 }
 

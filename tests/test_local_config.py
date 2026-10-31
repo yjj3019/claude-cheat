@@ -80,7 +80,9 @@ class LocalConfigTests(LocalTestCase):
                     " http://127.0.0.1/v1/messages", "http://127.0.0.1/v1/messages\n",
                     "http://127.0.0.1/\tv1/messages", "http://127.0.0.1/v1/mess ages",
                     "http://127.0.0.1/v1/messages?x=1", "http://127.0.0.1/v1/messages#fragment",
-                    "http://127.0.0.1/other", "ftp://127.0.0.1/v1/messages"):
+                    "http://127.0.0.1/other", "ftp://127.0.0.1/v1/messages",
+                    "http://127.1/v1/messages", "http://127.0.0.1/a/../v1/messages",
+                    "http://127.0.0.1/%2e%2e/v1/messages", "http://[0:0:0:0:0:0:0:1]/v1/messages"):
             with self.subTest(url=url), self.assertRaises(ValueError):
                 route.local_endpoint(url, False)
 

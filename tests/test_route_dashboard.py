@@ -109,6 +109,30 @@ class RouteLogTests(unittest.TestCase):
         later = now + timedelta(minutes=6)
         self.assertEqual(dash.routing_state(dash.parse_route_log(), now=later)["state"], "idle")
 
+    def test_routing_windows_parse_each_event_once_and_keep_boundaries(self):
+        now = datetime(2026, 10, 25, 3, 0, 0, tzinfo=timezone.utc)
+        events = [{"ts": (now - timedelta(minutes=minutes)).isoformat(), "event": "route_selected",
+                   "provider": "local", "reason": "replacement"} for minutes in (0, 10, 11, 60, 61)]
+        events += [{"ts": "invalid", "event": "circuit_open"},
+                   {"ts": (now + timedelta(seconds=10)).isoformat(), "event": "request_shape", "family": "sonnet"}]
+        original = dash._age_seconds
+        with mock.patch.object(dash, "_age_seconds", wraps=original) as age:
+            state = dash.routing_state(events, now=now)
+        self.assertEqual(age.call_count, len(events) + 1)
+        self.assertEqual(state["counts"]["external"], 4)
+        self.assertEqual(state["short"]["counts"]["external"], 2)
+        self.assertEqual(state["shapes"]["total"], 1)
+        self.assertEqual(state["circuit_opens"], 0)
+
+    def test_fallback_categories_keep_combined_reason_counts(self):
+        now = datetime(2026, 10, 25, 3, 0, 0, tzinfo=timezone.utc)
+        events = [{"ts": now.isoformat(), "event": "route_selected", "provider": "plan",
+                   "reason": "fallback", "detail": detail} for detail in ("request", "transient")]
+        state = dash.routing_state(events, now=now)
+        self.assertEqual(state["plan_reasons"], [("fallback", 2)])
+        self.assertEqual(state["last"]["detail"], "transient")
+        self.assertIn("fallback", dash.REASON_HELP)
+
     def test_failures_and_circuit_opens_are_counted_inside_the_window_only(self):
         now = datetime(2026, 10, 25, 3, 0, 0, tzinfo=timezone.utc)
         stamp = lambda minutes: (now - timedelta(minutes=minutes)).isoformat().replace("+00:00", "Z")
@@ -245,6 +269,14 @@ class CurrentRoutingTests(unittest.TestCase):
         routing = dash._current_routing([], self.session, self.metrics, now=self.now)
         self.assertIsNone(routing["last"]["model"])
         self.assertIsNone(routing["last"]["provider"])
+
+    def test_fallback_failure_detail_is_restricted_to_known_categories(self):
+        self.metrics["last"].update(reason="fallback", fallbackFailure="rate_limit")
+        routing = dash._current_routing([], self.session, self.metrics, now=self.now)
+        self.assertEqual(routing["last"]["detail"], "rate_limit")
+        self.metrics["last"]["fallbackFailure"] = "secret-response"
+        routing = dash._current_routing([], self.session, self.metrics, now=self.now)
+        self.assertIsNone(routing["last"]["detail"])
 
     def test_failed_external_request_is_not_described_as_success(self):
         self.metrics["last"].update(route="external", reason="replacement", status=503, outcome="failed")
@@ -678,6 +710,10 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(report["status"], "degraded")
         self.assertTrue(report["read_only"])
         self.assertFalse(report["inference_performed"])
+        self.assertEqual(report["capabilities"], {"scope": "configured_model", "source": "not_checked",
+                         "tools": "unknown", "vision": "unknown", "thinking": "unknown",
+                         "streaming": "unknown", "context_limit": "unknown",
+                         "tool_roundtrip_evidence": {"status": "not_checked", "scope": "backend_only"}})
         self.assertEqual(report["configuration"]["next_provider"], "local")
         self.assertEqual(report["configuration"]["configured_model"], "fixture-local")
         self.assertFalse(report["session"]["active"])
@@ -3123,9 +3159,88 @@ class RequirementAuditRegressionTests(unittest.TestCase):
 
 
 class ToolRoundtripApiTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch.dict(dash._TOOL_EVIDENCE, {}, clear=True))
+
+    def test_evidence_uses_the_exact_snapshot_and_is_redacted(self):
+        import modelQualityProbe
+        original = {"LOCAL_LLM_MODEL": "model-a", "LOCAL_LLM_API_KEY": "private-key", "LOCAL_LLM_URL": "http://private"}
+        changed = {**original, "LOCAL_LLM_MODEL": "model-b"}
+        with mock.patch.object(dash, "read_settings", return_value=original), \
+                mock.patch.object(modelQualityProbe, "configured_call", return_value=(object(), "model-a")) as configured, \
+                mock.patch.object(modelQualityProbe, "evaluate", return_value={"ok": True, "reason": "passed",
+                    "first_model_matches_requested": True, "second_model_matches_requested": True}):
+            dash.run_tool_roundtrip("local")
+        self.assertEqual(configured.call_args.kwargs["values"], original)
+        report = dash._tool_probe_evidence("local", original)
+        self.assertEqual((report["status"], report["model_match"]), ("passed", True))
+        self.assertNotIn("private", json.dumps(report))
+        self.assertEqual(dash._tool_probe_evidence("local", changed)["status"], "configuration_changed")
+        self.assertEqual(dash._tool_probe_evidence("openrouter", original)["status"], "not_checked")
+        with mock.patch.object(dash.time, "monotonic", return_value=dash._TOOL_EVIDENCE["local"]["monotonic"] + 86401):
+            self.assertEqual(dash._tool_probe_evidence("local", original)["status"], "stale")
+
+    def test_failed_probe_replaces_previous_success_and_busy_does_not(self):
+        import modelQualityProbe
+        values = {"LOCAL_LLM_MODEL": "model-a"}
+        with mock.patch.object(dash, "read_settings", return_value=values), \
+                mock.patch.object(modelQualityProbe, "configured_call", return_value=(object(), "model-a")), \
+                mock.patch.object(modelQualityProbe, "evaluate", side_effect=[
+                    {"ok": True, "reason": "passed"}, RuntimeError("secret")]):
+            dash.run_tool_roundtrip("local")
+            self.assertEqual(dash._tool_probe_evidence("local", values)["status"], "passed")
+            self.assertTrue(dash._TOOL_PROBE_LOCK.acquire(blocking=False))
+            try:
+                self.assertEqual(dash.run_tool_roundtrip("local")["reason"], "probe_busy")
+            finally:
+                dash._TOOL_PROBE_LOCK.release()
+            self.assertEqual(dash._tool_probe_evidence("local", values)["status"], "passed")
+            dash.run_tool_roundtrip("local")
+            self.assertEqual(dash._tool_probe_evidence("local", values)["status"], "failed")
+
+    def test_new_probe_invalidates_old_evidence_before_config_read(self):
+        import modelQualityProbe
+        values = {"LOCAL_LLM_MODEL": "model-a"}
+        with mock.patch.object(dash, "read_settings", return_value=values), \
+                mock.patch.object(modelQualityProbe, "configured_call", return_value=(object(), "model-a")), \
+                mock.patch.object(modelQualityProbe, "evaluate", return_value={"ok": True, "reason": "passed"}):
+            dash.run_tool_roundtrip("local")
+        self.assertEqual(dash._tool_probe_evidence("local", values)["status"], "passed")
+        with mock.patch.object(dash, "read_settings", side_effect=OSError("hidden")):
+            self.assertEqual(dash.run_tool_roundtrip("local")["reason"], "probe_failed")
+        self.assertEqual(dash._tool_probe_evidence("local", values)["status"], "not_checked")
+
+    def test_inflight_probe_hides_previous_evidence(self):
+        import threading
+        import modelQualityProbe
+        values = {"LOCAL_LLM_MODEL": "model-a"}
+        entered, release = threading.Event(), threading.Event()
+        def evaluate(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(5))
+            raise RuntimeError("synthetic")
+        with mock.patch.object(dash, "read_settings", return_value=values), \
+                mock.patch.object(modelQualityProbe, "configured_call", return_value=(object(), "model-a")), \
+                mock.patch.object(modelQualityProbe, "evaluate", return_value={"ok": True, "reason": "passed"}):
+            dash.run_tool_roundtrip("local")
+        with mock.patch.object(dash, "read_settings", return_value=values), \
+                mock.patch.object(modelQualityProbe, "configured_call", return_value=(object(), "model-a")), \
+                mock.patch.object(modelQualityProbe, "evaluate", side_effect=evaluate):
+            worker = threading.Thread(target=dash.run_tool_roundtrip, args=("local",))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                self.assertEqual(dash._tool_probe_evidence("local", values)["status"], "not_checked")
+            finally:
+                release.set()
+                worker.join(5)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(dash._tool_probe_evidence("local", values)["status"], "failed")
+
     def test_probe_limits_concurrency_and_redacts_unexpected_output(self):
         import modelQualityProbe
-        with mock.patch.object(modelQualityProbe, "configured_call", return_value=(object(), "private-model")), \
+        with mock.patch.object(dash, "read_settings", return_value={"LOCAL_LLM_MODEL": "fixture"}), \
+                mock.patch.object(modelQualityProbe, "configured_call", return_value=(object(), "private-model")), \
                 mock.patch.object(modelQualityProbe, "evaluate", return_value={"ok": True, "reason": "passed", "raw": "private-secret", "first_model_matches_requested": False}):
             result = dash.run_tool_roundtrip("local")
         self.assertTrue(result["ok"])
@@ -3139,7 +3254,8 @@ class ToolRoundtripApiTests(unittest.TestCase):
 
     def test_probe_error_does_not_leak_and_releases_slot(self):
         import modelQualityProbe
-        with mock.patch.object(modelQualityProbe, "configured_call", side_effect=RuntimeError("private-secret")):
+        with mock.patch.object(dash, "read_settings", return_value={"LOCAL_LLM_MODEL": "fixture"}), \
+                mock.patch.object(modelQualityProbe, "configured_call", side_effect=RuntimeError("private-secret")):
             result = dash.run_tool_roundtrip("local")
         self.assertEqual(result["reason"], "probe_failed")
         self.assertNotIn("private-secret", json.dumps(result))

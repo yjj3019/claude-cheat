@@ -16,6 +16,7 @@ actions explicitly update the shared configuration file. Run it next to a routin
 import argparse
 import gzip
 import hashlib
+import hmac
 import http.client
 import json
 import math
@@ -371,6 +372,9 @@ def routing_state(events, now=None, idle_after=300):
     else:
         state = "plan"
 
+    # Both windows use the same timestamp parse, keeping independent aggregates.
+    aged_events = [(event, _age_seconds(event["ts"], now)) for event in events]
+
     def aggregate(minutes):
         counts = {"external": 0, "plan": 0}
         plan_reasons = {}
@@ -379,8 +383,7 @@ def routing_state(events, now=None, idle_after=300):
         circuits = 0
         shapes = {"total": 0, "by_family": {}, "text_only": {}}
         kept = []
-        for event in events:
-            age_sec = _age_seconds(event["ts"], now)
+        for event, age_sec in aged_events:
             if age_sec is None or age_sec > minutes * 60:
                 continue
             name = event.get("event")
@@ -390,7 +393,7 @@ def routing_state(events, now=None, idle_after=300):
                 if key == "plan":
                     reason = event.get("reason") or "unknown"
                     detail = event.get("detail")
-                    label = f"{reason}:{detail}" if detail else reason
+                    label = f"{reason}:{detail}" if detail and reason != "fallback" else reason
                     plan_reasons[label] = plan_reasons.get(label, 0) + 1
                 served = event.get("model")
                 if isinstance(served, str) and served and len(served) <= 200:
@@ -2235,6 +2238,33 @@ def _connection_reply_text(data):
 
 
 _TOOL_PROBE_LOCK = threading.BoundedSemaphore(1)
+_TOOL_EVIDENCE_LOCK = threading.Lock()
+_TOOL_EVIDENCE_KEY = secrets.token_bytes(32)
+_TOOL_EVIDENCE = {}
+_TOOL_EVIDENCE_MAX_AGE = 24 * 60 * 60
+
+
+def _tool_config_identity(provider, values):
+    payload = json.dumps([provider, values], sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+    return hmac.digest(_TOOL_EVIDENCE_KEY, payload, "sha256")
+
+
+def _tool_probe_evidence(provider, values):
+    empty = {"status": "not_checked", "scope": "backend_only"}
+    if provider not in ROUTING_PROVIDERS or not isinstance(values, dict):
+        return empty
+    with _TOOL_EVIDENCE_LOCK:
+        entry = _TOOL_EVIDENCE.get(provider)
+        entry = dict(entry) if entry else None
+    if not entry:
+        return empty
+    if not hmac.compare_digest(entry["identity"], _tool_config_identity(provider, values)):
+        return {**empty, "status": "configuration_changed"}
+    age = time.monotonic() - entry["monotonic"]
+    if age < 0 or age > _TOOL_EVIDENCE_MAX_AGE:
+        return {**empty, "status": "stale"}
+    return {"status": entry["status"], "scope": "backend_only", "source": "explicit_probe",
+            "timestamp": entry["timestamp"], "model_match": entry["model_match"]}
 
 
 def run_tool_roundtrip(provider):
@@ -2244,12 +2274,18 @@ def run_tool_roundtrip(provider):
         return {**base, "reason": "invalid_provider"}
     if not _TOOL_PROBE_LOCK.acquire(blocking=False):
         return {**base, "reason": "probe_busy"}
+    with _TOOL_EVIDENCE_LOCK:
+        _TOOL_EVIDENCE.pop(provider, None)
     deadline = time.monotonic() + 180
+    identity = None
+    evidence = {"status": "failed", "model_match": None}
     try:
         import modelQualityProbe
         from types import SimpleNamespace
+        values = dict(read_settings(provider))
+        identity = _tool_config_identity(provider, values)
         dashboard = SimpleNamespace(read_settings=read_settings, _validate_config=_validate_config, _http_json=_http_json)
-        call, model = modelQualityProbe.configured_call(provider, dashboard=dashboard, deadline=deadline)
+        call, model = modelQualityProbe.configured_call(provider, dashboard=dashboard, deadline=deadline, values=values)
         result = modelQualityProbe.evaluate(call, model, deadline=deadline)
         allowed = {"ok", "reason", "tool_proposal_valid", "tool_result_understood", "first_usage_reported",
                    "second_usage_reported", "first_model_reported", "second_model_reported",
@@ -2259,6 +2295,10 @@ def run_tool_roundtrip(provider):
         safe = {key: value for key, value in result.items() if key in allowed and
                 (key == "reason" or value is None or type(value) is bool or
                  key == "elapsed_ms" and type(value) is int and 0 <= value <= 86400000)}
+        matches = (safe.get("first_model_matches_requested"), safe.get("second_model_matches_requested"))
+        match = False if False in matches else True if matches == (True, True) else None
+        evidence = {"status": "passed" if safe.get("ok") is True and safe.get("reason") == "passed" else "failed",
+                    "model_match": match}
         return {**base, **safe}
     except TimeoutError:
         return {**base, "reason": "probe_timeout"}
@@ -2266,6 +2306,10 @@ def run_tool_roundtrip(provider):
         # Provider errors can contain credentials or raw model output.
         return {**base, "reason": "probe_timeout" if time.monotonic() >= deadline else "probe_failed"}
     finally:
+        if identity is not None:
+            with _TOOL_EVIDENCE_LOCK:
+                _TOOL_EVIDENCE[provider] = {**evidence, "identity": identity, "monotonic": time.monotonic(),
+                                             "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds")}
         _TOOL_PROBE_LOCK.release()
 
 
@@ -2385,7 +2429,11 @@ def _current_routing(events, session, metrics, now=None, idle_after=300):
         provider = config.get("provider") if single_provider else None
         model = config.get("model") if single_provider else None
     detail = last.get("detail")
-    detail = detail if "native_feature:" + str(detail) in REASON_HELP else None
+    if last.get("reason") == "fallback":
+        candidate = last.get("fallbackFailure")
+        detail = candidate if candidate in ("request", "provider", "rate_limit", "transient") else None
+    else:
+        detail = detail if "native_feature:" + str(detail) in REASON_HELP else None
     age = _age_seconds(last["ts"], now)
     routing["last"] = {"ts": last["ts"], "provider": provider, "model": model,
                        "reason": last.get("reason"), "detail": detail, "age_seconds": age,
@@ -3907,6 +3955,10 @@ def diagnostics_report():
     return {
         "schema_version": 1, "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "status": status, "read_only": True, "inference_performed": False, "checks": checks,
+        "capabilities": {"scope": "configured_model", "source": "not_checked",
+                         "tools": "unknown", "vision": "unknown", "thinking": "unknown",
+                         "streaming": "unknown", "context_limit": "unknown",
+                         "tool_roundtrip_evidence": _tool_probe_evidence(next_provider, values.get(next_provider))},
         "configuration": {"default_provider": preferred, "next_provider": next_provider,
                           "configured_model": configured_model, "model_status": configured_status,
                           "dual_provider": dual, "providers": providers,
@@ -3920,7 +3972,9 @@ def diagnostics_report():
                     "plan_fallback": proxy_config.get("planFallback") if type(proxy_config.get("planFallback")) is bool else None},
         "last_route": {"provider": last.get("provider") if last.get("provider") in (*ROUTING_PROVIDERS, "plan") else None,
                        "model": last_model, "model_status": last_status, "timestamp": last_stamp,
-                       "age_seconds": last.get("age_seconds"), "current_session": current_session},
+                       "age_seconds": last.get("age_seconds"), "current_session": current_session,
+                       "fallback_failure": last.get("detail") if current_session and last.get("reason") == "fallback"
+                       and last.get("detail") in ("request", "provider", "rate_limit", "transient") else None},
         "metrics": {"source": "live_proxy" if metrics else "unavailable", **counters,
                     "routingTimingMs": timing_report, "attemptCounts": attempt_report,
                     **_diagnostic_cli_metrics(metrics if (session or {}).get("provider") == "cli" else None)},

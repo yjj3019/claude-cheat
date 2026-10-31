@@ -188,6 +188,29 @@ test('expectedExternalBody mirrors the proxy rewrite without mutating the client
   assert.equal(custom.model, 'other/model');
 });
 
+test('expected payload pins host guidance, system shapes and serialized field order', () => {
+  const guidance = 'Host tool access: Determine workspace access from the host-provided environment, applicable system and project instructions, and actual tool results. Do not infer that the host workspace is read-only merely from a separate model runtime or sandbox. Respect any explicit read-only restriction and all host permission decisions; do not bypass them. If appropriate tools are available, use them within those limits. Report an access restriction only when supported by the host instructions, environment, or tool results.';
+  const messages = [{ role: 'user', content: 'hi' }];
+  const input = { model: CLIENT_MODEL, max_tokens: 16, messages };
+  const expected = { model: UPSTREAM_MODEL, max_tokens: 16, messages,
+    thinking: { type: 'disabled' }, provider: { allow_fallbacks: false }, system: guidance };
+  assert.equal(JSON.stringify(expectedExternalBody(input)), JSON.stringify(expected));
+  const expectation = externalPayloadExpectation(JSON.stringify(input));
+  assert.equal(expectation.hash, sha256(JSON.stringify(expected)));
+  assert.equal(expectation.bytes, Buffer.byteLength(JSON.stringify(expected)));
+
+  for (const system of ['', 'Project: read-only.', [{ type: 'text', text: 'Rules', cache_control: { type: 'ephemeral' } }]]) {
+    const client = { model: CLIENT_MODEL, system, max_tokens: 16, messages };
+    const snapshot = structuredClone(client);
+    const systemExpected = typeof system === 'string' ? `${system}\n\n${guidance}` :
+      [...system, { type: 'text', text: guidance }];
+    const body = { model: UPSTREAM_MODEL, system: systemExpected, max_tokens: 16, messages,
+      thinking: { type: 'disabled' }, provider: { allow_fallbacks: false } };
+    assert.equal(JSON.stringify(expectedExternalBody(client)), JSON.stringify(body));
+    assert.deepEqual(client, snapshot);
+  }
+});
+
 test('external payload expectation hashes the exact rewritten body', () => {
   const body = JSON.stringify({ model: CLIENT_MODEL, max_tokens: 16,
     messages: [{ role: 'user', content: 'hi' }] });

@@ -59,11 +59,11 @@ def evaluate(call, model, deadline=None):
             "elapsed_ms": round((time.monotonic() - started) * 1000)}
 
 
-def configured_call(provider, dashboard=None, deadline=None):
+def configured_call(provider, dashboard=None, deadline=None, values=None):
     if provider == "cli":
         import cliBackend
         import routeConfig
-        values = routeConfig.Store().read_provider("cli")
+        values = dict(values) if values is not None else routeConfig.Store().read_provider("cli")
         backend = cliBackend.Backend(values)
         def call(body):
             message, metadata = backend.generate(body, lambda: deadline is not None and time.monotonic() >= deadline)
@@ -74,7 +74,7 @@ def configured_call(provider, dashboard=None, deadline=None):
         return call, backend.protocol_model
     if dashboard is None:
         import routeDashboard as dashboard
-    values = dashboard.read_settings(provider)
+    values = dict(values) if values is not None else dashboard.read_settings(provider)
     dashboard._validate_config(provider, values)
     if provider == "local":
         url, model, key = values["LOCAL_LLM_URL"], values["LOCAL_LLM_MODEL"], values.get("LOCAL_LLM_API_KEY", "")

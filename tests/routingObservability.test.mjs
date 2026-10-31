@@ -93,6 +93,19 @@ test('CLI failure categories and 429 count distinguish backend responses from Pl
   }
 });
 
+test('fallback records only a bounded failure class without upstream content', async t => {
+  const events = captureEvents(t);
+  const secret = 'PRIVATE-UPSTREAM-RESPONSE';
+  const f = await fixture(t, async url => url === PLAN ? Response.json(message(body.model)) :
+    new Response(secret, { status: 415 }));
+  assert.equal((await f.send()).status, 200);
+  const m = await f.metrics();
+  assert.equal(m.last.reason, 'fallback');
+  assert.equal(m.last.fallbackFailure, 'request');
+  assert.equal(events.find(e => e.event === 'route_selected' && e.provider === 'plan').detail, 'request');
+  assert.ok(!JSON.stringify({ events, m }).includes(secret));
+});
+
 test('empty JSON diagnostics contain bounded enums/counts and safe usage, never content or arbitrary metadata', async t => {
   const events = captureEvents(t);
   const secret = 'PRIVATE-PAYLOAD-DO-NOT-LOG';

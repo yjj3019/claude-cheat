@@ -78,6 +78,24 @@ class ModelQualityProbeTest(unittest.TestCase):
         self.assertIsNone(second["model_matches_requested"])
         self.assertTrue(second["usage_measured"])
 
+    def test_captured_config_is_used_for_http_and_cli_adapters(self):
+        values = {"LOCAL_LLM_URL": "http://127.0.0.1:8080/v1/messages", "LOCAL_LLM_MODEL": "model-a",
+                  "LOCAL_LLM_API_KEY": "synthetic-key"}
+        with patch.object(dashboard, "read_settings", side_effect=AssertionError("unexpected settings read")), \
+                patch.object(dashboard, "_http_json", return_value=(200, {"model": "model-a"})) as request:
+            call, model = probe.configured_call("local", dashboard=dashboard, values=values)
+            values["LOCAL_LLM_MODEL"] = "changed"
+            call({"model": model})
+        self.assertEqual(model, "model-a")
+        self.assertEqual(request.call_args.args[0], "http://127.0.0.1:8080/v1/messages")
+        self.assertEqual(request.call_args.args[1]["authorization"], "Bearer synthetic-key")
+        cli_values = {"CLI_KIND": "codex", "CLI_MODEL": "original"}
+        with patch.object(cliBackend, "Backend") as backend, patch.object(routeConfig, "Store", side_effect=AssertionError("unexpected read")):
+            backend.return_value.protocol_model = "cli/codex"
+            probe.configured_call("cli", values=cli_values)
+        self.assertEqual(backend.call_args.args[0], cli_values)
+        self.assertIsNot(backend.call_args.args[0], cli_values)
+
     def test_cli_adapter_accepts_both_probe_turns(self):
         class FakeBackend:
             protocol_model = "cli/codex"
