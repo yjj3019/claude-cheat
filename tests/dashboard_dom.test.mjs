@@ -676,6 +676,16 @@ test('CLI auto-detect fills the kind and executable path', async () => {
   const cliCall = page.requests.find(request => request.url === '/api/cli');
   assert.ok(cliCall, 'auto-detect must re-query the CLI endpoint');
   assert.ok(cliCall.options.headers['x-dashboard-token'], 'detection carries the write token');
+  assert.ok(page.requests.filter(request => request.url === '/api/cli').length >= 2,
+    'the button refreshes detection instead of reusing the page-load result');
+});
+
+test('CLI auto-detect does not double a trailing directory separator', async () => {
+  const page = await settingsPage({ config: { openrouter: READY_OPENROUTER, local: READY_LOCAL },
+    cli: [{ kind: 'claude', found: true, name: 'claude.exe', dir: 'C:\\tools\\', via: 'PATH',
+      version: '2.1.316', reason: null }] });
+  await vm.runInContext('autoDetectCli()', page.sandbox);
+  assert.equal(page.sandbox.document.getElementById('cfg-cli-CLI_BINARY').value, 'C:\\tools\\claude.exe');
 });
 
 test('CLI auto-detect keeps a user-pinned executable path', async () => {
