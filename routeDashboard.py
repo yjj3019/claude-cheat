@@ -57,6 +57,7 @@ METRICS_FILE = ROOT / ".proxy-metrics.json"
 PROXY_FILE = ROOT / "claudeRouteProxy.mjs"
 PID_FILE = ROOT / ".dashboard.pid"
 SESSION_HANDOFF_FILE = ROOT / ".session-handoff.json"
+SESSION_SELECTION_FILE = ROOT / ".dashboard.session"
 PROJECTS = Path.home() / ".claude" / "projects"
 DEFAULT_PORT = 8787
 ACCOUNT_TTL = 60
@@ -1861,14 +1862,33 @@ def provider_states():
     return {name: provider_configured(name) for name in ROUTING_PROVIDERS if name in CONFIG_FILES}
 
 
-def _live_session(offline=False):
-    """Authenticate the recorded loopback proxy and read its current counters once."""
-    if offline:
-        return None, None
+MAX_LIVE_SESSIONS = 12
+_INSTANCE_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_SHOWN_INSTANCE = None
+_SHOWN_INSTANCE_LOADED = False
+
+
+def _read_shown_instance():
     try:
-        record = json.loads(SESSION_HANDOFF_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None, None
+        value = SESSION_SELECTION_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value if _INSTANCE_RE.fullmatch(value) else None
+
+
+def _write_shown_instance(instance_id):
+    if not _INSTANCE_RE.fullmatch(instance_id):
+        return
+    try:
+        temporary = SESSION_SELECTION_FILE.with_name(SESSION_SELECTION_FILE.name + ".tmp")
+        temporary.write_text(instance_id, encoding="utf-8")
+        os.replace(temporary, SESSION_SELECTION_FILE)
+    except OSError:
+        pass
+
+
+def _session_from_record(record):
+    """Authenticate one recorded loopback proxy and read its current counters once."""
     if not isinstance(record, dict) or record.get("provider") not in ROUTING_PROVIDERS:
         return None, None
     port, nonce = record.get("port"), record.get("nonce")
@@ -1878,7 +1898,6 @@ def _live_session(offline=False):
         return None, None
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.5)
     try:
-        # http.client connects directly and never follows redirects or environment proxies.
         connection.request("GET", "/api/metrics", headers={"x-local-route-token": nonce})
         response = connection.getresponse()
         if response.status != 200:
@@ -1895,12 +1914,9 @@ def _live_session(offline=False):
         connection.close()
     started = record.get("started")
     instance = record.get("instance_id")
-    instance = instance if isinstance(instance, str) and re.fullmatch(
-        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", instance) else None
+    instance = instance if isinstance(instance, str) and _INSTANCE_RE.fullmatch(instance) else None
     proxy_pid = record.get("proxy_pid")
     proxy_pid = proxy_pid if type(proxy_pid) is int and proxy_pid > 0 else None
-    # The handoff's instance must be the one that answered with this nonce: a singleton
-    # handoff can otherwise point at a different launcher than the live proxy.
     reported = metrics.get("instanceId")
     if instance and isinstance(reported, str) and reported != instance:
         return None, None
@@ -1908,9 +1924,103 @@ def _live_session(offline=False):
     session = {"provider": record["provider"],
                "started": started if isinstance(started, str) else None,
                "instance_id": instance,
-               # True only when the recorded proxy pid still exists with that pid value.
+               "port": port,
                "pid_verified": bool(identity is not None and identity[0] == proxy_pid)}
     return session, {**metrics, "age_seconds": 0, "stale": False}
+
+
+def _live_session(offline=False):
+    """Authenticate the singleton handoff's loopback proxy (kept for status/takeover)."""
+    if offline:
+        return None, None
+    try:
+        record = json.loads(SESSION_HANDOFF_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, None
+    return _session_from_record(record)
+
+
+def _session_summary(saved):
+    session, metrics = saved["session"], saved["metrics"]
+    configuration = metrics.get("configuration") if isinstance(metrics.get("configuration"), dict) else {}
+    return {"instance_id": session.get("instance_id"),
+            "port": session.get("port"),
+            "provider": session.get("provider"),
+            "started": session.get("started"),
+            "model": configuration.get("model"),
+            "requests": metrics.get("requests"),
+            "inflight": metrics.get("inflightRequests"),
+            "routes": metrics.get("routes"),
+            "selected": False}
+
+
+def live_sessions(limit=MAX_LIVE_SESSIONS):
+    """Every live routed session, newest handoff first; a dead or unrelated port is skipped."""
+    base = ROOT / ".usage-stats" / "instances"
+    try:
+        paths = sorted(base.glob("*/handoff.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:limit]
+    except OSError:
+        return []
+    rows = []
+    seen = set()
+    for handoff in paths:
+        try:
+            record = json.loads(handoff.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        port = record.get("port") if isinstance(record, dict) else None
+        if type(port) is not int or port in seen or not _port_open(port):
+            continue
+        seen.add(port)
+        session, metrics = _session_from_record(record)
+        if session is None or not session.get("instance_id"):
+            continue
+        rows.append({"session": session, "metrics": metrics})
+    return rows
+
+
+def _display_session():
+    """Pick a stable live session: keep the shown one, else the previous choice, else the busiest."""
+    global _SHOWN_INSTANCE, _SHOWN_INSTANCE_LOADED
+    rows = live_sessions()
+    if not rows:
+        # Older launchers (or a test fixture) may have only the singleton handoff.
+        session, metrics = _live_session()
+        if session is None:
+            return None, None, []
+        if not _SHOWN_INSTANCE_LOADED:
+            _SHOWN_INSTANCE = _read_shown_instance()
+            _SHOWN_INSTANCE_LOADED = True
+        _SHOWN_INSTANCE = session.get("instance_id")
+        return session, metrics, []
+    if not _SHOWN_INSTANCE_LOADED:
+        _SHOWN_INSTANCE = _read_shown_instance()
+        _SHOWN_INSTANCE_LOADED = True
+    by_id = {row["session"]["instance_id"]: row for row in rows}
+    chosen = by_id.get(_SHOWN_INSTANCE)
+    if chosen is None:
+        chosen = max(rows, key=lambda row: (row["metrics"].get("requests") or 0,
+                                            row["session"].get("started") or ""))
+        _SHOWN_INSTANCE = chosen["session"]["instance_id"]
+        _write_shown_instance(_SHOWN_INSTANCE)
+    summaries = [_session_summary(row) for row in rows]
+    for summary in summaries:
+        summary["selected"] = summary["instance_id"] == _SHOWN_INSTANCE
+    return chosen["session"], chosen["metrics"], summaries
+
+
+def select_live_session(instance_id):
+    """Remember an explicit session choice; return whether the instance is currently live."""
+    global _SHOWN_INSTANCE, _SHOWN_INSTANCE_LOADED
+    if not isinstance(instance_id, str) or not _INSTANCE_RE.fullmatch(instance_id):
+        return False
+    live_ids = {row["session"]["instance_id"] for row in live_sessions()}
+    if instance_id not in live_ids:
+        return False
+    _SHOWN_INSTANCE = instance_id
+    _SHOWN_INSTANCE_LOADED = True
+    _write_shown_instance(instance_id)
+    return True
 
 
 def active_session():
@@ -2746,7 +2856,7 @@ def proxy_metrics():
 def snapshot():
     """Everything the page renders, in one JSON document."""
     now = datetime.now(timezone.utc)
-    session, live_metrics = _live_session()
+    session, live_metrics, live_session_rows = _display_session()
     routing = _current_routing(parse_route_log(), session, live_metrics, now=now)
     provider, config, model = _display_service(routing, session)
     account, pricing = _service_finances(provider, config, model)
@@ -2774,6 +2884,8 @@ def snapshot():
         "configured": any_provider_configured(),
         "providers": providers,
         "active_session": session,
+        "sessions": live_session_rows,
+        "selected_instance": (session or {}).get("instance_id"),
         "provider": provider,
         "refresh_ms": refresh_interval_ms(routing),
         "proxy_stale": proxy_stale(routing),
@@ -3200,6 +3312,8 @@ def _page(kind="dashboard"):
                '<span class="signal-lamps" aria-hidden="true"><i class="signal-red-lamp"></i>'
                '<i class="signal-warn-lamp"></i><i class="signal-green-lamp"></i></span>'
                '<span id="live-text">확인 중</span></span>'
+               '<select id="session-picker" title="모니터링할 세션" aria-label="모니터링할 세션 선택"'
+               ' onchange="selectSession(this.value)" hidden></select>'
                '<span class="pill signal-warn" id="attention-pill" role="status" hidden></span>'
                '<button class="btn btn-sm btn-ghost" id="notify-toggle" type="button"'
                ' onclick="toggleNotify()" aria-pressed="false" hidden>알림</button>'
@@ -3946,6 +4060,37 @@ PAGE_CSS += """
 
 
 PAGE_CSS += "[hidden]{display:none !important}\n"
+PAGE_CSS += ("#session-picker{height:30px;max-width:230px;padding:0 8px;border-radius:10px;"
+             "border:1px solid var(--line-2);background:var(--panel-2);color:var(--fg-2);font-size:12px}\n")
+
+JS_DASHBOARD += '''
+const renderHeaderWithSessionPicker = renderHeader;
+renderHeader = function (data) {
+  renderHeaderWithSessionPicker(data);
+  const picker = document.getElementById('session-picker');
+  if (!picker) return;
+  const sessions = Array.isArray(data.sessions) ? data.sessions : [];
+  if (sessions.length < 2) { picker.hidden = true; picker.innerHTML = ''; return; }
+  const options = sessions.map(session => {
+    const provider = ({openrouter:'OpenRouter', local:'Local', cli:'CLI'}[session.provider] || session.provider || '?');
+    return `<option value="${esc(session.instance_id)}"${session.instance_id === data.selected_instance ? ' selected' : ''}>`
+      + `${esc(provider)} · ${num(session.requests)}건${session.port ? ' · :' + esc(session.port) : ''}</option>`;
+  }).join('');
+  if (picker.innerHTML !== options) picker.innerHTML = options;
+  picker.hidden = false;
+  picker.title = `${sessions.length}개 세션 중 표시 중`;
+};
+async function selectSession(instance) {
+  try {
+    const response = await fetch('/api/select-session', {method:'POST', headers:{'content-type':'application/json','x-dashboard-token':TOKEN}, body: JSON.stringify({instance_id: instance})});
+    if (!response.ok) throw new Error('select failed');
+    await tick(true);
+  } catch (error) {
+    toast('warn', '세션을 선택하지 못했습니다');
+  }
+}
+'''
+
 PAGE = _page("dashboard")
 SETTINGS_PAGE = _page("settings")
 BLACKBOX_PAGE = _page("blackbox")
@@ -4106,7 +4251,7 @@ class Handler(BaseHTTPRequestHandler):
         if not _host_allowed(self.headers.get("host")):
             return self._send(403, "application/json; charset=utf-8", json.dumps({"error": "host_rejected"}))
         path = self.path.split("?")[0]
-        if path not in ("/api/config", "/api/test", "/api/default-provider", "/api/config-reset", "/api/blackbox"):
+        if path not in ("/api/config", "/api/test", "/api/default-provider", "/api/config-reset", "/api/blackbox", "/api/select-session"):
             return self._send(404, "application/json; charset=utf-8", json.dumps({"error": "not_found"}))
         if not self._authorized():
             return self._send(403, "application/json; charset=utf-8", json.dumps({"error": "token_required"}))
@@ -4135,6 +4280,17 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, "application/json; charset=utf-8", json.dumps({"error": "invalid_json"}))
         if not isinstance(payload, dict):
             return self._send(400, "application/json; charset=utf-8", json.dumps({"error": "invalid_payload"}))
+        if path == "/api/select-session":
+            if not select_live_session(payload.get("instance_id")):
+                return self._send(409, "application/json; charset=utf-8", json.dumps({"error": "session_not_live"}))
+            try:
+                _SNAPSHOT["data"] = snapshot()
+                _SNAPSHOT["at"] = time.monotonic()
+                _SNAPSHOT["error"] = None
+            except Exception:
+                pass
+            return self._send(200, "application/json; charset=utf-8",
+                              json.dumps({"selected": _SHOWN_INSTANCE}, ensure_ascii=False))
         if path == "/api/blackbox":
             action = payload.get("action")
             mode = payload.get("mode")

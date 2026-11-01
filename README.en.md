@@ -410,6 +410,8 @@ The server-side checks are read-only: they never restart a session, write settin
 
 **Code changes apply automatically.** When `routeDashboard.py`, `routeConfig.py` or `localProcessTree.py` changes, the running dashboard restarts itself and serves the new page. If the live proxy was started from older code (`proxy_hash` mismatch), the dashboard requests an **automatic takeover on the same port and token while no request is in flight**, so the Claude Code session keeps working on the new proxy. Attempts and failures are recorded in `.auto-update.log`. Without a running dashboard, or in a mode that cannot take over, the change applies at the next session start.
 
+**Multiple sessions can run at once.** The dashboard scans `.usage-stats/instances/*/handoff.json`, reads every live session's own metrics, and shows the busiest one when no choice is saved. Restarting another session does not reset the view; if the shown session disappears, the dashboard switches to the busiest remaining session instead of a new empty one. With two or more live sessions the header exposes a **session picker**, and the choice is stored in `.dashboard.session` across dashboard restarts. The restarted proxy's own time series still begins at its new proxy start.
+
 | Panel | Content |
 | --- | --- |
 | Now | **OpenRouter, Local LLM or CLI serving / Plan bypass / idle**, the **last request's actual routing model**, age, reason |

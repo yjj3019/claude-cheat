@@ -254,7 +254,7 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 연결 자동 복구 | `/api/snapshot` 실패 시 1·2·4·8·16초 지수 백오프로 재시도하고, 복구 시 토스트로 알림 | 기능 추가 |
 | 보안 경계 | 능동 점검은 로컬 상태만 읽고 쓰기·세션 제어를 하지 않음. 알림 권한 거부 시에도 배너·배지는 동작 | 문서화 |
 
-검증: Node **724 pass / 0 fail**(DOM 99 포함), Python **696개 수집(11 skip)**, 대시보드 모듈 267 pass. 라이브 대시보드에서 `proactive` 키·탭 배지·알림 버튼 서빙 확인.
+검증: Node **724 pass / 0 fail**(DOM 99 포함), Python **696개 수집(11 skip)**, 대시보드 모듈 271 pass. 라이브 대시보드에서 `proactive` 키·탭 배지·알림 버튼 서빙 확인.
 
 
 ## 14. 대시보드 헤더 레이아웃 (2026-11-01)
@@ -267,7 +267,7 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 1600px 이하 2행 | 브랜드+내비 1행, 액션(상태·알림·새로고침·도움말) 2행으로 분리. 720px 이하 기존 모바일 순서 유지 | 수정 |
 | 넓은 창 | 1600px 초과에서는 한 행 유지(내비 4개 라벨 한 줄) | 확인 |
 
-검증: 헤드리스 Edge 스크린샷 1087·1280·1500·1920px에서 라벨 줄바꿈 없음, 대시보드 모듈 267 pass.
+검증: 헤드리스 Edge 스크린샷 1087·1280·1500·1920px에서 라벨 줄바꿈 없음, 대시보드 모듈 271 pass.
 
 
 ## 15. 실행기 설치 자동화 (2026-11-01)
@@ -319,7 +319,7 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 헤더 요약 툴팁 | 한 줄로 잘린 헤더 요약의 전체 문장을 `title` 툴팁에 유지 | PageTests(`data.summary ? data.summary`) |
 | 이벤트 루프 max 추적 | 100ms 이상 지연을 100ms 샘플러로 기록(최대 5건, ISO 시각)하고 `/api/metrics` `process.eventLoopSpikes` 로 노출, 프로세스 카드에 최근 3건 표시 | `tests/metrics.test.mjs`, `tests/dashboard_dom.test.mjs` |
 
-검증: Node **724 pass / 0 fail**(DOM 99), Python **699 tests OK**(11 skip), 대시보드 모듈 **264 pass**. 프록시 스파이크 기록은 다음 새 세션부터 적용됩니다.
+검증: Node **724 pass / 0 fail**(DOM 99), Python **703 tests OK**(11 skip), 대시보드 모듈 **264 pass**. 프록시 스파이크 기록은 다음 새 세션부터 적용됩니다.
 
 ## 19. 코드 변경 자동 반영 (2026-11-01)
 
@@ -331,4 +331,18 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 프록시 자동 takeover | 대시보드가 `proxy_hash` 불일치 + `inflightRequests=0`을 감지하면 `openrouterAdvisor.py --takeover`를 분리 실행해 같은 포트·토큰으로 교체. 60초 스로틀, 활성 턴이면 다음 기회 | `AutoUpdateTests` |
 | 감사 로그 | 모든 자동 반영 시도·실패를 `.auto-update.log`에 ISO 시각으로 기록 | 구현 확인 |
 
-검증: Python **699 tests OK**(11 skip), Node **724 pass**, 대시보드 모듈 **267 pass**, `AutoUpdateTests` 3 pass.
+검증: Python **703 tests OK**(11 skip), Node **724 pass**, 대시보드 모듈 **267 pass**, `AutoUpdateTests` 3 pass.
+
+## 20. 다중 세션 모니터링 (2026-11-02)
+
+사용자 보고: Claude Code 세션 2개 중 하나를 재시작하면 모니터링 페이지가 초기화됨. 원인은 대시보드가 싱글턴 `.session-handoff.json`만 읽어 최신 세션 하나만 추적한 것이었습니다.
+
+| 변경 | 내용 |
+| --- | --- |
+| 세션 발견 | `.usage-stats/instances/*/handoff.json`을 스캔해 살아 있는 모든 프록시의 `/api/metrics`를 읽고 요청·경로·모델을 수집 |
+| 안정 선택 | 선택이 없으면 **가장 요청이 많은 세션** 표시. 표시 세션이 살아 있으면 다른 세션 재시작에도 유지. 표시 세션이 사라지면 새 빈 세션이 아니라 남은 세션 중 가장 활발한 세션으로 전환 |
+| 선택 저장 | `.dashboard.session`(Git 무시)에 선택 인스턴스 저장 → 대시보드 자동 재시작 후에도 유지 |
+| 세션 선택 UI | 2개 이상일 때 헤더 드롭다운 표시, `POST /api/select-session`으로 전환 |
+| 호환 | 인스턴스 핸드오프가 없는 구버전 세션은 기존 싱글턴 핸드오프로 폴백 |
+
+검증: 라이브 세션 2개(68건/41건)를 동시에 발견하고 선택 API로 68건↔41건 전환이 실제 동작함. Python **703 tests OK**(11 skip), Node **724 pass**, 대시보드 모듈 **271 pass**.

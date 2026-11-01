@@ -1331,6 +1331,7 @@ class ServerTests(unittest.TestCase):
 
 class ConfigTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(mock.patch.object(dash, "live_sessions", return_value=[]))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.path = self.root / "openclaude.config.yaml"
         self.files = {
@@ -1955,6 +1956,7 @@ class SnapshotReuseTests(unittest.TestCase):
 class ProxyMetricsTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(mock.patch.object(dash, "_live_session", return_value=(None, None)))
+        self.enterContext(mock.patch.object(dash, "live_sessions", return_value=[]))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.path = self.root / ".proxy-metrics.json"
         self.enterContext(mock.patch.object(dash, "METRICS_FILE", self.path))
@@ -2565,6 +2567,7 @@ class InsightTests(unittest.TestCase):
 class SnapshotTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(mock.patch.object(dash, "_live_session", return_value=(None, None)))
+        self.enterContext(mock.patch.object(dash, "live_sessions", return_value=[]))
 
     def test_snapshot_shape_and_loopback_only_binding(self):
         with mock.patch.object(dash, "scan_sessions", return_value=dash._empty_usage()), \
@@ -2578,7 +2581,7 @@ class SnapshotTests(unittest.TestCase):
                          ["account", "active_session", "alerts", "configured", "generated_at", "help",
                           "insights", "model", "pricing", "proactive", "provider", "providers",
                           "proxy_metrics", "proxy_modified_at", "proxy_stale", "refresh_ms",
-                          "routing", "summary", "usage"])
+                          "routing", "selected_instance", "sessions", "summary", "usage"])
         self.assertEqual(data["model"], "vendor/model")
         self.assertEqual(data["routing"]["state"], "unknown")
         self.assertEqual(data["alerts"], [])
@@ -3222,7 +3225,7 @@ class ProviderSelectionDisplayTests(unittest.TestCase):
         with mock.patch.object(dash.http.client, "HTTPConnection", return_value=connection) as connect:
             self.assertEqual(dash.active_session(),
                              {"provider": "local", "started": "2026-10-26T00:00:00+00:00",
-                              "instance_id": None, "pid_verified": False})
+                              "instance_id": None, "port": 48432, "pid_verified": False})
         connect.assert_called_once_with("127.0.0.1", 48432, timeout=0.5)
         connection.request.assert_called_once_with("GET", "/api/metrics",
                                                    headers={"x-local-route-token": "private-token"})
@@ -3974,3 +3977,53 @@ class AutoUpdateTests(unittest.TestCase):
             second = dash.source_fingerprint([path])
             self.assertNotEqual(first, second)
             self.assertEqual(len(first), 1)
+
+class MultiSessionTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch.object(dash, "_SHOWN_INSTANCE", None))
+        self.enterContext(mock.patch.object(dash, "_SHOWN_INSTANCE_LOADED", False))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.object(dash, "SESSION_SELECTION_FILE", self.root / ".dashboard.session"))
+
+    def row(self, instance_id, requests, port=10000):
+        return {"session": {"instance_id": instance_id, "provider": "openrouter", "started": "2026-11-02T00:00:00+00:00",
+                            "port": port, "pid_verified": True},
+                "metrics": {"requests": requests, "inflightRequests": 0,
+                            "configuration": {"model": "vendor/model"}, "routes": {"external": requests, "plan": 0}}}
+
+    def test_no_saved_selection_shows_the_busiest_live_session(self):
+        a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        with mock.patch.object(dash, "live_sessions", return_value=[self.row(a, 2), self.row(b, 9)]):
+            session, metrics, summaries = dash._display_session()
+        self.assertEqual(session["instance_id"], b)
+        self.assertEqual(metrics["requests"], 9)
+        self.assertEqual([item["selected"] for item in summaries], [False, True])
+
+    def test_explicit_selection_is_kept_and_survives_a_restart(self):
+        a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        with mock.patch.object(dash, "live_sessions", return_value=[self.row(a, 2), self.row(b, 9)]):
+            self.assertTrue(dash.select_live_session(a))
+            session, _, _ = dash._display_session()
+        self.assertEqual(session["instance_id"], a)
+        self.assertEqual((self.root / ".dashboard.session").read_text(encoding="utf-8"), a)
+        # A fresh dashboard process loads the saved instance instead of jumping to the busiest.
+        self.enterContext(mock.patch.object(dash, "_SHOWN_INSTANCE_LOADED", False))
+        self.enterContext(mock.patch.object(dash, "_SHOWN_INSTANCE", None))
+        with mock.patch.object(dash, "live_sessions", return_value=[self.row(a, 2), self.row(b, 9)]):
+            session, _, _ = dash._display_session()
+        self.assertEqual(session["instance_id"], a)
+
+    def test_unknown_or_dead_selection_is_rejected(self):
+        a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        with mock.patch.object(dash, "live_sessions", return_value=[self.row(a, 2)]):
+            self.assertFalse(dash.select_live_session("cccccccc-cccc-4ccc-8ccc-cccccccccccc"))
+            self.assertFalse(dash.select_live_session("not-an-instance"))
+            self.assertTrue(dash.select_live_session(a))
+
+    def test_page_shows_a_session_picker_only_with_multiple_sessions(self):
+        self.assertIn('id="session-picker"', dash.PAGE)
+        self.assertIn('#session-picker', dash.PAGE_CSS)
+        self.assertIn('renderHeaderWithSessionPicker', dash.PAGE)
+        self.assertIn('selectSession', dash.PAGE)

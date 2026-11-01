@@ -27,3 +27,4 @@ SESSION_LOG.md
 openclaude.config.yaml
 openclaude.config.yaml.*
 .openclaude.config.yaml.*
+.dashboard.session
