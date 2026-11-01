@@ -992,6 +992,8 @@ python tests/live_smoke.py --dry-run       # 설정 존재 여부만 확인(무�
 
 모의 업스트림으로 트래픽을 만들어 처리량·지연·메모리·라우팅 결과를 측정합니다. 외부 모델을 호출하지 않습니다.
 
+측정 기준선·실험 기록·다음 개선 후보는 [`docs/PROXY-PERFORMANCE-MONITORING-RESEARCH.ko.md`](docs/PROXY-PERFORMANCE-MONITORING-RESEARCH.ko.md)에 계속 누적합니다.
+
 ```powershell
 node tests/simulate.mjs                                   # 혼합 트래픽 + 장기 세션 + 회로 차단
 node tests/simulate.mjs --requests 4000 --concurrency 48 --json
