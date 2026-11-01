@@ -232,6 +232,8 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | L8 `--print` 프롬프트 | 프롬프트를 argv에서 빼고 표준 입력으로 전달(`run_cli`, `--input-format text` 기본). argv에 프롬프트가 없고 stdin으로 전달되는지 단위 테스트로 확인 | 해결 |
 | 부하 flaky 테스트 | `test_route_cli`의 명령 상한 4초가 부하 시 정상 node 스폰까지 시간 초과시키던 문제. 15초로 올려 flaky 제거(느린 모드 검증은 유지) | 수정 |
 | L5·L10·L15 | 포트 스쿼트, CLI 해석 불일치, symlink/TOCTOU는 구조적 잔여 위험으로 `SECURITY.ko.md` §7에 명시 | 문서화 |
+| 실행 정책 진입점 | 설치 포워더·체크아웃 진입점을 `.cmd`로 바꿔 PowerShell 실행 정책(`AllSigned`)과 무관하게 실행. 설치 시 같은 이름의 구 `.ps1` 포워더를 제거해 PowerShell이 다시 `.ps1`을 우선 선택하지 않게 함 | 수정 |
+| 토큰 오류 안내 | 대시보드 재시작으로 토큰이 바뀐 뒤 설정 페이지가 "새로고침"만 안내하던 문제. 403이면 `write_url`로 다시 접속하라는 구체적 안내로 교체 | 수정 |
 | 저장소 위생 | 추적되지 않던 `NUL` 잔여 파일 삭제 | 정리 |
 
-검증: Node **710 pass / 0 fail**(DOM 87 포함), Python **668개 수집(11 skip)**. 변경 모듈(`test_launcher_arguments`·`test_route_cli`·`test_route_dashboard`·`test_handover_contract`·`test_launcher_scripts`) 통과, 이전 flaky였던 `ConnectionTest.test_reasons_through_shim`은 새 상한에서 21초에 통과.
+검증: Node **710 pass / 0 fail**(DOM 87 포함), Python **669개 수집(11 skip)**. 변경 모듈(`test_launcher_arguments`·`test_route_cli`·`test_route_dashboard`·`test_handover_contract`·`test_launcher_scripts`) 통과, 이전 flaky였던 `ConnectionTest.test_reasons_through_shim`은 새 상한에서 21초에 통과.

@@ -1102,6 +1102,10 @@ class PageTests(unittest.TestCase):
         self.assertNotIn('class="card col-6" id="card-', self.scripts()["settings"])
         self.assertIn(".card[hidden]{display:none}", dash.SETTINGS_PAGE)
 
+    def test_settings_page_explains_a_missing_or_stale_write_token(self):
+        # A dashboard restart rotates the token; the generic "refresh" hint would hide the fix.
+        self.assertIn('쓰기 토큰이 없거나 만료되었습니다', dash.SETTINGS_PAGE)
+
     def test_routes_serve_the_matching_page(self):
         import threading
         import urllib.error

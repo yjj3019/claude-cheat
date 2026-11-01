@@ -886,7 +886,7 @@ python -m unittest discover -s tests -p test_fuzz_dashboard.py  # 대시보드 �
 python tests/live_smoke.py --dry-run       # 설정 존재 여부만 확인(무과금)
 ```
 
-현재 저장소 기준 회귀 검사 수는 **Node 710개**(대시보드 DOM 87개 포함), **Python 668개**(11개는 환경 의존 검사로 skip)입니다. 테스트 수는 릴리스마다 달라질 수 있으므로 위 명령으로 직접 확인하세요.
+현재 저장소 기준 회귀 검사 수는 **Node 710개**(대시보드 DOM 87개 포함), **Python 669개**(11개는 환경 의존 검사로 skip)입니다. 테스트 수는 릴리스마다 달라질 수 있으므로 위 명령으로 직접 확인하세요.
 
 - Windows 프로세스 트리 테스트(`test_local_lifecycle`)와 동시성 스트레스(`test_dashboard_concurrency`)는 **기본 스위트에서 건너뜁니다**. 실제 프로세스 트리를 띄우거나 서버에 12스레드를 걸기 때문에 느리고 부하에 민감합니다. 필요할 때만 `$env:CLAUDE_CHEAT_SLOW = '1'`로 켜세요.
 - 프로세스 트리 테스트는 **Git Bash**가 필요합니다. `C:\Windows\System32\bash.exe`(WSL)는 Windows 파이썬 경로를 실행하지 못해 자동으로 건너뜁니다.

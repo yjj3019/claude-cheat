@@ -2986,7 +2986,9 @@ async function loadConfig() {
     const response = await fetch('/api/config', {cache: 'no-store', headers: {'x-dashboard-token': TOKEN}});
     if (!response.ok) {
       const status = document.getElementById('default-provider-status');
-      if (status) status.textContent = '설정을 읽지 못했습니다. 페이지를 새로고침한 뒤 다시 시도하세요.';
+      if (status) status.textContent = response.status === 403
+        ? '쓰기 토큰이 없거나 만료되었습니다. 런처가 출력한 #token=… 주소(write_url)로 다시 접속하세요.'
+        : '설정을 읽지 못했습니다. 페이지를 새로고침한 뒤 다시 시도하세요.';
       return;
     }
     CONFIG = await response.json();
