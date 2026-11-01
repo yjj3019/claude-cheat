@@ -2542,12 +2542,14 @@ class SnapshotTests(unittest.TestCase):
              mock.patch.object(dash, "parse_route_log", return_value=[]), \
              mock.patch.object(dash, "account_state", return_value={"ok": False, "error": "configuration_missing"}), \
              mock.patch.object(dash, "model_pricing", return_value={"ok": False, "error": "configuration_missing"}), \
+             mock.patch.object(dash, "proactive_alerts", return_value=[]), \
              mock.patch.object(dash, "read_settings", return_value={"OPENROUTER_MODEL": "vendor/model", "ROUTE_DEFAULT_PROVIDER": "openrouter"}):
             data = dash.snapshot()
         self.assertEqual(sorted(data),
                          ["account", "active_session", "alerts", "configured", "generated_at", "help",
-                          "insights", "model", "pricing", "provider", "providers", "proxy_metrics",
-                          "proxy_modified_at", "proxy_stale", "refresh_ms", "routing", "summary", "usage"])
+                          "insights", "model", "pricing", "proactive", "provider", "providers",
+                          "proxy_metrics", "proxy_modified_at", "proxy_stale", "refresh_ms",
+                          "routing", "summary", "usage"])
         self.assertEqual(data["model"], "vendor/model")
         self.assertEqual(data["routing"]["state"], "unknown")
         self.assertEqual(data["alerts"], [])
@@ -3815,6 +3817,61 @@ class CliAutoDetectFlowTests(unittest.TestCase):
         launcher_view = routeConfig.Store(self.path)
         self.assertEqual(launcher_view.read_provider("cli")["CLI_KIND"], "claude")
         self.assertEqual(launcher_view.read_provider("routing")["ROUTE_DEFAULT_PROVIDER"], "cli")
+
+
+class ProactiveReactionTests(unittest.TestCase):
+    """The snapshot must surface actionable problems without the user opening diagnostics."""
+
+    def codes(self, alerts):
+        return [alert.get("code") for alert in alerts]
+
+    def test_no_configured_service_is_a_critical_next_step(self):
+        alerts = dash.proactive_alerts({"openrouter": False, "local": False, "cli": False},
+                                       None, None, routing_values={})
+        self.assertEqual(alerts[0]["code"], "no_configured_service")
+        self.assertEqual(alerts[0]["level"], "critical")
+
+    def test_a_default_service_that_lost_its_settings_is_flagged(self):
+        alerts = dash.proactive_alerts({"openrouter": True, "local": False, "cli": False},
+                                       None, None, routing_values={"ROUTE_DEFAULT_PROVIDER": "local"})
+        self.assertIn("default_provider_not_configured", self.codes(alerts))
+        self.assertIn("Local LLM", alerts[0]["detail"])
+
+    def test_auto_with_several_services_asks_for_a_choice(self):
+        alerts = dash.proactive_alerts({"openrouter": True, "local": True, "cli": False},
+                                       None, None, routing_values={})
+        self.assertIn("provider_choice_required", self.codes(alerts))
+
+    def test_a_running_session_with_another_service_is_flagged(self):
+        alerts = dash.proactive_alerts(
+            {"openrouter": True, "local": True, "cli": False},
+            {"provider": "openrouter"},
+            {"configuration": {"provider": "local"}},
+            routing_values={"ROUTE_DEFAULT_PROVIDER": "openrouter"})
+        self.assertIn("session_provider_mismatch", self.codes(alerts))
+        self.assertTrue(any(alert.get("command") for alert in alerts))
+
+    def test_changed_cli_kind_or_model_is_flagged(self):
+        alerts = dash.proactive_alerts(
+            {"openrouter": False, "local": False, "cli": True},
+            {"provider": "cli"},
+            {"configuration": {"provider": "cli", "cliKind": "codex", "requestedModel": "gpt-x"}},
+            routing_values={"ROUTE_DEFAULT_PROVIDER": "cli"},
+            cli_values={"CLI_KIND": "claude", "CLI_MODEL": "gpt-x"})
+        self.assertIn("cli_settings_changed", self.codes(alerts))
+
+    def test_a_consistent_session_raises_nothing(self):
+        alerts = dash.proactive_alerts(
+            {"openrouter": True, "local": False, "cli": False},
+            {"provider": "openrouter"},
+            {"configuration": {"provider": "openrouter", "model": "vendor/model"}},
+            routing_values={"ROUTE_DEFAULT_PROVIDER": "openrouter"})
+        self.assertEqual(alerts, [])
+
+    def test_an_invalid_routing_value_is_reported(self):
+        alerts = dash.proactive_alerts({"openrouter": True, "local": False, "cli": False},
+                                       None, None, routing_values={"ROUTE_DEFAULT_PROVIDER": "bogus"})
+        self.assertIn("routing_configuration_invalid", self.codes(alerts))
 
 
 if __name__ == "__main__":

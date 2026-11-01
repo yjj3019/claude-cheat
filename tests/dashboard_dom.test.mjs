@@ -1448,3 +1448,64 @@ test('a route-log model id is escaped before it reaches the connection summary',
   assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
   assert.doesNotMatch(html, /<img src=x onerror/);
 });
+
+// ---- proactive reactions: attention badge, desktop notifications, recovery ----
+
+function loadDashboard() {
+  const context = buildContext();
+  const sandbox = { ...context, globalThis: null };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(scriptBundle(), sandbox, { filename: 'dashboard.js' });
+  return { context, sandbox };
+}
+
+test('the tab title carries a proactive attention badge', () => {
+  const { context, sandbox } = loadDashboard();
+  sandbox.render(fixture({ alerts: [], insights: [] }));
+  assert.equal(context.document.title, 'Claude-Cheat 라우팅 콘솔');
+  sandbox.render(fixture({ alerts: [{ level: 'warn', title: '주의', detail: 'd', code: 'w1' }], insights: [] }));
+  assert.match(context.document.title, /^⚠ 1 · /);
+  sandbox.render(fixture({ alerts: [{ level: 'critical', title: '위험', detail: 'd', code: 'c1' }], insights: [] }));
+  assert.match(context.document.title, /^⛔ 1 · /);
+  assert.equal(context.nodes.get('attention-pill').textContent, '확인 필요 1');
+});
+
+test('critical alerts notify once per condition when notifications are enabled', () => {
+  const context = buildContext();
+  context.localStorage = { getItem: () => '1', setItem() {} };
+  const sent = [];
+  context.window = {
+    addEventListener() {}, focus() {},
+    Notification: class {
+      static permission = 'granted';
+      static async requestPermission() { return 'granted'; }
+      constructor(title, options) { sent.push({ title, options }); }
+      close() {}
+    },
+  };
+  const sandbox = { ...context, globalThis: null };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(scriptBundle(), sandbox, { filename: 'dashboard.js' });
+  const critical = { level: 'critical', title: '한도 소진', detail: '남은 금액 $1', code: 'low_balance' };
+  sandbox.render(fixture({ alerts: [critical], insights: [] }));
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].title, /한도 소진/);
+  sandbox.render(fixture({ alerts: [critical], insights: [] }));
+  assert.equal(sent.length, 1, 'the same alert must not re-notify');
+  sandbox.render(fixture({ alerts: [], insights: [] }));
+  sandbox.render(fixture({ alerts: [critical], insights: [] }));
+  assert.equal(sent.length, 2, 'a condition that clears and returns may notify again');
+});
+
+test('a dropped dashboard connection backs off and reports the recovery', async () => {
+  const { context, sandbox } = loadDashboard();
+  sandbox.fetch = async () => { throw new Error('down'); };
+  await vm.runInContext('tick()', sandbox);
+  assert.equal(vm.runInContext('tickFailures', sandbox), 1);
+  sandbox.fetch = async () => ({ ok: true, json: async () => fixture({ alerts: [], insights: [] }) });
+  await vm.runInContext('tick()', sandbox);
+  assert.equal(vm.runInContext('tickFailures', sandbox), 0);
+  assert.match(context.nodes.get('toasts').children.at(-1).innerHTML, /복구/);
+});

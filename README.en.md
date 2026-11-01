@@ -372,6 +372,19 @@ The **insights** card ranks *what changed, why, and what to do next* instead of 
 | Latency | session p95 ≥20s | shows **response and first-byte p95 separately**; they can describe different requests and include network, queueing and buffering |
 | Session idle | no decision for 30 minutes | reference |
 
+**Proactive reactions.** The page does not wait for you to look: every snapshot refresh recomputes the conditions below on the server and surfaces them as banners, a tab-title badge and optional desktop notifications.
+
+| Reaction | Trigger | Behavior |
+| --- | --- | --- |
+| Default service unconfigured | the routing default points at a service whose required values are missing, or routing cannot be read | critical banner + `⛔` tab title + settings/restart hint |
+| Service choice required | two or more services are configured while the default is `auto` | banner + `⚠` tab title |
+| Session or CLI settings differ | the running session's provider, or its CLI kind/model, differs from the saved values | banner + copyable `.\OpenClaude.ps1` |
+| Connection dropped | `/api/snapshot` fails | exponential backoff (1, 2, 4, 8, 16s) and a recovery toast |
+| Tab title badge | any warning/critical item exists | `⛔ n · …` or `⚠ n · …` |
+| Desktop notification | new critical item while notifications are enabled | one per cause (re-notifies after the cause clears and returns) |
+
+The server-side checks are read-only: they never restart a session, write settings or call a provider. Banners and the title badge work even when notification permission is denied.
+
 | Panel | Content |
 | --- | --- |
 | Now | **OpenRouter, Local LLM or CLI serving / Plan bypass / idle**, the **last request's actual routing model**, age, reason |

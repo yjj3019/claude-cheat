@@ -238,4 +238,19 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | CLI 자동 검색 | 설정 화면 CLI 카드에 **CLI 자동 검색** 버튼 추가. `/api/cli` 감지 결과로 CLI 종류와 실행 파일 경로를 채움(지원 백엔드만, 임의 PATH 명령 검색 아님). 채운 값은 저장 버튼으로 확정. DOM 시뮬레이션(채움·고정 경로 보존·미설치·403)과 실서버 흐름(감지→저장→기본값→발행 설정) 테스트로 고정 | 기능 추가 |
 | 저장소 위생 | 추적되지 않던 `NUL` 잔여 파일 삭제 | 정리 |
 
-검증: Node **715 pass / 0 fail**(DOM 92 포함), Python **677개 수집(11 skip)**. 변경 모듈(`test_launcher_arguments`·`test_route_cli`·`test_route_dashboard`·`test_handover_contract`·`test_launcher_scripts`) 통과, 이전 flaky였던 `ConnectionTest.test_reasons_through_shim`은 새 상한에서 21초에 통과.
+검증: Node **718 pass / 0 fail**(DOM 95 포함), Python **684개 수집(11 skip)**. 변경 모듈(`test_launcher_arguments`·`test_route_cli`·`test_route_dashboard`·`test_handover_contract`·`test_launcher_scripts`) 통과, 이전 flaky였던 `ConnectionTest.test_reasons_through_shim`은 새 상한에서 21초에 통과.
+
+
+## 13. 능동형 반응 (2026-11-01)
+
+전체 소스를 다시 훑어 수동 확인에 의존하던 상태를 **읽기 전용 능동 반응**으로 보강했습니다.
+
+| 항목 | 내용 | 상태 |
+| --- | --- | --- |
+| 서버 능동 점검 | 스냅샷마다 routing 기본값·설정된 서비스·실행 세션을 비교해 `기본 서비스 미설정`, `실행 서비스 선택 필요`, `세션 서비스 불일치`, `CLI 설정 변경됨`, `routing 설정 오류`를 배너로 산출. 재시작·설정 저장·제공자 호출 없음 | 기능 추가 |
+| 탭 제목 배지 | 경고/심각 항목이 있으면 `⛔ n`/`⚠ n`을 제목 앞에 표시해 백그라운드 탭에서도 보이게 함 | 기능 추가 |
+| 데스크톱 알림(옵트인) | 헤더 **알림** 버튼으로 권한을 허용한 경우에만 심각 항목을 1회 알림. 원인이 해소된 뒤 재발하면 다시 알림 | 기능 추가 |
+| 연결 자동 복구 | `/api/snapshot` 실패 시 1·2·4·8·16초 지수 백오프로 재시도하고, 복구 시 토스트로 알림 | 기능 추가 |
+| 보안 경계 | 능동 점검은 로컬 상태만 읽고 쓰기·세션 제어를 하지 않음. 알림 권한 거부 시에도 배너·배지는 동작 | 문서화 |
+
+검증: Node **718 pass / 0 fail**(DOM 95 포함), Python **684개 수집(11 skip)**, 대시보드 모듈 257 pass. 라이브 대시보드에서 `proactive` 키·탭 배지·알림 버튼 서빙 확인.
