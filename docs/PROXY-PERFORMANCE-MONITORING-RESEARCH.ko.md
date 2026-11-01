@@ -36,7 +36,7 @@
 
 ### 검증
 
-- Node **722 pass / 0 fail**(DOM 97, metrics 11 포함), Python **688개 수집(11 skip)**, 대시보드 모듈 **260 pass**
+- Node **724 pass / 0 fail**(DOM 97, metrics 11 포함), Python **688개 수집(11 skip)**, 대시보드 모듈 **260 pass**
 - `bench_proxy.mjs --quick` PASS(정확성 58응답, 업스트림 해시 일치, 스트리밍 6프레임 일치)
 - 대시보드 재시작 후 페이지에 `renderProcessHealth`·`프로세스 상태` 포함 확인
 

@@ -1488,6 +1488,7 @@ test('critical alerts notify once per condition when notifications are enabled',
   sandbox.globalThis = sandbox;
   vm.createContext(sandbox);
   vm.runInContext(scriptBundle(), sandbox, { filename: 'dashboard.js' });
+  assert.equal(context.nodes.get('notify-toggle').hidden, false, 'a supported notification button is visible');
   const critical = { level: 'critical', title: '한도 소진', detail: '남은 금액 $1', code: 'low_balance' };
   sandbox.render(fixture({ alerts: [critical], insights: [] }));
   assert.equal(sent.length, 1);
@@ -1532,4 +1533,22 @@ test('process health is not invented when the proxy reports none', () => {
   grid.insertAdjacentHTML = () => { calls += 1; };
   sandbox.render(fixture({ proxy_metrics: { stale: true } }));
   assert.equal(calls, 0);
+});
+
+test('an all-zero metric chart reports no observation instead of a fake peak', () => {
+  const { sandbox } = loadDashboard();
+  const zero = vm.runInContext(
+    "historyLine([{minute:'2026-11-01T09:24:00Z'},{minute:'2026-11-01T09:25:00Z'}], () => 0, '%', 'line-coral')",
+    sandbox);
+  assert.match(zero, /관측값 없음\(0\)/);
+  assert.doesNotMatch(zero, /최대 1\.00/);
+  const measured = vm.runInContext(
+    "historyLine([{minute:'2026-11-01T09:24:00Z'},{minute:'2026-11-01T09:25:00Z'}], () => 5, '%', 'line-coral')",
+    sandbox);
+  assert.match(measured, /최대 5\.00 %/);
+});
+
+test('the notification button stays hidden without a Notification API', () => {
+  const { context } = loadDashboard();
+  assert.equal(context.nodes.get('notify-toggle').hidden, true);
 });

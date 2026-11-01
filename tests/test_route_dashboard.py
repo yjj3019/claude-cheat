@@ -1112,6 +1112,13 @@ class PageTests(unittest.TestCase):
         # Detection is only offered for the supported backends, not arbitrary PATH commands.
         self.assertIn("getElementById('cfg-cli-CLI_KIND')", dash.SETTINGS_PAGE)
 
+    def test_hidden_elements_and_empty_charts_do_not_mislead(self):
+        # A .pill/.btn author display rule beats the UA [hidden] rule; zero metrics must not
+        # render a fake "최대 1.00 %" scale label.
+        self.assertIn('[hidden]{display:none !important}', dash.PAGE_CSS)
+        self.assertIn('peak > 0 ?', dash.PAGE)
+        self.assertIn('관측값 없음(0)', dash.PAGE)
+
     def test_header_navigation_labels_never_wrap_inside_their_buttons(self):
         css = dash.PAGE_CSS
         self.assertIn('.nav-link{white-space:nowrap', css)
