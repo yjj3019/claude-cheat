@@ -4085,3 +4085,28 @@ class MultiSessionTests(unittest.TestCase):
         self.assertIn('ov-tile', dash.PAGE_CSS)
         self.assertIn('세션 · 작업', dash.PAGE)
         self.assertIn('session-path', dash.PAGE_CSS)
+
+class SnapshotCacheTests(unittest.TestCase):
+    def test_etag_ignores_clocks_and_sampling_noise(self):
+        base = {"generated_at": "2026-11-02T00:00:00+00:00", "snapshot_age_seconds": 1.2,
+                "refresh_ms": 5000, "proxy_metrics": {"requests": 3, "uptimeMs": 1000,
+                "process": {"pid": 1, "rssBytes": 1048576, "heapUsedBytes": 2,
+                            "eventLoopLagMs": {"p95Ms": 9.2, "maxMs": 50},
+                            "eventLoopSpikes": [{"at": "now", "ms": 400}]}},
+                "routing": {"last": {"age_seconds": 1, "ts": "2026-11-02T00:00:00Z"}}}
+        changed = json.loads(json.dumps(base))
+        changed["generated_at"] = "2026-11-02T00:00:02+00:00"
+        changed["snapshot_age_seconds"] = 0.1
+        changed["proxy_metrics"]["uptimeMs"] = 2000
+        changed["proxy_metrics"]["process"].update({"pid": 2, "heapUsedBytes": 4,
+                                                    "eventLoopSpikes": [], "eventLoopLagMs": {"p95Ms": 9.4, "maxMs": 400}})
+        changed["routing"]["last"]["age_seconds"] = 3
+        self.assertEqual(dash.snapshot_etag(base), dash.snapshot_etag(changed))
+        self.assertEqual(len(dash.snapshot_etag(base)), 32)
+        changed["proxy_metrics"]["requests"] = 4
+        self.assertNotEqual(dash.snapshot_etag(base), dash.snapshot_etag(changed))
+
+    def test_page_polls_with_an_etag_and_handles_304(self):
+        self.assertIn('if-none-match', dash.PAGE)
+        self.assertIn('response.status === 304', dash.PAGE)
+        self.assertIn('snapshot_etag', Path('routeDashboard.py').read_text(encoding='utf-8'))

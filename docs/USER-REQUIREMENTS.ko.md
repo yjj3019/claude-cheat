@@ -162,3 +162,24 @@
 - `LICENSE-REVIEW.md` — DSH MIT 참고 검토
 
 **위반 시 조치**: 라우트 로그를 다시 요청 스레드의 동기 per-line 쓰기로 되돌리거나, 모니터링 지표를 제거하는 변경은 되돌립니다.
+
+## R15. 모니터링 조건부 캐시와 게이트웨이 관측 성능
+
+**요구**: 데이터가 바뀌지 않은 폴링은 본문 전송과 DOM 재렌더를 반복하지 않아야 하고, 게이트웨이/프록시 상태를 캐시 적중·지연과 함께 관측할 수 있어야 합니다.
+
+**수용 기준**
+
+- `/api/snapshot`은 변경 가능한 값(시계·샘플링 잡음·pid·원시 RSS/이벤트 루프 버퍼)을 제외한 안정적 내용으로 **ETag**를 만들고, 일치하는 `If-None-Match`에는 **304 Not Modified**를 반환한다.
+- 응답에 `x-dashboard-cache: HIT|MISS`를 표시해 캐시 적중을 진단할 수 있다.
+- 대시보드 JS는 ETag를 보내고 304를 받으면 기존 `SNAP`을 유지해 **불필요한 전체 렌더를 생략**한다. 새로고침 버튼은 304에서도 안내한다.
+- ETag는 캐시에서 빠른 수준으로 계산되어 스냅샷 생성 hot path를 막지 않는다.
+- OpenCode(참고)는 MIT이며 코드를 복사하지 않고 캐시·계측 개념만 독자 구현한다. 복사 시 MIT 고지를 추가한다.
+
+**회귀 감시**
+
+- `tests/test_route_dashboard.py::SnapshotCacheTests.test_etag_ignores_clocks_and_sampling_noise`
+- `tests/test_route_dashboard.py::SnapshotCacheTests.test_page_polls_with_an_etag_and_handles_304`
+- `tests/test_route_dashboard.py::PageTests` — `if-none-match`·304 처리
+- `LICENSE-REVIEW.md` — OpenCode MIT 참고 검토
+
+**위반 시 조치**: 조건부 폴링을 제거해 매 주기 전체 본문·DOM을 다시 보내도록 되돌리는 변경은 되돌립니다.
