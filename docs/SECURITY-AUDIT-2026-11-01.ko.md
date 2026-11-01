@@ -402,4 +402,4 @@ DSH 게이트웨이·영속화·텔레메트리 설계를 참고해 프록시의
 - `/api/metrics`의 `blocking`·`gc`와 대시보드 프로세스 카드에 `GC n회 · max ... · 동기 블로킹 top`을 표시해 `eventLoopSpikes`와 대조.
 - 계측은 카운터/짧은 타이머만 사용하며 요청·응답 동작을 바꾸지 않습니다.
 
-검증: 통제 프록시에서 `diagnostics 0.16ms`, `body_parse 0.03ms` 수준 확인, GC 0회(소형 요청). Python **709 tests OK**(11 skip), Node **724 pass**, 대시보드 모듈 **277 pass**.
+검증: 통제 프록시에서 소형 요청 `diagnostics 0.16ms`, `body_parse 0.03ms`, 1MB 요청 `body_parse 1.22ms`, GC 2회·max 0.48ms로 확인되어 남은 980ms max의 주원인이 이 구간들이 아님을 분리했습니다. 서버 listen 시 histogram을 reset해 **모듈 import/부팅 지연을 요청 지연 통계에서 제외**했습니다. Python **709 tests OK**(11 skip), Node **724 pass**, 대시보드 모듈 **277 pass**.

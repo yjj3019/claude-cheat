@@ -194,6 +194,7 @@
 - `PerformanceObserver`의 `gc` 엔트리로 GC 횟수·최대·최근 시각을 기록한다.
 - `/api/metrics`에 `blocking`(상위 구간)과 `gc`를 노출하고, 프로세스 카드에 `GC n회 · max ... · 동기 블로킹 구간 max`를 표시한다.
 - 계측 오버헤드는 요청당 수 마이크로초 수준이며 요청/응답을 변경하지 않는다.
+- 서버가 listen을 시작할 때 이벤트 루프 histogram을 reset해 모듈 import·부팅 지연을 요청 지연 통계에서 제외한다.
 - `eventLoopSpikes` 시각과 함께 GC·블로킹 상위 구간을 대조해 다음 최적화 대상을 정한다.
 
 **회귀 감시**

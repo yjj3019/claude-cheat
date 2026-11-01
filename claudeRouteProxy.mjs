@@ -2264,6 +2264,9 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     flushMetrics(true);
     process.off('exit', flushOnExit);
   });
+  // Exclude module import and server bootstrap from request-latency health. The histogram
+  // starts before this module finishes loading, so its first max is not request handling.
+  server.once('listening', () => { loopLag.reset(); loopLagSpikes.length = 0; });
   return server;
 }
 
