@@ -234,4 +234,4 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | L5·L10·L15 | 포트 스쿼트, CLI 해석 불일치, symlink/TOCTOU는 구조적 잔여 위험으로 `SECURITY.ko.md` §7에 명시 | 문서화 |
 | 저장소 위생 | 추적되지 않던 `NUL` 잔여 파일 삭제 | 정리 |
 
-검증: Node **710 pass / 0 fail**(DOM 87 포함), Python **666개 수집(11 skip)**. 변경 모듈(`test_launcher_arguments`·`test_route_cli`·`test_route_dashboard`·`test_handover_contract`·`test_launcher_scripts`) 통과, 이전 flaky였던 `ConnectionTest.test_reasons_through_shim`은 새 상한에서 21초에 통과.
+검증: Node **710 pass / 0 fail**(DOM 87 포함), Python **668개 수집(11 skip)**. 변경 모듈(`test_launcher_arguments`·`test_route_cli`·`test_route_dashboard`·`test_handover_contract`·`test_launcher_scripts`) 통과, 이전 flaky였던 `ConnectionTest.test_reasons_through_shim`은 새 상한에서 21초에 통과.

@@ -98,25 +98,18 @@ With `routing: dual_provider: true` in `openclaude.config.yaml` and **both servi
 
 If you install a global launcher separately, configuration is read beside its target script. Cloning this repository neither installs a global command nor changes an existing launcher target. Run the script in the intended checkout explicitly.
 
-> Scripts use the **product-name form**: `OpenClaude.ps1` (routing session) and `OpenClaudeDashboard.ps1` (dashboard). The previous names `startClaudeOpenRouter.ps1`, `startOpenClaude.ps1`, `startClaudeDashboard.ps1` and `startDashboard.ps1` remain as **compatibility shims**, so existing shortcuts and aliases keep working (they forward every argument and print a one-line notice).
+> Scripts use the **product-name form**: `OpenClaude.ps1` (routing session) and `OpenClaudeDashboard.ps1` (dashboard). The previous names `startClaudeOpenRouter.ps1`, `startOpenClaude.ps1`, `startClaudeDashboard.ps1` and `startDashboard.ps1` remain as **compatibility shims**, so existing shortcuts and aliases keep working (they forward every argument and print a one-line notice). In a terminal whose policy requires signatures, use the equivalent `OpenClaude.cmd` / `OpenClaudeDashboard.cmd` entry points.
 >
 > To run them as bare commands from any folder, install the forwarders once:
 >
 > ```powershell
-> .\installLauncher.ps1          # writes OpenClaude, OpenClaudeDashboard (and the old names) into %USERPROFILE%\.local\bin
+> .\installLauncher.ps1          # writes OpenClaude, OpenClaudeDashboard (.cmd forwarders) into %USERPROFILE%\.local\bin
 > .\installLauncher.ps1 -Remove  # removes every installed forwarder
 > ```
 >
-> They embed this checkout's path, so re-run the installer if the repository moves.
+> The forwarders are `.cmd` files, so the PowerShell execution policy never applies to them; each one re-launches the real `.ps1` with `-ExecutionPolicy Bypass`. Same-named `.ps1` forwarders written by earlier versions are removed on install, because PowerShell would otherwise resolve those first. They embed this checkout's path, so re-run the installer if the repository moves.
 >
-> **If the execution policy blocks the installer**: `installLauncher.ps1` is unsigned. Terminals whose effective policy is `AllSigned` (or a managed policy that requires signatures) stop with "the file is not digitally signed". Run the sibling `installLauncher.cmd` instead — it invokes the installer with `-ExecutionPolicy Bypass`:
->
-> ```powershell
-> .\installLauncher.cmd            # install or refresh, regardless of the session policy
-> .\installLauncher.cmd -Remove    # remove the forwarders
-> ```
->
-> Otherwise run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\installLauncher.ps1`. The `OpenClaude`/`OpenClaudeDashboard` forwarders are `.ps1` too, so they can be blocked in the same terminal: use `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$HOME\.local\bin\OpenClaude.ps1"`, or set the current-user policy to `RemoteSigned` (`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, no admin required). A GPO that enforces `AllSigned` overrides the bypass; contact your administrator in that case.
+> **If the execution policy blocks `.ps1` files**: the scripts are unsigned, so `AllSigned` (or a managed policy that requires signatures) fails with "the file is not digitally signed". Use the `.cmd` entry points instead — `.\installLauncher.cmd` to install, `.\OpenClaude.cmd` / `.\OpenClaudeDashboard.cmd` in the checkout, and the installed `OpenClaude`/`OpenClaudeDashboard` commands all work regardless of policy. If something still blocks, run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\installLauncher.ps1`, or set the current-user policy to `RemoteSigned` (`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, no admin required). A GPO that enforces `AllSigned` overrides the bypass; contact your administrator in that case.
 
 Configure OpenRouter once in the web console — it runs without a routing session and shows setup guidance while the settings are empty:
 

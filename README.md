@@ -109,25 +109,18 @@ claude auth status
 
 전역 실행기를 따로 설치했다면 그 대상 폴더에서 설정을 읽습니다. 저장소를 clone해도 전역 명령이 자동 설치되거나 기존 실행기의 대상이 바뀌지 않습니다. 새 checkout은 해당 폴더의 실행기를 명시적으로 실행하세요.
 
-> 실행 스크립트는 **제품명 형태**입니다: `OpenClaude.ps1`(라우팅 세션), `OpenClaudeDashboard.ps1`(대시보드). 이전 이름 `startClaudeOpenRouter.ps1`·`startOpenClaude.ps1`·`startClaudeDashboard.ps1`·`startDashboard.ps1`은 **호환 shim**으로 남아 있어 기존 바로가기·별칭이 그대로 동작합니다(새 이름으로 인자를 넘기고 안내만 출력).
+> 실행 스크립트는 **제품명 형태**입니다: `OpenClaude.ps1`(라우팅 세션), `OpenClaudeDashboard.ps1`(대시보드). 이전 이름 `startClaudeOpenRouter.ps1`·`startOpenClaude.ps1`·`startClaudeDashboard.ps1`·`startDashboard.ps1`은 **호환 shim**으로 남아 있어 기존 바로가기·별칭이 그대로 동작합니다(새 이름으로 인자를 넘기고 안내만 출력). 실행 정책이 서명을 요구하는 터미널에서는 같은 동작의 `OpenClaude.cmd`·`OpenClaudeDashboard.cmd`를 쓰면 됩니다.
 
 **어느 폴더에서나 이름만으로 실행하려면** 한 번 설치합니다.
 
 ```powershell
-.\installLauncher.ps1          # %USERPROFILE%\.local\bin 에 OpenClaude·OpenClaudeDashboard + 이전 이름 포워더 생성
+.\installLauncher.ps1          # %USERPROFILE%\.local\bin 에 OpenClaude·OpenClaudeDashboard(.cmd) + 이전 이름 포워더 생성
 .\installLauncher.ps1 -Remove   # 설치한 포워더 전부 삭제
 ```
 
-설치 폴더가 PATH에 등록되어 있으면 다른 작업 폴더에서도 `OpenClaude` 또는 `OpenClaudeDashboard`만 입력하면 됩니다. 포워더는 이 체크아웃의 경로를 담으므로, 저장소를 옮기면 다시 설치하세요. `.local\bin`이 PATH에 없으면 설치 스크립트가 추가 명령을 안내합니다.
+설치 폴더가 PATH에 등록되어 있으면 다른 작업 폴더에서도 `OpenClaude` 또는 `OpenClaudeDashboard`만 입력하면 됩니다. 포워더는 `.cmd`라서 PowerShell 실행 정책의 영향을 받지 않고, 내부에서 `-ExecutionPolicy Bypass`로 실제 `.ps1`을 실행합니다. 이전 버전이 설치한 같은 이름의 `.ps1` 포워더는 설치 시 자동으로 제거됩니다(PowerShell이 `.ps1`을 먼저 찾아 다시 막히는 것을 방지). 포워더는 이 체크아웃의 경로를 담으므로, 저장소를 옮기면 다시 설치하세요. `.local\bin`이 PATH에 없으면 설치 스크립트가 추가 명령을 안내합니다.
 
-> **실행 정책으로 설치가 막히면**: `installLauncher.ps1`은 서명되지 않은 스크립트입니다. 실행 정책이 `AllSigned`이거나 관리 정책이 서명을 요구하는 터미널에서는 `installLauncher.ps1 파일이 디지털 서명되지 않았습니다` 오류로 중단됩니다. 이때는 같은 폴더의 `installLauncher.cmd`를 실행하세요(내부에서 `-ExecutionPolicy Bypass`로 설치 스크립트만 실행).
->
-> ```powershell
-> .\installLauncher.cmd            # 실행 정책과 무관하게 설치·갱신
-> .\installLauncher.cmd -Remove    # 포워더 삭제
-> ```
->
-> `installLauncher.cmd`가 없거나 직접 실행해야 한다면 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\installLauncher.ps1`을 쓰면 됩니다. 같은 이유로 `OpenClaude`·`OpenClaudeDashboard` 포워더(`.ps1`)도 그 터미널에서 막힐 수 있으므로, 그럴 때는 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$HOME\.local\bin\OpenClaude.ps1"`로 실행하거나 현재 사용자 범위 정책을 `RemoteSigned`로 두세요(`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, 관리자 권한 불필요). 회사 GPO가 `AllSigned`를 강제하면 우회가 막히므로 관리자에게 문의해야 합니다.
+> **실행 정책으로 `.ps1`이 막히면**: 스크립트가 서명되지 않았으므로 `AllSigned`(또는 서명을 요구하는 관리 정책) 터미널에서는 `파일이 디지털 서명되지 않았습니다` 오류가 납니다. 이때는 `.cmd` 진입점을 사용하세요 — 설치(`.\installLauncher.cmd`), 체크아웃 직접 실행(`.\OpenClaude.cmd`·`.\OpenClaudeDashboard.cmd`), PATH의 `OpenClaude`/`OpenClaudeDashboard` 모두 정책과 무관하게 동작합니다. 그래도 막히면 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\installLauncher.ps1`처럼 실행하거나 현재 사용자 범위 정책을 `RemoteSigned`로 두세요(`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, 관리자 권한 불필요). 회사 GPO가 `AllSigned`를 강제하면 `-ExecutionPolicy Bypass`도 무시되므로 관리자에게 문의해야 합니다.
 
 예전 `.env.*` 파일을 계속 읽는 경우 형식은 한 줄에 `KEY=VALUE` 하나입니다. 빈 줄·`#`으로 시작하는 주석·값 전체를 감싼 따옴표는 허용하며, 여러 줄 값·셸 변수 확장은 지원하지 않습니다. 키 뒤에 같은 줄 주석을 붙이지 마세요. 새 설정은 `openclaude.config.yaml`을 사용합니다. 실제 설정 파일은 Git에서 제외하며 예제에는 실제 인증값을 넣지 마세요.
 
@@ -893,7 +886,7 @@ python -m unittest discover -s tests -p test_fuzz_dashboard.py  # 대시보드 �
 python tests/live_smoke.py --dry-run       # 설정 존재 여부만 확인(무과금)
 ```
 
-현재 저장소 기준 회귀 검사 수는 **Node 710개**(대시보드 DOM 87개 포함), **Python 666개**(11개는 환경 의존 검사로 skip)입니다. 테스트 수는 릴리스마다 달라질 수 있으므로 위 명령으로 직접 확인하세요.
+현재 저장소 기준 회귀 검사 수는 **Node 710개**(대시보드 DOM 87개 포함), **Python 668개**(11개는 환경 의존 검사로 skip)입니다. 테스트 수는 릴리스마다 달라질 수 있으므로 위 명령으로 직접 확인하세요.
 
 - Windows 프로세스 트리 테스트(`test_local_lifecycle`)와 동시성 스트레스(`test_dashboard_concurrency`)는 **기본 스위트에서 건너뜁니다**. 실제 프로세스 트리를 띄우거나 서버에 12스레드를 걸기 때문에 느리고 부하에 민감합니다. 필요할 때만 `$env:CLAUDE_CHEAT_SLOW = '1'`로 켜세요.
 - 프로세스 트리 테스트는 **Git Bash**가 필요합니다. `C:\Windows\System32\bash.exe`(WSL)는 Windows 파이썬 경로를 실행하지 못해 자동으로 건너뜁니다.
@@ -983,6 +976,7 @@ python tests/bench_dashboard.py            # 10MB 로그 · 2,000개 세션 파�
 | --- | --- |
 | [OpenClaude.ps1](OpenClaude.ps1) | 제공자 선택과 Python 실행기 호출 |
 | [OpenClaudeDashboard.ps1](OpenClaudeDashboard.ps1) | 대시보드·설정 화면 실행 |
+| [OpenClaude.cmd](OpenClaude.cmd)·[OpenClaudeDashboard.cmd](OpenClaudeDashboard.cmd) | 실행 정책이 서명을 요구하는 터미널용 `.cmd` 진입점(내부에서 `-ExecutionPolicy Bypass`) |
 | [installLauncher.ps1](installLauncher.ps1) | 다른 폴더에서 사용할 전역 실행기 설치·갱신 |
 | [installLauncher.cmd](installLauncher.cmd) | 실행 정책이 `AllSigned`인 터미널에서도 설치·갱신(내부에서 `-ExecutionPolicy Bypass`) |
 | [openrouterAdvisor.py](openrouterAdvisor.py) | Plan 인증 검사·환경 격리·프록시 수명 관리·Local 목록 점검 |
