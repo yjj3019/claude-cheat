@@ -18,6 +18,9 @@ SPEC = importlib.util.spec_from_file_location(
     "route_dashboard", Path(__file__).resolve().parents[1] / "routeDashboard.py")
 dash = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(dash)
+# Attention state is user data; never let tests write the real dashboard state file.
+_ATTENTION_TMP = tempfile.TemporaryDirectory()
+dash.ATTENTION_FILE = Path(_ATTENTION_TMP.name) / ".dashboard-attention.json"
 
 
 def route_line(stamp, payload):
@@ -2584,7 +2587,7 @@ class SnapshotTests(unittest.TestCase):
              mock.patch.object(dash, "read_settings", return_value={"OPENROUTER_MODEL": "vendor/model", "ROUTE_DEFAULT_PROVIDER": "openrouter"}):
             data = dash.snapshot()
         self.assertEqual(sorted(data),
-                         ["account", "active_session", "alerts", "configured", "generated_at", "help",
+                         ["account", "active_session", "alerts", "attention", "configured", "generated_at", "help",
                           "insights", "model", "pricing", "proactive", "provider", "providers",
                           "proxy_metrics", "proxy_modified_at", "proxy_stale", "refresh_ms",
                           "routing", "selected_instance", "sessions", "summary", "usage"])
@@ -4047,6 +4050,9 @@ class MultiSessionTests(unittest.TestCase):
                              "tokenFlow": {"openrouter": {"inputTokens": 5000, "outputTokens": 1600}},
                              "process": {"rssBytes": 256 * 1048576, "eventLoopLagMs": {"p95Ms": 40.5}},
                              "uptimeMs": 600000, "last": {"ts": "2026-11-02T01:00:00+00:00"},
+                             "retries": 2, "attempts": 3, "circuitOpens": 1,
+                             "rateLimit": {"status": 429, "retryAfterMs": 1500,
+                                           "at": datetime.now(timezone.utc).isoformat(timespec="seconds")},
                              "configuration": {"model": "vendor/model"}}}
         summary = dash._session_summary(saved)
         self.assertEqual(summary["requests"], 120)
@@ -4061,6 +4067,9 @@ class MultiSessionTests(unittest.TestCase):
         self.assertEqual(summary["loop_p95_ms"], 40.5)
         self.assertEqual(summary["last_ts"], "2026-11-02T01:00:00+00:00")
         self.assertEqual(summary["model"], "vendor/model")
+        self.assertEqual(summary["retry_health"]["state"], "rate_limited")
+        self.assertEqual(summary["retry_health"]["retries"], 2)
+        self.assertEqual(summary["retry_health"]["retry_after_ms"], 1500)
 
     def test_session_monitor_ui_is_present(self):
         self.assertIn('renderSessionMonitor', dash.PAGE)
@@ -4110,3 +4119,51 @@ class SnapshotCacheTests(unittest.TestCase):
         self.assertIn('if-none-match', dash.PAGE)
         self.assertIn('response.status === 304', dash.PAGE)
         self.assertIn('snapshot_etag', Path('routeDashboard.py').read_text(encoding='utf-8'))
+
+class AttentionQueueTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        dash.ATTENTION_FILE = self.root / ".dashboard-attention.json"
+        self.alert = {"level": "critical", "title": "테스트 주의", "detail": "조치가 필요합니다",
+                      "code": "test_attention", "command": ".\\OpenClaude.ps1"}
+
+    def test_open_ack_snooze_resolve_and_reopen(self):
+        first = dash.attention_snapshot([self.alert])
+        item_id = first["items"][0]["id"]
+        self.assertEqual(first["counts"]["open"], 1)
+        self.assertEqual(first["counts"]["critical"], 1)
+        self.assertEqual(first["items"][0]["command"], ".\\OpenClaude.ps1")
+
+        dash.attention_action(item_id, "ack")
+        acked = dash.attention_snapshot([self.alert])
+        self.assertEqual(acked["counts"]["open"], 0)
+        self.assertEqual(acked["counts"]["acknowledged"], 1)
+
+        dash.attention_action(item_id, "reopen")
+        dash.attention_action(item_id, "snooze", minutes=30)
+        snoozed = dash.attention_snapshot([self.alert])
+        self.assertEqual(snoozed["counts"]["open"], 0)
+        self.assertEqual(snoozed["counts"]["snoozed"], 1)
+
+        dash.attention_action(item_id, "resolve")
+        resolved = dash.attention_snapshot([self.alert])
+        self.assertEqual(resolved["counts"]["open"], 0)
+        self.assertEqual(resolved["history"][0]["resolution"], "manual")
+
+        dash.attention_action(item_id, "reopen")
+        self.assertEqual(dash.attention_snapshot([self.alert])["counts"]["open"], 1)
+
+    def test_cleared_condition_moves_to_history(self):
+        first = dash.attention_snapshot([self.alert])
+        item_id = first["items"][0]["id"]
+        cleared = dash.attention_snapshot([])
+        self.assertEqual(cleared["counts"]["open"], 0)
+        self.assertEqual(cleared["history"][0]["id"], item_id)
+        self.assertEqual(cleared["history"][0]["resolution"], "auto")
+
+    def test_missing_item_is_reported(self):
+        self.assertIsNone(dash.attention_action("000000000000", "ack"))
+        with self.assertRaises(ValueError):
+            dash.attention_action("not-an-id", "ack")
+        with self.assertRaises(ValueError):
+            dash.attention_action("000000000000", "snooze", minutes=0)

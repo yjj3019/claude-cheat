@@ -204,3 +204,26 @@
 - `routeDashboard.py`의 프로세스 카드, `claudeRouteProxy.mjs`의 `timeSync`·GC observer
 
 **위반 시 조치**: 원인 계측을 제거해 스파이크 원인을 다시 추정에 의존하도록 되돌리는 변경은 되돌립니다.
+
+## R17. Attention-first 운영 큐
+
+**요구**: 대시보드는 지표 나열보다 “지금 사람이 결정해야 할 것”을 먼저 보여 주고, 확인·미루기·해결 상태를 잃지 않아야 합니다.
+
+**수용 기준**
+
+- `/api/snapshot`의 `attention`은 open/acknowledged/snoozed/resolved 상태와 `counts`를 포함한다.
+- 경고가 사라지면 자동으로 `resolved` 이력으로 이동하고, 건강한 상태는 한 줄로 접힌다.
+- `POST /api/attention`은 세션 토큰을 요구하며 `ack`·`snooze`(5~1440분)·`resolve`·`reopen`을 지원한다.
+- 세션 요약에 `retry_health`(rate_limited/retried, 재시도·시도·회로·Retry-After)가 포함되고 세션 표에 표시된다.
+- 속도 제한은 능동 경고(`session_rate_limited`)로 승격되어 주의 큐에 들어간다.
+- ETag는 attention의 시계·last_seen 값을 제외해 건강한 상태에서 304를 유지한다.
+- Superagent의 attention-first 아이디어를 참고하되 코드를 복사하지 않고 독자 구현한다.
+
+**회귀 감시**
+
+- `tests/test_route_dashboard.py::AttentionQueueTests` — ack/snooze/resolve/reopen/auto-resolve
+- `tests/test_route_dashboard.py::MultiSessionTests.test_session_summary_exposes_usage_and_proxy_load` — retry health
+- `tests/dashboard_dom.test.mjs` — 주의 큐 액션·건강한 상태
+- `LICENSE-REVIEW.md` — Superagent MIT 참고 검토
+
+**위반 시 조치**: 주의 항목의 사람 상태를 저장하지 않거나, 건강한 상태에 큰 카드를 다시 표시하는 변경은 되돌립니다.

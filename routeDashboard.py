@@ -58,6 +58,7 @@ PROXY_FILE = ROOT / "claudeRouteProxy.mjs"
 PID_FILE = ROOT / ".dashboard.pid"
 SESSION_HANDOFF_FILE = ROOT / ".session-handoff.json"
 SESSION_SELECTION_FILE = ROOT / ".dashboard.session"
+ATTENTION_FILE = ROOT / ".dashboard-attention.json"
 PROJECTS = Path.home() / ".claude" / "projects"
 DEFAULT_PORT = 8787
 ACCOUNT_TTL = 60
@@ -189,6 +190,7 @@ HELP_SECTION = {
         ["POST /api/config", "서비스 설정 저장·삭제(clear)"],
         ["POST /api/test", "연결 검사 (metadata·inference·tool_roundtrip)"],
         ["POST /api/config-reset", "OpenRouter·Local 인증 정보 삭제·초기화"],
+    ["POST /api/attention", "대시보드 주의 항목 확인·미루기·해결"],
         ["GET /api/metrics (프록시)", "프록시 카운터. 같은 세션 토큰 필요, 127.0.0.1 전용"],
     ],
     "states": [["external", "외부 모델 사용 중 (Local·OpenRouter·CLI)"], ["plan", "Plan 우회 중"],
@@ -1969,6 +1971,7 @@ def _session_summary(saved):
     lag = process.get("eventLoopLagMs") if isinstance(process.get("eventLoopLagMs"), dict) else {}
     admission = metrics.get("requestAdmission") if isinstance(metrics.get("requestAdmission"), dict) else {}
     last = metrics.get("last") if isinstance(metrics.get("last"), dict) else {}
+    rate_limit = metrics.get("rateLimit") if isinstance(metrics.get("rateLimit"), dict) else {}
 
     def number(value):
         return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
@@ -1979,6 +1982,22 @@ def _session_summary(saved):
     output_tokens = number(performance.get("outputTokens"))
     elapsed_ms = number(performance.get("elapsedMs"))
     rate = round(requests * 60000 / uptime, 2) if requests is not None and uptime else None
+    retries = number(metrics.get("retries"))
+    attempts = number(metrics.get("attempts"))
+    circuit_opens = number(metrics.get("circuitOpens"))
+    rate_limit_at = rate_limit.get("at") if isinstance(rate_limit.get("at"), str) else None
+    retry_after_ms = number(rate_limit.get("retryAfterMs"))
+    retry_state = None
+    if rate_limit_at:
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(rate_limit_at.replace("Z", "+00:00"))).total_seconds()
+        except ValueError:
+            age = None
+        window = max(300, (retry_after_ms or 0) / 1000 + 60)
+        if age is not None and 0 <= age <= window:
+            retry_state = "rate_limited"
+    if retry_state is None and retries:
+        retry_state = "retried"
     output_rate = (round(output_tokens * 1000 / elapsed_ms, 2)
                    if samples and output_tokens is not None and elapsed_ms else None)
     return {"instance_id": session.get("instance_id"),
@@ -2008,6 +2027,9 @@ def _session_summary(saved):
             "rss_bytes": number(process.get("rssBytes")),
             "loop_p95_ms": number(lag.get("p95Ms")),
             "last_ts": last.get("ts") if isinstance(last.get("ts"), str) else None,
+            "retry_health": {"state": retry_state or "ok", "retries": retries, "attempts": attempts,
+                             "circuit_opens": circuit_opens, "rate_limit_at": rate_limit_at,
+                             "retry_after_ms": retry_after_ms},
             "selected": False}
 
 
@@ -2962,6 +2984,181 @@ def proxy_metrics():
     return data
 
 
+ATTENTION_LOCK = threading.Lock()
+ATTENTION_STATES = {"open", "acknowledged", "snoozed", "resolved"}
+ATTENTION_HISTORY_LIMIT = 100
+ATTENTION_HISTORY_SHOWN = 6
+ATTENTION_RESOLVE_MUTE_SECONDS = 3600
+
+
+def _attention_iso(now=None):
+    return (now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
+
+
+def _attention_time(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _attention_read():
+    try:
+        data = json.loads(ATTENTION_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"schema": 1, "items": {}, "updated_at": None}
+    if not isinstance(data, dict) or not isinstance(data.get("items"), dict):
+        return {"schema": 1, "items": {}, "updated_at": None}
+    return data
+
+
+def _attention_write(state):
+    temporary = ATTENTION_FILE.with_name(f".{ATTENTION_FILE.name}.{os.getpid()}.{secrets.token_hex(3)}.tmp")
+    try:
+        temporary.write_text(json.dumps(state, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        os.replace(temporary, ATTENTION_FILE)
+    except OSError:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+
+
+def attention_id(alert):
+    """Stable identity for one alert, independent of changing detail values."""
+    code = str(alert.get("code") or "")
+    title = str(alert.get("title") or "")
+    return hashlib.sha1(f"{code}\0{title}".encode("utf-8")).hexdigest()[:12]
+
+
+def _attention_public(item, now):
+    age = None
+    created = _attention_time(item.get("created_at"))
+    if created is not None:
+        age = max(0, round((now - created).total_seconds()))
+    return {"id": item.get("id"), "code": item.get("code"), "level": item.get("level"),
+            "title": item.get("title"), "detail": item.get("detail"), "command": item.get("command"),
+            "state": item.get("state", "open"), "created_at": item.get("created_at"),
+            "updated_at": item.get("updated_at"), "last_seen_at": item.get("last_seen_at"),
+            "acknowledged_at": item.get("acknowledged_at"), "snooze_until": item.get("snooze_until"),
+            "resolved_at": item.get("resolved_at"), "resolution": item.get("resolution"),
+            "project": item.get("project"), "instance_id": item.get("instance_id"), "age_seconds": age}
+
+
+def _attention_reconcile(state, alerts, session, now):
+    items = state.setdefault("items", {})
+    if not isinstance(items, dict):
+        items = state["items"] = {}
+    seen = set()
+    session = session if isinstance(session, dict) else {}
+    for alert in alerts if isinstance(alerts, list) else []:
+        if not isinstance(alert, dict) or alert.get("level") not in ("critical", "warn"):
+            continue
+        item_id = attention_id(alert)
+        item = items.get(item_id)
+        if not isinstance(item, dict):
+            item = {"id": item_id, "created_at": _attention_iso(now), "state": "open"}
+        previous = item.get("state") if item.get("state") in ATTENTION_STATES else "open"
+        if previous == "resolved":
+            muted = _attention_time(item.get("muted_until"))
+            if muted is None or muted <= now:
+                item["state"] = "open"
+                item["resolution"] = None
+                item["resolved_at"] = None
+        elif previous == "snoozed":
+            until = _attention_time(item.get("snooze_until"))
+            if until is not None and until <= now:
+                item["state"] = "open"
+                item["snooze_until"] = None
+        item.update({"code": alert.get("code"), "title": alert.get("title"), "detail": alert.get("detail"),
+                     "level": alert.get("level"), "command": alert.get("command"),
+                     "last_seen_at": _attention_iso(now), "updated_at": _attention_iso(now)})
+        if session.get("project"):
+            item["project"] = session.get("project")
+        if session.get("instance_id"):
+            item["instance_id"] = session.get("instance_id")
+        items[item_id] = item
+        seen.add(item_id)
+    for item_id, item in items.items():
+        if not isinstance(item, dict) or item_id in seen:
+            continue
+        if item.get("state") in ("open", "acknowledged", "snoozed"):
+            # The condition cleared: keep it in history, but stop asking for attention.
+            item.update({"state": "resolved", "resolution": "auto", "resolved_at": _attention_iso(now),
+                         "updated_at": _attention_iso(now)})
+    resolved = [item for item in items.values() if isinstance(item, dict) and item.get("state") == "resolved"]
+    resolved.sort(key=lambda item: item.get("resolved_at") or "", reverse=True)
+    for item in resolved[ATTENTION_HISTORY_LIMIT:]:
+        items.pop(item.get("id"), None)
+    state["updated_at"] = _attention_iso(now)
+    return state
+
+
+def attention_snapshot(alerts=None, session=None, now=None, reconcile=True):
+    """Attention-first view derived from alerts, with persisted human state.
+
+    Open alerts are the only items that ask for a person. Acknowledged/snoozed items stay
+    visible but out of the count; cleared conditions move to history instead of vanishing.
+    """
+    now = now or datetime.now(timezone.utc)
+    with ATTENTION_LOCK:
+        state = _attention_read()
+        if reconcile:
+            state = _attention_reconcile(state, alerts or [], session, now)
+            _attention_write(state)
+        items = [item for item in (state.get("items") or {}).values() if isinstance(item, dict)]
+    public = [_attention_public(item, now) for item in items]
+    public.sort(key=lambda item: ({"critical": 0, "warn": 1}.get(item.get("level"), 2),
+                                  item.get("created_at") or ""))
+    open_items = [item for item in public if item.get("state") == "open"]
+    acknowledged = [item for item in public if item.get("state") == "acknowledged"]
+    snoozed = [item for item in public if item.get("state") == "snoozed"]
+    history = [item for item in public if item.get("state") == "resolved"][:ATTENTION_HISTORY_SHOWN]
+    counts = {"open": len(open_items),
+              "critical": sum(1 for item in open_items if item.get("level") == "critical"),
+              "warn": sum(1 for item in open_items if item.get("level") == "warn"),
+              "acknowledged": len(acknowledged), "snoozed": len(snoozed),
+              "history": len(history)}
+    return {"schema": 1, "generated_at": _attention_iso(now), "counts": counts,
+            "items": open_items, "acknowledged": acknowledged, "snoozed": snoozed,
+            "history": history, "updated_at": state.get("updated_at")}
+
+
+def attention_action(item_id, action, minutes=None, now=None):
+    """Apply one human decision to an attention item and return its new public state."""
+    if action not in ("ack", "snooze", "resolve", "reopen"):
+        raise ValueError("invalid_attention_action")
+    if not isinstance(item_id, str) or not re.fullmatch(r"[0-9a-f]{12}", item_id):
+        raise ValueError("invalid_attention_id")
+    if action == "snooze" and (type(minutes) is not int or not 5 <= minutes <= 1440):
+        raise ValueError("invalid_attention_minutes")
+    now = now or datetime.now(timezone.utc)
+    with ATTENTION_LOCK:
+        state = _attention_read()
+        item = (state.get("items") or {}).get(item_id)
+        if not isinstance(item, dict):
+            return None
+        if action == "ack":
+            item.update({"state": "acknowledged", "acknowledged_at": _attention_iso(now),
+                         "updated_at": _attention_iso(now)})
+        elif action == "snooze":
+            if not isinstance(minutes, int) or isinstance(minutes, bool) or not 5 <= minutes <= 1440:
+                raise ValueError("invalid_attention_minutes")
+            item.update({"state": "snoozed", "snooze_until": _attention_iso(now + timedelta(minutes=minutes)),
+                         "updated_at": _attention_iso(now)})
+        elif action == "resolve":
+            item.update({"state": "resolved", "resolution": "manual", "resolved_at": _attention_iso(now),
+                         "muted_until": _attention_iso(now + timedelta(seconds=ATTENTION_RESOLVE_MUTE_SECONDS)),
+                         "updated_at": _attention_iso(now)})
+        else:
+            item.update({"state": "open", "resolution": None, "resolved_at": None, "snooze_until": None,
+                         "muted_until": None, "updated_at": _attention_iso(now)})
+        _attention_write(state)
+        return _attention_public(item, now)
+
+
 def snapshot():
     """Everything the page renders, in one JSON document."""
     now = datetime.now(timezone.utc)
@@ -2981,13 +3178,16 @@ def snapshot():
     insights = build_insights(routing, usage, account, pricing, metrics=metrics)
     providers = provider_states()
     proactive = proactive_alerts(providers, session, metrics)
+    alerts = build_alerts(routing, usage, account, pricing) + proactive
+    attention = attention_snapshot(alerts, session, now=now)
     return {
         "generated_at": now.isoformat(timespec="seconds"),
         "routing": routing,
         "usage": usage,
         "account": account,
         "pricing": pricing,
-        "alerts": build_alerts(routing, usage, account, pricing) + proactive,
+        "alerts": alerts,
+        "attention": attention,
         "proactive": proactive,
         "insights": insights,
         "summary": summary_line(routing, usage, account, insights, live=bool(session)),
@@ -3026,6 +3226,7 @@ _SNAPSHOT_VOLATILE_KEYS = {
     "generated_at", "snapshot_age_seconds", "refresh_ms", "age_seconds", "uptimeMs",
     "eventLoopLagMs", "eventLoopSpikes", "pid", "rssBytes", "heapUsedBytes", "heapTotalBytes",
     "queuedBytes", "maxQueuedBytes", "writeMsMax", "writeMsAvg",
+    "last_seen_at", "updated_at",
 }
 
 
@@ -3080,6 +3281,7 @@ def cached_snapshot():
     return {
         "generated_at": now.isoformat(timespec="seconds"),
         "building": True,
+        "attention": attention_snapshot([], session, now=now, reconcile=False),
         "routing": routing,
         "usage": usage,
         "account": account,
@@ -4305,6 +4507,7 @@ function renderSessionMonitor(data) {
       <td><span class="session-dot"></span><strong>${esc(session.project || '정보 없음')}</strong>
         ${session.project_source === 'inferred' ? '<span class="chip">추정</span>' : ''}
         ${session.branch ? `<span class="chip">${esc(session.branch)}</span>` : ''}
+        ${session.retry_health && session.retry_health.state !== 'ok' ? `<span class="chip chip-warn">${session.retry_health.state === 'rate_limited' ? '속도 제한' : '재시도 ' + num(session.retry_health.retries)}</span>` : ''}
         ${selected ? '<span class="chip chip-selected">표시 중</span>' : `<button type="button" class="btn btn-sm btn-ghost" data-session-select="${esc(session.instance_id)}">표시</button>`}
         <div class="session-path mono" title="${esc(session.cwd || '')}">${esc(session.cwd || '경로 미보고')}</div>
         <div class="session-service">${esc(names[session.provider] || session.provider || '?')} · :${esc(session.port)}</div></td>
@@ -4425,6 +4628,122 @@ renderGrid = function (data) {
   renderOverviewHero(data);
 };
 """
+JS_DASHBOARD += """
+// Attention-first queue: a person's next action comes before any metric. The
+// badge/notification functions above remain the proactive signal; this queue
+// persists acknowledgment, snooze and resolution state on the server.
+function attentionAge(item) {
+  const age = Number(item.age_seconds);
+  if (!Number.isFinite(age)) return '';
+  if (age < 60) return Math.round(age) + '초 전';
+  if (age < 3600) return Math.round(age / 60) + '분 전';
+  return Math.round(age / 3600) + '시간 전';
+}
+function attentionButtons(item) {
+  if (item.state === 'acknowledged' || item.state === 'snoozed') {
+    return `<button class="btn btn-sm btn-ghost" data-attention-action="reopen" data-attention-id="${esc(item.id)}">다시 열기</button>`;
+  }
+  return `<button class="btn btn-sm" data-attention-action="ack" data-attention-id="${esc(item.id)}">확인</button>`
+    + `<button class="btn btn-sm btn-ghost" data-attention-action="snooze" data-attention-minutes="60" data-attention-id="${esc(item.id)}">1시간 미루기</button>`
+    + `<button class="btn btn-sm btn-ghost" data-attention-action="resolve" data-attention-id="${esc(item.id)}">해결</button>`;
+}
+function attentionItem(item) {
+  const level = item.level === 'critical' ? 'critical' : 'warn';
+  const state = item.state === 'snoozed' ? ` · ${esc(item.snooze_until || '')}까지 미룸`
+    : item.state === 'acknowledged' ? ' · 확인함' : '';
+  const project = item.project ? ` · ${esc(item.project)}` : '';
+  return `<article class="attention-item ${level}" data-attention-row="${esc(item.id)}">
+    <span class="attention-dot" aria-hidden="true"></span>
+    <div class="attention-body"><b>${esc(item.title)}</b><p>${esc(item.detail || '')}</p>
+    <small>${esc(attentionAge(item))}${project}${state}</small></div>
+    <div class="attention-actions">${attentionButtons(item)}</div></article>`;
+}
+function renderAttentionQueue(data) {
+  const host = document.getElementById('alerts');
+  if (!host) return;
+  const attention = data.attention || {};
+  const counts = attention.counts || {};
+  const open = Array.isArray(attention.items) ? attention.items : [];
+  const acknowledged = Array.isArray(attention.acknowledged) ? attention.acknowledged : [];
+  const snoozed = Array.isArray(attention.snoozed) ? attention.snoozed : [];
+  const history = Array.isArray(attention.history) ? attention.history : [];
+  const guide = data.configured ? '' : '<div class="attention-guide"><b>처음 설정이 필요합니다.</b> 설정에서 서비스와 모델을 저장한 뒤 새 세션을 시작하세요. <a class="btn btn-sm" href="/settings">설정 열기</a></div>';
+  if (!open.length && !acknowledged.length && !snoozed.length) {
+    host.innerHTML = `<section class="attention attention-quiet-card" aria-labelledby="attention-title">
+      <header class="attention-head"><div><h2 id="attention-title">지금 필요한 것</h2>
+      <p class="sub">사람이 결정해야 하는 항목만 표시합니다</p></div>
+      <span class="pill pill-ok">조치 없음</span></header>
+      <div class="card-b">${guide || '<div class="attention-quiet"><span class="attention-dot ok"></span>지금 조치할 항목이 없습니다. 건강한 상태는 공간을 차지하지 않습니다.</div>'}
+      ${history.length ? `<details class="attention-history"><summary>최근 해결 ${history.length}건</summary>${history.map(attentionItem).join('')}</details>` : ''}</div></section>`;
+    return;
+  }
+  const rest = acknowledged.length + snoozed.length;
+  host.innerHTML = `<section class="attention" aria-labelledby="attention-title">
+    <header class="attention-head"><div><h2 id="attention-title">지금 필요한 것</h2>
+    <p class="sub">${counts.critical ? '치명 ' + counts.critical + ' · ' : ''}조치 ${counts.open || open.length}건${rest ? ' · 낮은 우선순위 ' + rest + '건' : ''}</p></div>
+    <span class="pill ${counts.critical ? 'signal-red' : 'signal-warn'}">${counts.critical ? '확인 필요' : '주의'}</span></header>
+    <div class="card-b">${guide}<div class="attention-list">${open.map(attentionItem).join('')}</div>
+    ${rest ? `<details class="attention-history"><summary>확인함 ${acknowledged.length} · 미룸 ${snoozed.length}</summary>${[...acknowledged, ...snoozed].map(attentionItem).join('')}</details>` : ''}
+    ${history.length ? `<details class="attention-history"><summary>최근 해결 ${history.length}건</summary>${history.map(attentionItem).join('')}</details>` : ''}</div></section>`;
+}
+const renderAlertsLegacy = renderAlerts;
+renderAlerts = function (data) {
+  if (!data || !data.attention) return renderAlertsLegacy(data);
+  renderAttentionQueue(data);
+};
+function attentionCounts(data) {
+  const counts = data && data.attention && data.attention.counts;
+  if (counts) return {critical: counts.critical || 0, warn: counts.warn || 0};
+  const items = [...(data?.alerts || []), ...(data?.insights || [])];
+  const fallback = {critical: 0, warn: 0};
+  for (const item of items) {
+    if (item.level === 'critical') fallback.critical += 1;
+    else if (item.level === 'warn') fallback.warn += 1;
+  }
+  return fallback;
+}
+async function attentionAction(id, action, minutes) {
+  const response = await fetch('/api/attention', {method: 'POST',
+    headers: {'content-type': 'application/json', 'x-dashboard-token': TOKEN},
+    body: JSON.stringify({id, action, minutes})});
+  let result = {};
+  try { result = await response.json(); } catch (error) {}
+  if (!response.ok || !result.updated) {
+    toast('bad', result.error === 'attention_not_found' ? '이미 정리된 항목입니다' : '주의 항목을 변경하지 못했습니다');
+    return;
+  }
+  if (action === 'ack') toast('ok', '확인으로 표시했습니다');
+  else if (action === 'snooze') toast('ok', '1시간 미뤘습니다');
+  else if (action === 'resolve') toast('ok', '해결로 표시했습니다');
+  else toast('ok', '다시 열었습니다');
+  await tick(true);
+}
+document.addEventListener('click', event => {
+  const button = event.target.closest('[data-attention-action]');
+  if (!button) return;
+  attentionAction(button.dataset.attentionId, button.dataset.attentionAction,
+    Number(button.dataset.attentionMinutes || 0) || undefined);
+});
+"""
+
+PAGE_CSS += """
+.attention{margin-bottom:14px;border:1px solid var(--line);border-left:4px solid #d79b2b;border-radius:12px;background:var(--surface,#fff);overflow:hidden}
+.attention.critical{border-left-color:#d05252}
+.attention-head{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 16px 0}
+.attention-head h2{margin:0;font-size:15px}.attention-head .sub{margin:2px 0 0;font-size:11.5px;color:var(--fg-4)}
+.attention .card-b{padding:10px 16px 14px}
+.attention-list{display:grid;gap:8px;max-height:176px;overflow:auto;padding-right:4px}
+.attention-item{display:grid;grid-template-columns:10px minmax(0,1fr) auto;gap:10px;align-items:start;padding:9px 10px;border:1px solid var(--line);border-radius:9px;background:#fff}
+.attention-item.critical{border-color:#e5b9b9}.attention-dot{width:8px;height:8px;margin-top:5px;border-radius:50%;background:#d79b2b}.attention-item.critical .attention-dot{background:#d05252}.attention-dot.ok{background:#3b9b6d}
+.attention-body b{display:block;font-size:12.5px}.attention-body p{margin:3px 0 0;font-size:11.5px;line-height:1.5;color:var(--fg-3)}.attention-body small{display:block;margin-top:4px;font-size:10.5px;color:var(--fg-4)}
+.attention-actions{display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end}
+.attention-quiet{display:flex;align-items:center;gap:8px;padding:10px 2px;font-size:12px;color:var(--fg-3)}
+.attention-quiet-card{border-left-color:#3b9b6d}.attention-guide{padding:8px 0;font-size:12px}
+.attention-history{margin-top:8px;border-top:1px solid var(--line);padding-top:7px;font-size:11px;color:var(--fg-3)}
+.attention-history summary{cursor:pointer;color:var(--fg-3)}.attention-history .attention-item{margin-top:6px;opacity:.82}
+@media(max-width:760px){.attention-item{grid-template-columns:10px minmax(0,1fr)}.attention-actions{grid-column:2;justify-content:flex-start}}
+"""
+
 PAGE = _page("dashboard")
 SETTINGS_PAGE = _page("settings")
 BLACKBOX_PAGE = _page("blackbox")
@@ -4597,7 +4916,7 @@ class Handler(BaseHTTPRequestHandler):
         if not _host_allowed(self.headers.get("host")):
             return self._send(403, "application/json; charset=utf-8", json.dumps({"error": "host_rejected"}))
         path = self.path.split("?")[0]
-        if path not in ("/api/config", "/api/test", "/api/default-provider", "/api/config-reset", "/api/blackbox", "/api/select-session"):
+        if path not in ("/api/config", "/api/test", "/api/default-provider", "/api/config-reset", "/api/blackbox", "/api/select-session", "/api/attention"):
             return self._send(404, "application/json; charset=utf-8", json.dumps({"error": "not_found"}))
         if not self._authorized():
             return self._send(403, "application/json; charset=utf-8", json.dumps({"error": "token_required"}))
@@ -4626,6 +4945,33 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, "application/json; charset=utf-8", json.dumps({"error": "invalid_json"}))
         if not isinstance(payload, dict):
             return self._send(400, "application/json; charset=utf-8", json.dumps({"error": "invalid_payload"}))
+        if path == "/api/attention":
+            action = payload.get("action")
+            minutes = payload.get("minutes")
+            if action not in ("ack", "snooze", "resolve", "reopen"):
+                return self._send(400, "application/json; charset=utf-8",
+                                  json.dumps({"error": "invalid_attention_action"}))
+            if action == "snooze" and (type(minutes) is not int or not 5 <= minutes <= 1440):
+                return self._send(400, "application/json; charset=utf-8",
+                                  json.dumps({"error": "invalid_attention_minutes"}))
+            try:
+                updated = attention_action(payload.get("id"), action, minutes=minutes)
+            except ValueError as error:
+                return self._send(400, "application/json; charset=utf-8",
+                                  json.dumps({"error": str(error)}))
+            if updated is None:
+                return self._send(404, "application/json; charset=utf-8",
+                                  json.dumps({"error": "attention_not_found"}))
+            try:
+                _SNAPSHOT["data"] = snapshot()
+                _SNAPSHOT["at"] = time.monotonic()
+                _SNAPSHOT["error"] = None
+            except Exception:
+                pass
+            attention = (_SNAPSHOT.get("data") or {}).get("attention")
+            return self._send(200, "application/json; charset=utf-8",
+                              json.dumps({"updated": True, "item": updated, "attention": attention},
+                                         ensure_ascii=False))
         if path == "/api/select-session":
             if not select_live_session(payload.get("instance_id")):
                 return self._send(409, "application/json; charset=utf-8", json.dumps({"error": "session_not_live"}))
@@ -5342,6 +5688,19 @@ def proactive_alerts(providers, session, metrics, routing_values=None, cli_value
                 add("warn", "CLI 설정 변경됨",
                     "저장된 CLI 종류/모델과 실행 중 프록시의 값이 다릅니다. 진행 중 작업을 마치고 재시작하면 반영됩니다.",
                     "cli_settings_changed", ".\\OpenClaude.ps1")
+    rate_limit = (metrics or {}).get("rateLimit") if isinstance(metrics, dict) else None
+    if session and isinstance(rate_limit, dict) and isinstance(rate_limit.get("at"), str):
+        at = _attention_time(rate_limit["at"])
+        retry_ms = rate_limit.get("retryAfterMs")
+        if at is not None:
+            age = (datetime.now(timezone.utc) - at).total_seconds()
+            window = max(300, (retry_ms if isinstance(retry_ms, (int, float)) else 0) / 1000 + 60)
+            if 0 <= age <= window:
+                wait = round((retry_ms if isinstance(retry_ms, (int, float)) else 1000) / 1000)
+                add("warn", "외부 서비스 속도 제한",
+                    f"최근 요청이 HTTP {rate_limit.get('status', 429)}로 제한되었습니다. 약 {wait}초 뒤 재시도하며, "
+                    "계속되면 공급자 사용량과 모델을 확인하세요.",
+                    "session_rate_limited")
     # A configured external service whose session never attempted it is easy to misread as a
     # routing fault; native-only features keep such requests on Plan by design.
     routes = (metrics or {}).get("routes") if isinstance(metrics, dict) else None

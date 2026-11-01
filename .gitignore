@@ -28,3 +28,5 @@ openclaude.config.yaml
 openclaude.config.yaml.*
 .openclaude.config.yaml.*
 .dashboard.session
+.dashboard-attention.json
+.dashboard-attention.json.*.tmp

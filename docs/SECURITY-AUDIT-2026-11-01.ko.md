@@ -403,3 +403,15 @@ DSH 게이트웨이·영속화·텔레메트리 설계를 참고해 프록시의
 - 계측은 카운터/짧은 타이머만 사용하며 요청·응답 동작을 바꾸지 않습니다.
 
 검증: 통제 프록시에서 소형 요청 `diagnostics 0.16ms`, `body_parse 0.03ms`, 1MB 요청 `body_parse 1.22ms`, GC 2회·max 0.48ms로 확인되어 남은 980ms max의 주원인이 이 구간들이 아님을 분리했습니다. 서버 listen 시 histogram을 reset해 **모듈 import/부팅 지연을 요청 지연 통계에서 제외**했습니다. Python **709 tests OK**(11 skip), Node **724 pass**, 대시보드 모듈 **277 pass**.
+
+## 27. Attention-first 운영 큐와 세션 재시도 상태 (2026-11-02)
+
+DSH Superagent의 “사람의 주의를 최소화한다”는 운영 원칙을 대시보드에 독자 구현했습니다. 코드는 복사하지 않았고 [LICENSE-REVIEW](../LICENSE-REVIEW.md)에 MIT 참고 검토를 기록했습니다.
+
+- `attention_snapshot`이 경고에서 **open/acknowledged/snoozed/resolved** 상태를 파생하고 `.dashboard-attention.json`에 사람의 결정을 저장합니다.
+- `POST /api/attention`(세션 토큰)이 확인·5~1440분 미루기·해결·다시 열기를 지원합니다.
+- 경고가 사라지면 자동으로 `resolved` 이력으로 이동하고, 건강한 상태는 한 줄 카드만 표시합니다.
+- 세션 요약에 `retry_health`(rate_limited/retried·Retry-After·회로)를 추가하고 세션 표에 표시합니다. 최근 속도 제한은 `session_rate_limited` 능동 경고로 주의 큐에 들어갑니다.
+- attention의 시계·`last_seen_at`은 ETag 계산에서 제외해 건강한 상태의 304를 유지합니다.
+
+검증: Python **712 tests OK**(11 skip), Node **726 pass**, dashboard module **280 pass**(주의 큐·건강한 상태), ETag 조건부 GET 304 유지.

@@ -1562,3 +1562,33 @@ test('the notification button stays hidden without a Notification API', () => {
   const { context } = loadDashboard();
   assert.equal(context.nodes.get('notify-toggle').hidden, true);
 });
+
+test('attention queue renders only actionable items with direct actions', () => {
+  const { context, sandbox } = loadDashboard();
+  sandbox.render(fixture({
+    alerts: [{ level: 'critical', title: 'OpenRouter 잔액 부족', detail: '남은 금액 $1.00', code: 'low_balance' }],
+    attention: {
+      counts: { open: 1, critical: 1, warn: 0, acknowledged: 0, snoozed: 0, history: 0 },
+      items: [{ id: '0123456789ab', level: 'critical', title: 'OpenRouter 잔액 부족',
+        detail: '남은 금액 $1.00', state: 'open', command: null, age_seconds: 12 }],
+      acknowledged: [], snoozed: [], history: [],
+    },
+  }));
+  const html = context.nodes.get('alerts').innerHTML;
+  assert.match(html, /지금 필요한 것/);
+  assert.match(html, /data-attention-action="ack"/);
+  assert.match(html, /data-attention-action="resolve"/);
+  assert.match(html, /1시간 미루기/);
+});
+
+test('healthy attention state takes little space', () => {
+  const { context, sandbox } = loadDashboard();
+  sandbox.render(fixture({
+    alerts: [], insights: [],
+    attention: { counts: { open: 0, critical: 0, warn: 0, acknowledged: 0, snoozed: 0, history: 0 },
+      items: [], acknowledged: [], snoozed: [], history: [] },
+  }));
+  const html = context.nodes.get('alerts').innerHTML;
+  assert.match(html, /지금 조치할 항목이 없습니다/);
+  assert.doesNotMatch(html, /data-attention-action/);
+});

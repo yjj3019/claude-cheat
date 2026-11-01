@@ -112,6 +112,13 @@
 | **P2** | **Prompt/skill 버전 관리** | Prompts/Versions | 운영 문구 변경 추적 (현재 proxy엔 우선순위 낮음) |
 | 제외 | PR/merge, worker slot, per-ticket directory, Feishu/GitHub source, tool permission | 실행 agent 고유 영역 | 현 proxy/launcher 범위 밖 |
 
+## 8.1 구현 현황 (2026-11-02)
+
+- P0 **Attention-first 운영 큐**: 구현됨 — `POST /api/attention`, ack/snooze/resolve/reopen, 자동 해결 이력, 건강한 상태 접힘.
+- P1 **세션별 RetryHealth**: 부분 구현됨 — rate-limit/재시도/회로를 세션 표에 표시하고 속도 제한을 주의 큐로 승격.
+- P0 **Versioned 설정·정책**: 아직 미구현 — 다음 작업 후보.
+- P1 **알림 outbox**, **settings diff/rollback**: 아직 미구현.
+
 ## 9. 라이선스
 
 Superagent Prototype은 **MIT**입니다. 이번 조사는 개념 참고이며 코드·문장을 복사하지 않았습니다. 향후 코드를 실질적으로 복사·번역하면 MIT 저작권·허가 고지를 `LICENSE`/`THIRD_PARTY_NOTICES`에 추가해야 합니다.
