@@ -618,10 +618,9 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
     dual = None if isolated or compat else dual_provider_setup(provider)
     if openrouter_compat or provider == "openrouter" or (
             dual is not None and dual.get("ROUTE_ALT_PROVIDER") == "openrouter"):
-        # Regression guard: this was accidentally narrowed to openrouter_compat in e075542,
-        # which made ordinary OpenRouter sessions send experimental betas and divert every
-        # request to Plan. Ordinary OpenRouter (and a dual session with an OpenRouter
-        # alternate) keeps the provider's stable protocol, so no extra flag is needed.
+        # User requirement R1 (docs/USER-REQUIREMENTS.ko.md): an ordinary OpenRouter session
+        # must route externally without -OpenRouterCompat. Narrowing this to compat mode in
+        # e075542 made every request fall back to Plan; do not repeat that regression.
         env.update(CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="1", CLAUDE_CODE_DISABLE_ADVISOR_TOOL="1")
     # The user's own Git Bash location is needed by the Bash tool; it is not provider routing.
     if isolated and "CLAUDE_CODE_GIT_BASH_PATH" in os.environ:

@@ -46,9 +46,11 @@ cd D:\AI-Codding\Claude\claude-cheat
 
 설정 변경은 **다음 새 세션부터** 적용됩니다. 일반 모드의 Plan 우회와 별도로 [Local 전용 모드](#claude-cli-local-전용-모드) 및 [Local 호환 모드](#claude-cli-local-호환-모드)를 제공합니다.
 
+> **요구사항 원장**: 사용자가 명시한 동작은 [`docs/USER-REQUIREMENTS.ko.md`](docs/USER-REQUIREMENTS.ko.md)에 기록되며, 코드·테스트·문서가 이를 어기면 해당 변경을 되돌립니다. 대표적으로 **R1 — 옵션 없이 OpenRouter로 라우팅**이 회귀 감시 테스트로 고정되어 있습니다.
+
 ## 목차
 
-자주 찾는 항목: [전역 실행기와 자동 PATH](#전역-실행기-설치와-자동-path) · [실시간 대시보드](#실시간-대시보드) · [사용량 통계](#사용량-통계) · [CLI 백엔드](#cli를-모델-백엔드로-사용하기) · [AI 진단 API](#ai-디버깅용-상태-점검-api)
+자주 찾는 항목: [요구사항 원장](docs/USER-REQUIREMENTS.ko.md) · [전역 실행기와 자동 PATH](#전역-실행기-설치와-자동-path) · [실시간 대시보드](#실시간-대시보드) · [사용량 통계](#사용량-통계) · [CLI 백엔드](#cli를-모델-백엔드로-사용하기) · [AI 진단 API](#ai-디버깅용-상태-점검-api)
 
 1. [어떤 요청이 어디로 가나요?](#1-어떤-요청이-어디로-가나요)
 2. [준비와 설정 파일 위치](#2-준비와-설정-파일-위치)
@@ -982,7 +984,7 @@ python -m unittest discover -s tests -p test_fuzz_dashboard.py  # 대시보드 �
 python tests/live_smoke.py --dry-run       # 설정 존재 여부만 확인(무과금)
 ```
 
-현재 저장소 기준 회귀 검사 수는 **Node 722개**(대시보드 DOM 97개 포함), **Python 690개**(11개는 환경 의존 검사로 skip)입니다. 테스트 수는 릴리스마다 달라질 수 있으므로 위 명령으로 직접 확인하세요.
+현재 저장소 기준 회귀 검사 수는 **Node 722개**(대시보드 DOM 97개 포함), **Python 694개**(11개는 환경 의존 검사로 skip)입니다. 테스트 수는 릴리스마다 달라질 수 있으므로 위 명령으로 직접 확인하세요.
 
 - Windows 프로세스 트리 테스트(`test_local_lifecycle`)와 동시성 스트레스(`test_dashboard_concurrency`)는 **기본 스위트에서 건너뜁니다**. 실제 프로세스 트리를 띄우거나 서버에 12스레드를 걸기 때문에 느리고 부하에 민감합니다. 필요할 때만 `$env:CLAUDE_CHEAT_SLOW = '1'`로 켜세요.
 - 프로세스 트리 테스트는 **Git Bash**가 필요합니다. `C:\Windows\System32\bash.exe`(WSL)는 Windows 파이썬 경로를 실행하지 못해 자동으로 건너뜁니다.

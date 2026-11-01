@@ -239,7 +239,7 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 프록시 자체 부하 모니터링 | `/api/metrics`에 프로세스 상태(pid·RSS·힙·이벤트 루프 지연 p50/p95/max)를 추가하고 대시보드 **프로세스 상태** 카드로 표시. 이벤트 루프 p95 ≥250ms·RSS ≥1.5GiB는 능동 경고. 지표 파일 기록을 **비동기**로 바꿔 이벤트 루프 블로킹 제거(close/exit는 동기 최종 flush) | 기능 추가 |
 | 저장소 위생 | 추적되지 않던 `NUL` 잔여 파일 삭제 | 정리 |
 
-검증: Node **722 pass / 0 fail**(DOM 97 포함), Python **690개 수집(11 skip)**. 변경 모듈(`test_launcher_arguments`·`test_route_cli`·`test_route_dashboard`·`test_handover_contract`·`test_launcher_scripts`) 통과, 이전 flaky였던 `ConnectionTest.test_reasons_through_shim`은 새 상한에서 21초에 통과.
+검증: Node **722 pass / 0 fail**(DOM 97 포함), Python **694개 수집(11 skip)**. 변경 모듈(`test_launcher_arguments`·`test_route_cli`·`test_route_dashboard`·`test_handover_contract`·`test_launcher_scripts`) 통과, 이전 flaky였던 `ConnectionTest.test_reasons_through_shim`은 새 상한에서 21초에 통과.
 
 
 ## 13. 능동형 반응 (2026-11-01)
@@ -254,7 +254,7 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 연결 자동 복구 | `/api/snapshot` 실패 시 1·2·4·8·16초 지수 백오프로 재시도하고, 복구 시 토스트로 알림 | 기능 추가 |
 | 보안 경계 | 능동 점검은 로컬 상태만 읽고 쓰기·세션 제어를 하지 않음. 알림 권한 거부 시에도 배너·배지는 동작 | 문서화 |
 
-검증: Node **722 pass / 0 fail**(DOM 97 포함), Python **690개 수집(11 skip)**, 대시보드 모듈 262 pass. 라이브 대시보드에서 `proactive` 키·탭 배지·알림 버튼 서빙 확인.
+검증: Node **722 pass / 0 fail**(DOM 97 포함), Python **694개 수집(11 skip)**, 대시보드 모듈 262 pass. 라이브 대시보드에서 `proactive` 키·탭 배지·알림 버튼 서빙 확인.
 
 
 ## 14. 대시보드 헤더 레이아웃 (2026-11-01)
@@ -280,7 +280,7 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 안전 경계 | 명시적 `-Target`에는 적용하지 않고 `-NoPath`로 끌 수 있음(테스트로 사용자 PATH 불변 확인) | 확인 |
 | 문서 | `openClaude.ps1`이 아니라 `OpenClaude`(확장자 없이)·`OpenClaude.cmd`가 PATH 명령임을 README에 명시 | 문서 정정 |
 
-검증: 설치 테스트 11 pass(사용자 PATH 불변 포함), Python **690개 수집(11 skip)**.
+검증: 설치 테스트 11 pass(사용자 PATH 불변 포함), Python **694개 수집(11 skip)**.
 
 
 ## 16. 기본 OpenRouter 라우팅 회귀 복원 (2026-11-01)
@@ -293,4 +293,18 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 2026-10-28 | `e075542` | CLI 백엔드 통합 중 조건이 `if openrouter_compat:`로 좁혀져 일반 OpenRouter 세션이 실험 beta를 그대로 보내고 **모든 요청이 Plan으로 우회**(회귀) |
 | 2026-11-01 | 이번 수정 | `if openrouter_compat or provider == "openrouter" or (dual의 대체 provider가 openrouter)`로 복원. 일반 OpenRouter·OpenRouter 대체 dual 세션이 안정 프로토콜을 사용 |
 
-검증: `tests.test_openrouter_config`·`tests.test_dual_provider`·`tests.test_launcher_arguments`·`tests.test_local_config`·`ProactiveReactionTests` **116 pass**, 전체 Node **722 pass**, Python **690개 수집**(11 skip), 대시보드 모듈 **262 pass**. 대시보드의 `Plan 전용 기능으로 우회 중` 경고 문구도 재시작 안내로 수정.
+검증: `tests.test_openrouter_config`·`tests.test_dual_provider`·`tests.test_launcher_arguments`·`tests.test_local_config`·`ProactiveReactionTests` **116 pass**, 전체 Node **722 pass**, Python **694개 수집**(11 skip), 대시보드 모듈 **262 pass**. 대시보드의 `Plan 전용 기능으로 우회 중` 경고 문구도 재시작 안내로 수정.
+
+
+## 17. 요구사항 보존 장치 (2026-11-01)
+
+사용자 요구를 테스트 변경으로 조용히 뒤집지 못하도록 원장과 회귀 감시를 추가했습니다.
+
+| 항목 | 내용 |
+| --- | --- |
+| 요구사항 원장 | [`docs/USER-REQUIREMENTS.ko.md`](USER-REQUIREMENTS.ko.md). R1(옵션 없이 OpenRouter 라우팅)과 그 밖의 확정 동작을 수용 기준·회귀 테스트와 함께 기록 |
+| R1 전용 회귀 테스트 | `tests/test_user_requirements.py`: 일반·dual·compat 세션의 안정 프로토콜 설정과 원장/주석 존재를 검증. 실패하면 해당 변경을 되돌리는 것이 원칙 |
+| 코드 주석 | `openrouterAdvisor.py`의 조건부 블록에 "User requirement R1" 명시 |
+| 문서 | README(한/영)에 원장 링크와 "위반 시 원복" 원칙 명시 |
+
+검증: Python **694개 수집(11 skip)**, R1 회귀 테스트 4 pass, 관련 런처 테스트 43 pass.

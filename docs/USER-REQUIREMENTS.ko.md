@@ -1,0 +1,47 @@
+# 사용자 요구사항 원장
+
+이 문서는 사용자가 명시적으로 요구한 동작을 기록하는 **원장(ledger)** 입니다. 아래 요구사항을 바꾸려면 사용자의 명시적 승인이 필요하며, 코드·테스트·문서가 이 원장과 어긋나면 **그 변경을 되돌리는 것을 원칙**으로 합니다.
+
+각 항목에는 수용 기준과 회귀 감시 테스트를 함께 적습니다.
+
+## R1. 옵션 없이 지정 모델(OpenRouter)로 라우팅
+
+**요구**: `OpenClaude`를 옵션 없이 실행해 저장된 기본 서비스가 OpenRouter이면, **별도의 `-OpenRouterCompat` 없이** 설정한 OpenRouter 모델로 라우팅되어야 합니다. Plan은 실험적 기능·미지원 요청처럼 외부로 보낼 수 없는 경우에만 폴백으로 사용합니다.
+
+**수용 기준**
+
+- 일반 OpenRouter 세션의 자식 환경에 `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`과 `CLAUDE_CODE_DISABLE_ADVISOR_TOOL=1`이 설정된다.
+- OpenRouter를 대체 provider로 쓰는 dual 세션도 같은 설정을 사용한다.
+- `-OpenRouterCompat`은 "Plan 폴백까지 완전히 차단"하는 추가 옵션으로 남고, 기본 라우팅의 전제 조건이 아니다.
+- 대시보드는 외부 서비스가 설정됐는데 이 세션의 외부 시도가 0이고 전부 Plan이면 `session_plan_only` 경고와 재시작 안내를 표시한다.
+
+**회귀 감시**
+
+- `tests/test_user_requirements.py` — R1 전용 테스트(일반·dual·compat)
+- `tests/test_openrouter_config.py::test_openrouter_sessions_pin_the_provider_stable_protocol_by_default`
+- `tests/test_dual_provider.py::test_ordinary_dual_session_pins_the_stable_protocol_for_an_openrouter_alternate`
+- `openrouterAdvisor.py`의 `routed_session` 조건부 블록(회귀 방지 주석 포함)
+
+**회귀 이력**
+
+| 커밋 | 내용 |
+| --- | --- |
+| `15298f0` (2026-10-24) | 일반 OpenRouter 세션에서 실험 beta·advisor 도구를 끄고 안정 프로토콜로 시작 → 옵션 없이 외부 라우팅 |
+| `e075542` (2026-10-28) | CLI 백엔드 통합 중 조건이 `openrouter_compat`로 좁혀져 일반 세션의 모든 요청이 Plan으로 우회 |
+| `0e2143b` (2026-11-01) | 기본 동작 복원 + 회귀 방지 테스트 고정 |
+
+**위반 시 조치**: 요구사항을 약화하는 커밋·테스트 변경은 `git revert`로 되돌립니다. 요구 자체를 바꾸려면 사용자의 명시적 승인을 먼저 받습니다.
+
+## 그 밖에 사용자가 요구해 확정된 동작
+
+아래 항목도 임의로 약화하지 않습니다. 상세 동작과 테스트는 연결된 문서를 기준으로 합니다.
+
+| ID | 요구 | 기준 |
+| --- | --- | --- |
+| R2 | 대시보드 쓰기 토큰은 재시작해도 유지되어 열어 둔 탭이 계속 동작해야 한다 | `.dashboard.token`, `tests/test_route_dashboard.py::TokenPersistenceTests` |
+| R3 | CLI 자동 검색으로 감지된 CLI 종류·실행 파일 경로를 채울 수 있어야 한다 | `routeDashboard.py`의 `autoDetectCli`, `tests/dashboard_dom.test.mjs` |
+| R4 | 설치 후 어느 폴더에서나 `OpenClaude`·`OpenClaudeDashboard`·`installLauncher`가 동작해야 한다 | `.cmd` 포워더, 사용자 PATH 자동 등록, `tests/test_install_launcher.py` |
+| R5 | PowerShell 실행 정책이 서명을 요구하는 터미널에서도 실행되어야 한다 | `.cmd` 진입점(`-ExecutionPolicy Bypass`), README 실행 정책 절 |
+| R6 | 문제를 기다리지 않고 먼저 알리는 능동형 모니터링(배지·알림·복구·경고)을 유지해야 한다 | `proactive_alerts`, 탭 제목 배지, `tests/dashboard_dom.test.mjs`·`ProactiveReactionTests` |
+| R7 | 프록시 성능·모니터링 개선을 지속적으로 연구하고 기록해야 한다 | `docs/PROXY-PERFORMANCE-MONITORING-RESEARCH.ko.md`, `tests/metrics.test.mjs` |
+| R8 | 위 동작은 README에 자세히 기록되어야 한다 | `README.md` 관련 절 |

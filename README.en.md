@@ -42,6 +42,8 @@ Set `model` to a concrete ID from the [OpenRouter model list](https://openrouter
 
 The selected model must support the [Messages API](https://openrouter.ai/docs/api/api-reference/anthropic-messages/create-messages?explorer=true) and the tools you need. Model selection does not guarantee every model or native feature is compatible. Response model identity remains strict; dynamic aliases or presets returning another ID can fail and are unverified. Endpoint and retry policy remain fixed as documented in the example.
 
+> **Requirement ledger**: behavior you explicitly requested is recorded in [`docs/USER-REQUIREMENTS.ko.md`](docs/USER-REQUIREMENTS.ko.md). If code, tests, or docs contradict it, the change is reverted. R1 — routing to OpenRouter without an extra option — is pinned by regression tests.
+
 From the checkout root:
 
 ```powershell
