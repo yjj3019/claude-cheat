@@ -1106,6 +1106,12 @@ class PageTests(unittest.TestCase):
         # A dashboard restart rotates the token; the generic "refresh" hint would hide the fix.
         self.assertIn('쓰기 토큰이 없거나 만료되었습니다', dash.SETTINGS_PAGE)
 
+    def test_cli_card_can_fill_the_detected_binary(self):
+        self.assertIn('CLI 자동 검색', dash.SETTINGS_PAGE)
+        self.assertIn('async function autoDetectCli()', dash.SETTINGS_PAGE)
+        # Detection is only offered for the supported backends, not arbitrary PATH commands.
+        self.assertIn("getElementById('cfg-cli-CLI_KIND')", dash.SETTINGS_PAGE)
+
     def test_routes_serve_the_matching_page(self):
         import threading
         import urllib.error
@@ -1134,6 +1140,32 @@ class PageTests(unittest.TestCase):
         self.assertNotIn("__DASHBOARD_TOKEN__", blackbox_page)
         self.assertNotIn("__DASHBOARD_TOKEN__", dashboard)
         self.assertNotIn("__DASHBOARD_TOKEN__", settings)
+
+
+class TokenPersistenceTests(unittest.TestCase):
+    def test_token_survives_a_dashboard_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".dashboard.token"
+            first = dash._load_or_create_token(path)
+            self.assertRegex(first, r"^[A-Za-z0-9_-]{16,128}$")
+            self.assertEqual(path.read_text(encoding="ascii").strip(), first)
+            # A new process must reuse the file instead of rotating every open tab.
+            self.assertEqual(dash._load_or_create_token(path), first)
+
+    def test_invalid_token_file_is_replaced(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".dashboard.token"
+            path.write_text("bad token!\n", encoding="ascii")
+            token = dash._load_or_create_token(path)
+            self.assertRegex(token, r"^[A-Za-z0-9_-]{16,128}$")
+            self.assertEqual(path.read_text(encoding="ascii").strip(), token)
+
+    def test_dashboard_token_environment_overrides_the_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".dashboard.token"
+            with mock.patch.dict(os.environ, {"DASHBOARD_TOKEN": "env-token-1234567890"}):
+                self.assertEqual(dash._load_or_create_token(path), "env-token-1234567890")
+            self.assertFalse(path.exists())
 
 
 class ProxyStaleTests(unittest.TestCase):
