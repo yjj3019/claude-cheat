@@ -4091,6 +4091,20 @@ async function selectSession(instance) {
 }
 '''
 
+PAGE_CSS += """
+# Stable dashboard geometry: value/sentence changes must not move the cards below.
+@media(min-width:1400px){
+ .overview,.flow-card{height:560px;min-height:560px;overflow:hidden}
+ .overview>.card-b,.flow-card>.card-b{overflow:hidden}
+}
+.metrics-strip .v{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.overview-state{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.overview-tile .context{display:block;max-height:2.8em;overflow:hidden}
+.flow-card .flow-active,.flow-card .flow-window,.flow-card .flow-queue{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.insight{height:128px;overflow:hidden}
+.insight p{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.insight .chips{max-height:24px;overflow:hidden}
+"""
 PAGE = _page("dashboard")
 SETTINGS_PAGE = _page("settings")
 BLACKBOX_PAGE = _page("blackbox")

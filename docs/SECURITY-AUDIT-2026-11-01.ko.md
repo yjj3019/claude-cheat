@@ -346,3 +346,9 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 호환 | 인스턴스 핸드오프가 없는 구버전 세션은 기존 싱글턴 핸드오프로 폴백 |
 
 검증: 라이브 세션 2개(68건/41건)를 동시에 발견하고 선택 API로 68건↔41건 전환이 실제 동작함. Python **703 tests OK**(11 skip), Node **724 pass**, 대시보드 모듈 **271 pass**.
+
+## 21. 대시보드 레이아웃 고정 (2026-11-02)
+
+사용자 보고: 텍스트·수치 결과에 따라 카드 높이가 변해 레이아웃이 흔들림. 폭 1400px 이상에서 상단 **한눈에 보기**·**요청 흐름** 카드를 560px로 고정하고, 긴 모델/상태는 한 줄 말줄임, 지표 값은 말줄임, 인사이트는 3줄 클램프·128px 고정으로 처리했습니다. 좁은 화면은 가독성을 위해 자동 높이를 유지합니다.
+
+검증: PageTests에서 `Stable dashboard geometry`, `height:560px`, `-webkit-line-clamp:3` 고정. Python **703 tests OK**(11 skip), Node **724 pass**, 대시보드 모듈 **271 pass**. 1500px 스크린샷에서 카드 높이 고정 확인.

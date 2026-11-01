@@ -412,6 +412,8 @@ The server-side checks are read-only: they never restart a session, write settin
 
 **Multiple sessions can run at once.** The dashboard scans `.usage-stats/instances/*/handoff.json`, reads every live session's own metrics, and shows the busiest one when no choice is saved. Restarting another session does not reset the view; if the shown session disappears, the dashboard switches to the busiest remaining session instead of a new empty one. With two or more live sessions the header exposes a **session picker**, and the choice is stored in `.dashboard.session` across dashboard restarts. The restarted proxy's own time series still begins at its new proxy start.
 
+**Layout is fixed independently of content.** From 1400 px wide, the **overview** and **request flow** cards keep a fixed 560 px height; long model/state text truncates to one line, metric values ellipsize, and insights clamp to three lines. Changing token counts or sentences no longer pushes the charts and diagnostics up or down. Narrow screens keep automatic height for readability.
+
 | Panel | Content |
 | --- | --- |
 | Now | **OpenRouter, Local LLM or CLI serving / Plan bypass / idle**, the **last request's actual routing model**, age, reason |

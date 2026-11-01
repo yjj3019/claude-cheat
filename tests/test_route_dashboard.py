@@ -1123,6 +1123,10 @@ class PageTests(unittest.TestCase):
         self.assertIn('overviewCompleted', dash.PAGE)
         self.assertIn('건 완료', dash.PAGE)
         self.assertIn('data.summary ? data.summary', dash.PAGE)
+        # Content-length changes must not resize the top cards and shift everything below.
+        self.assertIn('Stable dashboard geometry', dash.PAGE_CSS)
+        self.assertIn('height:560px', dash.PAGE_CSS)
+        self.assertIn('-webkit-line-clamp:3', dash.PAGE_CSS)
 
     def test_header_navigation_labels_never_wrap_inside_their_buttons(self):
         css = dash.PAGE_CSS

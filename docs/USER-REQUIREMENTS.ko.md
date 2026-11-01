@@ -82,3 +82,21 @@
 - `routeDashboard.py`의 `live_sessions`, `_display_session`, `select_live_session`, `/api/select-session`
 
 **위반 시 조치**: 단일 세션만 추적하도록 되돌리는 변경은 되돌립니다.
+
+## R11. 텍스트·결과와 무관하게 대시보드 레이아웃 고정
+
+**요구**: 모델명·상태 문장·토큰 수·인사이트 문구가 바뀌어도 카드 위치와 크기가 흔들리지 않아야 합니다.
+
+**수용 기준**
+
+- 폭 1400px 이상에서 상단 **한눈에 보기**와 **요청 흐름** 카드는 높이가 고정(560px)되고, 내용은 잘림/스크롤로 처리되어 아래 카드가 밀리지 않는다.
+- 긴 모델명·상태·세션 요약은 한 줄 말줄임(`text-overflow:ellipsis`), 지표 값은 말줄임, 인사이트 본문은 3줄 클램프로 고정 높이(128px)를 유지한다.
+- 좁은 화면(1400px 미만)에서는 가독성을 위해 자동 높이를 허용한다.
+- 값이 없거나 길어져도 위 카드의 높이가 바뀌어 차트·진단 카드가 이동하지 않는다.
+
+**회귀 감시**
+
+- `tests/test_route_dashboard.py::PageTests.test_hidden_elements_and_empty_charts_do_not_mislead` — `Stable dashboard geometry`, `height:560px`, `-webkit-line-clamp:3` 존재
+- `routeDashboard.py`의 `PAGE_CSS` 고정 지오메트리 블록
+
+**위반 시 조치**: 콘텐츠에 따라 카드 높이가 다시 변하도록 되돌리는 변경은 되돌립니다.
