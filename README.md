@@ -120,6 +120,15 @@ claude auth status
 
 설치 폴더가 PATH에 등록되어 있으면 다른 작업 폴더에서도 `OpenClaude` 또는 `OpenClaudeDashboard`만 입력하면 됩니다. 포워더는 이 체크아웃의 경로를 담으므로, 저장소를 옮기면 다시 설치하세요. `.local\bin`이 PATH에 없으면 설치 스크립트가 추가 명령을 안내합니다.
 
+> **실행 정책으로 설치가 막히면**: `installLauncher.ps1`은 서명되지 않은 스크립트입니다. 실행 정책이 `AllSigned`이거나 관리 정책이 서명을 요구하는 터미널에서는 `installLauncher.ps1 파일이 디지털 서명되지 않았습니다` 오류로 중단됩니다. 이때는 같은 폴더의 `installLauncher.cmd`를 실행하세요(내부에서 `-ExecutionPolicy Bypass`로 설치 스크립트만 실행).
+>
+> ```powershell
+> .\installLauncher.cmd            # 실행 정책과 무관하게 설치·갱신
+> .\installLauncher.cmd -Remove    # 포워더 삭제
+> ```
+>
+> `installLauncher.cmd`가 없거나 직접 실행해야 한다면 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\installLauncher.ps1`을 쓰면 됩니다. 같은 이유로 `OpenClaude`·`OpenClaudeDashboard` 포워더(`.ps1`)도 그 터미널에서 막힐 수 있으므로, 그럴 때는 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$HOME\.local\bin\OpenClaude.ps1"`로 실행하거나 현재 사용자 범위 정책을 `RemoteSigned`로 두세요(`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, 관리자 권한 불필요). 회사 GPO가 `AllSigned`를 강제하면 우회가 막히므로 관리자에게 문의해야 합니다.
+
 예전 `.env.*` 파일을 계속 읽는 경우 형식은 한 줄에 `KEY=VALUE` 하나입니다. 빈 줄·`#`으로 시작하는 주석·값 전체를 감싼 따옴표는 허용하며, 여러 줄 값·셸 변수 확장은 지원하지 않습니다. 키 뒤에 같은 줄 주석을 붙이지 마세요. 새 설정은 `openclaude.config.yaml`을 사용합니다. 실제 설정 파일은 Git에서 제외하며 예제에는 실제 인증값을 넣지 마세요.
 
 ## 3. OpenRouter 모델 시작하기
@@ -975,6 +984,7 @@ python tests/bench_dashboard.py            # 10MB 로그 · 2,000개 세션 파�
 | [OpenClaude.ps1](OpenClaude.ps1) | 제공자 선택과 Python 실행기 호출 |
 | [OpenClaudeDashboard.ps1](OpenClaudeDashboard.ps1) | 대시보드·설정 화면 실행 |
 | [installLauncher.ps1](installLauncher.ps1) | 다른 폴더에서 사용할 전역 실행기 설치·갱신 |
+| [installLauncher.cmd](installLauncher.cmd) | 실행 정책이 `AllSigned`인 터미널에서도 설치·갱신(내부에서 `-ExecutionPolicy Bypass`) |
 | [openrouterAdvisor.py](openrouterAdvisor.py) | Plan 인증 검사·환경 격리·프록시 수명 관리·Local 목록 점검 |
 | [routeConfig.py](routeConfig.py) | 통합 설정 읽기·검증·원자적 저장·백업 |
 | [routeDashboard.py](routeDashboard.py) | 상태 화면·설정·모델 목록·AI 진단 API |

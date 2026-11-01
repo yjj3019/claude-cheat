@@ -108,6 +108,15 @@ If you install a global launcher separately, configuration is read beside its ta
 > ```
 >
 > They embed this checkout's path, so re-run the installer if the repository moves.
+>
+> **If the execution policy blocks the installer**: `installLauncher.ps1` is unsigned. Terminals whose effective policy is `AllSigned` (or a managed policy that requires signatures) stop with "the file is not digitally signed". Run the sibling `installLauncher.cmd` instead — it invokes the installer with `-ExecutionPolicy Bypass`:
+>
+> ```powershell
+> .\installLauncher.cmd            # install or refresh, regardless of the session policy
+> .\installLauncher.cmd -Remove    # remove the forwarders
+> ```
+>
+> Otherwise run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\installLauncher.ps1`. The `OpenClaude`/`OpenClaudeDashboard` forwarders are `.ps1` too, so they can be blocked in the same terminal: use `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$HOME\.local\bin\OpenClaude.ps1"`, or set the current-user policy to `RemoteSigned` (`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, no admin required). A GPO that enforces `AllSigned` overrides the bypass; contact your administrator in that case.
 
 Configure OpenRouter once in the web console — it runs without a routing session and shows setup guidance while the settings are empty:
 
