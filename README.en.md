@@ -100,17 +100,27 @@ If you install a global launcher separately, configuration is read beside its ta
 
 > Scripts use the **product-name form**: `OpenClaude.ps1` (routing session) and `OpenClaudeDashboard.ps1` (dashboard). The previous names `startClaudeOpenRouter.ps1`, `startOpenClaude.ps1`, `startClaudeDashboard.ps1` and `startDashboard.ps1` remain as **compatibility shims**, so existing shortcuts and aliases keep working (they forward every argument and print a one-line notice). In a terminal whose policy requires signatures, use the equivalent `OpenClaude.cmd` / `OpenClaudeDashboard.cmd` entry points.
 >
-> To run them as bare commands from any folder, install the forwarders once:
+> To run them as bare commands from any folder, install the forwarders once **from the checkout folder**:
 >
 > ```powershell
-> .\installLauncher.ps1          # writes the .cmd forwarders into %USERPROFILE%\.local\bin and adds it to the user PATH
-> .\installLauncher.ps1 -Remove  # removes every installed forwarder
-> .\installLauncher.ps1 -NoPath  # installs the forwarders without touching PATH
+> cd <checkout>
+> .\installLauncher.cmd          # writes the .cmd forwarders and adds the folder to the user PATH
+> .\installLauncher.cmd -Remove  # removes every installed forwarder
+> .\installLauncher.cmd -NoPath  # installs the forwarders without touching PATH
 > ```
 >
-> From another folder, type **`OpenClaude` or `OpenClaudeDashboard`** (no extension). The `.ps1` scripts exist only in the checkout, so `openClaude.ps1` (or a bare filename without `.\`) cannot be found on PATH. The forwarders are `.cmd` files, so the PowerShell execution policy never applies to them; each one re-launches the real `.ps1` with `-ExecutionPolicy Bypass`. Same-named `.ps1` forwarders written by earlier versions are removed on install, because PowerShell would otherwise resolve those first. They embed this checkout's path, so re-run the installer if the repository moves. If the default folder is missing from the user PATH, the installer now **adds it automatically**; terminals that were already open need to be reopened to see it.
+> `.\installLauncher.ps1` behaves the same where the execution policy allows `.ps1`. After that first install, these work from any folder:
 >
-> Verify with `Get-Command OpenClaude | Select-Object Source` (it should resolve to `%USERPROFILE%\.local\bin\OpenClaude.cmd`). If it does not resolve, open a new terminal first (PATH changes apply to new processes), then re-run the installer from the checkout, or use `.\installLauncher.cmd` when the policy blocks `.ps1`. `-Remove` deletes the forwarders but leaves the PATH entry, so remove that entry in Windows Environment Variables if you want it gone too.
+> ```powershell
+> OpenClaude                 # routing session
+> OpenClaudeDashboard        # dashboard
+> installLauncher            # re-run the installation refresh from anywhere
+> OpenClaude -Help           # options without starting a session
+> ```
+>
+> From another folder, type **`OpenClaude` or `OpenClaudeDashboard`** (no extension). The `.ps1` scripts exist only in the checkout, so `openClaude.ps1` or `installLauncher.ps1` (or a bare filename without `.\`) cannot be found on PATH. The forwarders are `.cmd` files, so the PowerShell execution policy never applies to them; each one re-launches the real `.ps1` with `-ExecutionPolicy Bypass`. Same-named `.ps1` forwarders written by earlier versions are removed on install, because PowerShell would otherwise resolve those first. They embed this checkout's path, so re-run the installer if the repository moves. If the default folder is missing from the user PATH, the installer now **adds it automatically**; terminals that were already open need to be reopened to see it.
+>
+> Verify with `Get-Command OpenClaude, OpenClaudeDashboard, installLauncher | Select-Object Name, Source` (they should resolve to `%USERPROFILE%\.local\bin\*.cmd`). If it does not resolve, open a new terminal first (PATH changes apply to new processes), then re-run the installer from the checkout, or use `.\installLauncher.cmd` when the policy blocks `.ps1`. `-Remove` deletes the forwarders but leaves the PATH entry, so remove that entry in Windows Environment Variables if you want it gone too.
 
 >
 > **If the execution policy blocks `.ps1` files**: the scripts are unsigned, so `AllSigned` (or a managed policy that requires signatures) fails with "the file is not digitally signed". Use the `.cmd` entry points instead — `.\installLauncher.cmd` to install, `.\OpenClaude.cmd` / `.\OpenClaudeDashboard.cmd` in the checkout, and the installed `OpenClaude`/`OpenClaudeDashboard` commands all work regardless of policy. If something still blocks, run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\installLauncher.ps1`, or set the current-user policy to `RemoteSigned` (`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, no admin required). A GPO that enforces `AllSigned` overrides the bypass; contact your administrator in that case.

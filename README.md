@@ -37,9 +37,10 @@ Claude Code, Node.js, Python을 설치하고 [준비 사항](#2-준비와-설정
    Invoke-RestMethod http://127.0.0.1:8787/api/diagnostics | ConvertTo-Json -Depth 8
    ```
 
-어느 폴더에서나 `OpenClaude`·`OpenClaudeDashboard`로 실행하려면 **한 번만** 설치합니다. 포워더 생성과 사용자 PATH 등록이 자동으로 처리됩니다([전역 실행기 설치와 자동 PATH](#전역-실행기-설치와-자동-path)).
+어느 폴더에서나 `OpenClaude`·`OpenClaudeDashboard`로 실행하려면 **체크아웃 폴더에서 한 번만** 설치합니다. 포워더 생성과 사용자 PATH 등록이 자동으로 처리되고, 이후에는 `installLauncher`로 어느 폴더에서나 갱신할 수 있습니다([전역 실행기 설치와 자동 PATH](#전역-실행기-설치와-자동-path)).
 
 ```powershell
+cd D:\AI-Codding\Claude\claude-cheat
 .\installLauncher.cmd
 ```
 
@@ -117,15 +118,23 @@ claude auth status
 
 > 실행 스크립트는 **제품명 형태**입니다: `OpenClaude.ps1`(라우팅 세션), `OpenClaudeDashboard.ps1`(대시보드). 이전 이름 `startClaudeOpenRouter.ps1`·`startOpenClaude.ps1`·`startClaudeDashboard.ps1`·`startDashboard.ps1`은 **호환 shim**으로 남아 있어 기존 바로가기·별칭이 그대로 동작합니다(새 이름으로 인자를 넘기고 안내만 출력). 실행 정책이 서명을 요구하는 터미널에서는 같은 동작의 `OpenClaude.cmd`·`OpenClaudeDashboard.cmd`를 쓰면 됩니다.
 
-**어느 폴더에서나 이름만으로 실행하려면** 한 번 설치합니다.
+**어느 폴더에서나 이름만으로 실행하려면** 먼저 **체크아웃 폴더에서** 한 번 설치합니다.
 
 ```powershell
-.\installLauncher.ps1          # %USERPROFILE%\.local\bin 에 포워더 생성 + 사용자 PATH에 자동 등록(이미 있으면 생략)
-.\installLauncher.ps1 -Remove   # 설치한 포워더 전부 삭제
-.\installLauncher.ps1 -NoPath   # PATH는 건드리지 않고 포워더만 설치
+cd D:\AI-Codding\Claude\claude-cheat
+.\installLauncher.cmd            # 실행 정책과 무관. 포워더 생성 + 사용자 PATH 자동 등록
+.\installLauncher.cmd -Remove    # 설치한 포워더 전부 삭제
+.\installLauncher.cmd -NoPath    # PATH는 건드리지 않고 포워더만 설치
 ```
 
-다른 작업 폴더에서는 **`OpenClaude` 또는 `OpenClaudeDashboard`**(확장자 없이)만 입력하면 됩니다.
+정책이 허용되는 터미널이면 `.\installLauncher.ps1`도 같은 동작입니다. **첫 설치만 체크아웃 폴더에서** 실행하면 되고, 그 다음부터는 어느 폴더에서나 다음 명령을 쓸 수 있습니다.
+
+```powershell
+OpenClaude                 # 라우팅 세션
+OpenClaudeDashboard        # 대시보드
+installLauncher            # 설치·갱신을 어느 폴더에서나 다시 실행
+OpenClaude -Help           # 세션을 시작하지 않고 옵션 확인
+```
 
 ### 전역 실행기 설치와 자동 PATH
 
@@ -140,7 +149,7 @@ claude auth status
 
 | 단계 | 동작 | 조건·실패 시 |
 | --- | --- | --- |
-| 포워더 생성 | `%USERPROFILE%\.local\bin`에 `OpenClaude.cmd`·`OpenClaudeDashboard.cmd`와 이전 이름 포워더 생성 | 같은 이름의 파일이 이 스크립트가 만든 것이 아니면 덮어쓰지 않고 보존 |
+| 포워더 생성 | `%USERPROFILE%\.local\bin`에 `OpenClaude.cmd`·`OpenClaudeDashboard.cmd`·`installLauncher.cmd`와 이전 이름 포워더 생성 | 같은 이름의 파일이 이 스크립트가 만든 것이 아니면 덮어쓰지 않고 보존 |
 | 구형 정리 | 같은 이름으로 남아 있던 생성된 `.ps1` 포워더를 제거 | 사용자가 직접 만든 `.ps1`은 보존 |
 | PATH 등록 | 기본 폴더가 **사용자 PATH**에 없으면 자동 추가(관리자 권한 불필요) | `-Target`을 지정했거나 `-NoPath`를 주면 생략 |
 | 즉시 반영 | 현재 프로세스 PATH에도 추가하고 새 터미널 안내 | 이미 열려 있던 다른 터미널은 새로 열어야 반영 |
@@ -153,15 +162,19 @@ claude auth status
 | --- | --- | --- |
 | `OpenClaude` | PATH의 `OpenClaude.cmd` 실행 | 확장자 없는 이름을 PATH에서 찾습니다 |
 | `OpenClaude.cmd` | 동일 | 명시적 파일명 |
-| `openClaude.ps1` | **인식 안 됨** | PATH에 `.ps1` 포워더가 없습니다. `.ps1`은 체크아웃 폴더에만 있습니다 |
-| `.\OpenClaude.ps1` | 체크아웃 폴더에서만 실행 | 현재 폴더 기준 상대 경로 |
+| `OpenClaudeDashboard` | PATH의 `OpenClaudeDashboard.cmd` 실행 | 대시보드 |
+| `installLauncher` | PATH의 `installLauncher.cmd` 실행(설치·갱신) | 첫 설치 후에는 어느 폴더에서나 갱신할 수 있습니다 |
+| `openClaude.ps1` / `installLauncher.ps1` | **인식 안 됨** | PATH에 `.ps1` 파일이 없습니다. `.ps1`은 체크아웃 폴더에만 있습니다 |
+| `.\OpenClaude.ps1` / `.\installLauncher.ps1` | 체크아웃 폴더에서만 실행 | 현재 폴더 기준 상대 경로 |
 | `OpenClaudeDashboard -Open` | 대시보드 + 설정 페이지 열기 | 쓰기 토큰이 포함된 `write_url`로 엽니다 |
 
 **동작 확인과 복구:**
 
 ```powershell
-Get-Command OpenClaude | Select-Object Source
-# C:\Users\<사용자>\.local\bin\OpenClaude.cmd
+Get-Command OpenClaude, OpenClaudeDashboard, installLauncher | Select-Object Name, Source
+# OpenClaude.cmd          C:\Users\<사용자>\.local\bin\OpenClaude.cmd
+# OpenClaudeDashboard.cmd C:\Users\<사용자>\.local\bin\OpenClaudeDashboard.cmd
+# installLauncher.cmd     C:\Users\<사용자>\.local\bin\installLauncher.cmd
 
 where.exe OpenClaude
 $env:PATH -split ';' | Select-String '\.local\\bin'

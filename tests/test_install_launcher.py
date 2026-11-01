@@ -18,6 +18,7 @@ POWERSHELL = shutil.which("pwsh") or shutil.which("powershell")
 FORWARDERS = {
     "OpenClaude.cmd": "OpenClaude.ps1",
     "OpenClaudeDashboard.cmd": "OpenClaudeDashboard.ps1",
+    "installLauncher.cmd": "installLauncher.ps1",
     "startOpenClaude.cmd": "OpenClaude.ps1",
     "startDashboard.cmd": "OpenClaudeDashboard.ps1",
     "startClaudeOpenRouter.cmd": "OpenClaude.ps1",
