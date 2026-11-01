@@ -103,11 +103,12 @@ If you install a global launcher separately, configuration is read beside its ta
 > To run them as bare commands from any folder, install the forwarders once:
 >
 > ```powershell
-> .\installLauncher.ps1          # writes OpenClaude, OpenClaudeDashboard (.cmd forwarders) into %USERPROFILE%\.local\bin
+> .\installLauncher.ps1          # writes the .cmd forwarders into %USERPROFILE%\.local\bin and adds it to the user PATH
 > .\installLauncher.ps1 -Remove  # removes every installed forwarder
+> .\installLauncher.ps1 -NoPath  # installs the forwarders without touching PATH
 > ```
 >
-> The forwarders are `.cmd` files, so the PowerShell execution policy never applies to them; each one re-launches the real `.ps1` with `-ExecutionPolicy Bypass`. Same-named `.ps1` forwarders written by earlier versions are removed on install, because PowerShell would otherwise resolve those first. They embed this checkout's path, so re-run the installer if the repository moves.
+> From another folder, type **`OpenClaude` or `OpenClaudeDashboard`** (no extension). The `.ps1` scripts exist only in the checkout, so `openClaude.ps1` (or a bare filename without `.\`) cannot be found on PATH. The forwarders are `.cmd` files, so the PowerShell execution policy never applies to them; each one re-launches the real `.ps1` with `-ExecutionPolicy Bypass`. Same-named `.ps1` forwarders written by earlier versions are removed on install, because PowerShell would otherwise resolve those first. They embed this checkout's path, so re-run the installer if the repository moves. If the default folder is missing from the user PATH, the installer now **adds it automatically**; terminals that were already open need to be reopened to see it.
 >
 > **If the execution policy blocks `.ps1` files**: the scripts are unsigned, so `AllSigned` (or a managed policy that requires signatures) fails with "the file is not digitally signed". Use the `.cmd` entry points instead — `.\installLauncher.cmd` to install, `.\OpenClaude.cmd` / `.\OpenClaudeDashboard.cmd` in the checkout, and the installed `OpenClaude`/`OpenClaudeDashboard` commands all work regardless of policy. If something still blocks, run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\installLauncher.ps1`, or set the current-user policy to `RemoteSigned` (`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, no admin required). A GPO that enforces `AllSigned` overrides the bypass; contact your administrator in that case.
 

@@ -62,6 +62,19 @@ class InstallLauncherTests(unittest.TestCase):
                 self.assertIn("%*", body)
                 self.assertIn("-ExecutionPolicy Bypass", body)
 
+    def test_a_custom_target_never_rewrites_the_user_path(self):
+        # Auto-registering the default folder must not leak into an explicit -Target install.
+        probe = [POWERSHELL, "-NoProfile", "-Command",
+                 "[Environment]::GetEnvironmentVariable('Path','User')"]
+        before = subprocess.run(probe, capture_output=True, text=True, timeout=60,
+                                encoding="utf-8", errors="replace").stdout
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr[-600:])
+        after = subprocess.run(probe, capture_output=True, text=True, timeout=60,
+                               encoding="utf-8", errors="replace").stdout
+        self.assertEqual(before, after)
+        self.assertNotIn(str(self.target), after)
+
     def test_forwarder_reaches_the_real_script(self):
         self.assertEqual(self.run_installer().returncode, 0)
         # An invalid provider is rejected by the target script's ValidateSet, which proves

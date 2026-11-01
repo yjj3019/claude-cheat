@@ -114,11 +114,12 @@ claude auth status
 **어느 폴더에서나 이름만으로 실행하려면** 한 번 설치합니다.
 
 ```powershell
-.\installLauncher.ps1          # %USERPROFILE%\.local\bin 에 OpenClaude·OpenClaudeDashboard(.cmd) + 이전 이름 포워더 생성
+.\installLauncher.ps1          # %USERPROFILE%\.local\bin 에 포워더 생성 + 사용자 PATH에 자동 등록(이미 있으면 생략)
 .\installLauncher.ps1 -Remove   # 설치한 포워더 전부 삭제
+.\installLauncher.ps1 -NoPath   # PATH는 건드리지 않고 포워더만 설치
 ```
 
-설치 폴더가 PATH에 등록되어 있으면 다른 작업 폴더에서도 `OpenClaude` 또는 `OpenClaudeDashboard`만 입력하면 됩니다. 포워더는 `.cmd`라서 PowerShell 실행 정책의 영향을 받지 않고, 내부에서 `-ExecutionPolicy Bypass`로 실제 `.ps1`을 실행합니다. 이전 버전이 설치한 같은 이름의 `.ps1` 포워더는 설치 시 자동으로 제거됩니다(PowerShell이 `.ps1`을 먼저 찾아 다시 막히는 것을 방지). 포워더는 이 체크아웃의 경로를 담으므로, 저장소를 옮기면 다시 설치하세요. `.local\bin`이 PATH에 없으면 설치 스크립트가 추가 명령을 안내합니다.
+다른 작업 폴더에서는 **`OpenClaude` 또는 `OpenClaudeDashboard`**(확장자 없이)만 입력하면 됩니다. `.ps1`은 체크아웃 폴더에만 있으므로 `openClaude.ps1`처럼 `.ps1`을 붙이거나 `.\` 없이 파일명만 쓰면 PATH에서 찾지 못합니다. 포워더는 `.cmd`라서 PowerShell 실행 정책의 영향을 받지 않고, 내부에서 `-ExecutionPolicy Bypass`로 실제 `.ps1`을 실행합니다. 이전 버전이 설치한 같은 이름의 `.ps1` 포워더는 설치 시 자동으로 제거됩니다(PowerShell이 `.ps1`을 먼저 찾아 다시 막히는 것을 방지). 포워더는 이 체크아웃의 경로를 담으므로, 저장소를 옮기면 다시 설치하세요. 기본 폴더가 사용자 PATH에 없으면 설치 스크립트가 **자동으로 추가**하며, 이미 열려 있던 터미널에서는 새 터미널을 열어야 반영됩니다.
 
 > **실행 정책으로 `.ps1`이 막히면**: 스크립트가 서명되지 않았으므로 `AllSigned`(또는 서명을 요구하는 관리 정책) 터미널에서는 `파일이 디지털 서명되지 않았습니다` 오류가 납니다. 이때는 `.cmd` 진입점을 사용하세요 — 설치(`.\installLauncher.cmd`), 체크아웃 직접 실행(`.\OpenClaude.cmd`·`.\OpenClaudeDashboard.cmd`), PATH의 `OpenClaude`/`OpenClaudeDashboard` 모두 정책과 무관하게 동작합니다. 그래도 막히면 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\installLauncher.ps1`처럼 실행하거나 현재 사용자 범위 정책을 `RemoteSigned`로 두세요(`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, 관리자 권한 불필요). 회사 GPO가 `AllSigned`를 강제하면 `-ExecutionPolicy Bypass`도 무시되므로 관리자에게 문의해야 합니다.
 
@@ -901,7 +902,7 @@ python -m unittest discover -s tests -p test_fuzz_dashboard.py  # 대시보드 �
 python tests/live_smoke.py --dry-run       # 설정 존재 여부만 확인(무과금)
 ```
 
-현재 저장소 기준 회귀 검사 수는 **Node 718개**(대시보드 DOM 95개 포함), **Python 685개**(11개는 환경 의존 검사로 skip)입니다. 테스트 수는 릴리스마다 달라질 수 있으므로 위 명령으로 직접 확인하세요.
+현재 저장소 기준 회귀 검사 수는 **Node 718개**(대시보드 DOM 95개 포함), **Python 686개**(11개는 환경 의존 검사로 skip)입니다. 테스트 수는 릴리스마다 달라질 수 있으므로 위 명령으로 직접 확인하세요.
 
 - Windows 프로세스 트리 테스트(`test_local_lifecycle`)와 동시성 스트레스(`test_dashboard_concurrency`)는 **기본 스위트에서 건너뜁니다**. 실제 프로세스 트리를 띄우거나 서버에 12스레드를 걸기 때문에 느리고 부하에 민감합니다. 필요할 때만 `$env:CLAUDE_CHEAT_SLOW = '1'`로 켜세요.
 - 프로세스 트리 테스트는 **Git Bash**가 필요합니다. `C:\Windows\System32\bash.exe`(WSL)는 Windows 파이썬 경로를 실행하지 못해 자동으로 건너뜁니다.

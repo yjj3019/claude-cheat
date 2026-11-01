@@ -1,12 +1,13 @@
-param([switch]$Remove, [string]$Target = (Join-Path $HOME '.local\bin'))
+param([switch]$Remove, [string]$Target = (Join-Path $HOME '.local\bin'), [switch]$NoPath)
 # Installs bare commands that forward to this checkout:
 #   OpenClaude.cmd            -> routing session
 #   OpenClaudeDashboard.cmd   -> dashboard
 #   startOpenClaude.cmd, startDashboard.cmd,
 #   startClaudeOpenRouter.cmd, startClaudeDashboard.cmd  -> forwarders for previous names
-#   .\installLauncher.ps1          # install or refresh
+#   .\installLauncher.ps1          # install or refresh (adds the default folder to the user PATH)
 #   .\installLauncher.cmd          # same, from a shell that blocks unsigned scripts
 #   .\installLauncher.ps1 -Remove  # delete every installed forwarder
+#   .\installLauncher.ps1 -NoPath  # install the forwarders but do not touch the user PATH
 #
 # The forwarders are .cmd on purpose: cmd.exe is not subject to the PowerShell execution
 # policy, and each one re-launches PowerShell with -ExecutionPolicy Bypass. Unsigned .ps1
@@ -136,7 +137,28 @@ foreach ($name in $commands.Keys) {
 
 Remove-LegacyForwarders
 
-$onPath = ($env:PATH -split ';' | Where-Object { $_ }) -contains $destination
+# Register the default install directory in the *user* PATH so a new terminal can run the bare
+# command without editing Windows Environment Variables by hand. A custom -Target is never
+# registered (the caller chose it deliberately), and -NoPath opts out.
+function Add-UserPathEntry([string]$directory) {
+    $entries = @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' | Where-Object { $_ })
+    $normalized = $entries | ForEach-Object { $_.TrimEnd('\', '/') }
+    if ($normalized -contains $directory) { return $false }
+    $updated = (@($entries) + $directory) -join ';'
+    [Environment]::SetEnvironmentVariable('Path', $updated, 'User')
+    return $true
+}
+
+$defaultTarget = Resolve-Directory (Join-Path $HOME '.local\bin')
+$onPath = ($env:PATH -split ';' | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\', '/') }) -contains $destination
+if (-not $onPath -and $destination -eq $defaultTarget -and -not $NoPath) {
+    if (Add-UserPathEntry $destination) {
+        Write-Host "added to user PATH: $destination (open a new terminal to use it there)"
+    }
+    $env:PATH = ($env:PATH.TrimEnd(';') + ';' + $destination)
+    $onPath = $true
+}
+
 if ($onPath) {
     Write-Host 'run from any folder:  OpenClaude   |   OpenClaudeDashboard'
 } else {
