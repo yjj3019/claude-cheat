@@ -4391,14 +4391,22 @@ def _stop_previous(port, path=None, timeout=5.0):
     if not _port_open(port):
         return False
     verdict = _verify_pid_record(record)
-    if verdict != "verified":
+    # An in-place auto-reload spawns the replacement as a child of the process it is
+    # replacing; the normal own-tree guard would refuse to stop the old instance.
+    forced = os.environ.pop("ROUTE_DASHBOARD_REEXEC", None)
+    if verdict != "verified" and forced != str(record.get("pid")):
         print(json.dumps({"event": "dashboard_previous_instance_refused",
                           **_refusal_report(record, verdict)}), file=sys.stderr, flush=True)
         return False
     try:
         os.kill(record["pid"], signal.SIGTERM)
     except OSError:
-        return False
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not _port_open(port):
+                return True
+            time.sleep(0.05)
+        return not _port_open(port)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if not _port_open(port):
@@ -4477,7 +4485,12 @@ def _auto_takeover_loop():
 
 
 def _auto_reload_loop(initial):
-    """Restart this dashboard in place when its own sources change."""
+    """Restart this dashboard when its own sources change.
+
+    The replacement is spawned first; it uses the normal single-instance restart path
+    (``_stop_previous``) to stop this process and bind the same port, so the listening
+    socket is never closed by a serving thread.
+    """
     if os.environ.get("ROUTE_DASHBOARD_AUTO_RELOAD", "1").strip().lower() in {"0", "false", "no"}:
         return
     while True:
@@ -4488,7 +4501,14 @@ def _auto_reload_loop(initial):
             continue
         if current != initial:
             _record_auto_update("dashboard source changed; restarting the dashboard")
-            os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
+            os.environ["ROUTE_DASHBOARD_REEXEC"] = str(os.getpid())
+            flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            with AUTO_UPDATE_LOG.open("a", encoding="utf-8") as log:
+                subprocess.Popen(
+                    [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
+                    cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                    creationflags=flags, close_fds=True)
+            os._exit(0)
 
 
 def serve(host="127.0.0.1", port=DEFAULT_PORT, refresh=3, allow_fallback=False, open_page=None):
