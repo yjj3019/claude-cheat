@@ -4507,7 +4507,7 @@ function renderSessionMonitor(data) {
       <td><span class="session-dot"></span><strong>${esc(session.project || '정보 없음')}</strong>
         ${session.project_source === 'inferred' ? '<span class="chip">추정</span>' : ''}
         ${session.branch ? `<span class="chip">${esc(session.branch)}</span>` : ''}
-        ${session.retry_health && session.retry_health.state !== 'ok' ? `<span class="chip chip-warn">${session.retry_health.state === 'rate_limited' ? '속도 제한' : '재시도 ' + num(session.retry_health.retries)}</span>` : ''}
+        ${session.retry_health && session.retry_health.state !== 'ok' ? `<span class="chip chip-warn">${session.retry_health.state === 'rate_limited' ? '속도 제한' : '재시도 이력 ' + num(session.retry_health.retries)}</span>` : ''}
         ${selected ? '<span class="chip chip-selected">표시 중</span>' : `<button type="button" class="btn btn-sm btn-ghost" data-session-select="${esc(session.instance_id)}">표시</button>`}
         <div class="session-path mono" title="${esc(session.cwd || '')}">${esc(session.cwd || '경로 미보고')}</div>
         <div class="session-service">${esc(names[session.provider] || session.provider || '?')} · :${esc(session.port)}</div></td>
