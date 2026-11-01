@@ -1,8 +1,14 @@
 import http from 'node:http';
 import { once } from 'node:events';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { appendFile, appendFileSync, readFileSync, renameSync, statSync, writeFileSync, unlinkSync } from 'node:fs';
+import { appendFile, appendFileSync, readFileSync, rename, renameSync, statSync, unlink, unlinkSync, writeFile, writeFileSync } from 'node:fs';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+
+// Monitoring: event-loop delay samples separate the proxy's own work from upstream latency.
+// The histogram's timer is unref'ed, so it never keeps the process alive.
+const loopLag = monitorEventLoopDelay({ resolution: 10 });
+loopLag.enable();
 
 // Diagnostics leave the process through one redaction pass: an upstream error body echoed
 // into a log line or an error response must never carry a credential. The tags stay stable
@@ -1098,6 +1104,19 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     const at = fraction => Number(sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * fraction))].toFixed(2));
     return { count: sorted.length, p50: at(0.5), p95: at(0.95), max: at(1) };
   };
+  const loopLagSummary = () => {
+    if (!loopLag.count) return { samples: 0, p50Ms: null, p95Ms: null, maxMs: null };
+    const ms = value => Number((value / 1e6).toFixed(2));
+    return { samples: loopLag.count, p50Ms: ms(loopLag.percentile(50)),
+      p95Ms: ms(loopLag.percentile(95)), maxMs: ms(loopLag.max) };
+  };
+  // Process health is measured, never inferred: RSS/heap and event-loop delay explain latency
+  // that upstream timings cannot (e.g. a blocked event loop during body parsing or logging).
+  const processSnapshot = () => {
+    const memory = process.memoryUsage();
+    return { pid: process.pid, rssBytes: memory.rss, heapUsedBytes: memory.heapUsed,
+      heapTotalBytes: memory.heapTotal, eventLoopLagMs: loopLagSummary() };
+  };
   const publicMetricModel = value => validOpenRouterModel(value) &&
     !/^(?:sk-|xai-|bearer)/i.test(value) &&
     !/(?:^|\/)(?:gsk_[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{30,})(?:$|\/)/i.test(value) &&
@@ -1122,6 +1141,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     ...(usageId ? { instanceId: usageId, usageRecording: { ...usageState, enqueued: usageSeq,
       pending: usageQueue.length + usageBatchSize } } : {}),
     uptimeMs: Date.now() - metrics.startedAt,
+    process: processSnapshot(),
     requests: metrics.requests, ok: metrics.ok, failed: metrics.failed,
     // Accepted message requests (including body upload), excluding diagnostics/metrics.
     inflightRequests: inflight,
@@ -1146,20 +1166,49 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     last: metrics.last,
     rateLimit: lastRateLimit ? { ...lastRateLimit } : null,
   });
-  let flushTimer = null, lastFlushAt = 0, metricsDirty = false;
-  const flushMetrics = () => {
+  let flushTimer = null, lastFlushAt = 0, metricsDirty = false, flushInFlight = false, flushSeq = 0;
+  // Persisted metrics are a convenience snapshot, so periodic flushes use async I/O: a
+  // writeFileSync + renameSync every second would block request handling for no benefit.
+  const writeSnapshot = (path, payload, sync, seq) => {
+    // Unique temp names prevent different sessions from racing on a shared legacy path.
+    const temporary = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+    if (sync) {
+      try { writeFileSync(temporary, payload, { mode: 0o600 }); renameSync(temporary, path); }
+      catch { try { unlinkSync(temporary); } catch {} }
+      return Promise.resolve();
+    }
+    return new Promise(resolve => {
+      writeFile(temporary, payload, { mode: 0o600 }, error => {
+        if (error) return unlink(temporary, () => resolve());
+        // A newer snapshot replaced this one while writing; discarding prevents stale data
+        // from landing after a fresh flush (for example during server close).
+        if (seq !== flushSeq) return unlink(temporary, () => resolve());
+        rename(temporary, path, renameError => {
+          if (renameError) unlink(temporary, () => resolve()); else resolve();
+        });
+      });
+    });
+  };
+  const flushMetrics = (sync = false) => {
     flushTimer = null;
     lastFlushAt = Date.now();
     if (!metricsDirty || (!metricsPath && !instanceMetricsPath)) return;
+    if (!sync && flushInFlight) return;
     metricsDirty = false;
     // The minute history is live-session only; keep disk snapshots compact.
     const { monitoringHistory: _liveHistory, tokenFlow: _liveTokenFlow, ...persisted } = metricsSnapshot();
-    for (const path of [metricsPath, instanceMetricsPath].filter(Boolean)) {
-      // Unique temp names prevent different sessions from racing on a shared legacy path.
-      const temporary = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
-      try { writeFileSync(temporary, JSON.stringify(persisted), { mode: 0o600 }); renameSync(temporary, path); }
-      catch { try { unlinkSync(temporary); } catch {} }
+    const payload = JSON.stringify(persisted);
+    const seq = ++flushSeq;
+    const paths = [metricsPath, instanceMetricsPath].filter(Boolean);
+    if (sync) {
+      for (const path of paths) writeSnapshot(path, payload, true, seq);
+      return;
     }
+    flushInFlight = true;
+    Promise.all(paths.map(path => writeSnapshot(path, payload, false, seq))).finally(() => {
+      flushInFlight = false;
+      if (metricsDirty) scheduleMetricsFlush();
+    });
   };
   const scheduleMetricsFlush = () => {
     metricsDirty = true;
@@ -1167,7 +1216,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     flushTimer = setTimeout(flushMetrics, Math.max(0, 1000 - (Date.now() - lastFlushAt)));
     flushTimer.unref?.();
   };
-  if (metricsPath || instanceMetricsPath) process.once('exit', flushMetrics);
+  const flushOnExit = () => flushMetrics(true);
+  if (metricsPath || instanceMetricsPath) process.once('exit', flushOnExit);
   let inflight = 0;
   // Admission is claimed before a message body is buffered: the semaphore bounds turns that
   // are concurrently parsing/routing, and the byte budget bounds their combined bodies.
@@ -2063,8 +2113,10 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   }
   if (metricsPath || instanceMetricsPath) server.once('close', () => {
     if (flushTimer) clearTimeout(flushTimer);
-    flushMetrics();
-    process.off('exit', flushMetrics);
+    // The close callback must leave a complete snapshot on disk for the dashboard, so this
+    // one flush stays synchronous; a pending async flush is invalidated by the sequence check.
+    flushMetrics(true);
+    process.off('exit', flushOnExit);
   });
   return server;
 }

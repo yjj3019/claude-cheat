@@ -1509,3 +1509,27 @@ test('a dropped dashboard connection backs off and reports the recovery', async 
   assert.equal(vm.runInContext('tickFailures', sandbox), 0);
   assert.match(context.nodes.get('toasts').children.at(-1).innerHTML, /복구/);
 });
+
+test('process health is rendered separately from upstream performance', () => {
+  const { context, sandbox } = loadDashboard();
+  const grid = context.document.getElementById('grid');
+  let inserted = '';
+  grid.insertAdjacentHTML = (position, html) => { inserted = html; };
+  sandbox.render(fixture({ proxy_metrics: { stale: false, process: {
+    pid: 1234, rssBytes: 120 * 1048576, heapUsedBytes: 40 * 1048576,
+    eventLoopLagMs: { samples: 20, p50Ms: 2, p95Ms: 12.5, maxMs: 30 } } } }));
+  assert.match(inserted, /프로세스 상태/);
+  assert.match(inserted, /120\.0 MB/);
+  assert.match(inserted, /40\.0 MB/);
+  assert.match(inserted, /12\.5 ms/);
+  assert.doesNotMatch(inserted, /undefined/);
+});
+
+test('process health is not invented when the proxy reports none', () => {
+  const { context, sandbox } = loadDashboard();
+  const grid = context.document.getElementById('grid');
+  let calls = 0;
+  grid.insertAdjacentHTML = () => { calls += 1; };
+  sandbox.render(fixture({ proxy_metrics: { stale: true } }));
+  assert.equal(calls, 0);
+});

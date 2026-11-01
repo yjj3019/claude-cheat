@@ -220,3 +220,20 @@ OpenRouter /api/v1/key, /models ─→ account/pricing (TTL 60s/3600s)
 - Node: `tests/dashboard_dom.test.mjs` 82개, `tests/streaming.test.mjs` 16개, 프록시·로깅 316개(회전 연속 마커 검증 포함) 통과. 전체 스위트는 아래 최종 확인 절 참조.
 - 대시보드를 새 코드로 재시작한 뒤 `/api/snapshot`·`/api/status`에서 `provider`, `snapshot_age_seconds`, `connection_counts`, `window_truncated`와 새 UI 카드(연결점별 결정·스냅샷 갱신)를 확인한다.
 
+
+
+## 6. 프록시 자체 부하 모니터링 (2026-11-01)
+
+업스트림 지연과 프록시 자체 병목을 분리하기 위해 `/api/metrics`에 **측정 기반 프로세스 상태**를 추가했습니다.
+
+| 항목 | 내용 |
+| --- | --- |
+| `process.pid` · `rssBytes` · `heapUsedBytes` · `heapTotalBytes` | 실행 중 프록시가 `process.memoryUsage()`로 직접 측정한 값 |
+| `process.eventLoopLagMs` | `perf_hooks.monitorEventLoopDelay` 히스토그램의 samples·p50·p95·max(ms). 타이머가 예정보다 늦게 실행된 시간 |
+| 대시보드 | **프로세스 상태** 카드(RSS·힙·이벤트 루프 p95/max)를 기존 업스트림 성능 지표와 분리해 표시 |
+| 능동 경고 | 이벤트 루프 지연 p95 ≥ **250ms**, RSS ≥ **1.5GiB** |
+| 지표 파일 기록 | 1초 간격 스냅샷을 **비동기 `writeFile` + `rename`**으로 저장(기존 `writeFileSync` + `renameSync`는 이벤트 루프를 블로킹). server close/exit는 대시보드가 잘린 파일을 읽지 않도록 최종 스냅샷을 동기로 기록하고, 진행 중이던 비동기 쓰기는 시퀀스 검사로 폐기 |
+
+측정 예(로컬 합성, 업스트림 즉시 응답, 동시성 32, 400요청): **697 req/s**, 외부 p95 0.71ms, 이벤트 루프 지연 p95 **76.2ms**/max 136.7ms, RSS 107MB, 거부 0. 로컬 하네스 기준이며 실제 제공자 지연은 포함하지 않습니다.
+
+검증: Node **722 pass**(DOM 97, metrics 11), Python **688개 수집(11 skip)**, 대시보드 모듈 260 pass.

@@ -399,10 +399,13 @@ The **insights** card ranks *what changed, why, and what to do next* instead of 
 
 The server-side checks are read-only: they never restart a session, write settings or call a provider. Banners and the title badge work even when notification permission is denied.
 
+**Process health card.** The dashboard shows what the running proxy reports about itself: **RSS and heap usage**, **event-loop delay p95/max** and the process PID. Event-loop delay measures how late timers ran because the proxy's own work — body parsing, header/field validation, logging, metrics persistence — blocked the loop; it is separate from upstream latency. An event-loop p95 of **250 ms or more** raises a proactive warning, and **RSS of 1.5 GiB or more** raises a memory warning. The figures require the same session token as `/api/metrics`, and the `.proxy-metrics.json` snapshot is written **asynchronously** so persistence never blocks request handling.
+
 | Panel | Content |
 | --- | --- |
 | Now | **OpenRouter, Local LLM or CLI serving / Plan bypass / idle**, the **last request's actual routing model**, age, reason |
 | Performance | Live proxy session requests, failure rate, average requests per minute, external and Plan routes, response and first-byte latency. Observed output token throughput is shown only when response usage is reported. |
+| Process health | Proxy RSS/heap, **event-loop delay p95/max**, PID — separates the proxy's own bottlenecks from upstream latency. |
 | Alerts | Shown when Plan bypass reaches 50% within ten minutes, a circuit opens, a 400/413/422 rejection repeats, or the balance drops below 10% |
 | Last 60 minutes | Replacement versus Plan counts, circuit opens |
 | Bypass reasons | Counts per `native_feature` `detail` with **meaning and action**, external failure statuses and validation classes |

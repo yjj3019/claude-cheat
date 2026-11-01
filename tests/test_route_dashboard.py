@@ -3881,6 +3881,27 @@ class ProactiveReactionTests(unittest.TestCase):
                                        None, None, routing_values={"ROUTE_DEFAULT_PROVIDER": "bogus"})
         self.assertIn("routing_configuration_invalid", self.codes(alerts))
 
+    def test_proxy_event_loop_delay_and_memory_are_surfaced(self):
+        metrics = {"configuration": {"provider": "openrouter"},
+                   "process": {"rssBytes": 2 * 1024 * 1024 * 1024,
+                               "eventLoopLagMs": {"samples": 30, "p50Ms": 12, "p95Ms": 420, "maxMs": 910}}}
+        alerts = dash.proactive_alerts(
+            {"openrouter": True, "local": False, "cli": False},
+            {"provider": "openrouter"}, metrics,
+            routing_values={"ROUTE_DEFAULT_PROVIDER": "openrouter"})
+        self.assertIn("proxy_event_loop_lag", self.codes(alerts))
+        self.assertIn("proxy_memory_high", self.codes(alerts))
+
+    def test_a_healthy_proxy_process_raises_nothing(self):
+        metrics = {"configuration": {"provider": "openrouter"},
+                   "process": {"rssBytes": 120 * 1024 * 1024,
+                               "eventLoopLagMs": {"samples": 30, "p50Ms": 4, "p95Ms": 18, "maxMs": 40}}}
+        alerts = dash.proactive_alerts(
+            {"openrouter": True, "local": False, "cli": False},
+            {"provider": "openrouter"}, metrics,
+            routing_values={"ROUTE_DEFAULT_PROVIDER": "openrouter"})
+        self.assertEqual(alerts, [])
+
 
 if __name__ == "__main__":
     unittest.main()

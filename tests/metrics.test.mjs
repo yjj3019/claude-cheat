@@ -91,6 +91,51 @@ test('metrics endpoint requires the session token', async () => {
   }
 });
 
+test('metrics expose measured process health and event-loop delay', async () => {
+  const { server, metrics } = await start();
+  try {
+    const response = await fetch(metrics, { headers: { 'x-local-route-token': NONCE } });
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+    assert.ok(Number.isInteger(payload.process.pid) && payload.process.pid > 0);
+    assert.ok(payload.process.rssBytes > 0);
+    assert.ok(payload.process.heapUsedBytes > 0);
+    assert.ok(payload.process.heapTotalBytes >= payload.process.heapUsedBytes);
+    const lag = payload.process.eventLoopLagMs;
+    assert.ok(Number.isInteger(lag.samples) && lag.samples >= 0);
+    if (lag.samples > 0) {
+      assert.ok(lag.p50Ms >= 0 && lag.p95Ms >= lag.p50Ms && lag.maxMs >= lag.p95Ms);
+    }
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test('periodic metrics persistence is asynchronous yet keeps the final snapshot', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'claude-cheat-metrics-async-'));
+  const path = join(dir, 'metrics.json');
+  const { server, base } = await start({ metricsPath: path });
+  try {
+    assert.equal(await send(base), 200);
+    // The flush interval is one second; wait past it to prove the async write completes.
+    await new Promise(resolve => setTimeout(resolve, 1400));
+    const snapshot = JSON.parse(await readFile(path, 'utf8'));
+    assert.equal(snapshot.requests, 1);
+    assert.equal(snapshot.ok, 1);
+    assert.ok(snapshot.process.rssBytes > 0);
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+    // Closing still flushes synchronously so the dashboard never sees a truncated file.
+    const finalSnapshot = JSON.parse(await readFile(path, 'utf8'));
+    assert.equal(finalSnapshot.requests, 1);
+  } finally {
+    server.closeAllConnections();
+    if (server.listening) await new Promise(resolve => server.close(resolve));
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('closing a proxy flushes pending metrics and removes its exit listener', async () => {
   const dir=await mkdtemp(join(tmpdir(),'claude-cheat-metrics-close-'));
   const path=join(dir,'metrics.json'), baseline=process.listenerCount('exit');

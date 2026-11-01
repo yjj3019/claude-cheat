@@ -236,9 +236,10 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 토큰 오류 안내 | 대시보드 재시작으로 토큰이 바뀐 뒤 설정 페이지가 "새로고침"만 안내하던 문제. 403이면 `write_url`로 다시 접속하라는 구체적 안내로 교체 | 수정 |
 | 토큰 재시작 유지 | 재시작마다 토큰이 바뀌어 열어 둔 설정 탭이 전부 무효화되던 문제. 토큰을 `.dashboard.token`(같은 사용자 파일, Git 제외)에 보관해 재시작 후에도 같은 탭이 동작. 교체는 파일 삭제 또는 `DASHBOARD_TOKEN`. CLI 감지 403도 구체적 안내로 교체 | 수정 |
 | CLI 자동 검색 | 설정 화면 CLI 카드에 **CLI 자동 검색** 버튼 추가. `/api/cli` 감지 결과로 CLI 종류와 실행 파일 경로를 채움(지원 백엔드만, 임의 PATH 명령 검색 아님). 채운 값은 저장 버튼으로 확정. DOM 시뮬레이션(채움·고정 경로 보존·미설치·403)과 실서버 흐름(감지→저장→기본값→발행 설정) 테스트로 고정 | 기능 추가 |
+| 프록시 자체 부하 모니터링 | `/api/metrics`에 프로세스 상태(pid·RSS·힙·이벤트 루프 지연 p50/p95/max)를 추가하고 대시보드 **프로세스 상태** 카드로 표시. 이벤트 루프 p95 ≥250ms·RSS ≥1.5GiB는 능동 경고. 지표 파일 기록을 **비동기**로 바꿔 이벤트 루프 블로킹 제거(close/exit는 동기 최종 flush) | 기능 추가 |
 | 저장소 위생 | 추적되지 않던 `NUL` 잔여 파일 삭제 | 정리 |
 
-검증: Node **718 pass / 0 fail**(DOM 95 포함), Python **686개 수집(11 skip)**. 변경 모듈(`test_launcher_arguments`·`test_route_cli`·`test_route_dashboard`·`test_handover_contract`·`test_launcher_scripts`) 통과, 이전 flaky였던 `ConnectionTest.test_reasons_through_shim`은 새 상한에서 21초에 통과.
+검증: Node **722 pass / 0 fail**(DOM 97 포함), Python **688개 수집(11 skip)**. 변경 모듈(`test_launcher_arguments`·`test_route_cli`·`test_route_dashboard`·`test_handover_contract`·`test_launcher_scripts`) 통과, 이전 flaky였던 `ConnectionTest.test_reasons_through_shim`은 새 상한에서 21초에 통과.
 
 
 ## 13. 능동형 반응 (2026-11-01)
@@ -253,7 +254,7 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 연결 자동 복구 | `/api/snapshot` 실패 시 1·2·4·8·16초 지수 백오프로 재시도하고, 복구 시 토스트로 알림 | 기능 추가 |
 | 보안 경계 | 능동 점검은 로컬 상태만 읽고 쓰기·세션 제어를 하지 않음. 알림 권한 거부 시에도 배너·배지는 동작 | 문서화 |
 
-검증: Node **718 pass / 0 fail**(DOM 95 포함), Python **686개 수집(11 skip)**, 대시보드 모듈 258 pass. 라이브 대시보드에서 `proactive` 키·탭 배지·알림 버튼 서빙 확인.
+검증: Node **722 pass / 0 fail**(DOM 97 포함), Python **688개 수집(11 skip)**, 대시보드 모듈 260 pass. 라이브 대시보드에서 `proactive` 키·탭 배지·알림 버튼 서빙 확인.
 
 
 ## 14. 대시보드 헤더 레이아웃 (2026-11-01)
@@ -266,7 +267,7 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 1600px 이하 2행 | 브랜드+내비 1행, 액션(상태·알림·새로고침·도움말) 2행으로 분리. 720px 이하 기존 모바일 순서 유지 | 수정 |
 | 넓은 창 | 1600px 초과에서는 한 행 유지(내비 4개 라벨 한 줄) | 확인 |
 
-검증: 헤드리스 Edge 스크린샷 1087·1280·1500·1920px에서 라벨 줄바꿈 없음, 대시보드 모듈 258 pass.
+검증: 헤드리스 Edge 스크린샷 1087·1280·1500·1920px에서 라벨 줄바꿈 없음, 대시보드 모듈 260 pass.
 
 
 ## 15. 실행기 설치 자동화 (2026-11-01)
@@ -279,4 +280,4 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 안전 경계 | 명시적 `-Target`에는 적용하지 않고 `-NoPath`로 끌 수 있음(테스트로 사용자 PATH 불변 확인) | 확인 |
 | 문서 | `openClaude.ps1`이 아니라 `OpenClaude`(확장자 없이)·`OpenClaude.cmd`가 PATH 명령임을 README에 명시 | 문서 정정 |
 
-검증: 설치 테스트 11 pass(사용자 PATH 불변 포함), Python **686개 수집(11 skip)**.
+검증: 설치 테스트 11 pass(사용자 PATH 불변 포함), Python **688개 수집(11 skip)**.
