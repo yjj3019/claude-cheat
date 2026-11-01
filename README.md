@@ -50,7 +50,7 @@ cd D:\AI-Codding\Claude\claude-cheat
 
 ## 목차
 
-자주 찾는 항목: [요구사항 원장](docs/USER-REQUIREMENTS.ko.md) · [OpenCode 기능 조사](docs/OPENCODE-FEATURE-SURVEY.ko.md) · [전역 실행기와 자동 PATH](#전역-실행기-설치와-자동-path) · [실시간 대시보드](#실시간-대시보드) · [사용량 통계](#사용량-통계) · [CLI 백엔드](#cli를-모델-백엔드로-사용하기) · [AI 진단 API](#ai-디버깅용-상태-점검-api)
+자주 찾는 항목: [요구사항 원장](docs/USER-REQUIREMENTS.ko.md) · [OpenCode 기능 조사](docs/OPENCODE-FEATURE-SURVEY.ko.md) · [Superagent 기능 조사](docs/SUPERAGENT-FEATURE-SURVEY.ko.md) · [전역 실행기와 자동 PATH](#전역-실행기-설치와-자동-path) · [실시간 대시보드](#실시간-대시보드) · [사용량 통계](#사용량-통계) · [CLI 백엔드](#cli를-모델-백엔드로-사용하기) · [AI 진단 API](#ai-디버깅용-상태-점검-api)
 
 1. [어떤 요청이 어디로 가나요?](#1-어떤-요청이-어디로-가나요)
 2. [준비와 설정 파일 위치](#2-준비와-설정-파일-위치)
