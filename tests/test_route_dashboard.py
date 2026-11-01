@@ -2747,6 +2747,19 @@ class CliSettingsTests(unittest.TestCase):
             with self.assertRaises(ImportError):
                 dash._cli_detection({})
 
+    def test_detection_passes_the_saved_pinned_binary_to_the_cli_probe(self):
+        # The settings card fills its path from this detection, so a pinned path must be honoured.
+        values = self.valid(CLI_BINARY="C:\\tools\\codex.exe")
+        kinds = dash._cli_detection(values)
+        self.assertEqual([call for call in self.calls if call[0] == "detect_all"],
+                         [("detect_all", {"codex": "C:\\tools\\codex.exe"})])
+        self.assertEqual([row["kind"] for row in kinds], ["codex", "grok", "claude"])
+        self.assertTrue(kinds[0]["found"])
+
+    def test_detection_without_a_pinned_binary_uses_the_default_probe(self):
+        dash._cli_detection({"CLI_KIND": "codex", "CLI_BINARY": ""})
+        self.assertEqual([call for call in self.calls if call[0] == "detect_all"], [("detect_all", None)])
+
     def test_cli_catalog_reads_only_visible_valid_codex_slugs(self):
         import tempfile
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {"CODEX_HOME": directory}):
@@ -3062,6 +3075,24 @@ class ConfigEndpointAuthTests(unittest.TestCase):
         response = self.get([("x-dashboard-token", "\xff")])
         self.assertIn(b"403", response.split(b"\r\n", 1)[0])
         self.assertIn(b"token_required", response)
+
+    def test_cli_detection_needs_the_token_and_returns_supported_kinds(self):
+        import urllib.error
+        import urllib.request
+        base = f"http://127.0.0.1:{self.port}/api/cli"
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with self.assertRaises(urllib.error.HTTPError) as denied:
+            opener.open(base, timeout=10)
+        self.assertEqual(denied.exception.code, 403)
+        self.assertIn(b"token_required", denied.exception.read())
+        denied.exception.close()
+        kinds = [{"kind": "claude", "found": True, "name": "claude.exe",
+                  "dir": "C:\\fixture", "via": "PATH", "version": "2.1.316", "reason": None}]
+        with mock.patch.object(dash, "_cli_detection", return_value=kinds):
+            requested = urllib.request.Request(base, headers={"x-dashboard-token": dash.TOKEN})
+            body = opener.open(requested, timeout=10).read().decode("utf-8")
+        self.assertIn('"claude"', body)
+        self.assertIn("2.1.316", body)
 
     def test_blackbox_actions_require_token_and_reject_cross_origin(self):
         import blackbox
@@ -3707,6 +3738,83 @@ class CredentialSafetyTests(unittest.TestCase):
         values["LOCAL_LLM_MODELS_URL"] = "http://127.0.0.1:8080/v1/models"
         self.assertEqual(dash._models_endpoint("local", values)[0],
                          "http://127.0.0.1:8080/v1/models")
+
+
+class CliAutoDetectFlowTests(unittest.TestCase):
+    """Simulates the settings flow end to end: detect the CLI, save it, select it for launch."""
+
+    def setUp(self):
+        import threading
+
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.path = self.root / "openclaude.config.yaml"
+        files = {name: {**spec, "path": self.path} for name, spec in dash.CONFIG_FILES.items()}
+        self.enterContext(mock.patch.object(dash, "CONFIG_FILES", files))
+        # A pinned path must be an existing file whose name matches the kind.
+        (self.root / "claude.exe").write_bytes(b"")
+        self.kinds = [{"kind": "claude", "found": True, "name": "claude.exe", "dir": str(self.root),
+                       "via": "pinned", "version": "2.1.316", "reason": None},
+                      {"kind": "codex", "found": False, "name": None, "dir": None, "via": None,
+                       "version": None, "reason": "not_found"}]
+        self.enterContext(mock.patch.object(dash, "_cli_detection", return_value=self.kinds))
+        self.server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self._shutdown)
+        self.base = f"http://127.0.0.1:{self.port}"
+        self.headers = {"x-dashboard-token": dash.TOKEN, "Origin": self.base,
+                        "Content-Type": "application/json"}
+
+    def _shutdown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def get(self, path):
+        import urllib.request
+
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        request = urllib.request.Request(self.base + path,
+                                         headers={"x-dashboard-token": dash.TOKEN})
+        return json.loads(opener.open(request, timeout=15).read().decode("utf-8"))
+
+    def post(self, path, payload):
+        import urllib.request
+
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        request = urllib.request.Request(self.base + path, data=json.dumps(payload).encode("utf-8"),
+                                         headers=self.headers, method="POST")
+        return json.loads(opener.open(request, timeout=15).read().decode("utf-8"))
+
+    def test_detected_cli_can_be_saved_and_selected_for_the_next_launch(self):
+        rows = self.get("/api/cli")["kinds"]
+        self.assertEqual(rows[0]["kind"], "claude")
+        self.assertTrue(rows[0]["found"])
+        detected = os.path.join(rows[0]["dir"], rows[0]["name"])
+        self.assertTrue(os.path.isfile(detected))
+
+        saved = self.post("/api/config", {"provider": "cli", "values": {
+            "CLI_KIND": rows[0]["kind"], "CLI_BINARY": detected,
+            "CLI_MODEL": "", "CLI_TIMEOUT_S": "60"}})
+        self.assertTrue(saved["saved"])
+        values = dash.read_settings("cli")
+        self.assertEqual(values["CLI_KIND"], "claude")
+        self.assertEqual(values["CLI_BINARY"], detected)
+
+        snapshot = dash.config_snapshot()["cli"]["fields"]
+        self.assertEqual(snapshot["CLI_KIND"]["value"], "claude")
+        self.assertEqual(snapshot["CLI_BINARY"]["value"], detected)
+
+        chosen = self.post("/api/default-provider", {"provider": "cli"})
+        self.assertTrue(chosen["saved"])
+        self.assertEqual(chosen["default_provider"], "cli")
+        # The launcher reads the same saved values for the next session.
+        published = self.get("/api/config")
+        self.assertEqual(published["default_provider"], "cli")
+        self.assertEqual(published["cli"]["fields"]["CLI_KIND"]["value"], "claude")
+        import routeConfig
+        launcher_view = routeConfig.Store(self.path)
+        self.assertEqual(launcher_view.read_provider("cli")["CLI_KIND"], "claude")
+        self.assertEqual(launcher_view.read_provider("routing")["ROUTE_DEFAULT_PROVIDER"], "cli")
 
 
 if __name__ == "__main__":

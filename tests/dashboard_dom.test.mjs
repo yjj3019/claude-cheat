@@ -628,7 +628,8 @@ const READY_LOCAL = { fields: {
   LOCAL_LLM_URL: { value: 'http://127.0.0.1:11434/v1/messages', set: true },
   LOCAL_LLM_MODEL: { value: 'llama', set: true } } };
 
-async function settingsPage({ config, store = new Map(), blockedStorage = false, configStatus = 200 } = {}) {
+async function settingsPage({ config, store = new Map(), blockedStorage = false, configStatus = 200,
+  cli = [], cliStatus = 200 } = {}) {
   const context = buildContext();
   const handlers = {};
   const select = context.document.getElementById('provider-select');
@@ -636,6 +637,12 @@ async function settingsPage({ config, store = new Map(), blockedStorage = false,
   const requests = [];
   context.fetch = async (url, options) => {
     requests.push({ url, options });
+    if (url === '/api/cli' && cliStatus !== 200) {
+      return { ok: false, status: cliStatus,
+        clone() { return { json: async () => ({ error: 'token_required' }) }; },
+        json: async () => ({ error: 'token_required' }) };
+    }
+    if (url === '/api/cli') return { ok: true, status: 200, json: async () => ({ kinds: cli }) };
     return { ok: configStatus === 200, status: configStatus, json: async () => config };
   };
   context.localStorage = blockedStorage
@@ -650,6 +657,49 @@ async function settingsPage({ config, store = new Map(), blockedStorage = false,
 }
 
 const visible = nodes => ['openrouter', 'local'].filter(name => !nodes.get(`card-${name}`).hidden);
+
+const DETECTED_CLIS = [
+  { kind: 'codex', found: true, name: 'codex.exe',
+    dir: 'C:\\Users\\fixture\\AppData\\Local\\Programs\\OpenAI\\Codex-cli\\bin', via: 'PATH', version: '0.166.0', reason: null },
+  { kind: 'claude', found: true, name: 'claude.exe', dir: 'C:\\Users\\fixture\\.local\\bin', via: 'PATH',
+    version: '2.1.316', reason: null },
+];
+
+test('CLI auto-detect fills the kind and executable path', async () => {
+  const page = await settingsPage({ config: { openrouter: READY_OPENROUTER, local: READY_LOCAL }, cli: DETECTED_CLIS });
+  await vm.runInContext('autoDetectCli()', page.sandbox);
+  assert.equal(page.nodes.get('cfg-cli-CLI_KIND').value, 'codex');
+  assert.equal(page.nodes.get('cfg-cli-CLI_BINARY').value,
+    'C:\\Users\\fixture\\AppData\\Local\\Programs\\OpenAI\\Codex-cli\\bin\\codex.exe');
+  assert.match(page.nodes.get('cli-detect-status').textContent, /codex/);
+  assert.match(page.nodes.get('cli-detect-status').textContent, /0\.166\.0/);
+  const cliCall = page.requests.find(request => request.url === '/api/cli');
+  assert.ok(cliCall, 'auto-detect must re-query the CLI endpoint');
+  assert.ok(cliCall.options.headers['x-dashboard-token'], 'detection carries the write token');
+});
+
+test('CLI auto-detect keeps a user-pinned executable path', async () => {
+  const page = await settingsPage({ config: { openrouter: READY_OPENROUTER, local: READY_LOCAL }, cli: DETECTED_CLIS });
+  page.sandbox.document.getElementById('cfg-cli-CLI_BINARY').value = 'D:\\custom\\codex.exe';
+  await vm.runInContext('autoDetectCli()', page.sandbox);
+  assert.equal(page.nodes.get('cfg-cli-CLI_BINARY').value, 'D:\\custom\\codex.exe');
+  assert.equal(page.nodes.get('cfg-cli-CLI_KIND').value, 'codex');
+});
+
+test('CLI auto-detect explains when no supported backend is installed', async () => {
+  const page = await settingsPage({ config: { openrouter: READY_OPENROUTER, local: READY_LOCAL },
+    cli: [{ kind: 'claude', found: false, name: null, dir: null, version: null, reason: 'not_found' }] });
+  await vm.runInContext('autoDetectCli()', page.sandbox);
+  assert.match(page.nodes.get('cli-detect-status').textContent, /감지된 CLI가 없습니다/);
+  assert.equal(page.sandbox.document.getElementById('cfg-cli-CLI_KIND').value, '');
+});
+
+test('CLI detection explains a missing write token instead of an empty table', async () => {
+  const page = await settingsPage({ config: { openrouter: READY_OPENROUTER, local: READY_LOCAL }, cliStatus: 403 });
+  assert.match(page.nodes.get('cli-detect').innerHTML, /쓰기 토큰/);
+  await vm.runInContext('autoDetectCli()', page.sandbox);
+  assert.match(page.nodes.get('cli-detect').innerHTML, /쓰기 토큰/);
+});
 
 test('reset asks before posting and refreshes after a partial failure', async () => {
   const page = await settingsPage({ config: { openrouter: READY_OPENROUTER, local: READY_LOCAL } });

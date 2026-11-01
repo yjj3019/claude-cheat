@@ -235,7 +235,7 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 실행 정책 진입점 | 설치 포워더·체크아웃 진입점을 `.cmd`로 바꿔 PowerShell 실행 정책(`AllSigned`)과 무관하게 실행. 설치 시 같은 이름의 구 `.ps1` 포워더를 제거해 PowerShell이 다시 `.ps1`을 우선 선택하지 않게 함 | 수정 |
 | 토큰 오류 안내 | 대시보드 재시작으로 토큰이 바뀐 뒤 설정 페이지가 "새로고침"만 안내하던 문제. 403이면 `write_url`로 다시 접속하라는 구체적 안내로 교체 | 수정 |
 | 토큰 재시작 유지 | 재시작마다 토큰이 바뀌어 열어 둔 설정 탭이 전부 무효화되던 문제. 토큰을 `.dashboard.token`(같은 사용자 파일, Git 제외)에 보관해 재시작 후에도 같은 탭이 동작. 교체는 파일 삭제 또는 `DASHBOARD_TOKEN`. CLI 감지 403도 구체적 안내로 교체 | 수정 |
-| CLI 자동 검색 | 설정 화면 CLI 카드에 **CLI 자동 검색** 버튼 추가. `/api/cli` 감지 결과로 CLI 종류와 실행 파일 경로를 채움(지원 백엔드만, 임의 PATH 명령 검색 아님). 채운 값은 저장 버튼으로 확정 | 기능 추가 |
+| CLI 자동 검색 | 설정 화면 CLI 카드에 **CLI 자동 검색** 버튼 추가. `/api/cli` 감지 결과로 CLI 종류와 실행 파일 경로를 채움(지원 백엔드만, 임의 PATH 명령 검색 아님). 채운 값은 저장 버튼으로 확정. DOM 시뮬레이션(채움·고정 경로 보존·미설치·403)과 실서버 흐름(감지→저장→기본값→발행 설정) 테스트로 고정 | 기능 추가 |
 | 저장소 위생 | 추적되지 않던 `NUL` 잔여 파일 삭제 | 정리 |
 
-검증: Node **710 pass / 0 fail**(DOM 87 포함), Python **673개 수집(11 skip)**. 변경 모듈(`test_launcher_arguments`·`test_route_cli`·`test_route_dashboard`·`test_handover_contract`·`test_launcher_scripts`) 통과, 이전 flaky였던 `ConnectionTest.test_reasons_through_shim`은 새 상한에서 21초에 통과.
+검증: Node **714 pass / 0 fail**(DOM 91 포함), Python **677개 수집(11 skip)**. 변경 모듈(`test_launcher_arguments`·`test_route_cli`·`test_route_dashboard`·`test_handover_contract`·`test_launcher_scripts`) 통과, 이전 flaky였던 `ConnectionTest.test_reasons_through_shim`은 새 상한에서 21초에 통과.
