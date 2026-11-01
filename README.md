@@ -913,6 +913,7 @@ node --test tests/dashboard_dom.test.mjs
 | 증상 | 먼저 확인할 내용 |
 | --- | --- |
 | `openClaude.ps1`이 인식되지 않음 | PATH 명령은 **`OpenClaude`**(확장자 없이)입니다. `.ps1`은 체크아웃 폴더에만 있습니다. `Get-Command OpenClaude`로 확인하고, 없으면 새 터미널에서 `.\installLauncher.ps1`(또는 `.\installLauncher.cmd`)을 한 번 실행하세요 |
+| `찾을 수 없지만 현재 위치에 있습니다` | PowerShell은 현재 폴더의 스크립트를 자동으로 실행하지 않습니다. 체크아웃 폴더라면 **`.\OpenClaude.ps1`**처럼 `.\`를 붙이거나, PATH 명령 **`OpenClaude`**(확장자 없이)를 사용하세요 |
 | 다른 폴더에서만 `OpenClaude`가 안 됨 | PATH 갱신 전 터미널인지 확인하고 새 터미널을 엽니다. `$env:PATH -split ';'`에 `C:\Users\<사용자>\.local\bin`이 없으면 설치 스크립트를 다시 실행하거나 `-NoPath`로 설치한 경우 사용자 PATH에 직접 추가하세요 |
 | `openclaude.config.yaml`을 찾지 못함 | 현재 작업 폴더가 아닌 실제 실행기 폴더에 저장했는지 확인 |
 | OpenRouter 401 / `Missing Authentication header` | 전용 파일의 실제 키·유효성을 확인; HUD 플러그인 설치 성공은 API 인증 성공과 별개 |
