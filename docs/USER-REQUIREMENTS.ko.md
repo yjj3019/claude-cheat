@@ -147,7 +147,7 @@
 
 **수용 기준**
 
-- 라우트 로그는 **줄마다 개별 동기 append하지 않고 10ms 배치·상한 큐(4,096줄/2MiB)·드롭 카운터·종료 동기 flush**로 기록한다. 큐가 넘치면 진단 줄만 드롭하고 요청은 계속 처리된다.
+- 라우트 로그는 **줄마다 개별 동기 append하지 않고 10ms 비동기 배치·상한 큐(4,096줄/2MiB)·드롭 카운터·종료 동기 flush**로 기록한다. 큐가 넘치면 진단 줄만 드롭하고 요청은 계속 처리된다.
 - `/api/metrics`에 `routeLog` 지표(written/dropped/errors/queueLines/queuedBytes/writeMsMax/writeMsAvg)가 포함된다.
 - 대시보드 프로세스 카드에 **라우트 로그 쓰기 max·큐·드롭**이 표시되어 이벤트 루프 지연 원인을 로그 I/O와 구분할 수 있다.
 - 기존 로그 회전, start 마커, 개행 위조 방지, `-Stop`/handover 시 flush 동작이 유지된다.

@@ -389,6 +389,6 @@ DSH 게이트웨이·영속화·텔레메트리 설계를 참고해 프록시의
 - `/api/snapshot`이 시계·샘플링 잡음·PID·원시 RSS/루프 버퍼를 제외한 안정 내용으로 **ETag**를 계산합니다.
 - `If-None-Match`가 일치하면 **304 Not Modified**를 반환하고, 응답에 `x-dashboard-cache: HIT/MISS`를 표시합니다.
 - 대시보드 JS는 ETag를 보내고 304에서 기존 `SNAP`을 유지하므로, 유휴 시 **128KB급 본문 전송과 전체 DOM 재렌더를 생략**합니다.
-- 프록시 라우트 로그는 10ms 배치·상한 큐로 기록하고 `/api/metrics`의 `routeLog`와 프로세스 카드에 writer max·큐·드롭을 노출합니다.
+- 프록시 라우트 로그는 10ms 비동기 배치·상한 큐로 기록하고 `/api/metrics`의 `routeLog`와 프로세스 카드에 writer max·큐·드롭을 노출합니다.
 
 검증: 라이브 `/api/snapshot` ETag + `curl If-None-Match` → **304**, 첫 응답 **MISS**·조건부 **HIT**. Python **709 tests OK**(11 skip), Node **724 pass**, 대시보드 모듈 **277 pass**, 프록시 벤치마크 PASS.
