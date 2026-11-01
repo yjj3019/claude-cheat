@@ -331,6 +331,10 @@ Independent validation after these Local additions passed Node tests, Python tes
 
 Requires Claude Code 2.1.304 or newer and the same two `openclaude.config.yaml` OpenRouter settings. All Claude model roles use the selected `OPENROUTER_MODEL`, without Plan login or fallback. The LocalCompat profile retains client plugins, skills, MCP, hooks, subagents, thinking and effort settings, ordinary configuration sources and default permissions. API-key helpers are disabled; the proxy route and temporary authentication are pinned in launch settings. Provider credentials stay in the proxy. Unknown native fields/betas and token counting are rejected. Ordinary routing and both Local modes remain available.
 
+**Ordinary OpenRouter sessions also work without an extra option.** A session started with `OpenClaude` (or `-Provider OpenRouter`) disables experimental betas and the advisor tool, so it speaks the provider's stable protocol and routes to the configured OpenRouter model. `-OpenRouterCompat` additionally removes Plan fallback entirely.
+
+> A regression in `e075542` (CLI backend integration) narrowed that stable-protocol setup to compat mode only, so ordinary OpenRouter sessions diverted every request to Plan. It is restored here, with tests pinned against a repeat.
+
 Responses are fully validated as JSON before conversion to client SSE. This mode uses one 120-second upstream attempt and a 30-second failure cooldown, with OpenRouter provider fallback disabled. Model identity, Messages/tool support and reasoning behavior still depend on the selected model; forwarding effort does not establish Sonnet-equivalent reasoning.
 
 Every interactive launch now makes one minimal provider-only inference check before opening the CLI: a 15-second deadline and a 512-token budget for HTTP providers; CLI backends use their configured deadline and native output constraints. OpenRouter charges may apply. Logs contain `connection_check`, provider, inference/model/reply booleans, a fixed reason and optional HTTP status, never endpoints, keys or response bodies. Check failure logs `provider_connection_unavailable` with `action: continue` and still opens the CLI. Ordinary mode retains Plan routing/fallback; explicit Local-only and compatibility modes retain their Plan block. Configuration errors and missing executables remain startup errors. Standalone `-CheckLocal` and `-DiagnoseLocal` still exit after diagnosis.
@@ -393,7 +397,7 @@ The **insights** card ranks *what changed, why, and what to do next* instead of 
 | Default service unconfigured | the routing default points at a service whose required values are missing, or routing cannot be read | critical banner + `⛔` tab title + settings/restart hint |
 | Service choice required | two or more services are configured while the default is `auto` | banner + `⚠` tab title |
 | Session or CLI settings differ | the running session's provider, or its CLI kind/model, differs from the saved values | banner + copyable `.\OpenClaude.ps1` |
-| Plan-only features keep routing to Plan | an external service is configured, but this session has 0 external attempts and every decision is `native_feature` Plan | banner + copyable `.\OpenClaude.ps1 -OpenRouterCompat` (disables experimental betas and Plan fallback for a new session) |
+| Plan-only features keep routing to Plan | an external service is configured, but this session has 0 external attempts and every decision is `native_feature` Plan | banner + `.\OpenClaude.ps1` restart hint (a normal OpenRouter session disables experimental betas and routes externally); use `-OpenRouterCompat` to remove Plan fallback too |
 | Connection dropped | `/api/snapshot` fails | exponential backoff (1, 2, 4, 8, 16s) and a recovery toast |
 | Tab title badge | any warning/critical item exists | `⛔ n · …` or `⚠ n · …` |
 | Desktop notification | new critical item while notifications are enabled | one per cause (re-notifies after the cause clears and returns) |

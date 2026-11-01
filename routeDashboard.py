@@ -4737,9 +4737,9 @@ def proactive_alerts(providers, session, metrics, routing_values=None, cli_value
         if plan_routes >= 5 and external_routes == 0 and native >= plan_routes:
             add("warn", "Plan 전용 기능으로 우회 중",
                 f"이 세션에서 외부 시도 없이 {plan_routes}건이 모두 Plan으로 처리됐습니다. "
-                "실험적 beta·고급 도구 기능이 켜져 있으면 일반 모드에서는 OpenRouter로 보내지 않고 Plan을 유지합니다. "
-                "OpenRouter로 보내려면 -OpenRouterCompat(Plan 비활성)으로 새 세션을 시작하세요.",
-                "session_plan_only", ".\\OpenClaude.ps1 -OpenRouterCompat")
+                "구버전 실행기로 시작한 세션이거나 실험적 beta·고급 도구 기능이 켜져 있으면 일반 모드에서는 OpenRouter로 보내지 않고 Plan을 유지합니다. "
+                "실행기를 재시작하면 기본 OpenRouter 세션이 실험 beta를 끄고 외부로 라우팅합니다(Plan 폴백까지 끄려면 -OpenRouterCompat).",
+                "session_plan_only", ".\\OpenClaude.ps1")
     process_health = (metrics or {}).get("process") if isinstance(metrics, dict) else None
     if session and isinstance(process_health, dict):
         lag = process_health.get("eventLoopLagMs")

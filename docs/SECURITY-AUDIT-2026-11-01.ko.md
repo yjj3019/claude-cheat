@@ -281,3 +281,16 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 문서 | `openClaude.ps1`이 아니라 `OpenClaude`(확장자 없이)·`OpenClaude.cmd`가 PATH 명령임을 README에 명시 | 문서 정정 |
 
 검증: 설치 테스트 11 pass(사용자 PATH 불변 포함), Python **690개 수집(11 skip)**.
+
+
+## 16. 기본 OpenRouter 라우팅 회귀 복원 (2026-11-01)
+
+사용자 보고("옵션 없이 지정 모델로 라우팅되어야 한다")를 추적해 회귀를 확인하고 복원했습니다.
+
+| 시점 | 커밋 | 동작 |
+| --- | --- | --- |
+| 2026-10-24 | `15298f0` | 일반 OpenRouter 세션에서 실험 beta·advisor 도구를 끄고 안정 프로토콜로 시작 → 옵션 없이 외부 라우팅 |
+| 2026-10-28 | `e075542` | CLI 백엔드 통합 중 조건이 `if openrouter_compat:`로 좁혀져 일반 OpenRouter 세션이 실험 beta를 그대로 보내고 **모든 요청이 Plan으로 우회**(회귀) |
+| 2026-11-01 | 이번 수정 | `if openrouter_compat or provider == "openrouter" or (dual의 대체 provider가 openrouter)`로 복원. 일반 OpenRouter·OpenRouter 대체 dual 세션이 안정 프로토콜을 사용 |
+
+검증: `tests.test_openrouter_config`·`tests.test_dual_provider`·`tests.test_launcher_arguments`·`tests.test_local_config`·`ProactiveReactionTests` **116 pass**, 전체 Node **722 pass**, Python **690개 수집**(11 skip), 대시보드 모듈 **262 pass**. 대시보드의 `Plan 전용 기능으로 우회 중` 경고 문구도 재시작 안내로 수정.

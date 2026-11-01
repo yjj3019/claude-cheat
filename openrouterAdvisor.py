@@ -612,10 +612,16 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
                    ANTHROPIC_SMALL_FAST_MODEL="claude-haiku-5-5", CLAUDE_CODE_SUBAGENT_MODEL="claude-sonnet-5-5")
     # Dual provider is an ordinary-session convenience: local-only and compatibility modes
     # rewrite requests and disable Plan fallback, so they never get a second provider.
-    # Ordinary sessions keep native features; unsupported provider requests retain Plan fallback.
+    # Ordinary OpenRouter sessions (and a dual session whose alternate is OpenRouter) keep the
+    # provider's stable protocol: Claude Code's experimental betas otherwise divert every
+    # request to Plan even though the user configured the external model with no extra option.
     dual = None if isolated or compat else dual_provider_setup(provider)
-    if openrouter_compat:
-        # Explicit no-Plan mode needs the provider's stable protocol.
+    if openrouter_compat or provider == "openrouter" or (
+            dual is not None and dual.get("ROUTE_ALT_PROVIDER") == "openrouter"):
+        # Regression guard: this was accidentally narrowed to openrouter_compat in e075542,
+        # which made ordinary OpenRouter sessions send experimental betas and divert every
+        # request to Plan. Ordinary OpenRouter (and a dual session with an OpenRouter
+        # alternate) keeps the provider's stable protocol, so no extra flag is needed.
         env.update(CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="1", CLAUDE_CODE_DISABLE_ADVISOR_TOOL="1")
     # The user's own Git Bash location is needed by the Bash tool; it is not provider routing.
     if isolated and "CLAUDE_CODE_GIT_BASH_PATH" in os.environ:
@@ -1225,8 +1231,10 @@ def _self_test_isolated() -> None:
     with patch(__name__ + ".run_owned", return_value=auth), patch("shutil.which", return_value="executable"), patch(__name__ + ".read_env", return_value={"ANTHROPIC_AUTH_TOKEN": "sk-or-test-placeholder", "OPENROUTER_MODEL": "fixture/model"}), patch(__name__ + ".provider_config", return_value={"SONNET_PROVIDER": "openrouter", "OPENROUTER_API_KEY": "sk-or-test-placeholder", "OPENROUTER_MODEL": "fixture/model"}), patch(__name__ + ".check_connection", return_value=0), patch("subprocess.Popen", return_value=proxy) as start:
         with routed_session() as env:
             assert env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:12345"
-            assert "CLAUDE_CODE_DISABLE_ADVISOR_TOOL" not in env
-            assert "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS" not in env
+            # Regression guard: a configured OpenRouter session must route externally without
+            # the extra compat flag, so the experimental betas stay disabled here.
+            assert env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] == "1"
+            assert env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] == "1"
             assert "MAX_THINKING_TOKENS" not in env
             assert "CLAUDE_CONFIG_DIR" not in env
             assert "ANTHROPIC_AUTH_TOKEN" not in env and "ANTHROPIC_API_KEY" not in env

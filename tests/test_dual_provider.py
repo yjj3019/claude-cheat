@@ -160,11 +160,13 @@ class DualSessionTests(DualProviderTestCase):
         self.assertEqual(env["ANTHROPIC_CUSTOM_MODEL_OPTION"], "claude-route-local",
                          "the entry the launcher owns must replace the stale export")
 
-    def test_ordinary_dual_session_preserves_native_frontend_features(self):
+    def test_ordinary_dual_session_pins_the_stable_protocol_for_an_openrouter_alternate(self):
         write_config(self.root, BOTH + DUAL)
         env, proxy_env = self.run_session("local")
-        self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", env)
-        self.assertNotIn("CLAUDE_CODE_DISABLE_ADVISOR_TOOL", env)
+        # The alternate is OpenRouter, so the front session must keep the provider's stable
+        # protocol; otherwise its experimental betas divert every request to Plan again.
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "1")
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"], "1")
         self.assertEqual(proxy_env["ROUTE_ALT_PROVIDER"], "openrouter")
         write_config(self.root, BOTH)
         env, proxy_env = self.run_session("local")

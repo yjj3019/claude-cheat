@@ -3911,8 +3911,10 @@ class ProactiveReactionTests(unittest.TestCase):
             routing_values={"ROUTE_DEFAULT_PROVIDER": "openrouter"})
         codes = self.codes(alerts)
         self.assertIn("session_plan_only", codes)
-        detail = next(alert for alert in alerts if alert["code"] == "session_plan_only")["detail"]
-        self.assertIn("OpenRouterCompat", detail)
+        alert = next(item for item in alerts if item["code"] == "session_plan_only")
+        self.assertIn("재시작", alert["detail"])
+        self.assertIn("OpenRouterCompat", alert["detail"])
+        self.assertEqual(alert["command"], ".\\OpenClaude.ps1")
 
     def test_a_session_that_attempted_the_external_service_is_not_flagged(self):
         metrics = {"configuration": {"provider": "openrouter"},

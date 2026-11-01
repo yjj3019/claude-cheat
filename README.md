@@ -323,6 +323,10 @@ Local 단독 일반 세션에서는 이 두 비활성화 스위치를 설정하�
 
 Claude Code 2.1.304 이상에서 `openclaude.config.yaml`의 같은 OpenRouter 키와 `openrouter.model`을 사용합니다. 주 모델·빠른 모델·하위 에이전트의 Claude 모델 선택을 모두 지정한 같은 OpenRouter 모델로 전달하며, Plan 로그인과 Plan fallback은 사용하지 않습니다. 기존 일반 실행과 Local 모드는 유지합니다.
 
+**일반 OpenRouter 세션도 옵션 없이 동작합니다.** `OpenClaude`(또는 `-Provider OpenRouter`)로 시작한 일반 세션은 실행기가 실험적 beta와 advisor 도구를 끄고 제공자의 안정 프로토콜로 시작하므로, 설정한 OpenRouter 모델로 라우팅됩니다. `-OpenRouterCompat`은 여기에 더해 **Plan 폴백까지 완전히 차단**할 때 사용합니다.
+
+> 과거 `e075542`(CLI 백엔드 통합)에서 이 처리가 호환 모드에만 남도록 좁혀져 일반 OpenRouter 세션이 모든 요청을 Plan으로 보내는 회귀가 있었습니다. 기본 동작으로 복원했으며, 테스트가 다시 회귀하지 않도록 고정합니다.
+
 LocalCompat과 같은 호환 처리로 플러그인·스킬·MCP·hooks·하위 에이전트 및 thinking·추론 강도 설정을 허용합니다. 사용자·프로젝트 설정과 기본 승인·거절 규칙을 유지하고, API 키 helper는 끕니다. 실행 설정으로 프록시 주소와 임시 인증을 고정하며 제공자 키는 프록시에만 전달합니다. 알려진 CLI 제어 필드만 변환하고, 지원하지 않는 beta·필드·토큰 계산 API는 명시적으로 거절합니다.
 
 응답은 JSON 전체를 검증한 뒤 CLI용 SSE로 전달합니다. 요청당 120초·외부 시도 1회·오류 후 30초 재요청 대기를 적용하며 OpenRouter의 제공자 fallback도 차단합니다. 선택 모델의 Messages API·도구·thinking 지원과 정확한 응답 모델 ID가 필요합니다. 추론 강도 전달이 Sonnet과 동일한 추론 효과를 보증하지는 않습니다.
@@ -647,7 +651,7 @@ Sonnet 선택과 HUD의 모델·비용 표시는 실제 외부 라우팅이나 �
 | 기본 서비스 미설정 | routing 기본값이 가리키는 서비스의 필수 값이 비었거나 설정을 읽지 못함 | 빨간 배너 + 탭 제목 `⛔`, 설정/재실행 명령 안내 |
 | 실행 서비스 선택 필요 | 설정된 서비스가 2개 이상인데 기본값이 `auto` | 배너 + 탭 제목 `⚠` |
 | 세션 서비스·CLI 설정 불일치 | 실행 중 세션 provider 또는 CLI 종류·모델이 저장값과 다름 | 배너 + `.\OpenClaude.ps1` 명령 복사 |
-| Plan 전용 기능으로 우회 중 | 외부 서비스가 설정됐는데 이 세션의 외부 시도가 0이고 모든 결정이 `native_feature` Plan | 배너 + `.\OpenClaude.ps1 -OpenRouterCompat` 명령 복사(실험적 beta를 끄고 Plan 비활성으로 새 세션) |
+| Plan 전용 기능으로 우회 중 | 외부 서비스가 설정됐는데 이 세션의 외부 시도가 0이고 모든 결정이 `native_feature` Plan | 배너 + `.\OpenClaude.ps1` 재시작 안내(기본 OpenRouter 세션은 실험 beta를 끄고 외부로 라우팅). Plan 폴백까지 끄려면 `-OpenRouterCompat` |
 | 연결 끊김 | `/api/snapshot` 요청 실패 | 1·2·4·8·16초 지수 백오프로 재시도하고 복구 시 토스트 |
 | 탭 제목 배지 | 경고/심각 항목 존재 | `⛔ n · …` 또는 `⚠ n · …` |
 | 데스크톱 알림 | 위 항목이 새로 발생 | **알림** 버튼으로 허용한 경우에만, 같은 원인은 1회 알림(해소 후 재발하면 다시 알림) |
@@ -923,7 +927,7 @@ node --test tests/dashboard_dom.test.mjs
 | OpenRouter 401 / `Missing Authentication header` | 전용 파일의 실제 키·유효성을 확인; HUD 플러그인 설치 성공은 API 인증 성공과 별개 |
 | Local 설정을 바꿔도 이전 서버 사용 | 프로세스 환경변수 우선순위와 전역 실행기 대상 확인 후 세션 재시작 |
 | Local 모델 목록 성공인데 추론 실패 | Messages API·모델 ID·도구/응답 형식 호환성을 별도 확인 |
-| Sonnet 선택 후 계속 Plan 사용 | `-Debug`로 `route_selected` 확인. `native_feature`/`unsupported_beta`는 **실험적 beta·고급 도구 기능이 켜진 세션을 Plan으로 유지하는 정상 동작**입니다. OpenRouter로 보내려면 `OpenClaude -OpenRouterCompat`(Plan 비활성)로 새 세션을 시작하거나 해당 실험 기능을 끄세요. 대시보드에 `Plan 전용 기능으로 우회 중` 경고가 뜨면 같은 조치를 안내합니다 |
+| Sonnet 선택 후 계속 Plan 사용 | `-Debug`로 `route_selected` 확인. **현재 실행기로 새 세션**을 시작하면 일반 OpenRouter 세션이 실험 beta를 끄고 외부로 라우팅합니다. 그래도 모두 Plan이면 `OpenClaude -OpenRouterCompat`(Plan 폴백까지 차단)으로 시작하거나 해당 실험 기능을 끄세요. 대시보드 `Plan 전용 기능으로 우회 중` 경고도 같은 조치를 안내합니다 |
 | 대시보드에 `실행기 재시작 필요` | 실행 중인 프록시가 현재 코드보다 먼저 시작됨. 경고의 **명령 복사** 버튼으로 `.\OpenClaude.ps1`을 복사해 세션을 재시작. `지금 상태` 카드의 **프록시 코드**·**소스 수정** 시각으로 차이를 확인 |
 | 세션이 갑자기 끊김 | `.route.log`에서 `parent_disconnected`(실행기 종료) 여부 확인. 다른 스크립트·작업이 `python` 프로세스를 **일괄 종료**하지 않았는지 확인. 대시보드는 `python routeDashboard.py --stop`으로만 종료 |
 | `503 ... restart required`가 반복됨 | 과거 실행기/프록시 잔존 여부·첫 upstream 오류를 확인하고 최신 실행기로 새 세션 시작; 후속 503만으로 원인 단정 금지 |
