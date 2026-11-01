@@ -1112,6 +1112,14 @@ class PageTests(unittest.TestCase):
         # Detection is only offered for the supported backends, not arbitrary PATH commands.
         self.assertIn("getElementById('cfg-cli-CLI_KIND')", dash.SETTINGS_PAGE)
 
+    def test_header_navigation_labels_never_wrap_inside_their_buttons(self):
+        css = dash.PAGE_CSS
+        self.assertIn('.nav-link{white-space:nowrap', css)
+        self.assertIn('@media(max-width:1600px)', css)
+        self.assertIn('.top-actions{order:3;flex:1 1 100%', css)
+        # The narrow layout must restore the mobile ordering it overrides.
+        self.assertIn('.brand{flex:1 0 100%}', css)
+
     def test_routes_serve_the_matching_page(self):
         import threading
         import urllib.error

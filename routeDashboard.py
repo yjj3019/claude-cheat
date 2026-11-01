@@ -3893,6 +3893,24 @@ globalThis.fetch = async (...args) => {
 JS_SHARED = JS_SHARED.replace('const TOKEN = "__DASHBOARD_TOKEN__";', _TOKEN_SCRIPT, 1)
 PAGE_CSS += "\n.token-notice{padding:10px 18px;background:#4a3413;color:#f2b95e;border-bottom:1px solid #7a5a1f;font-size:13px}\n"
 
+# Header layout: nav labels must never wrap inside their buttons, and below 1600px the header
+# becomes two rows (brand + nav / actions) instead of squeezing every label into one line.
+PAGE_CSS += """
+.nav-link{white-space:nowrap;flex:0 0 auto}
+@media(max-width:1600px){
+ .topbar-in{height:auto;min-height:66px;flex-wrap:wrap;gap:8px 14px;padding:10px 0}
+ .brand{flex:1 1 auto;min-width:0}
+ .nav-link{padding:0 10px}
+ .top-nav{flex-wrap:wrap;row-gap:4px;order:2;margin-left:auto;justify-content:flex-end}
+ .top-actions{order:3;flex:1 1 100%;justify-content:flex-end;flex-wrap:wrap}
+}
+@media(max-width:720px){
+ .brand{flex:1 0 100%}
+ .top-nav{order:3;flex-basis:100%;justify-content:flex-start;margin:0}
+ .top-actions{justify-content:flex-start}
+}
+"""
+
 PAGE = _page("dashboard")
 SETTINGS_PAGE = _page("settings")
 BLACKBOX_PAGE = _page("blackbox")

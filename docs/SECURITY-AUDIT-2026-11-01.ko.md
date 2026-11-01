@@ -238,7 +238,7 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | CLI 자동 검색 | 설정 화면 CLI 카드에 **CLI 자동 검색** 버튼 추가. `/api/cli` 감지 결과로 CLI 종류와 실행 파일 경로를 채움(지원 백엔드만, 임의 PATH 명령 검색 아님). 채운 값은 저장 버튼으로 확정. DOM 시뮬레이션(채움·고정 경로 보존·미설치·403)과 실서버 흐름(감지→저장→기본값→발행 설정) 테스트로 고정 | 기능 추가 |
 | 저장소 위생 | 추적되지 않던 `NUL` 잔여 파일 삭제 | 정리 |
 
-검증: Node **718 pass / 0 fail**(DOM 95 포함), Python **684개 수집(11 skip)**. 변경 모듈(`test_launcher_arguments`·`test_route_cli`·`test_route_dashboard`·`test_handover_contract`·`test_launcher_scripts`) 통과, 이전 flaky였던 `ConnectionTest.test_reasons_through_shim`은 새 상한에서 21초에 통과.
+검증: Node **718 pass / 0 fail**(DOM 95 포함), Python **685개 수집(11 skip)**. 변경 모듈(`test_launcher_arguments`·`test_route_cli`·`test_route_dashboard`·`test_handover_contract`·`test_launcher_scripts`) 통과, 이전 flaky였던 `ConnectionTest.test_reasons_through_shim`은 새 상한에서 21초에 통과.
 
 
 ## 13. 능동형 반응 (2026-11-01)
@@ -253,4 +253,17 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 연결 자동 복구 | `/api/snapshot` 실패 시 1·2·4·8·16초 지수 백오프로 재시도하고, 복구 시 토스트로 알림 | 기능 추가 |
 | 보안 경계 | 능동 점검은 로컬 상태만 읽고 쓰기·세션 제어를 하지 않음. 알림 권한 거부 시에도 배너·배지는 동작 | 문서화 |
 
-검증: Node **718 pass / 0 fail**(DOM 95 포함), Python **684개 수집(11 skip)**, 대시보드 모듈 257 pass. 라이브 대시보드에서 `proactive` 키·탭 배지·알림 버튼 서빙 확인.
+검증: Node **718 pass / 0 fail**(DOM 95 포함), Python **685개 수집(11 skip)**, 대시보드 모듈 258 pass. 라이브 대시보드에서 `proactive` 키·탭 배지·알림 버튼 서빙 확인.
+
+
+## 14. 대시보드 헤더 레이아웃 (2026-11-01)
+
+좁은 창에서 상단 내비게이션 글자가 버튼 안에서 줄바꿈(`대시보/드`, `설/정`)되고 액션 버튼과 겹치던 문제를 수정했습니다.
+
+| 항목 | 내용 | 상태 |
+| --- | --- | --- |
+| 내비 라벨 줄바꿈 | `.nav-link`에 `white-space:nowrap`·`flex:0 0 auto` 적용 | 수정 |
+| 1600px 이하 2행 | 브랜드+내비 1행, 액션(상태·알림·새로고침·도움말) 2행으로 분리. 720px 이하 기존 모바일 순서 유지 | 수정 |
+| 넓은 창 | 1600px 초과에서는 한 행 유지(내비 4개 라벨 한 줄) | 확인 |
+
+검증: 헤드리스 Edge 스크린샷 1087·1280·1500·1920px에서 라벨 줄바꿈 없음, 대시보드 모듈 258 pass.
