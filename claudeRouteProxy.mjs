@@ -207,27 +207,22 @@ if (routeLogPath) {
 
   const drain = () => {
     if (writing || !queue.length) return;
+    if (stats.written % 200 === 0) rotateIfNeeded();
     writing = true;
-    try {
-      while (queue.length) {
-        rotateIfNeeded();
-        const batch = queue.splice(0, 64);
-        const bytes = batch.reduce((sum, line) => sum + Buffer.byteLength(line), 0);
-        const started = performance.now();
-        appendFileSync(routeLogPath, batch.join(''));
-        const elapsed = performance.now() - started;
-        stats.writeMsTotal += elapsed;
-        stats.writeMsMax = Math.max(stats.writeMsMax, elapsed);
-        stats.batches += 1;
-        stats.written += batch.length;
-        queuedBytes = Math.max(0, queuedBytes - bytes);
-      }
-    } catch {
-      stats.errors += 1;
-    } finally {
+    const batch = queue.splice(0, 64);
+    const bytes = batch.reduce((sum, line) => sum + Buffer.byteLength(line), 0);
+    const started = performance.now();
+    appendFile(routeLogPath, batch.join(''), { encoding: 'utf8' }, error => {
+      const elapsed = performance.now() - started;
+      if (error) stats.errors += 1;
+      else stats.written += batch.length;
+      stats.writeMsTotal += elapsed;
+      stats.writeMsMax = Math.max(stats.writeMsMax, elapsed);
+      stats.batches += 1;
+      queuedBytes = Math.max(0, queuedBytes - bytes);
       writing = false;
       if (queue.length) schedule();
-    }
+    });
   };
 
   const schedule = () => {
