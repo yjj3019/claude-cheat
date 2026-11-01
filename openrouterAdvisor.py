@@ -389,6 +389,47 @@ def write_json_state(path: Path, payload: dict) -> bool:
             pass
 
 
+def _git_branch(repo_root: Path):
+    """Branch name from .git/HEAD, including worktree gitdir indirection; no subprocess."""
+    head = None
+    marker = repo_root / ".git"
+    if marker.is_dir():
+        head = marker / "HEAD"
+    elif marker.is_file():
+        try:
+            pointer = marker.read_text(encoding="utf-8").strip()
+        except OSError:
+            pointer = ""
+        if pointer.startswith("gitdir:"):
+            target = Path(pointer.split(":", 1)[1].strip())
+            if not target.is_absolute():
+                target = (repo_root / target).resolve()
+            head = target / "HEAD"
+    if head is None:
+        return None
+    try:
+        value = head.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if value.startswith("ref: refs/heads/"):
+        return value[len("ref: refs/heads/"):][:200] or None
+    return value[:40] or None
+
+
+def project_context(cwd=None) -> dict:
+    """Describe the launch directory and its git checkout without invoking git."""
+    base = Path(cwd or Path.cwd()).resolve()
+    project = base.name or str(base)
+    repo = branch = None
+    for parent in (base, *base.parents):
+        if (parent / ".git").exists():
+            repo = parent.name
+            branch = _git_branch(parent)
+            break
+    return {"cwd": str(base)[:1024], "project": project[:200],
+            "repo": repo[:200] if repo else None, "branch": branch}
+
+
 def write_handoff(*, port, nonce, proxy_pid, provider, cli_pid, mode, dual=None, instance_id=None, instance_dir=None):
     """Record the live route so another terminal can take it over without changing the port.
 
@@ -403,6 +444,10 @@ def write_handoff(*, port, nonce, proxy_pid, provider, cli_pid, mode, dual=None,
     if dual:
         payload["dual"] = {"provider": dual["ROUTE_ALT_PROVIDER"], "alias": dual["ROUTE_ALT_ALIAS"],
                            "model": dual["ROUTE_ALT_MODEL"]}
+    context = project_context()
+    for key in ("cwd", "project", "repo", "branch"):
+        if context.get(key):
+            payload[key] = context[key]
     if instance_id and instance_dir:
         payload["instance_id"] = instance_id
         if not write_json_state(instance_dir / "handoff.json", payload):

@@ -3229,7 +3229,8 @@ class ProviderSelectionDisplayTests(unittest.TestCase):
         with mock.patch.object(dash.http.client, "HTTPConnection", return_value=connection) as connect:
             self.assertEqual(dash.active_session(),
                              {"provider": "local", "started": "2026-10-26T00:00:00+00:00",
-                              "instance_id": None, "port": 48432, "pid_verified": False})
+                              "instance_id": None, "port": 48432, "pid_verified": False,
+                              "cwd": None, "project": None, "repo": None, "branch": None})
         connect.assert_called_once_with("127.0.0.1", 48432, timeout=0.5)
         connection.request.assert_called_once_with("GET", "/api/metrics",
                                                    headers={"x-local-route-token": "private-token"})
@@ -4063,3 +4064,22 @@ class MultiSessionTests(unittest.TestCase):
         self.assertIn('renderSessionMonitor', dash.PAGE)
         self.assertIn('세션별 모니터링', dash.PAGE)
         self.assertIn('.session-monitor', dash.PAGE_CSS)
+
+    def test_inferred_project_uses_the_transcript_cwd_and_branch(self):
+        a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        summaries = [{"instance_id": a, "last_ts": "2026-11-02T01:00:00.000Z", "project": None,
+                      "repo": None, "branch": None, "cwd": None, "project_source": None}]
+        transcripts = [{"project": "repo", "last": "2026-11-02T01:00:03.000Z",
+                        "cwd": r"D:\work\repo", "git_branch": "main"}]
+        enriched = dash._attach_inferred_projects(summaries, transcripts)
+        self.assertEqual(enriched[0]["project"], "repo")
+        self.assertEqual(enriched[0]["repo"], "repo")
+        self.assertEqual(enriched[0]["branch"], "main")
+        self.assertEqual(enriched[0]["cwd"], r"D:\work\repo")
+        self.assertEqual(enriched[0]["project_source"], "inferred")
+
+    def test_overview_hero_and_project_columns_are_present(self):
+        self.assertIn('renderOverviewHero', dash.PAGE)
+        self.assertIn('ov-tile', dash.PAGE_CSS)
+        self.assertIn('세션 · 작업', dash.PAGE)
+        self.assertIn('session-path', dash.PAGE_CSS)

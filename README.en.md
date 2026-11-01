@@ -416,6 +416,8 @@ The server-side checks are read-only: they never restart a session, write settin
 
 **Per-session monitoring** compares every live session: requests and requests/minute, external/Plan routes, failures/cancellations, in-flight/active/queued work, external p95, output tokens/second, input/output tokens, RSS and event-loop p95, and the last activity. A **load** badge appears when work is in flight/queued or event-loop p95 reaches 250 ms; the **show** button switches the detailed cards to that session.
 
+**Overview** now puts the status LED, current route and model, a 60-minute external/Plan split bar, four measured tiles (requests, failure rate, observed speed, external p95), and the shown session's project/branch/port with today's tokens, cost and remaining credit on one card. Per-session rows show the **project, branch and cwd**; new sessions record the exact checkout in their handoff, while sessions without that metadata are matched to a Claude transcript and marked **inferred**.
+
 | Panel | Content |
 | --- | --- |
 | Now | **OpenRouter, Local LLM or CLI serving / Plan bypass / idle**, the **last request's actual routing model**, age, reason |

@@ -119,3 +119,24 @@
 - `routeDashboard.py`의 `_session_summary`, `renderSessionMonitor`
 
 **위반 시 조치**: 세션별 사용량·부하 비교를 제거하거나 단일 세션 요약만 남기는 변경은 되돌립니다.
+
+## R13. 한눈에 보기 개선과 세션 작업(프로젝트) 식별
+
+**요구**: **한눈에 보기**가 현재 상태를 더 직관적으로 보여주고, 세션별 모니터링에서 각 세션이 **어떤 프로젝트/디렉터리/브랜치에서 작업 중인지** 구분되어야 합니다.
+
+**수용 기준**
+
+- **한눈에 보기**는 상태 LED·현재 라우팅·모델, 최근 60분 외부/Plan 비율 막대, 요청·실패율·관측 속도·외부 p95 타일, 표시 세션·활성 세션 수·오늘 토큰/비용/잔액 컨텍스트를 한 카드에 표시한다.
+- 새 세션은 실행기가 cwd·프로젝트·저장소·브랜치를 인스턴스 핸드오프에 기록한다.
+- 기존 세션(컨텍스트 없는 핸드오프)은 Claude 트랜스크립트의 `cwd`·`gitBranch`와 최근 활동 시각을 매칭해 **추정**으로 표시하고, 추정임을 UI에 표시한다.
+- **세션별 모니터링** 표에 프로젝트명·브랜치·cwd(툴팁)와 서비스·포트를 표시하고, 세션 선택 드롭다운도 프로젝트명을 보여준다.
+- 트랜스크립트 캐시에 cwd/branch를 저장하며, 캐시 버전을 올려 기존 캐시는 한 번 재스캔한다.
+
+**회귀 감시**
+
+- `tests/test_openrouter_config.py::...test_project_context_reads_the_git_checkout_without_running_git`
+- `tests/test_route_dashboard.py::MultiSessionTests.test_inferred_project_uses_the_transcript_cwd_and_branch`
+- `tests/test_route_dashboard.py::MultiSessionTests.test_overview_hero_and_project_columns_are_present`
+- `routeDashboard.py`의 `project_context`, `_attach_inferred_projects`, `renderOverviewHero`, 트랜스크립트 cwd/gitBranch 파싱
+
+**위반 시 조치**: 프로젝트 식별을 제거하거나 추정/실측 구분 없이 표시하도록 되돌리는 변경은 되돌립니다.

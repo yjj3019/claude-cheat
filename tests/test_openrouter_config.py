@@ -406,3 +406,21 @@ class OpenRouterConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_project_context_reads_the_git_checkout_without_running_git(self):
+        repo = self.root / "repo"
+        nested = repo / "src"
+        (repo / ".git").mkdir(parents=True)
+        nested.mkdir()
+        (repo / ".git" / "HEAD").write_text("ref: refs/heads/feature/demo\n", encoding="utf-8")
+        context = route.project_context(nested)
+        self.assertEqual(context["cwd"], str(nested.resolve()))
+        self.assertEqual(context["project"], "src")
+        self.assertEqual(context["repo"], "repo")
+        self.assertEqual(context["branch"], "feature/demo")
+        plain = self.root / "plain"
+        plain.mkdir()
+        context = route.project_context(plain)
+        self.assertEqual(context["project"], "plain")
+        self.assertIsNone(context["repo"])
+        self.assertIsNone(context["branch"])

@@ -643,13 +643,14 @@ def _new_session_state():
     # them: if that owner later disappears, this file must be re-read to count them.
     return {"offset": 0, "size": None, "mtime_ns": None, "head_sha": None, "tail_sha": None,
             "turns": 0, "external": 0, "plan": 0, "last_ts": None,
+            "cwd": None, "git_branch": None,
             "tokens": {"external": [0, 0, 0, 0], "plan": [0, 0, 0, 0]},
             "tokens_1h": {"external": 0, "plan": 0},
             "models": {}, "hours": {}, "claims": {}, "deferred": 0}
 
 
 USAGE_CACHE_FILE = ROOT / ".usage-cache.json"
-USAGE_CACHE_VERSION = 6
+USAGE_CACHE_VERSION = 7
 USAGE_IDENTITY_BYTES = 4096
 # The claim ledger is a cross-file exactly-once index, so it must not grow without a
 # bound. Above this many claims the oldest transcripts' claims are dropped whole.
@@ -802,7 +803,8 @@ def _state_from_cache(entry):
             "tokens": {source: list(tokens[source]) for source in ("external", "plan")},
             "tokens_1h": {source: tokens_1h[source] for source in ("external", "plan")},
             "models": dict(models),
-            "hours": dict(hours),
+            "hours": dict(hours), "cwd": entry.get("cwd") if isinstance(entry.get("cwd"), str) else None,
+            "git_branch": (entry.get("git_branch") if isinstance(entry.get("git_branch"), str) else None),
             "claims": {claim_key: list(values) for claim_key, values in claims.items()},
             "deferred": deferred}
 
@@ -878,6 +880,7 @@ def _save_usage_states(states, now=None):
                       "last_ts": state["last_ts"], "tokens": state["tokens"],
                       "tokens_1h": state["tokens_1h"],
                       "models": state["models"], "hours": hours,
+                      "cwd": state.get("cwd"), "git_branch": state.get("git_branch"),
                       "claims": state["claims"], "deferred": state["deferred"]}
     payload = {"version": USAGE_CACHE_VERSION, "claims_evicted": evicted,
                "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "files": files}
@@ -1066,8 +1069,13 @@ def _apply_lines(key, state, lines):
         claim = _usage_claim_key(message, record)
         parsed.append((_classify(message.get("id")), delta, message.get("model"),
                        record.get("timestamp"),
-                       _claim_hash(claim) if claim else None))
-    for source, delta, model, stamp, claim_key in parsed:
+                       _claim_hash(claim) if claim else None,
+                       record.get("cwd"), record.get("gitBranch")))
+    for source, delta, model, stamp, claim_key, cwd, git_branch in parsed:
+        if isinstance(cwd, str) and cwd:
+            state["cwd"] = cwd[:1024]
+        if isinstance(git_branch, str) and git_branch:
+            state["git_branch"] = git_branch[:200]
         full_turn = True
         if claim_key is not None:
             owner = _CLAIM_OWNER.get(claim_key)
@@ -1300,8 +1308,12 @@ def scan_sessions(projects=None, max_files=SCAN_FILES, now=None, pricing=None):
             cost = _session_cost(state["tokens"]["external"], pricing,
                                  state["tokens_1h"]["external"])
             total_cost += cost or 0.0
+            session_cwd = state.get("cwd") if isinstance(state.get("cwd"), str) else None
             sessions.append({
-                "project": Path(path).parent.name.replace("D--", "").replace("--", "/"),
+                "project": (Path(session_cwd).name if session_cwd
+                            else Path(path).parent.name.replace("D--", "").replace("--", "/")),
+                "cwd": session_cwd,
+                "git_branch": state.get("git_branch"),
                 "session": Path(path).name[:8],
                 "last": state["last_ts"],
                 "turns": state["turns"],
@@ -1926,6 +1938,9 @@ def _session_from_record(record):
                "instance_id": instance,
                "port": port,
                "pid_verified": bool(identity is not None and identity[0] == proxy_pid)}
+    for key in ("cwd", "project", "repo", "branch"):
+        value = record.get(key)
+        session[key] = value[:512] if isinstance(value, str) and value else None
     return session, {**metrics, "age_seconds": 0, "stale": False}
 
 
@@ -1971,6 +1986,11 @@ def _session_summary(saved):
             "provider": provider,
             "started": session.get("started"),
             "model": configuration.get("model"),
+            "cwd": session.get("cwd"),
+            "project": session.get("project"),
+            "repo": session.get("repo"),
+            "branch": session.get("branch"),
+            "project_source": "launcher" if session.get("project") else None,
             "requests": requests,
             "ok": number(metrics.get("ok")),
             "failed": number(metrics.get("failed")),
@@ -2014,6 +2034,58 @@ def live_sessions(limit=MAX_LIVE_SESSIONS):
             continue
         rows.append({"session": session, "metrics": metrics})
     return rows
+
+
+def _attach_inferred_projects(summaries, sessions):
+    """Fallback for sessions launched before launcher context: match the newest transcript.
+
+    The proxy's last-response time and a Claude transcript's last-write time come from the
+    same conversation, so a unique match inside two minutes is a useful label. It is always
+    marked as inferred; a new launcher session supplies the exact cwd/repo/branch.
+    """
+    candidates = []
+    for row in sessions:
+        project = row.get("project") if isinstance(row, dict) else None
+        stamp = row.get("last") if isinstance(row, dict) else None
+        if not isinstance(project, str) or not isinstance(stamp, str):
+            continue
+        try:
+            when = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        candidates.append((when, project))
+    used = set()
+    for summary in summaries:
+        if summary.get("project"):
+            continue
+        stamp = summary.get("last_ts")
+        try:
+            when = datetime.fromisoformat(stamp.replace("Z", "+00:00")) if isinstance(stamp, str) else None
+        except ValueError:
+            when = None
+        best = None
+        if when is not None:
+            for candidate, project in candidates:
+                delta = abs((candidate - when).total_seconds())
+                if delta <= 300 and (best is None or delta < best[0]):
+                    best = (delta, project)
+        if best and best[1] not in used:
+            matched = next((row for row in sessions if row.get("project") == best[1]), None)
+            matched = matched if isinstance(matched, dict) else {}
+            cwd = matched.get("cwd") if isinstance(matched.get("cwd"), str) else None
+            summary["project"] = Path(cwd).name if cwd else best[1]
+            summary["cwd"] = cwd
+            summary["branch"] = matched.get("git_branch")
+            repo = Path(cwd).name if cwd else None
+            if cwd:
+                for parent in (Path(cwd), *Path(cwd).parents):
+                    if (parent / ".git").exists():
+                        repo = parent.name
+                        break
+            summary["repo"] = repo
+            summary["project_source"] = "inferred"
+            used.add(best[1])
+    return summaries
 
 
 def _display_session():
@@ -2903,6 +2975,7 @@ def snapshot():
     # Tokens are counted from session records for every connection, not only OpenRouter:
     # a CLI display provider must not hide an earlier Local/OpenRouter session's usage.
     usage = usage_snapshot(pricing=pricing, signature=signature)
+    live_session_rows = _attach_inferred_projects(live_session_rows, usage.get("sessions") or [])
     historical_metrics = proxy_metrics() if live_metrics is None else None
     metrics = live_metrics or ({**historical_metrics, "stale": True} if historical_metrics else None)
     insights = build_insights(routing, usage, account, pricing, metrics=metrics)
@@ -4110,8 +4183,9 @@ renderHeader = function (data) {
   if (sessions.length < 2) { picker.hidden = true; picker.innerHTML = ''; return; }
   const options = sessions.map(session => {
     const provider = ({openrouter:'OpenRouter', local:'Local', cli:'CLI'}[session.provider] || session.provider || '?');
+    const label = session.project || provider;
     return `<option value="${esc(session.instance_id)}"${session.instance_id === data.selected_instance ? ' selected' : ''}>`
-      + `${esc(provider)} · ${num(session.requests)}건${session.port ? ' · :' + esc(session.port) : ''}</option>`;
+      + `${esc(label)} · ${num(session.requests)}건${session.port ? ' · :' + esc(session.port) : ''}</option>`;
   }).join('');
   if (picker.innerHTML !== options) picker.innerHTML = options;
   picker.hidden = false;
@@ -4150,6 +4224,9 @@ PAGE_CSS += """
 .session-monitor .chip-selected{color:#8aefd0;border-color:var(--ok-line);background:var(--ok-soft)}
 .session-monitor .chip-load{color:var(--warn);border-color:var(--warn-line);background:var(--warn-soft);margin-left:4px}
 .session-monitor td small{color:var(--fg-4);font-size:10.5px;margin-left:4px}
+.session-monitor td strong{font-size:12.5px;margin-right:6px}
+.session-monitor .session-path{font-size:10px;color:var(--fg-4);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:3px}
+.session-monitor .session-service{font-size:10.5px;color:var(--fg-4);margin-top:2px}
 .session-monitor th{white-space:nowrap}
 """
 JS_DASHBOARD += """
@@ -4181,9 +4258,12 @@ function renderSessionMonitor(data) {
       + (scalar(session.admission_active) === null ? '' : ' · 실행 ' + count(session.admission_active))
       + (scalar(session.admission_queued) === null ? '' : ' · 대기 ' + count(session.admission_queued));
     return `<tr class="${selected ? 'session-selected' : ''}">
-      <td><span class="session-dot"></span>${esc(names[session.provider] || session.provider || '?')}
-        ${selected ? '<span class="chip chip-selected">표시 중</span>' : `<button type="button" class="btn btn-sm btn-ghost" data-session-select="${esc(session.instance_id)}">표시</button>`}</td>
-      <td class="id">:${esc(session.port)}</td>
+      <td><span class="session-dot"></span><strong>${esc(session.project || '정보 없음')}</strong>
+        ${session.project_source === 'inferred' ? '<span class="chip">추정</span>' : ''}
+        ${session.branch ? `<span class="chip">${esc(session.branch)}</span>` : ''}
+        ${selected ? '<span class="chip chip-selected">표시 중</span>' : `<button type="button" class="btn btn-sm btn-ghost" data-session-select="${esc(session.instance_id)}">표시</button>`}
+        <div class="session-path mono" title="${esc(session.cwd || '')}">${esc(session.cwd || '경로 미보고')}</div>
+        <div class="session-service">${esc(names[session.provider] || session.provider || '?')} · :${esc(session.port)}</div></td>
       <td>${count(session.requests)}건 <small>${rate(session.rate_per_min)}</small></td>
       <td>외부 ${count(routes.external)} · Plan ${count(routes.plan)}</td>
       <td>${count(session.failed)} / ${count(session.aborted)}</td>
@@ -4195,7 +4275,7 @@ function renderSessionMonitor(data) {
       <td>${age(session.last_ts)}${busy(session) ? ' <span class="chip chip-load">부하</span>' : ''}</td>
     </tr>`;
   }).join('');
-  const card = `<section class="card col-12 session-monitor" id="session-monitor"><header class="card-h"><div><h2>세션별 모니터링</h2><p class="sub">세션별 요청·토큰·지연·프로세스 부하 · ${sessions.length}개 세션</p></div></header><div class="card-b"><div class="table-scroll"><table><thead><tr><th>세션</th><th>포트</th><th>요청</th><th>경로</th><th>실패/취소</th><th>진행</th><th>p95</th><th>출력</th><th>입력/출력 토큰</th><th>프로세스</th><th>마지막</th></tr></thead><tbody>${rows}</tbody></table></div><p class="hint">요청·토큰은 각 세션 프록시가 보고한 값입니다. 부하는 진행·대기 요청이 있거나 이벤트 루프 p95가 250ms 이상일 때 표시합니다. 표시 버튼을 누르면 위 상세 카드가 해당 세션 기준으로 전환됩니다.</p></div></section>`;
+  const card = `<section class="card col-12 session-monitor" id="session-monitor"><header class="card-h"><div><h2>세션별 모니터링</h2><p class="sub">세션별 요청·토큰·지연·프로세스 부하 · ${sessions.length}개 세션</p></div></header><div class="card-b"><div class="table-scroll"><table><thead><tr><th>세션 · 작업</th><th>요청</th><th>경로</th><th>실패/취소</th><th>진행</th><th>p95</th><th>출력</th><th>입력/출력 토큰</th><th>프로세스</th><th>마지막</th></tr></thead><tbody>${rows}</tbody></table></div><p class="hint">요청·토큰은 각 세션 프록시가 보고한 값입니다. 부하는 진행·대기 요청이 있거나 이벤트 루프 p95가 250ms 이상일 때 표시합니다. 표시 버튼을 누르면 위 상세 카드가 해당 세션 기준으로 전환됩니다.</p></div></section>`;
   const historyCard = Array.from(grid.children).find(node => node.textContent.includes('최근 요청 추이'));
   if (historyCard) historyCard.insertAdjacentHTML('afterend', card);
   else grid.insertAdjacentHTML('beforeend', card);
@@ -4210,6 +4290,96 @@ document.addEventListener('click', event => {
   if (!button) return;
   selectSession(button.dataset.sessionSelect);
 });
+"""
+PAGE_CSS += """
+/* Overview: one readable status hero, four measured tiles, and session context. */
+.ov-top{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;padding-bottom:16px;border-bottom:1px solid var(--line)}
+.ov-state{display:flex;gap:12px;min-width:0}
+.ov-led{width:13px;height:13px;border-radius:50%;margin-top:7px;flex:0 0 auto;background:#718097;box-shadow:0 0 0 4px #71809722}
+.ov-led.green{background:#43d9a3;box-shadow:0 0 0 4px #43d9a322}
+.ov-led.red{background:#ff7089;box-shadow:0 0 0 4px #ff708922}
+.ov-led.amber{background:#f2b95e;box-shadow:0 0 0 4px #f2b95e22}
+.ov-kicker{display:block;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--fg-4);font-weight:700}
+.ov-title{font-size:27px;font-weight:750;line-height:1.15;letter-spacing:-.5px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ov-sub{display:block;color:var(--fg-3);font-size:12.5px;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ov-route{flex:0 1 320px;min-width:220px}
+.ov-route-head{display:flex;justify-content:space-between;gap:10px;color:var(--fg-3);font-size:11px;margin-bottom:7px}
+.ov-route-head b{color:var(--fg)}
+.ov-bar{height:9px;border-radius:99px;overflow:hidden;background:#26384c}
+.ov-bar i{display:block;height:100%;background:linear-gradient(90deg,#43d9a3,#79b7ff)}
+.ov-route-foot{display:flex;justify-content:space-between;color:var(--fg-4);font-size:10.5px;margin-top:6px}
+.ov-tiles{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:16px 0}
+.ov-tile{padding:11px 12px;border:1px solid #30475c;border-left:3px solid #79b7ff;border-radius:10px;background:rgba(5,12,22,.5);min-width:0}
+.ov-tile.coral{border-left-color:#ff879b}.ov-tile.amber{border-left-color:#efc67b}.ov-tile.violet{border-left-color:#9caaff}
+.ov-tile .k{font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--fg-4);font-weight:700}
+.ov-tile .v{font-size:23px;font-weight:750;line-height:1.2;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ov-tile .c{font-size:10.5px;color:var(--fg-4);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ov-context{display:grid;grid-template-columns:1.3fr .7fr 1fr;gap:12px;padding-top:13px;border-top:1px dashed var(--line)}
+.ov-ctx span{display:block;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--fg-4);font-weight:700}
+.ov-ctx b{display:block;font-size:13px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ov-ctx small{display:block;font-size:10.5px;color:var(--fg-4);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+@media(max-width:1240px){.ov-tiles{grid-template-columns:repeat(2,minmax(0,1fr))}.ov-context{grid-template-columns:1fr 1fr}.ov-route{flex-basis:240px}}
+"""
+JS_DASHBOARD += """
+function renderOverviewHero(data) {
+  const card = typeof document.querySelector === 'function' ? document.querySelector('#grid .overview') : null;
+  const body = card && card.querySelector('.card-b');
+  if (!body) return;
+  const current = data.proxy_metrics;
+  const live = data.active_session && current && !current.stale;
+  const routes = live ? (current.routes || {}) : {};
+  const sessions = Array.isArray(data.sessions) ? data.sessions : [];
+  const selected = sessions.find(session => session.selected === true) || null;
+  const value = item => typeof item === 'number' && Number.isFinite(item) ? item : null;
+  const count = item => value(item) === null ? '—' : num(item);
+  const tokens = list => Array.isArray(list) ? list.reduce((sum, item) => sum + (Number(item) || 0), 0) : 0;
+  const external = Number(routes.external) || 0, plan = Number(routes.plan) || 0;
+  const routeTotal = external + plan;
+  const share = routeTotal ? Math.round(external * 100 / routeTotal) : 0;
+  const requests = live ? value(current.requests) : null;
+  const ok = live ? value(current.ok) : null;
+  const failed = live ? value(current.failed) : null;
+  const aborted = live ? value(current.aborted) : null;
+  const inflight = live ? value(current.inflightRequests) : null;
+  const completed = ok !== null && failed !== null ? ok + failed - (aborted || 0) : null;
+  const failureRate = completed ? ((failed || 0) - (aborted || 0)) * 100 / completed : null;
+  const p95 = live ? value((current.latencyMs || {}).external?.p95) : null;
+  const performance = live ? ((current.modelPerformance || {})[current.configuration?.provider] || {}) : {};
+  const outputRate = value(performance.outputTokens) !== null && value(performance.elapsedMs)
+    ? performance.outputTokens * 1000 / performance.elapsedMs : null;
+  const today = data.usage?.today || {};
+  const todayTokens = tokens(today.external) + tokens(today.plan);
+  const todayCost = data.usage?.today_cost_usd ?? data.usage?.cost_usd;
+  const remaining = data.account?.remaining_usd;
+  const state = data.routing?.state || 'unknown';
+  const led = state === 'plan' ? 'red' : state === 'external' ? 'green' : state === 'idle' ? 'amber' : '';
+  const stateText = (typeof routingStateText === 'function' ? routingStateText(data.routing) : null) || '상태 확인';
+  const lastAge = data.routing?.last?.age_seconds;
+  const ageText = typeof lastAge === 'number' ? (lastAge < 60 ? Math.round(lastAge) + '초 전' : Math.round(lastAge / 60) + '분 전') : '기록 없음';
+  const model = data.model || selected?.model || '모델 미설정';
+  const project = selected?.project || '정보 없음';
+  const repoLine = [selected?.repo && selected.repo !== project ? selected.repo : null, selected?.branch || null,
+                    selected?.port ? ':' + selected.port : null].filter(Boolean).join(' · ') || '재시작 후 표시';
+  const source = selected?.project_source === 'inferred' ? ' · 추정' : selected ? ' · 실행기 보고' : '';
+  const tile = (label, valueText, context, tone) => `<div class="ov-tile ${tone}"><div class="k">${esc(label)}</div>`
+    + `<div class="v">${esc(valueText)}</div><div class="c">${esc(context)}</div></div>`;
+  body.innerHTML = `<div class="ov-top"><div class="ov-state"><span class="ov-led ${led}"></span><div><span class="ov-kicker">현재 라우팅</span>`
+    + `<div class="ov-title">${esc(stateText)}</div><span class="ov-sub">${esc(model)} · 마지막 결정 ${esc(ageText)}</span></div></div>`
+    + `<div class="ov-route"><div class="ov-route-head"><span>최근 ${data.routing?.window_minutes || 60}분 경로</span><b>외부 ${count(external)} · Plan ${count(plan)}</b></div>`
+    + `<div class="ov-bar"><i style="width:${share}%"></i></div><div class="ov-route-foot"><span>${share}% 외부</span><span>${100 - share}% Plan</span></div></div></div>`
+    + `<div class="ov-tiles">${tile('요청', live ? count(requests) + '건' : '—', live ? `완료 ${count(completed)} · 진행 ${count(inflight)}` : '현재 세션 데이터 없음', 'blue')}`
+    + `${tile('실패율', failureRate === null ? '—' : failureRate.toFixed(1) + '%', `실패 ${count(failed)} · 취소 ${count(aborted)}`, 'coral')}`
+    + `${tile('관측 속도', outputRate === null ? '—' : outputRate.toFixed(1) + ' 토큰/초', '출력 토큰 / 전체 요청 시간', 'amber')}`
+    + `${tile('외부 p95', p95 === null ? '—' : (p95 / 1000).toFixed(2) + '초', '최근 외부 요청 기준', 'violet')}</div>`
+    + `<div class="ov-context"><div class="ov-ctx"><span>표시 세션</span><b>${esc(project)}</b><small>${esc(repoLine)}${esc(source)}</small></div>`
+    + `<div class="ov-ctx"><span>활성 세션</span><b>${sessions.length}개</b><small>${sessions.length ? '세션별 모니터링에서 전환' : '실행 중인 세션 없음'}</small></div>`
+    + `<div class="ov-ctx"><span>오늘 사용</span><b>${count(todayTokens)}토큰</b><small>${count(tokens(today.plan))} Plan · $${typeof todayCost === 'number' ? todayCost.toFixed(3) : '—'}${typeof remaining === 'number' ? ' · 잔액 $' + remaining.toFixed(2) : ''}</small></div></div>`;
+}
+const renderGridWithOverviewHero = renderGrid;
+renderGrid = function (data) {
+  renderGridWithOverviewHero(data);
+  renderOverviewHero(data);
+};
 """
 PAGE = _page("dashboard")
 SETTINGS_PAGE = _page("settings")
