@@ -45,3 +45,21 @@
 | R6 | 문제를 기다리지 않고 먼저 알리는 능동형 모니터링(배지·알림·복구·경고)을 유지해야 한다 | `proactive_alerts`, 탭 제목 배지, `tests/dashboard_dom.test.mjs`·`ProactiveReactionTests` |
 | R7 | 프록시 성능·모니터링 개선을 지속적으로 연구하고 기록해야 한다 | `docs/PROXY-PERFORMANCE-MONITORING-RESEARCH.ko.md`, `tests/metrics.test.mjs` |
 | R8 | 위 동작은 README에 자세히 기록되어야 한다 | `README.md` 관련 절 |
+
+## R9. 코드 변경은 수동 재시작 없이 자동 반영
+
+**요구**: 커밋·배포 후 실행 중인 대시보드와 프록시가 사용자의 수동 재시작 없이 새 코드를 반영해야 합니다.
+
+**수용 기준**
+
+- 대시보드 소스가 바뀌면 실행 중인 대시보드가 스스로 재시작(`os.execv`)해 새 페이지/API를 제공한다. 쓰기 토큰은 유지된다.
+- 실행 중 프록시가 이전 코드(`proxy_hash` 불일치)이고 진행 중 요청이 없으면, 대시보드가 **같은 포트·토큰으로 자동 takeover**를 요청해 Claude Code 세션을 끊지 않고 새 프록시 코드를 적용한다.
+- 자동 takeover는 60초 간격으로만 시도하고, 활성 턴 중이면 대기하며, 모든 시도·실패는 `.auto-update.log`에 기록한다.
+- 대시보드가 실행 중이지 않거나 세션 모드가 takeover를 지원하지 않으면 기존처럼 다음 세션 시작 시 적용한다.
+
+**회귀 감시**
+
+- `tests/test_route_dashboard.py::AutoUpdateTests` — 유휴·stale·스로틀·최신 상태 판정과 소스 지문
+- `routeDashboard.py`의 `auto_update_action`, `_auto_takeover_loop`, `_auto_reload_loop`
+
+**위반 시 조치**: 자동 반영을 제거하거나 수동 재시작을 기본으로 되돌리는 변경은 되돌립니다.

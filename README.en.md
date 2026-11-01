@@ -408,6 +408,8 @@ The server-side checks are read-only: they never restart a session, write settin
 
 **Process health card.** The dashboard shows what the running proxy reports about itself: **RSS and heap usage**, **event-loop delay p95/max** and the process PID. Event-loop delay measures how late timers ran because the proxy's own work — body parsing, header/field validation, logging, metrics persistence — blocked the loop; it is separate from upstream latency. When a delay of **100 ms or more** occurs, the card lists the **latest three with timestamps**, so a spike can be matched to a snapshot/GC moment. An event-loop p95 of **250 ms or more** raises a proactive warning, and **RSS of 1.5 GiB or more** raises a memory warning. The figures require the same session token as `/api/metrics`, and the `.proxy-metrics.json` snapshot is written **asynchronously** so persistence never blocks request handling.
 
+**Code changes apply automatically.** When `routeDashboard.py`, `routeConfig.py` or `localProcessTree.py` changes, the running dashboard restarts itself and serves the new page. If the live proxy was started from older code (`proxy_hash` mismatch), the dashboard requests an **automatic takeover on the same port and token while no request is in flight**, so the Claude Code session keeps working on the new proxy. Attempts and failures are recorded in `.auto-update.log`. Without a running dashboard, or in a mode that cannot take over, the change applies at the next session start.
+
 | Panel | Content |
 | --- | --- |
 | Now | **OpenRouter, Local LLM or CLI serving / Plan bypass / idle**, the **last request's actual routing model**, age, reason |

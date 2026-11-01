@@ -3949,3 +3949,28 @@ class ProactiveReactionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class AutoUpdateTests(unittest.TestCase):
+    def test_stale_idle_session_requests_a_takeover(self):
+        routing = {"proxy_hash": "000000000000", "proxy_started_at": "2026-11-01T00:00:00+00:00"}
+        session = {"provider": "openrouter", "port": 1234}
+        self.assertEqual(dash.auto_update_action(session, {"inflightRequests": 0}, routing, 0.0, 100.0), "takeover")
+
+    def test_busy_fresh_or_throttled_sessions_are_left_alone(self):
+        stale = {"proxy_hash": "000000000000", "proxy_started_at": "2026-11-01T00:00:00+00:00"}
+        fresh = {"proxy_hash": dash.code_digest(), "proxy_started_at": "2026-11-01T00:00:00+00:00"}
+        session = {"provider": "openrouter", "port": 1234}
+        self.assertIsNone(dash.auto_update_action(session, {"inflightRequests": 2}, stale, 0.0, 100.0))
+        self.assertIsNone(dash.auto_update_action(session, {"inflightRequests": 0}, fresh, 0.0, 100.0))
+        self.assertIsNone(dash.auto_update_action(session, {"inflightRequests": 0}, stale, 90.0, 100.0))
+        self.assertIsNone(dash.auto_update_action(None, {"inflightRequests": 0}, stale, 0.0, 100.0))
+
+    def test_source_fingerprint_tracks_content_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "source.py"
+            path.write_text("one", encoding="utf-8")
+            first = dash.source_fingerprint([path])
+            path.write_text("two-longer", encoding="utf-8")
+            second = dash.source_fingerprint([path])
+            self.assertNotEqual(first, second)
+            self.assertEqual(len(first), 1)

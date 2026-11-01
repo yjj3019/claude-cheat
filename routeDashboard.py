@@ -25,6 +25,7 @@ import re
 import secrets
 import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -4406,8 +4407,94 @@ def _stop_previous(port, path=None, timeout=5.0):
     return not _port_open(port)
 
 
+AUTO_UPDATE_LOG = ROOT / ".auto-update.log"
+AUTO_UPDATE_INTERVAL_SECONDS = 60.0
+AUTO_UPDATE_POLL_SECONDS = 5.0
+DASHBOARD_SOURCE_FILES = (Path(__file__).resolve(), ROOT / "routeConfig.py", ROOT / "localProcessTree.py")
+_AUTO_TAKEOVER_LAST = 0.0
+_AUTO_TAKEOVER_LOCK = threading.Lock()
+
+
+def source_fingerprint(paths=DASHBOARD_SOURCE_FILES):
+    """mtime/size signature of the dashboard sources; a change triggers a self-restart."""
+    fingerprint = []
+    for path in paths:
+        try:
+            stat = Path(path).stat()
+        except OSError:
+            fingerprint.append((str(path), None, None))
+        else:
+            fingerprint.append((str(path), stat.st_mtime_ns, stat.st_size))
+    return tuple(fingerprint)
+
+
+def auto_update_action(session, metrics, routing, last_attempt, now, interval=AUTO_UPDATE_INTERVAL_SECONDS):
+    """Return "takeover" when a live ordinary session runs stale proxy code and is idle."""
+    if not session or not isinstance(metrics, dict):
+        return None
+    if metrics.get("inflightRequests") != 0:
+        return None
+    if proxy_stale(routing) is not True:
+        return None
+    if last_attempt and now - last_attempt < interval:
+        return None
+    return "takeover"
+
+
+def _record_auto_update(message):
+    try:
+        with AUTO_UPDATE_LOG.open("a", encoding="utf-8") as stream:
+            stream.write(f"{datetime.now(timezone.utc).isoformat(timespec='seconds')} {message}\n")
+    except OSError:
+        pass
+
+
+def _auto_takeover_loop():
+    """Apply newer proxy code to a live session without asking the user to restart it."""
+    global _AUTO_TAKEOVER_LAST
+    while True:
+        time.sleep(AUTO_UPDATE_POLL_SECONDS)
+        try:
+            session, metrics = _live_session()
+            if not session:
+                continue
+            routing = _current_routing(parse_route_log(), session, metrics)
+            if auto_update_action(session, metrics, routing, _AUTO_TAKEOVER_LAST, time.monotonic()) != "takeover":
+                continue
+            with _AUTO_TAKEOVER_LOCK:
+                if auto_update_action(session, metrics, routing, _AUTO_TAKEOVER_LAST, time.monotonic()) != "takeover":
+                    continue
+                _AUTO_TAKEOVER_LAST = time.monotonic()
+            _record_auto_update(f"proxy source is newer than the live proxy; requesting takeover on port {session.get('port')}")
+            flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            with AUTO_UPDATE_LOG.open("a", encoding="utf-8") as log:
+                subprocess.Popen(
+                    [sys.executable, str(ROOT / "openrouterAdvisor.py"), "--takeover"],
+                    cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                    creationflags=flags, close_fds=True)
+        except Exception as error:  # A watcher must never kill the dashboard.
+            _record_auto_update(f"auto-update check failed: {type(error).__name__}: {error}")
+
+
+def _auto_reload_loop(initial):
+    """Restart this dashboard in place when its own sources change."""
+    if os.environ.get("ROUTE_DASHBOARD_AUTO_RELOAD", "1").strip().lower() in {"0", "false", "no"}:
+        return
+    while True:
+        time.sleep(3)
+        try:
+            current = source_fingerprint()
+        except OSError:
+            continue
+        if current != initial:
+            _record_auto_update("dashboard source changed; restarting the dashboard")
+            os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
+
+
 def serve(host="127.0.0.1", port=DEFAULT_PORT, refresh=3, allow_fallback=False, open_page=None):
     threading.Thread(target=_refresh_loop, args=(max(1, refresh),), daemon=True).start()
+    threading.Thread(target=_auto_reload_loop, args=(source_fingerprint(),), daemon=True).start()
+    threading.Thread(target=_auto_takeover_loop, daemon=True).start()
     threading.Thread(target=_usage_refresh_loop, daemon=True).start()
     # A previous dashboard keeps its port between restarts; take it over instead of moving.
     _stop_previous(port)
