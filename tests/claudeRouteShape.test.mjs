@@ -27,11 +27,22 @@ async function send(t, body) {
     body: typeof body === 'string' ? body : JSON.stringify(body) });
   await r.text();
 }
-const shapes = () => readFileSync(logFile, 'utf8').split('\n').filter(l => l.includes('"request_shape"'))
-  .map(l => JSON.parse(l.slice(l.indexOf('{'))));
+const shapes = () => {
+  try { return readFileSync(logFile, 'utf8').split('\n').filter(l => l.includes('"request_shape"'))
+    .map(l => JSON.parse(l.slice(l.indexOf('{')))); } catch { return []; }
+};
+async function waitFor(predicate, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  throw new Error('timed out waiting for the batched route log');
+}
 async function shapeOf(t, body) {
   const before = shapes().length;
   await send(t, body);
+  await waitFor(() => shapes().length >= before + 1);
   const all = shapes();
   assert.equal(all.length, before + 1);
   const { traceId, ...rest } = all.at(-1);
@@ -75,7 +86,8 @@ test('malformed bodies never throw and requests are still answered', async t => 
   await send(t, '{not json');
 });
 
-test('log never contains prompt text or tool names', () => {
+test('log never contains prompt text or tool names', async () => {
+  await waitFor(() => { try { return readFileSync(logFile, 'utf8').includes('request_shape'); } catch { return false; } });
   const log = readFileSync(logFile, 'utf8');
   assert.ok(log.includes('request_shape'));
   assert.equal(log.includes(SECRET_PROMPT), false);

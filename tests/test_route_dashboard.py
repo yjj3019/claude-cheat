@@ -1127,6 +1127,8 @@ class PageTests(unittest.TestCase):
         self.assertIn('Stable dashboard geometry', dash.PAGE_CSS)
         self.assertIn('height:560px', dash.PAGE_CSS)
         self.assertIn('-webkit-line-clamp:3', dash.PAGE_CSS)
+        self.assertIn('라우트 로그 쓰기 max', dash.PAGE)
+        self.assertIn('pm.routeLog', dash.PAGE)
 
     def test_header_navigation_labels_never_wrap_inside_their_buttons(self):
         css = dash.PAGE_CSS

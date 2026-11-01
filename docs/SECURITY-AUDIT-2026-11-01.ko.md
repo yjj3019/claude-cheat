@@ -371,3 +371,13 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 - 세션별 표와 세션 선택 드롭다운에 프로젝트·브랜치·cwd를 표시합니다.
 
 검증: 라이브 세션 2개가 `openclaw-rss-intelligence`(main, `D:\AI-Codding\openclaw-rss-intelligence`)와 `enjoy-tesla`(master, `D:\AI-Codding\Claude\enjoy-tesla`)로 구분됨. Python **707 tests OK**(11 skip), Node **724 pass**, 대시보드 모듈 **275 pass**.
+
+## 24. 프록시 라우트 로그 write-behind와 모니터링 (2026-11-02)
+
+DSH 게이트웨이·영속화·텔레메트리 설계를 참고해 프록시의 모니터링 쓰기 경로를 개선했습니다. **DSH는 MIT이며 코드를 복사하지 않고 독자 설계**했습니다([LICENSE-REVIEW](../LICENSE-REVIEW.md)).
+
+- 기존: 모든 진단 줄을 `appendFileSync`로 즉시 기록 → Windows 디스크/백신 지연이 이벤트 루프 정지로 이어짐(관측 max 980ms, 100–170ms 스파이크).
+- 변경: 라우트 로그를 **10ms 배치, 4,096줄/2MiB 상한 큐**, 드롭·오류·회전 카운터, 종료 시 동기 flush로 기록. 기존 회전·start 마커·개행 위조 방지 유지.
+- `/api/metrics`에 `routeLog` 지표를 노출하고, 대시보드 프로세스 카드에 **쓰기 max·큐·드롭**을 표시해 이벤트 루프 지연 원인을 로그 I/O와 대조할 수 있게 했습니다.
+
+검증: 로깅 3 tests, 메트릭/DOM 113 tests, 프록시 벤치마크 PASS(16KB 2ms대, 1MB 10ms대, 히스토리 3ms대).

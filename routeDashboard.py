@@ -3340,6 +3340,10 @@ function renderProcessHealth(data) {
     : '';
   const mb = bytes => typeof bytes === 'number' && bytes >= 0 ? (bytes / 1048576).toFixed(1) + ' MB' : '—';
   const ms = value => typeof value === 'number' && value >= 0 ? value.toFixed(1) + ' ms' : '—';
+  const routeLog = pm.routeLog || {};
+  const logLine = routeLog.enabled === true
+    ? `<p class="hint">라우트 로그는 비동기 배치입니다: 큐 ${num(routeLog.queuedLines)}줄 · 누적 ${num(routeLog.written)}줄 · 드롭 ${num(routeLog.dropped)} · 쓰기 ${ms(routeLog.writeMsMax)}</p>`
+    : '';
   grid.insertAdjacentHTML('beforeend', `<section class="card col-12"><header class="card-h">`
     + `<div><h2>프로세스 상태</h2><p class="sub">프록시 자체 부하 · 이벤트 루프 지연</p></div></header><div class="card-b">`
     + `<div class="metrics-strip">`
@@ -3347,7 +3351,9 @@ function renderProcessHealth(data) {
     + `<div class="m"><span class="k">힙 사용</span><span class="v">${mb(health.heapUsedBytes)}</span></div>`
     + `<div class="m"><span class="k">이벤트 루프 지연 p95</span><span class="v">${ms(lag.p95Ms)}</span></div>`
     + `<div class="m"><span class="k">이벤트 루프 지연 max</span><span class="v">${ms(lag.maxMs)}</span></div>`
-    + `</div><p class="hint">이벤트 루프 지연은 타이머가 예정보다 늦게 실행된 시간입니다. 값이 크면 본문 파싱·검증·로그 같은 프록시 자체 작업이 요청 처리를 막고 있을 수 있으며, 업스트림 지연과는 별개입니다.</p>${spikeLine}</div></section>`);
+    + (routeLog.enabled === true ? `<div class="m"><span class="k">라우트 로그 쓰기 max</span><span class="v">${ms(routeLog.writeMsMax)}</span></div>`
+      + `<div class="m"><span class="k">라우트 로그 큐 · 드롭</span><span class="v">${num(routeLog.queuedLines)} · ${num(routeLog.dropped)}</span></div>` : '')
+    + `</div><p class="hint">이벤트 루프 지연은 타이머가 예정보다 늦게 실행된 시간입니다. 값이 크면 본문 파싱·검증·로그 같은 프록시 자체 작업이 요청 처리를 막고 있을 수 있으며, 업스트림 지연과는 별개입니다.</p>${logLine}${spikeLine}</div></section>`);
 }
 const renderGridWithProcess = renderGrid;
 renderGrid = function (data) {

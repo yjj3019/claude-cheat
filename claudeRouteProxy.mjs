@@ -159,23 +159,22 @@ function stabilizeSystem(system) {
 }
 
 // Diagnostic mirror: routing events also land in a file so a session can be explained afterwards.
-// The launcher sets ROUTE_LOG_PATH for Local and OpenRouter sessions; without it nothing is written.
+// The writer is a bounded write-behind queue: request handling never waits for disk I/O, and a
+// failing or slow disk can only drop diagnostic lines instead of stalling the event loop.
 const routeLogPath = process.env.ROUTE_LOG_PATH;
 const ROUTE_LOG_LIMIT = 8 * 1024 * 1024;
-// One shared log receives every launcher instance, so each line states which instance wrote
-// it. The dashboard can then attribute decisions to the session it is actually displaying.
+const ROUTE_LOG_QUEUE_LINES = 4096;
+const ROUTE_LOG_QUEUE_BYTES = 2 * 1024 * 1024;
 const routeInstanceId = typeof process.env.ROUTE_INSTANCE_ID === 'string' &&
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(process.env.ROUTE_INSTANCE_ID)
   ? process.env.ROUTE_INSTANCE_ID : null;
+let routeMirror = null;
 if (routeLogPath) {
   delete process.env.ROUTE_LOG_PATH;
   const emit = console.error.bind(console);
-  let writes = 0;
-  // Record which source revision this process loaded so a stale run is visible afterwards.
   const codeStamp = (() => {
     try { return statSync(fileURLToPath(import.meta.url)).mtime.toISOString(); } catch { return null; }
   })();
-  // A content digest tells the dashboard whether the code really differs, not just the mtime.
   const codeHash = (() => {
     try {
       return createHash('sha256').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex').slice(0, 12);
@@ -184,33 +183,115 @@ if (routeLogPath) {
   const startLine = continued => `${new Date().toISOString()} --- proxy start` +
     `${continued ? ' continued=1' : ''}${routeInstanceId ? ` instance=${routeInstanceId}` : ''}` +
     `${codeStamp ? ` code=${codeStamp}` : ''}${codeHash ? ` hash=${codeHash}` : ''} ---\n`;
-  // The log is diagnostic, not a journal: rotate it so a long-running session cannot
-  // fill the disk. The dashboard notices the new file through its prefix fingerprint.
-  const rotate = () => {
+  const bootMarker = startLine(false);
+  const stats = { written: 0, dropped: 0, errors: 0, rotations: 0, batches: 0,
+    writeMsTotal: 0, writeMsMax: 0, maxQueuedBytes: 0 };
+  let queue = [bootMarker];
+  let queuedBytes = Buffer.byteLength(bootMarker);
+  let writing = false, scheduled = false;
+
+  const rotateIfNeeded = () => {
     try {
       if (statSync(routeLogPath).size < ROUTE_LOG_LIMIT) return;
       renameSync(routeLogPath, `${routeLogPath}.1`);
-      // A rotated file has no start marker of its own. Re-state this session's identity so
-      // stale-code detection still works after the rotation without reading the old file.
-      appendFileSync(routeLogPath, startLine(true));
+      stats.rotations += 1;
+      if (queue[0] === bootMarker) {
+        queue.shift();
+        queuedBytes -= Buffer.byteLength(bootMarker);
+      }
+      const marker = startLine(true);
+      queue.unshift(marker);
+      queuedBytes += Buffer.byteLength(marker);
     } catch {}
+  };
+
+  const drain = () => {
+    if (writing || !queue.length) return;
+    writing = true;
+    try {
+      while (queue.length) {
+        rotateIfNeeded();
+        const batch = queue.splice(0, 64);
+        const bytes = batch.reduce((sum, line) => sum + Buffer.byteLength(line), 0);
+        const started = performance.now();
+        appendFileSync(routeLogPath, batch.join(''));
+        const elapsed = performance.now() - started;
+        stats.writeMsTotal += elapsed;
+        stats.writeMsMax = Math.max(stats.writeMsMax, elapsed);
+        stats.batches += 1;
+        stats.written += batch.length;
+        queuedBytes = Math.max(0, queuedBytes - bytes);
+      }
+    } catch {
+      stats.errors += 1;
+    } finally {
+      writing = false;
+      if (queue.length) schedule();
+    }
+  };
+
+  const schedule = () => {
+    if (scheduled || writing) return;
+    scheduled = true;
+    const timer = setTimeout(() => { scheduled = false; drain(); }, 10);
+    timer.unref?.();
+  };
+
+  const enqueue = (...args) => {
+    try {
+      const line = redactDiagnostic(args.join(' ')).replace(/[\r\n]+/g, ' ');
+      const entry = `${new Date().toISOString()} ${line}\n`;
+      const bytes = Buffer.byteLength(entry);
+      if (queue.length >= ROUTE_LOG_QUEUE_LINES || queuedBytes + bytes > ROUTE_LOG_QUEUE_BYTES) {
+        stats.dropped += 1;
+        return;
+      }
+      queue.push(entry);
+      queuedBytes += bytes;
+      stats.maxQueuedBytes = Math.max(stats.maxQueuedBytes, queuedBytes);
+      schedule();
+    } catch {
+      stats.errors += 1;
+    }
+  };
+
+  const flushSync = () => {
+    if (!queue.length) return;
+    try {
+      let text = queue.join('');
+      let info = null;
+      try { info = statSync(routeLogPath); } catch {}
+      if (info && info.size >= ROUTE_LOG_LIMIT) {
+        try {
+          renameSync(routeLogPath, `${routeLogPath}.1`);
+          stats.rotations += 1;
+          if (queue[0] === bootMarker) queue.shift();
+          text = startLine(true) + queue.join('');
+        } catch {}
+      }
+      appendFileSync(routeLogPath, text);
+      stats.written += queue.length;
+      queue = [];
+      queuedBytes = 0;
+    } catch {
+      stats.errors += 1;
+    }
+  };
+
+  process.once('exit', flushSync);
+  routeMirror = {
+    enqueue,
+    stats: () => ({ enabled: true, written: stats.written, dropped: stats.dropped,
+      errors: stats.errors, rotations: stats.rotations, queuedLines: queue.length,
+      queuedBytes, maxQueuedBytes: stats.maxQueuedBytes, batches: stats.batches,
+      writeMsMax: Number(stats.writeMsMax.toFixed(2)),
+      writeMsAvg: stats.batches ? Number((stats.writeMsTotal / stats.batches).toFixed(2)) : 0 }),
   };
   console.error = (...args) => {
     emit(...args);
-    try {
-      // Check before writing so the line that triggers the rotation lands in the new file.
-      if (writes % 200 === 0) rotate();
-      // stderr already received the redacted copy from the single sink; the mirror must not
-      // become the unredacted side channel, so it runs the same pass over the joined text.
-      // Embedded newlines would forge extra log lines, so the mirror keeps one event per line.
-      const line = redactDiagnostic(args.join(' ')).replace(/[\r\n]+/g, ' ');
-      appendFileSync(routeLogPath, `${new Date().toISOString()} ${line}\n`);
-      writes += 1;
-    } catch {}
+    routeMirror.enqueue(...args);
   };
-  try {
-    appendFileSync(routeLogPath, startLine(false));
-  } catch {}
+  schedule();
 }
 
 // Historical client alias only; the upstream model must be configured explicitly.
@@ -1157,6 +1238,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       pending: usageQueue.length + usageBatchSize } } : {}),
     uptimeMs: Date.now() - metrics.startedAt,
     process: processSnapshot(),
+    routeLog: routeMirror ? routeMirror.stats() : { enabled: false },
     requests: metrics.requests, ok: metrics.ok, failed: metrics.failed,
     // Accepted message requests (including body upload), excluding diagnostics/metrics.
     inflightRequests: inflight,

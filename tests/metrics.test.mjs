@@ -108,6 +108,7 @@ test('metrics expose measured process health and event-loop delay', async () => 
     }
     assert.ok(Array.isArray(payload.process.eventLoopSpikes));
     assert.ok(payload.process.eventLoopSpikes.length <= 5);
+    assert.equal(payload.routeLog.enabled, false, 'no route log is configured for this fixture');
     for (const spike of payload.process.eventLoopSpikes) {
       assert.ok(Number.isFinite(Date.parse(spike.at)));
       assert.ok(spike.ms >= 100);

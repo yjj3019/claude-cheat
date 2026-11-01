@@ -140,3 +140,25 @@
 - `routeDashboard.py`의 `project_context`, `_attach_inferred_projects`, `renderOverviewHero`, 트랜스크립트 cwd/gitBranch 파싱
 
 **위반 시 조치**: 프로젝트 식별을 제거하거나 추정/실측 구분 없이 표시하도록 되돌리는 변경은 되돌립니다.
+
+## R14. 프록시 핫패스 쓰기 최소화와 모니터링 분리
+
+**요구**: 대시보드·로그 같은 모니터링 작업이 요청 처리 지연을 키우지 않도록 쓰기 빈도를 줄이고, 프록시 자체 작업이 병목이 되면 계측으로 원인을 확인할 수 있어야 합니다.
+
+**수용 기준**
+
+- 라우트 로그는 **줄마다 개별 동기 append하지 않고 10ms 배치·상한 큐(4,096줄/2MiB)·드롭 카운터·종료 동기 flush**로 기록한다. 큐가 넘치면 진단 줄만 드롭하고 요청은 계속 처리된다.
+- `/api/metrics`에 `routeLog` 지표(written/dropped/errors/queueLines/queuedBytes/writeMsMax/writeMsAvg)가 포함된다.
+- 대시보드 프로세스 카드에 **라우트 로그 쓰기 max·큐·드롭**이 표시되어 이벤트 루프 지연 원인을 로그 I/O와 구분할 수 있다.
+- 기존 로그 회전, start 마커, 개행 위조 방지, `-Stop`/handover 시 flush 동작이 유지된다.
+- 외부 참고(DSH)는 MIT 라이선스이며 **코드를 복사하지 않고 독자 설계**한다. 복사가 발생하면 MIT 고지를 추가한다.
+
+**회귀 감시**
+
+- `tests/logging.test.mjs` — 회전·start 마커·개행 위조·종료 flush
+- `tests/metrics.test.mjs` — `routeLog` 지표
+- `tests/dashboard_dom.test.mjs` — 프로세스 카드의 로그 쓰기/큐 표시
+- `tests/test_route_dashboard.py::PageTests` — `라우트 로그 쓰기 max` UI
+- `LICENSE-REVIEW.md` — DSH MIT 참고 검토
+
+**위반 시 조치**: 라우트 로그를 다시 요청 스레드의 동기 per-line 쓰기로 되돌리거나, 모니터링 지표를 제거하는 변경은 되돌립니다.
