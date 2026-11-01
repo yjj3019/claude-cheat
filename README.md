@@ -37,11 +37,17 @@ Claude Code, Node.js, Python을 설치하고 [준비 사항](#2-준비와-설정
    Invoke-RestMethod http://127.0.0.1:8787/api/diagnostics | ConvertTo-Json -Depth 8
    ```
 
+어느 폴더에서나 `OpenClaude`·`OpenClaudeDashboard`로 실행하려면 **한 번만** 설치합니다. 포워더 생성과 사용자 PATH 등록이 자동으로 처리됩니다([전역 실행기 설치와 자동 PATH](#전역-실행기-설치와-자동-path)).
+
+```powershell
+.\installLauncher.cmd
+```
+
 설정 변경은 **다음 새 세션부터** 적용됩니다. 일반 모드의 Plan 우회와 별도로 [Local 전용 모드](#claude-cli-local-전용-모드) 및 [Local 호환 모드](#claude-cli-local-호환-모드)를 제공합니다.
 
 ## 목차
 
-자주 찾는 항목: [실시간 대시보드](#실시간-대시보드) · [사용량 통계](#사용량-통계) · [CLI 백엔드](#cli를-모델-백엔드로-사용하기) · [AI 진단 API](#ai-디버깅용-상태-점검-api)
+자주 찾는 항목: [전역 실행기와 자동 PATH](#전역-실행기-설치와-자동-path) · [실시간 대시보드](#실시간-대시보드) · [사용량 통계](#사용량-통계) · [CLI 백엔드](#cli를-모델-백엔드로-사용하기) · [AI 진단 API](#ai-디버깅용-상태-점검-api)
 
 1. [어떤 요청이 어디로 가나요?](#1-어떤-요청이-어디로-가나요)
 2. [준비와 설정 파일 위치](#2-준비와-설정-파일-위치)
@@ -119,7 +125,57 @@ claude auth status
 .\installLauncher.ps1 -NoPath   # PATH는 건드리지 않고 포워더만 설치
 ```
 
-다른 작업 폴더에서는 **`OpenClaude` 또는 `OpenClaudeDashboard`**(확장자 없이)만 입력하면 됩니다. `.ps1`은 체크아웃 폴더에만 있으므로 `openClaude.ps1`처럼 `.ps1`을 붙이거나 `.\` 없이 파일명만 쓰면 PATH에서 찾지 못합니다. 포워더는 `.cmd`라서 PowerShell 실행 정책의 영향을 받지 않고, 내부에서 `-ExecutionPolicy Bypass`로 실제 `.ps1`을 실행합니다. 이전 버전이 설치한 같은 이름의 `.ps1` 포워더는 설치 시 자동으로 제거됩니다(PowerShell이 `.ps1`을 먼저 찾아 다시 막히는 것을 방지). 포워더는 이 체크아웃의 경로를 담으므로, 저장소를 옮기면 다시 설치하세요. 기본 폴더가 사용자 PATH에 없으면 설치 스크립트가 **자동으로 추가**하며, 이미 열려 있던 터미널에서는 새 터미널을 열어야 반영됩니다.
+다른 작업 폴더에서는 **`OpenClaude` 또는 `OpenClaudeDashboard`**(확장자 없이)만 입력하면 됩니다.
+
+### 전역 실행기 설치와 자동 PATH
+
+```powershell
+.\installLauncher.ps1                      # 포워더 설치 + 사용자 PATH 자동 등록
+.\installLauncher.ps1 -Remove              # 포워더 삭제 (PATH 항목은 유지)
+.\installLauncher.ps1 -NoPath              # PATH는 건드리지 않고 설치만
+.\installLauncher.ps1 -Target D:\tools\bin # 다른 폴더에 설치 (이때는 PATH 자동 등록 안 함)
+```
+
+설치 스크립트가 자동으로 하는 일:
+
+| 단계 | 동작 | 조건·실패 시 |
+| --- | --- | --- |
+| 포워더 생성 | `%USERPROFILE%\.local\bin`에 `OpenClaude.cmd`·`OpenClaudeDashboard.cmd`와 이전 이름 포워더 생성 | 같은 이름의 파일이 이 스크립트가 만든 것이 아니면 덮어쓰지 않고 보존 |
+| 구형 정리 | 같은 이름으로 남아 있던 생성된 `.ps1` 포워더를 제거 | 사용자가 직접 만든 `.ps1`은 보존 |
+| PATH 등록 | 기본 폴더가 **사용자 PATH**에 없으면 자동 추가(관리자 권한 불필요) | `-Target`을 지정했거나 `-NoPath`를 주면 생략 |
+| 즉시 반영 | 현재 프로세스 PATH에도 추가하고 새 터미널 안내 | 이미 열려 있던 다른 터미널은 새로 열어야 반영 |
+
+포워더는 `.cmd`라서 PowerShell 실행 정책의 영향을 받지 않고, 내부에서 `-ExecutionPolicy Bypass`로 실제 `.ps1`을 실행합니다. 이전 버전이 설치한 같은 이름의 `.ps1` 포워더는 설치 시 자동으로 제거됩니다(PowerShell이 `.ps1`을 먼저 찾아 다시 막히는 것을 방지). 포워더는 이 체크아웃의 경로를 담으므로, **저장소를 옮기면 다시 설치**하세요.
+
+**명령 해석 규칙** — `OpenClaude`가 인식되지 않을 때 확인하세요:
+
+| 입력 | 결과 | 이유 |
+| --- | --- | --- |
+| `OpenClaude` | PATH의 `OpenClaude.cmd` 실행 | 확장자 없는 이름을 PATH에서 찾습니다 |
+| `OpenClaude.cmd` | 동일 | 명시적 파일명 |
+| `openClaude.ps1` | **인식 안 됨** | PATH에 `.ps1` 포워더가 없습니다. `.ps1`은 체크아웃 폴더에만 있습니다 |
+| `.\OpenClaude.ps1` | 체크아웃 폴더에서만 실행 | 현재 폴더 기준 상대 경로 |
+| `OpenClaudeDashboard -Open` | 대시보드 + 설정 페이지 열기 | 쓰기 토큰이 포함된 `write_url`로 엽니다 |
+
+**동작 확인과 복구:**
+
+```powershell
+Get-Command OpenClaude | Select-Object Source
+# C:\Users\<사용자>\.local\bin\OpenClaude.cmd
+
+where.exe OpenClaude
+$env:PATH -split ';' | Select-String '\.local\\bin'
+```
+
+인식되지 않으면 순서대로 확인하세요.
+
+1. **새 터미널**을 엽니다(PATH 변경은 새 프로세스부터 적용).
+2. `$env:PATH`에 `C:\Users\<사용자>\.local\bin`이 있는지 확인합니다.
+3. 없으면 체크아웃 폴더에서 `.\installLauncher.ps1`을 다시 실행합니다.
+4. 실행 정책 오류가 나면 `.\installLauncher.cmd`를 사용합니다(아래 참고).
+5. 회사 GPO가 `AllSigned`를 강제하면 우회가 막히므로 관리자 정책 변경이 필요합니다.
+
+> `-Remove`는 포워더만 삭제하고 PATH 항목은 남깁니다. PATH에서도 빼려면 Windows **환경 변수**에서 직접 제거하세요.
 
 > **실행 정책으로 `.ps1`이 막히면**: 스크립트가 서명되지 않았으므로 `AllSigned`(또는 서명을 요구하는 관리 정책) 터미널에서는 `파일이 디지털 서명되지 않았습니다` 오류가 납니다. 이때는 `.cmd` 진입점을 사용하세요 — 설치(`.\installLauncher.cmd`), 체크아웃 직접 실행(`.\OpenClaude.cmd`·`.\OpenClaudeDashboard.cmd`), PATH의 `OpenClaude`/`OpenClaudeDashboard` 모두 정책과 무관하게 동작합니다. 그래도 막히면 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\installLauncher.ps1`처럼 실행하거나 현재 사용자 범위 정책을 `RemoteSigned`로 두세요(`Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, 관리자 권한 불필요). 회사 GPO가 `AllSigned`를 강제하면 `-ExecutionPolicy Bypass`도 무시되므로 관리자에게 문의해야 합니다.
 
@@ -843,6 +899,8 @@ node --test tests/dashboard_dom.test.mjs
 
 | 증상 | 먼저 확인할 내용 |
 | --- | --- |
+| `openClaude.ps1`이 인식되지 않음 | PATH 명령은 **`OpenClaude`**(확장자 없이)입니다. `.ps1`은 체크아웃 폴더에만 있습니다. `Get-Command OpenClaude`로 확인하고, 없으면 새 터미널에서 `.\installLauncher.ps1`(또는 `.\installLauncher.cmd`)을 한 번 실행하세요 |
+| 다른 폴더에서만 `OpenClaude`가 안 됨 | PATH 갱신 전 터미널인지 확인하고 새 터미널을 엽니다. `$env:PATH -split ';'`에 `C:\Users\<사용자>\.local\bin`이 없으면 설치 스크립트를 다시 실행하거나 `-NoPath`로 설치한 경우 사용자 PATH에 직접 추가하세요 |
 | `openclaude.config.yaml`을 찾지 못함 | 현재 작업 폴더가 아닌 실제 실행기 폴더에 저장했는지 확인 |
 | OpenRouter 401 / `Missing Authentication header` | 전용 파일의 실제 키·유효성을 확인; HUD 플러그인 설치 성공은 API 인증 성공과 별개 |
 | Local 설정을 바꿔도 이전 서버 사용 | 프로세스 환경변수 우선순위와 전역 실행기 대상 확인 후 세션 재시작 |
@@ -993,7 +1051,7 @@ python tests/bench_dashboard.py            # 10MB 로그 · 2,000개 세션 파�
 | [OpenClaude.ps1](OpenClaude.ps1) | 제공자 선택과 Python 실행기 호출 |
 | [OpenClaudeDashboard.ps1](OpenClaudeDashboard.ps1) | 대시보드·설정 화면 실행 |
 | [OpenClaude.cmd](OpenClaude.cmd)·[OpenClaudeDashboard.cmd](OpenClaudeDashboard.cmd) | 실행 정책이 서명을 요구하는 터미널용 `.cmd` 진입점(내부에서 `-ExecutionPolicy Bypass`) |
-| [installLauncher.ps1](installLauncher.ps1) | 다른 폴더에서 사용할 전역 실행기 설치·갱신 |
+| [installLauncher.ps1](installLauncher.ps1) | 다른 폴더에서 사용할 전역 실행기 설치·갱신 + 사용자 PATH 자동 등록(`-NoPath`로 생략) |
 | [installLauncher.cmd](installLauncher.cmd) | 실행 정책이 `AllSigned`인 터미널에서도 설치·갱신(내부에서 `-ExecutionPolicy Bypass`) |
 | [openrouterAdvisor.py](openrouterAdvisor.py) | Plan 인증 검사·환경 격리·프록시 수명 관리·Local 목록 점검 |
 | [routeConfig.py](routeConfig.py) | 통합 설정 읽기·검증·원자적 저장·백업 |
