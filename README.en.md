@@ -393,6 +393,7 @@ The **insights** card ranks *what changed, why, and what to do next* instead of 
 | Default service unconfigured | the routing default points at a service whose required values are missing, or routing cannot be read | critical banner + `⛔` tab title + settings/restart hint |
 | Service choice required | two or more services are configured while the default is `auto` | banner + `⚠` tab title |
 | Session or CLI settings differ | the running session's provider, or its CLI kind/model, differs from the saved values | banner + copyable `.\OpenClaude.ps1` |
+| Plan-only features keep routing to Plan | an external service is configured, but this session has 0 external attempts and every decision is `native_feature` Plan | banner + copyable `.\OpenClaude.ps1 -OpenRouterCompat` (disables experimental betas and Plan fallback for a new session) |
 | Connection dropped | `/api/snapshot` fails | exponential backoff (1, 2, 4, 8, 16s) and a recovery toast |
 | Tab title badge | any warning/critical item exists | `⛔ n · …` or `⚠ n · …` |
 | Desktop notification | new critical item while notifications are enabled | one per cause (re-notifies after the cause clears and returns) |

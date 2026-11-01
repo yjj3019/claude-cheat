@@ -4726,6 +4726,20 @@ def proactive_alerts(providers, session, metrics, routing_values=None, cli_value
                 add("warn", "CLI 설정 변경됨",
                     "저장된 CLI 종류/모델과 실행 중 프록시의 값이 다릅니다. 진행 중 작업을 마치고 재시작하면 반영됩니다.",
                     "cli_settings_changed", ".\\OpenClaude.ps1")
+    # A configured external service whose session never attempted it is easy to misread as a
+    # routing fault; native-only features keep such requests on Plan by design.
+    routes = (metrics or {}).get("routes") if isinstance(metrics, dict) else None
+    reasons = (metrics or {}).get("reasons") if isinstance(metrics, dict) else None
+    if session and session.get("provider") in ("openrouter", "local") and isinstance(routes, dict):
+        plan_routes = routes.get("plan") if type(routes.get("plan")) is int else 0
+        external_routes = routes.get("external") if type(routes.get("external")) is int else 0
+        native = reasons.get("native_feature") if isinstance(reasons, dict) and type(reasons.get("native_feature")) is int else 0
+        if plan_routes >= 5 and external_routes == 0 and native >= plan_routes:
+            add("warn", "Plan 전용 기능으로 우회 중",
+                f"이 세션에서 외부 시도 없이 {plan_routes}건이 모두 Plan으로 처리됐습니다. "
+                "실험적 beta·고급 도구 기능이 켜져 있으면 일반 모드에서는 OpenRouter로 보내지 않고 Plan을 유지합니다. "
+                "OpenRouter로 보내려면 -OpenRouterCompat(Plan 비활성)으로 새 세션을 시작하세요.",
+                "session_plan_only", ".\\OpenClaude.ps1 -OpenRouterCompat")
     process_health = (metrics or {}).get("process") if isinstance(metrics, dict) else None
     if session and isinstance(process_health, dict):
         lag = process_health.get("eventLoopLagMs")

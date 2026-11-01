@@ -3902,6 +3902,27 @@ class ProactiveReactionTests(unittest.TestCase):
             routing_values={"ROUTE_DEFAULT_PROVIDER": "openrouter"})
         self.assertEqual(alerts, [])
 
+    def test_a_plan_only_session_with_a_configured_external_service_is_explained(self):
+        metrics = {"configuration": {"provider": "openrouter"},
+                   "routes": {"external": 0, "plan": 6}, "reasons": {"native_feature": 6}}
+        alerts = dash.proactive_alerts(
+            {"openrouter": True, "local": False, "cli": False},
+            {"provider": "openrouter"}, metrics,
+            routing_values={"ROUTE_DEFAULT_PROVIDER": "openrouter"})
+        codes = self.codes(alerts)
+        self.assertIn("session_plan_only", codes)
+        detail = next(alert for alert in alerts if alert["code"] == "session_plan_only")["detail"]
+        self.assertIn("OpenRouterCompat", detail)
+
+    def test_a_session_that_attempted_the_external_service_is_not_flagged(self):
+        metrics = {"configuration": {"provider": "openrouter"},
+                   "routes": {"external": 6, "plan": 0}, "reasons": {"replacement": 6}}
+        alerts = dash.proactive_alerts(
+            {"openrouter": True, "local": False, "cli": False},
+            {"provider": "openrouter"}, metrics,
+            routing_values={"ROUTE_DEFAULT_PROVIDER": "openrouter"})
+        self.assertNotIn("session_plan_only", self.codes(alerts))
+
 
 if __name__ == "__main__":
     unittest.main()
