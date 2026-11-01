@@ -100,3 +100,22 @@
 - `routeDashboard.py`의 `PAGE_CSS` 고정 지오메트리 블록
 
 **위반 시 조치**: 콘텐츠에 따라 카드 높이가 다시 변하도록 되돌리는 변경은 되돌립니다.
+
+## R12. 세션별 모니터링 (사용량·부하)
+
+**요구**: 여러 세션이 동시에 실행될 때 **각 세션이 얼마나 사용하고 어떤 부하를 만드는지** 한 화면에서 비교할 수 있어야 합니다.
+
+**수용 기준**
+
+- **세션별 모니터링** 표에 각 세션의 서비스·포트, 요청 수와 요청/분, 외부/Plan 경로, 실패/취소, 진행·실행·대기, 외부 p95, 출력 토큰/초, 입력/출력 토큰, RSS·이벤트 루프 p95, 마지막 활동이 표시된다.
+- 진행·대기 요청이 있거나 이벤트 루프 p95가 250ms 이상이면 해당 세션에 **부하** 표시가 붙는다.
+- 각 행의 **표시** 버튼으로 그 세션을 상세 카드의 기준으로 전환할 수 있고, 표시 중인 세션은 강조된다.
+- 모든 값은 각 세션의 프록시가 직접 보고한 값이며, 세션 토큰·자격 증명은 노출하지 않는다.
+
+**회귀 감시**
+
+- `tests/test_route_dashboard.py::MultiSessionTests.test_session_summary_exposes_usage_and_proxy_load`
+- `tests/test_route_dashboard.py::MultiSessionTests.test_session_monitor_ui_is_present`
+- `routeDashboard.py`의 `_session_summary`, `renderSessionMonitor`
+
+**위반 시 조치**: 세션별 사용량·부하 비교를 제거하거나 단일 세션 요약만 남기는 변경은 되돌립니다.

@@ -414,6 +414,8 @@ The server-side checks are read-only: they never restart a session, write settin
 
 **Layout is fixed independently of content.** From 1400 px wide, the **overview** and **request flow** cards keep a fixed 560 px height; long model/state text truncates to one line, metric values ellipsize, and insights clamp to three lines. Changing token counts or sentences no longer pushes the charts and diagnostics up or down. Narrow screens keep automatic height for readability.
 
+**Per-session monitoring** compares every live session: requests and requests/minute, external/Plan routes, failures/cancellations, in-flight/active/queued work, external p95, output tokens/second, input/output tokens, RSS and event-loop p95, and the last activity. A **load** badge appears when work is in flight/queued or event-loop p95 reaches 250 ms; the **show** button switches the detailed cards to that session.
+
 | Panel | Content |
 | --- | --- |
 | Now | **OpenRouter, Local LLM or CLI serving / Plan bypass / idle**, the **last request's actual routing model**, age, reason |

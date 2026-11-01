@@ -236,4 +236,4 @@ OpenRouter /api/v1/key, /models ─→ account/pricing (TTL 60s/3600s)
 
 측정 예(로컬 합성, 업스트림 즉시 응답, 동시성 32, 400요청): **697 req/s**, 외부 p95 0.71ms, 이벤트 루프 지연 p95 **76.2ms**/max 136.7ms, RSS 107MB, 거부 0. 로컬 하네스 기준이며 실제 제공자 지연은 포함하지 않습니다.
 
-검증: Node **724 pass**(DOM 97, metrics 11), Python **696개 수집(11 skip)**, 대시보드 모듈 271 pass.
+검증: Node **724 pass**(DOM 97, metrics 11), Python **696개 수집(11 skip)**, 대시보드 모듈 273 pass.

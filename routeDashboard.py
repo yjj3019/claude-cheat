@@ -1941,16 +1941,53 @@ def _live_session(offline=False):
 
 
 def _session_summary(saved):
+    """Compact per-session view of usage and proxy load; never exposes the session token."""
     session, metrics = saved["session"], saved["metrics"]
     configuration = metrics.get("configuration") if isinstance(metrics.get("configuration"), dict) else {}
+    provider = session.get("provider")
+    routes = metrics.get("routes") if isinstance(metrics.get("routes"), dict) else {}
+    performance = (metrics.get("modelPerformance") or {}).get(provider) or {}
+    flow = (metrics.get("tokenFlow") or {}).get(provider) or {}
+    latency = (metrics.get("latencyMs") or {}).get("external") or {}
+    ttfb = (metrics.get("latencyMs") or {}).get("ttfb") or {}
+    process = metrics.get("process") if isinstance(metrics.get("process"), dict) else {}
+    lag = process.get("eventLoopLagMs") if isinstance(process.get("eventLoopLagMs"), dict) else {}
+    admission = metrics.get("requestAdmission") if isinstance(metrics.get("requestAdmission"), dict) else {}
+    last = metrics.get("last") if isinstance(metrics.get("last"), dict) else {}
+
+    def number(value):
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+    requests = number(metrics.get("requests"))
+    uptime = number(metrics.get("uptimeMs"))
+    samples = number(performance.get("samples"))
+    output_tokens = number(performance.get("outputTokens"))
+    elapsed_ms = number(performance.get("elapsedMs"))
+    rate = round(requests * 60000 / uptime, 2) if requests is not None and uptime else None
+    output_rate = (round(output_tokens * 1000 / elapsed_ms, 2)
+                   if samples and output_tokens is not None and elapsed_ms else None)
     return {"instance_id": session.get("instance_id"),
             "port": session.get("port"),
-            "provider": session.get("provider"),
+            "provider": provider,
             "started": session.get("started"),
             "model": configuration.get("model"),
-            "requests": metrics.get("requests"),
-            "inflight": metrics.get("inflightRequests"),
-            "routes": metrics.get("routes"),
+            "requests": requests,
+            "ok": number(metrics.get("ok")),
+            "failed": number(metrics.get("failed")),
+            "aborted": number(metrics.get("aborted")),
+            "inflight": number(metrics.get("inflightRequests")),
+            "admission_active": number(admission.get("active")),
+            "admission_queued": number(admission.get("queued")),
+            "routes": routes,
+            "rate_per_min": rate,
+            "latency_p95_ms": number(latency.get("p95")),
+            "ttfb_p95_ms": number(ttfb.get("p95")),
+            "input_tokens": number(flow.get("inputTokens")),
+            "output_tokens": number(flow.get("outputTokens")),
+            "output_tokens_per_second": output_rate,
+            "rss_bytes": number(process.get("rssBytes")),
+            "loop_p95_ms": number(lag.get("p95Ms")),
+            "last_ts": last.get("ts") if isinstance(last.get("ts"), str) else None,
             "selected": False}
 
 
@@ -4104,6 +4141,75 @@ PAGE_CSS += """
 .insight{height:128px;overflow:hidden}
 .insight p{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
 .insight .chips{max-height:24px;overflow:hidden}
+"""
+PAGE_CSS += """
+.session-monitor .table-scroll{max-height:240px}
+.session-monitor table{min-width:1020px}
+.session-monitor tbody tr.session-selected td{background:rgba(91,157,255,.10)}
+.session-monitor .session-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#43d9a3;margin-right:6px}
+.session-monitor .chip-selected{color:#8aefd0;border-color:var(--ok-line);background:var(--ok-soft)}
+.session-monitor .chip-load{color:var(--warn);border-color:var(--warn-line);background:var(--warn-soft);margin-left:4px}
+.session-monitor td small{color:var(--fg-4);font-size:10.5px;margin-left:4px}
+.session-monitor th{white-space:nowrap}
+"""
+JS_DASHBOARD += """
+function renderSessionMonitor(data) {
+  const grid = document.getElementById('grid');
+  if (!grid || typeof grid.insertAdjacentHTML !== 'function') return;
+  const sessions = Array.isArray(data.sessions) ? data.sessions : [];
+  if (!sessions.length) return;
+  const scalar = value => typeof value === 'number' && Number.isFinite(value) ? value : null;
+  const count = value => scalar(value) === null ? '—' : num(value);
+  const rate = value => scalar(value) === null ? '—' : value.toFixed(1) + '/분';
+  const seconds = value => scalar(value) === null ? '—' : (value / 1000).toFixed(2) + '초';
+  const tokens = value => scalar(value) === null ? '—' : num(value);
+  const mb = value => scalar(value) === null ? '—' : (value / 1048576).toFixed(1) + ' MB';
+  const busy = session => (scalar(session.inflight) || 0) > 0 || (scalar(session.admission_queued) || 0) > 0 || (scalar(session.loop_p95_ms) || 0) >= 250;
+  const age = timestamp => {
+    const parsed = Date.parse(timestamp), now = Date.parse(data.generated_at);
+    if (!Number.isFinite(parsed) || !Number.isFinite(now)) return '—';
+    const elapsed = Math.max(0, (now - parsed) / 1000);
+    return elapsed < 60 ? Math.round(elapsed) + '초 전' : Math.round(elapsed / 60) + '분 전';
+  };
+  const names = {openrouter: 'OpenRouter', local: 'Local', cli: 'CLI'};
+  const rows = sessions.map(session => {
+    const routes = session.routes || {};
+    const selected = session.selected === true;
+    const process = mb(session.rss_bytes) + ' · ' + (scalar(session.loop_p95_ms) === null ? '—' : session.loop_p95_ms.toFixed(1) + 'ms');
+    const outputRate = scalar(session.output_tokens_per_second) === null ? '—' : session.output_tokens_per_second.toFixed(1) + ' 토큰/초';
+    const progress = count(session.inflight)
+      + (scalar(session.admission_active) === null ? '' : ' · 실행 ' + count(session.admission_active))
+      + (scalar(session.admission_queued) === null ? '' : ' · 대기 ' + count(session.admission_queued));
+    return `<tr class="${selected ? 'session-selected' : ''}">
+      <td><span class="session-dot"></span>${esc(names[session.provider] || session.provider || '?')}
+        ${selected ? '<span class="chip chip-selected">표시 중</span>' : `<button type="button" class="btn btn-sm btn-ghost" data-session-select="${esc(session.instance_id)}">표시</button>`}</td>
+      <td class="id">:${esc(session.port)}</td>
+      <td>${count(session.requests)}건 <small>${rate(session.rate_per_min)}</small></td>
+      <td>외부 ${count(routes.external)} · Plan ${count(routes.plan)}</td>
+      <td>${count(session.failed)} / ${count(session.aborted)}</td>
+      <td>${progress}</td>
+      <td>${seconds(session.latency_p95_ms)}</td>
+      <td>${outputRate}</td>
+      <td>${tokens(session.input_tokens)} / ${tokens(session.output_tokens)}</td>
+      <td>${process}</td>
+      <td>${age(session.last_ts)}${busy(session) ? ' <span class="chip chip-load">부하</span>' : ''}</td>
+    </tr>`;
+  }).join('');
+  const card = `<section class="card col-12 session-monitor" id="session-monitor"><header class="card-h"><div><h2>세션별 모니터링</h2><p class="sub">세션별 요청·토큰·지연·프로세스 부하 · ${sessions.length}개 세션</p></div></header><div class="card-b"><div class="table-scroll"><table><thead><tr><th>세션</th><th>포트</th><th>요청</th><th>경로</th><th>실패/취소</th><th>진행</th><th>p95</th><th>출력</th><th>입력/출력 토큰</th><th>프로세스</th><th>마지막</th></tr></thead><tbody>${rows}</tbody></table></div><p class="hint">요청·토큰은 각 세션 프록시가 보고한 값입니다. 부하는 진행·대기 요청이 있거나 이벤트 루프 p95가 250ms 이상일 때 표시합니다. 표시 버튼을 누르면 위 상세 카드가 해당 세션 기준으로 전환됩니다.</p></div></section>`;
+  const historyCard = Array.from(grid.children).find(node => node.textContent.includes('최근 요청 추이'));
+  if (historyCard) historyCard.insertAdjacentHTML('afterend', card);
+  else grid.insertAdjacentHTML('beforeend', card);
+}
+const renderGridWithSessionMonitor = renderGrid;
+renderGrid = function (data) {
+  renderGridWithSessionMonitor(data);
+  renderSessionMonitor(data);
+};
+document.addEventListener('click', event => {
+  const button = event.target.closest?.('[data-session-select]');
+  if (!button) return;
+  selectSession(button.dataset.sessionSelect);
+});
 """
 PAGE = _page("dashboard")
 SETTINGS_PAGE = _page("settings")

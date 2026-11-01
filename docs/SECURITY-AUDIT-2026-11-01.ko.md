@@ -254,7 +254,7 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 연결 자동 복구 | `/api/snapshot` 실패 시 1·2·4·8·16초 지수 백오프로 재시도하고, 복구 시 토스트로 알림 | 기능 추가 |
 | 보안 경계 | 능동 점검은 로컬 상태만 읽고 쓰기·세션 제어를 하지 않음. 알림 권한 거부 시에도 배너·배지는 동작 | 문서화 |
 
-검증: Node **724 pass / 0 fail**(DOM 99 포함), Python **696개 수집(11 skip)**, 대시보드 모듈 271 pass. 라이브 대시보드에서 `proactive` 키·탭 배지·알림 버튼 서빙 확인.
+검증: Node **724 pass / 0 fail**(DOM 99 포함), Python **696개 수집(11 skip)**, 대시보드 모듈 273 pass. 라이브 대시보드에서 `proactive` 키·탭 배지·알림 버튼 서빙 확인.
 
 
 ## 14. 대시보드 헤더 레이아웃 (2026-11-01)
@@ -267,7 +267,7 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 1600px 이하 2행 | 브랜드+내비 1행, 액션(상태·알림·새로고침·도움말) 2행으로 분리. 720px 이하 기존 모바일 순서 유지 | 수정 |
 | 넓은 창 | 1600px 초과에서는 한 행 유지(내비 4개 라벨 한 줄) | 확인 |
 
-검증: 헤드리스 Edge 스크린샷 1087·1280·1500·1920px에서 라벨 줄바꿈 없음, 대시보드 모듈 271 pass.
+검증: 헤드리스 Edge 스크린샷 1087·1280·1500·1920px에서 라벨 줄바꿈 없음, 대시보드 모듈 273 pass.
 
 
 ## 15. 실행기 설치 자동화 (2026-11-01)
@@ -319,7 +319,7 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 헤더 요약 툴팁 | 한 줄로 잘린 헤더 요약의 전체 문장을 `title` 툴팁에 유지 | PageTests(`data.summary ? data.summary`) |
 | 이벤트 루프 max 추적 | 100ms 이상 지연을 100ms 샘플러로 기록(최대 5건, ISO 시각)하고 `/api/metrics` `process.eventLoopSpikes` 로 노출, 프로세스 카드에 최근 3건 표시 | `tests/metrics.test.mjs`, `tests/dashboard_dom.test.mjs` |
 
-검증: Node **724 pass / 0 fail**(DOM 99), Python **703 tests OK**(11 skip), 대시보드 모듈 **264 pass**. 프록시 스파이크 기록은 다음 새 세션부터 적용됩니다.
+검증: Node **724 pass / 0 fail**(DOM 99), Python **705 tests OK**(11 skip), 대시보드 모듈 **264 pass**. 프록시 스파이크 기록은 다음 새 세션부터 적용됩니다.
 
 ## 19. 코드 변경 자동 반영 (2026-11-01)
 
@@ -331,7 +331,7 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 프록시 자동 takeover | 대시보드가 `proxy_hash` 불일치 + `inflightRequests=0`을 감지하면 `openrouterAdvisor.py --takeover`를 분리 실행해 같은 포트·토큰으로 교체. 60초 스로틀, 활성 턴이면 다음 기회 | `AutoUpdateTests` |
 | 감사 로그 | 모든 자동 반영 시도·실패를 `.auto-update.log`에 ISO 시각으로 기록 | 구현 확인 |
 
-검증: Python **703 tests OK**(11 skip), Node **724 pass**, 대시보드 모듈 **267 pass**, `AutoUpdateTests` 3 pass.
+검증: Python **705 tests OK**(11 skip), Node **724 pass**, 대시보드 모듈 **267 pass**, `AutoUpdateTests` 3 pass.
 
 ## 20. 다중 세션 모니터링 (2026-11-02)
 
@@ -345,10 +345,18 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 세션 선택 UI | 2개 이상일 때 헤더 드롭다운 표시, `POST /api/select-session`으로 전환 |
 | 호환 | 인스턴스 핸드오프가 없는 구버전 세션은 기존 싱글턴 핸드오프로 폴백 |
 
-검증: 라이브 세션 2개(68건/41건)를 동시에 발견하고 선택 API로 68건↔41건 전환이 실제 동작함. Python **703 tests OK**(11 skip), Node **724 pass**, 대시보드 모듈 **271 pass**.
+검증: 라이브 세션 2개(68건/41건)를 동시에 발견하고 선택 API로 68건↔41건 전환이 실제 동작함. Python **705 tests OK**(11 skip), Node **724 pass**, 대시보드 모듈 **271 pass**.
 
 ## 21. 대시보드 레이아웃 고정 (2026-11-02)
 
 사용자 보고: 텍스트·수치 결과에 따라 카드 높이가 변해 레이아웃이 흔들림. 폭 1400px 이상에서 상단 **한눈에 보기**·**요청 흐름** 카드를 560px로 고정하고, 긴 모델/상태는 한 줄 말줄임, 지표 값은 말줄임, 인사이트는 3줄 클램프·128px 고정으로 처리했습니다. 좁은 화면은 가독성을 위해 자동 높이를 유지합니다.
 
-검증: PageTests에서 `Stable dashboard geometry`, `height:560px`, `-webkit-line-clamp:3` 고정. Python **703 tests OK**(11 skip), Node **724 pass**, 대시보드 모듈 **271 pass**. 1500px 스크린샷에서 카드 높이 고정 확인.
+검증: PageTests에서 `Stable dashboard geometry`, `height:560px`, `-webkit-line-clamp:3` 고정. Python **705 tests OK**(11 skip), Node **724 pass**, 대시보드 모듈 **271 pass**. 1500px 스크린샷에서 카드 높이 고정 확인.
+
+## 22. 세션별 모니터링 (2026-11-02)
+
+사용자 요청: 다중 세션에서 **어느 세션이 얼마나 사용하고 어떤 부하를 만드는지** 비교가 필요함.
+
+`_session_summary`가 각 인스턴스의 프록시 `/api/metrics`에서 요청 수·요청/분, 외부/Plan 경로, 실패·취소, 진행·실행·대기, 외부 p95·TTFB p95, 입력/출력 토큰·출력 토큰/초, RSS·이벤트 루프 p95, 마지막 활동을 수집합니다. 대시보드의 **세션별 모니터링** 표가 이를 비교하고, 진행·대기 또는 이벤트 루프 p95 250ms 이상인 세션에 **부하**를 표시합니다. 각 행의 **표시** 버튼은 상세 카드 기준 세션을 전환하며 선택은 `.dashboard.session`에 유지됩니다.
+
+검증: 라이브 세션 2개에서 98건/108건, 출력 42.6/37.3 토큰/초, RSS·루프 값을 실제 표시. Python **705 tests OK**(11 skip), Node **724 pass**, 대시보드 모듈 **273 pass**.

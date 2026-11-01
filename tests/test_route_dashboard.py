@@ -4031,3 +4031,35 @@ class MultiSessionTests(unittest.TestCase):
         self.assertIn('#session-picker', dash.PAGE_CSS)
         self.assertIn('renderHeaderWithSessionPicker', dash.PAGE)
         self.assertIn('selectSession', dash.PAGE)
+
+    def test_session_summary_exposes_usage_and_proxy_load(self):
+        a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        saved = {"session": {"instance_id": a, "provider": "openrouter", "started": "2026-11-02T00:00:00+00:00",
+                            "port": 1234},
+                 "metrics": {"requests": 120, "ok": 118, "failed": 2, "aborted": 1, "inflightRequests": 3,
+                             "requestAdmission": {"active": 2, "queued": 1},
+                             "routes": {"external": 110, "plan": 10},
+                             "latencyMs": {"external": {"p95": 12000}, "ttfb": {"p95": 4000}},
+                             "modelPerformance": {"openrouter": {"samples": 8, "outputTokens": 1600, "elapsedMs": 80000}},
+                             "tokenFlow": {"openrouter": {"inputTokens": 5000, "outputTokens": 1600}},
+                             "process": {"rssBytes": 256 * 1048576, "eventLoopLagMs": {"p95Ms": 40.5}},
+                             "uptimeMs": 600000, "last": {"ts": "2026-11-02T01:00:00+00:00"},
+                             "configuration": {"model": "vendor/model"}}}
+        summary = dash._session_summary(saved)
+        self.assertEqual(summary["requests"], 120)
+        self.assertEqual(summary["failed"], 2)
+        self.assertEqual(summary["aborted"], 1)
+        self.assertEqual(summary["inflight"], 3)
+        self.assertEqual(summary["admission_queued"], 1)
+        self.assertEqual(summary["rate_per_min"], 12.0)
+        self.assertEqual(summary["latency_p95_ms"], 12000)
+        self.assertEqual(summary["output_tokens_per_second"], 20.0)
+        self.assertEqual(summary["rss_bytes"], 256 * 1048576)
+        self.assertEqual(summary["loop_p95_ms"], 40.5)
+        self.assertEqual(summary["last_ts"], "2026-11-02T01:00:00+00:00")
+        self.assertEqual(summary["model"], "vendor/model")
+
+    def test_session_monitor_ui_is_present(self):
+        self.assertIn('renderSessionMonitor', dash.PAGE)
+        self.assertIn('세션별 모니터링', dash.PAGE)
+        self.assertIn('.session-monitor', dash.PAGE_CSS)
