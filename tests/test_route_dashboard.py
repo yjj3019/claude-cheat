@@ -3420,7 +3420,24 @@ class ToolRoundtripApiTests(unittest.TestCase):
     def test_server_socket_limits_are_bounded(self):
         self.assertEqual(dash.Handler.timeout, 15)
         self.assertEqual(dash.DashboardServer.request_queue_size, 64)
+        self.assertEqual(dash.DashboardServer.max_connections, 64)
         self.assertTrue(dash.DashboardServer.daemon_threads)
+
+    def test_connection_cap_drops_sockets_instead_of_spawning_threads(self):
+        import socket
+        server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        try:
+            for _ in range(dash.DashboardServer.max_connections):
+                server._connection_slots.acquire()
+            left, right = socket.socketpair()
+            right.settimeout(5)
+            server.process_request(left, ("127.0.0.1", 0))
+            self.assertEqual(right.recv(1), b"")  # peer was closed, not handed to a thread
+            right.close()
+            for _ in range(dash.DashboardServer.max_connections):
+                server._connection_slots.release()
+        finally:
+            server.server_close()
 
 
 class MonitoringParityTests(unittest.TestCase):

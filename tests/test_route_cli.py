@@ -330,8 +330,12 @@ class RunSafely(FakeCase):
 
 
 class ConnectionTest(FakeCase):
-    def capped(self, seconds=4):
-        """Real run_safely, but the command (not the probe) gets a short timeout so slow-mode tests stay fast."""
+    def capped(self, seconds=15):
+        """Real run_safely, but the command (not the probe) gets a bounded timeout so slow-mode tests stay fast.
+
+        The cap must exceed the Windows node-shim startup cost seen on a loaded machine; 4s was
+        tight enough to time out healthy "ready" runs during full-suite load (flaky fail).
+        """
         real = rc.run_safely
         patcher = mock.patch.object(
             rc, "run_safely", side_effect=lambda argv, **k: real(argv, **(k if "--version" in argv else {**k, "timeout": seconds})))

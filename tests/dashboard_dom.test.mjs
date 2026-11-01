@@ -29,7 +29,7 @@ function fakeElement(id = '') {
   return element;
 }
 
-function buildContext(hash = '#token=test-token') {
+function buildContext(hash = '#token=test-token', fetchImpl = async () => ({ ok: true, json: async () => ({}) })) {
   const nodes = new Map();
   const get = id => {
     if (!nodes.has(id)) nodes.set(id, fakeElement(id));
@@ -43,11 +43,19 @@ function buildContext(hash = '#token=test-token') {
     addEventListener() {}, removeEventListener() {},
     body: fakeElement('body'),
   };
+  const sessionStorage = {
+    _map: new Map(),
+    getItem(key) { return this._map.has(key) ? this._map.get(key) : null; },
+    setItem(key, value) { this._map.set(key, String(value)); },
+    removeItem(key) { this._map.delete(key); },
+    clear() { this._map.clear(); },
+  };
   return {
     nodes, document, window: { addEventListener() {} },
     location: { hash, pathname: '/', search: '' },
     history: { replaceState() {} },
-    fetch: async () => ({ ok: true, json: async () => ({}) }),
+    sessionStorage,
+    fetch: fetchImpl,
     setInterval: () => 0, clearInterval() {}, setTimeout: () => 0, clearTimeout() {},
     console, navigator: { clipboard: { writeText: async () => {} } }, Event: class {},
   };
@@ -1331,12 +1339,39 @@ test('write token is read from the URL fragment and removed from the address bar
   vm.runInContext(scriptBundle(), sandbox, { filename: 'dashboard.js' });
   assert.equal(vm.runInContext('TOKEN', sandbox), 'abc123_-X');
   assert.equal(replaced, 1);
+  assert.equal(context.sessionStorage.getItem('claude-cheat-write-token'), 'abc123_-X');
+
+  // In-page navigation and refreshes drop the fragment; the same tab must keep its write token.
+  const next = buildContext('');
+  next.sessionStorage = context.sessionStorage;
+  const nextSandbox = { ...next, globalThis: null };
+  nextSandbox.globalThis = nextSandbox;
+  vm.createContext(nextSandbox);
+  vm.runInContext(scriptBundle(), nextSandbox, { filename: 'dashboard.js' });
+  assert.equal(vm.runInContext('TOKEN', nextSandbox), 'abc123_-X');
+
+  // A new tab starts with fresh sessionStorage and stays read-only.
   const bare = buildContext('');
   const bareSandbox = { ...bare, globalThis: null };
   bareSandbox.globalThis = bareSandbox;
   vm.createContext(bareSandbox);
   vm.runInContext(scriptBundle(), bareSandbox, { filename: 'dashboard.js' });
   assert.equal(vm.runInContext('TOKEN', bareSandbox), '');
+});
+
+test('a stale write token is dropped when the server answers token_required', async () => {
+  const fetchImpl = async () => ({ status: 403, ok: false,
+    clone() { return { json: async () => ({ error: 'token_required' }) }; } });
+  const context = buildContext('#token=stale-token', fetchImpl);
+  const sandbox = { ...context, globalThis: null };
+  sandbox.globalThis = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(scriptBundle(), sandbox, { filename: 'dashboard.js' });
+  assert.equal(context.sessionStorage.getItem('claude-cheat-write-token'), 'stale-token');
+  await vm.runInContext('fetch("/api/config")', sandbox);
+  assert.equal(context.sessionStorage.getItem('claude-cheat-write-token'), null);
+  assert.equal(context.document.body.children.length, 1);
+  assert.equal(context.document.body.children[0].className, 'token-notice');
 });
 
 test('a route-log model id is escaped before it reaches the connection summary', () => {

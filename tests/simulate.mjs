@@ -93,8 +93,12 @@ function makeUpstream(mode) {
 }
 
 async function startProxy(options = {}) {
+  // This harness measures routing throughput; keep the production admission caps out of the
+  // measurement (they are covered by claudeRouteProxy.test.mjs) so concurrency 24/48 does not
+  // turn into 429 responses.
   const server = createProxy({ key: KEY, nonce: NONCE, openrouterModel: 'sim/model', retryDelayMs: 0,
-    cooldownMs: 50, attemptTimeoutMs: 2000, fetchImpl: makeUpstream('mixed'), ...options });
+    cooldownMs: 50, attemptTimeoutMs: 2000, fetchImpl: makeUpstream('mixed'),
+    maxConcurrentRequests: 64, maxConnections: 1024, ...options });
   await listenSafe(server);
   return { server, base: `http://127.0.0.1:${server.address().port}/v1/messages` };
 }

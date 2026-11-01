@@ -184,11 +184,11 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 
 | 발견 | 조치 | 상태 |
 | --- | --- | --- |
-| D1 페이지 토큰 노출 | 토큰을 페이지 HTML에서 제거하고 시작 시 출력하는 `write_url`의 `#token=…` 프래그먼트로만 전달. 페이지 JS가 해시에서 읽은 뒤 `history.replaceState`로 주소창에서 제거하고 메모리에만 보관. 토큰 없는 페이지는 읽기 전용 + 안내 배너, 쓰기는 `token_required` | 해결 |
+| D1 페이지 토큰 노출 | 토큰을 페이지 HTML에서 제거하고 시작 시 출력하는 `write_url`의 `#token=…` 프래그먼트로만 전달. 페이지 JS가 해시에서 읽은 뒤 `history.replaceState`로 주소창에서 제거하고 그 탭의 `sessionStorage`(탭 범위)에 보관해 화면 이동·새로고침을 견딤. 토큰 없는 페이지는 읽기 전용 + 안내 배너, 쓰기는 `token_required` | 해결 |
 | D2 `/api/test` 게시 값으로 임의 실행 파일 구동 | `/api/test`의 게시 값 중 모델 ID·타임아웃만 반영. `CLI_BINARY`·`CLI_KIND`는 저장값만 사용 | 해결 |
 | D3 게시 URL + 저장 키 결합 | `LOCAL_LLM_URL`·`LOCAL_LLM_HTTP_URL`·`LOCAL_LLM_API_KEY`는 게시 값에서 제외(저장값만 사용) | 해결 |
-| D4 대시보드 타임아웃·연결 상한 없음 | `Handler.timeout = 15`, `request_queue_size` 64, 데몬 스레드 | 완화 |
-| D5 프록시 동시 32MiB 버퍼 | 동시 요청 8개(`ROUTE_MAX_CONCURRENT_REQUESTS`)·진행 중 본문 64MiB(`ROUTE_MAX_INFLIGHT_BYTES`) 상한, 초과 시 429/503 + `Retry-After` | 해결 |
+| D4 대시보드 타임아웃·연결 상한 없음 | `Handler.timeout = 15`, `request_queue_size` 64, 데몬 스레드, **동시 연결 64개 상한**(초과 소켓은 스레드 없이 즉시 종료) | 해결 |
+| D5 프록시 동시 32MiB 버퍼 | 동시 요청 32개(기본)(`ROUTE_MAX_CONCURRENT_REQUESTS`)·진행 중 본문 64MiB(`ROUTE_MAX_INFLIGHT_BYTES`) 상한, 초과 시 429/503 + `Retry-After` | 해결 |
 | D6 slow-drip 업로드 고정 | 본문 업로드 절대 기한 60초(`ROUTE_REQUEST_TOTAL_TIMEOUT_MS`) 추가, 초과 시 `client_body_total_timeout` | 해결 |
 | D7 저장형 XSS | `connectionSummary`에서 `last_model`을 `esc()`로 이스케이프 | 해결 |
 | D8 값비싼 GET·프로브 무제한 | `GET /api/models?refresh=1` 분당 6회, `/api/test` 동시 1개(`test_busy`) | 해결 |
@@ -201,6 +201,37 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | L9 env 덮어쓰기 | 동작 유지, 위험으로 문서화 | 문서 정정 |
 | L11 마스킹 6+4자 | 마스킹은 UI 편의를 위한 것이며 비밀값 앞부분 노출은 문서화 | 문서 정정 |
 | L12 status 경로·모델 노출 | 공개 읽기 범위를 문서에 명시 | 문서 정정 |
-| L5 포트 스쿼트, L8 `--print` argv, L10 CLI 해석, L14 블랙박스 동의, L15 symlink, L16 로그 인젝션 | 이번 조치 범위 밖 — 잔여 위험으로 유지 | 미해결 |
+| L14 블랙박스 동의 | 상세 기록은 옵트인·마스킹·크기 상한이라는 점과 기록 파일을 비밀값처럼 다뤄야 한다는 점을 문서화 | 문서 정정 |
+| L16 로그 인젝션 | `.route.log` 미러에서 삽입 개행을 공백으로 치환해 한 이벤트가 추가 줄을 위조하지 못하게 함 | 해결(미러) |
+| L8 `--print` 프롬프트 argv 노출 | `-p` 프롬프트를 argv에서 빼고 표준 입력으로 전달(`run_cli`, `--input-format text` 기본). 단위 테스트로 argv에 없음·stdin에 있음 확인 | 해결 |
+| L5 포트 스쿼트, L10 CLI 해석, L15 symlink | 이번 조치 범위 밖 — 잔여 위험으로 유지 | 미해결 |
 
-검증: `node --test tests/*.test.mjs` → **707 pass / 0 fail**, Python은 **664개 수집(11 skip)** 중 실행된 653개에서 **652 pass + 1 flaky fail**. flaky는 `test_route_cli.test_reasons_through_shim`(부하 시 node 스폰이 4초 상한을 넘어 시간 초과)이며, 같은 테스트를 20초 상한으로 실행하면 통과합니다. `routeCli.py`·`localProcessTree.py`는 이번 변경에 포함되지 않았습니다. 대시보드 모듈 단독은 240 pass.
+검증: `node --test tests/*.test.mjs` → **708 pass / 0 fail**, Python은 **665개 수집(11 skip)** 중 실행된 654개에서 **653 pass + 1 flaky fail**. flaky는 `test_route_cli.test_reasons_through_shim`(부하 시 node 스폰이 4초 상한을 넘어 시간 초과)이며, 같은 테스트를 20초 상한으로 실행하면 통과합니다. `routeCli.py`·`localProcessTree.py`는 이번 변경에 포함되지 않았습니다. 대시보드 모듈 단독은 241 pass.
+
+## 11. 2차 검토 (2026-11-01, 조치 이후)
+
+조치 결과를 다시 검토해 다음을 찾아 수정했습니다.
+
+| 항목 | 내용 | 상태 |
+| --- | --- | --- |
+| 토큰 유지 회귀 | 프래그먼트를 주소창에서 지운 뒤에는 화면 이동·새로고침 시 토큰이 사라져 쓰기가 막히는 문제. 세션 범위 `sessionStorage`에 보관해 같은 탭의 이동·새로고침을 견디고, 탭을 닫으면 사라지게 함(다른 탭·프로세스는 읽기 전용) | 수정 |
+| 대시보드 스레드 상한 | 연결마다 스레드가 생기는 구조에 동시 연결 64개 상한을 추가. 초과 연결은 새 스레드 없이 소켓을 닫음 | 수정 |
+| 미러 로그 인젝션 | `.route.log` 미러에 값 속 개행이 그대로 들어가 추가 이벤트 줄을 위조할 수 있던 문제. 개행을 공백으로 치환 | 수정 |
+| 속도 제한 경합 | `ThreadingHTTPServer`에서 분당 창 갱신이 원자적이지 않아 동시 요청 시 한도가 조금 넘을 수 있던 문제. 락으로 직렬화 | 수정 |
+| 문서 | `write_url`·`sessionStorage` 동작, 탭 종료/대시보드 재시작 시 토큰 수명, 토큰이 콘솔·브라우저 인자에 남을 수 있다는 점, 블랙박스 동의·로그 한 줄 보장을 `SECURITY.ko.md`·README에 반영 | 문서 정정 |
+| 벤치마크 하네스 상한 | `--soak-concurrency`를 8보다 크게 주거나 `simulate.mjs`의 기본 동시성(24)으로 실행하면 동시성 상한에 걸려 429가 섞일 수 있던 문제. `bench_proxy.mjs`(워커 env)와 `simulate.mjs`(createProxy 옵션)에서만 상한을 높여 라우팅 처리량을 측정하도록 수정 | 수정 |
+
+## 12. 3차 검토 (2026-11-01, 잔여 후보 처리)
+
+2차 검토에서 남긴 후보를 처리했습니다.
+
+| 항목 | 내용 | 상태 |
+| --- | --- | --- |
+| 동시 요청 기본값 | 병렬 서브에이전트가 9개 이상이면 429가 나던 기본값 8을 32로 올림(연결 상한 64 미만 유지, env로 조정 가능). 기본값을 메트릭으로 고정하는 테스트 추가 | 수정 |
+| stale 토큰 UX | 대시보드 재시작으로 무효가 된 토큰을 들고 있으면 저장이 조용히 실패하던 문제. 403 `token_required`를 받으면 해당 탭의 `sessionStorage`를 비우고 안내 배너를 다시 표시 | 수정 |
+| L8 `--print` 프롬프트 | 프롬프트를 argv에서 빼고 표준 입력으로 전달(`run_cli`, `--input-format text` 기본). argv에 프롬프트가 없고 stdin으로 전달되는지 단위 테스트로 확인 | 해결 |
+| 부하 flaky 테스트 | `test_route_cli`의 명령 상한 4초가 부하 시 정상 node 스폰까지 시간 초과시키던 문제. 15초로 올려 flaky 제거(느린 모드 검증은 유지) | 수정 |
+| L5·L10·L15 | 포트 스쿼트, CLI 해석 불일치, symlink/TOCTOU는 구조적 잔여 위험으로 `SECURITY.ko.md` §7에 명시 | 문서화 |
+| 저장소 위생 | 추적되지 않던 `NUL` 잔여 파일 삭제 | 정리 |
+
+검증: Node **710 pass / 0 fail**(DOM 87 포함), Python **666개 수집(11 skip)**. 변경 모듈(`test_launcher_arguments`·`test_route_cli`·`test_route_dashboard`·`test_handover_contract`·`test_launcher_scripts`) 통과, 이전 flaky였던 `ConnectionTest.test_reasons_through_shim`은 새 상한에서 21초에 통과.

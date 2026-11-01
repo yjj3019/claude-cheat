@@ -515,6 +515,18 @@ def clean_env() -> dict:
             and k.upper() not in {"CLAUDE_CONFIG_DIR", "CLAUDECODE", PRO_SESSION_GATE, "ROUTE_ALT_UPSTREAM_PROVIDER"}}
 
 
+def run_cli(command: list, env: dict, prompt: str | None = None) -> int:
+    """Run Claude Code in the foreground; a --print prompt goes through stdin, not argv.
+
+    An argv prompt is visible to every process the same user runs. Print mode reads text from
+    stdin by default (`--input-format text`), so piping it keeps the prompt out of the process
+    list while stdout/stderr and the exit code behave exactly like the previous direct call.
+    """
+    if prompt is None:
+        return subprocess.call(command, env=env)
+    return subprocess.run(command, env=env, input=prompt, text=True, check=False).returncode
+
+
 def run_owned(args: list, env: dict, cwd: str, prompt: str = "", timeout: int = 120) -> dict:
     process = subprocess.Popen(args, env=env, cwd=cwd, stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -1076,7 +1088,8 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
     # automated end-to-end check possible.
     print_args = []
     if print_prompt is not None:
-        print_args = ["-p", print_prompt] + (["--output-format", "json"] if print_json else [])
+        # The prompt itself travels on stdin (see run_cli), so only the mode flags stay in argv.
+        print_args = ["-p"] + (["--output-format", "json"] if print_json else [])
     claude = shutil.which("claude")
     if not claude:
         if isolated:
@@ -1095,7 +1108,7 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
             session_id, hooks = recording
             command += ["--session-id", session_id, "--settings", json.dumps({"hooks": hooks})]
         command += print_args + native_args
-        return subprocess.call(command, env=env)
+        return run_cli(command, env, print_prompt)
     if isolated and Path(claude).suffix.lower() in (".cmd", ".bat"):
         # shortcut: warn only; cmd.exe can mis-parse quotes/&/% in the workspace path or settings JSON passed through a shim.
         # Upgrade to a hard error if an injection is ever reproduced.
@@ -1137,7 +1150,7 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
                 settings["env"][name] = ""
             command[settings_index] = json.dumps(settings)
             try:
-                return subprocess.call((routeCli.resolve_command(command[0]) + command[1:] if native_args else command) + print_args + native_args, env=env)
+                return run_cli((routeCli.resolve_command(command[0]) + command[1:] if native_args else command) + print_args + native_args, env, print_prompt)
             except OSError:
                 raise startup_error("local_cli_start_failed") from None
     print(f"Sonnet replacement: {provider}. Opus/Haiku/Fable keep Claude Plan OAuth.")
@@ -1164,7 +1177,7 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
             session_settings["hooks"] = hooks
         if session_settings:
             command += ["--settings", json.dumps(session_settings)]
-        return subprocess.call((routeCli.resolve_command(command[0]) + command[1:] if native_args else command) + print_args + native_args, env=env)
+        return run_cli((routeCli.resolve_command(command[0]) + command[1:] if native_args else command) + print_args + native_args, env, print_prompt)
 
 
 def self_test() -> None:

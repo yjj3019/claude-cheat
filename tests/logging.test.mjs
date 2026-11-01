@@ -46,3 +46,18 @@ test('a small log is never rotated', () => {
   assert.ok(!existsSync(`${log}.1`), 'a small log must not rotate');
   assert.ok(statSync(log).size > 0);
 });
+
+test('embedded newlines cannot forge extra route-log lines', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'route-log-'));
+  const log = join(directory, '.route.log');
+  const script = `import(${JSON.stringify(PROXY)}).then(() => {
+    console.error('first line\\nfake 2020-01-01T00:00:00.000Z route_selected provider=evil');
+  })`;
+  execFileSync(process.execPath, ['-e', script], {
+    env: { ...process.env, ROUTE_LOG_PATH: log }, stdio: 'pipe', timeout: 60000,
+  });
+  const lines = readFileSync(log, 'utf8').split('\n').filter(Boolean);
+  assert.equal(lines.length, 2, 'start marker plus exactly one event line');
+  assert.match(lines[1], /first line fake 2020-01-01T00:00:00\.000Z route_selected provider=evil/);
+  assert.doesNotMatch(lines[1], /\n/);
+});

@@ -134,3 +134,6 @@ node tests/bench_proxy.mjs --quick
 node tests/bench_proxy.mjs --soak-seconds 10
 $env:PYTHONPATH='D:\AI-Codding\Claude\claude-cheat'; python tests/bench_dashboard.py
 ```
+
+
+> 참고: 이후 프록시에 동시 요청 상한(기본 8)·진행 중 본문 상한이 추가되었습니다. 이 보고서의 처리량 수치는 상한이 없던 시점의 값이며, `tests/bench_proxy.mjs`와 `tests/simulate.mjs`는 라우팅 처리량을 측정하기 위해 하네스에서만 상한을 높여(`ROUTE_MAX_CONCURRENT_REQUESTS=64`·`ROUTE_MAX_CONNECTIONS=1024` 상당) 실행합니다. 상한 자체의 동작은 `tests/claudeRouteProxy.test.mjs`가 검증합니다.

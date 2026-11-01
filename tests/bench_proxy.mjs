@@ -446,6 +446,11 @@ export async function spawnWorker({ mode = 'ok', stream = false, streamPassthrou
   if (streamPassthrough) args.push('--stream-passthrough');
   const env = { ...process.env };
   for (const name of POLLUTING_ENV) delete env[name];
+  // This harness measures routing throughput, not the proxy's admission caps. Without these
+  // overrides a soak above the default concurrency (8) would be answered with 429 and the
+  // throughput numbers would measure the limiter instead of the routing path.
+  env.ROUTE_MAX_CONCURRENT_REQUESTS = '64';
+  env.ROUTE_MAX_CONNECTIONS = '1024';
   const child = spawn(process.execPath, args, { cwd: REPO_ROOT, env, stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true });
   let stderr = '';

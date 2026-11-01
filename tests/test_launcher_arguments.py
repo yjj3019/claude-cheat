@@ -112,6 +112,19 @@ class LauncherArgumentsTests(unittest.TestCase):
         self.assertEqual(settings["hooks"], hooks)
         self.assertEqual(settings["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"], "8192")
 
+    def test_print_prompt_travels_on_stdin_not_in_argv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            record = Path(directory) / "record.json"
+            script = ("import json,sys;"
+                      "open(sys.argv[1],'w',encoding='utf-8').write(json.dumps("
+                      "{'argv':sys.argv[2:],'stdin':sys.stdin.read()}))")
+            prompt = "private prompt marker 7319"
+            code = route.run_cli([sys.executable, "-c", script, str(record)], dict(os.environ), prompt)
+            self.assertEqual(code, 0)
+            seen = json.loads(record.read_text(encoding="utf-8"))
+            self.assertEqual(seen["stdin"], prompt)
+            self.assertNotIn(prompt, seen["argv"])
+
     def test_utf8_encoding_preserves_argument_boundaries(self):
         values = ["--resume", "session id", "--plugin-dir", "C:\\fixture plugin\\", "--mcp-config",
                   json.dumps({"mcpServers": {"fixture": {"args": ["a b", 'quoted"']}}}), "", "??"]

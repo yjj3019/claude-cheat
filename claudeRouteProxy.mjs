@@ -182,7 +182,9 @@ if (routeLogPath) {
       if (writes % 200 === 0) rotate();
       // stderr already received the redacted copy from the single sink; the mirror must not
       // become the unredacted side channel, so it runs the same pass over the joined text.
-      appendFileSync(routeLogPath, `${new Date().toISOString()} ${redactDiagnostic(args.join(' '))}\n`);
+      // Embedded newlines would forge extra log lines, so the mirror keeps one event per line.
+      const line = redactDiagnostic(args.join(' ')).replace(/[\r\n]+/g, ' ');
+      appendFileSync(routeLogPath, `${new Date().toISOString()} ${line}\n`);
       writes += 1;
     } catch {}
   };
@@ -880,7 +882,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   // Bounded admission before any message body is buffered: the semaphore bounds concurrent
   // turns and the byte budget bounds their aggregate bodies.
   maxConcurrentRequests = Number.isFinite(Number(process.env.ROUTE_MAX_CONCURRENT_REQUESTS))
-    ? Number(process.env.ROUTE_MAX_CONCURRENT_REQUESTS) : 8,
+    ? Number(process.env.ROUTE_MAX_CONCURRENT_REQUESTS) : 32,
   maxInflightBytes = Number.isFinite(Number(process.env.ROUTE_MAX_INFLIGHT_BYTES))
     ? Number(process.env.ROUTE_MAX_INFLIGHT_BYTES) : 64 * 1024 * 1024,
   maxConnections = Number.isFinite(Number(process.env.ROUTE_MAX_CONNECTIONS))

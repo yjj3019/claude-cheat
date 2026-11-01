@@ -1827,6 +1827,15 @@ test('aggregate in-flight body bytes are bounded before buffering', async t => {
   assert.match((await response.json()).error.message, /inflight_budget/);
 });
 
+test('the default admission cap leaves room for parallel subagent turns', async t => {
+  const { request } = await fixture(t);
+  const response = await request(undefined, { method: 'GET', path: '/api/metrics' });
+  assert.equal(response.status, 200);
+  const metrics = await response.json();
+  assert.equal(metrics.requestAdmission.max, 32);
+  assert.equal(metrics.requestAdmission.max < 64, true, 'keep the cap below the connection cap');
+});
+
 test('an upload that never finishes is cut by the absolute body deadline', async t => {
   const log = t.mock.method(console, 'error', () => {});
   const { server } = await fixture(t, jsonResponse, { requestTotalTimeoutMs: 150, requestIdleTimeoutMs: 30000 });

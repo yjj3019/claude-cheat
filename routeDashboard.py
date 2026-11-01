@@ -3692,20 +3692,59 @@ JS_BLACKBOX = JS_BLACKBOX.replace(
 
 # The write token is handed out by the launcher as a URL fragment, never in the page itself.
 # A fragment is not sent to the server, is not in Referer and disappears from the address bar
-# after the first read, so another local process cannot harvest it from a public GET.
-_TOKEN_SCRIPT = '''const TOKEN = (() => {
+# after the first read, so another local process cannot harvest it from a public GET. The token
+# is kept in sessionStorage so refreshes and in-page navigation (which drop the fragment) keep
+# working; it is scoped to this tab and disappears when the tab closes.
+_TOKEN_SCRIPT = '''const TOKEN_KEY = 'claude-cheat-write-token';
+const TOKEN = (() => {
   const match = /[#&]token=([A-Za-z0-9_-]+)/.exec(location.hash || '');
-  if (!match) return '';
-  try { history.replaceState(null, '', location.pathname + location.search); } catch (error) {}
-  return match[1];
+  let token = '';
+  try {
+    if (match) {
+      token = match[1];
+      sessionStorage.setItem(TOKEN_KEY, token);
+      history.replaceState(null, '', location.pathname + location.search);
+    } else {
+      token = sessionStorage.getItem(TOKEN_KEY) || '';
+    }
+  } catch (error) {
+    token = match ? match[1] : token;
+  }
+  return token;
 })();
-if (!TOKEN) document.addEventListener('DOMContentLoaded', () => {
-  const notice = document.createElement('div');
-  notice.className = 'token-notice';
-  notice.setAttribute('role', 'status');
-  notice.textContent = '쓰기 토큰이 없습니다. 런처가 출력한 #token=… 주소로 접속하세요.';
-  document.body.prepend(notice);
-});'''
+let tokenNoticeShown = false;
+function showTokenNotice() {
+  if (tokenNoticeShown) return;
+  const show = () => {
+    if (tokenNoticeShown) return;
+    tokenNoticeShown = true;
+    const notice = document.createElement('div');
+    notice.className = 'token-notice';
+    notice.setAttribute('role', 'status');
+    notice.textContent = '쓰기 토큰이 없습니다. 런처가 출력한 #token=… 주소로 접속하세요.';
+    try { document.body.prepend(notice); } catch (error) {}
+  };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', show);
+  else show();
+}
+if (!TOKEN) showTokenNotice();
+// A token kept from an earlier dashboard process no longer matches, and every write answers
+// 403 token_required. Drop the stale value and explain how to get a fresh write_url instead of
+// leaving a page that looks authenticated but cannot save anything.
+const nativeFetch = globalThis.fetch.bind(globalThis);
+globalThis.fetch = async (...args) => {
+  const response = await nativeFetch(...args);
+  if (response && response.status === 403) {
+    try {
+      const body = await response.clone().json();
+      if (body && body.error === 'token_required') {
+        try { sessionStorage.removeItem(TOKEN_KEY); } catch (error) {}
+        showTokenNotice();
+      }
+    } catch (error) {}
+  }
+  return response;
+};'''
 JS_SHARED = JS_SHARED.replace('const TOKEN = "__DASHBOARD_TOKEN__";', _TOKEN_SCRIPT, 1)
 PAGE_CSS += "\n.token-notice{padding:10px 18px;background:#4a3413;color:#f2b95e;border-bottom:1px solid #7a5a1f;font-size:13px}\n"
 
@@ -3993,6 +4032,34 @@ class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
     block_on_close = False
     request_queue_size = 64
+    # Each accepted socket owns a thread until the handler finishes. The 15s socket timeout
+    # bounds how long one thread can live, and this cap bounds how many can exist at once so
+    # a connection flood cannot turn into an unbounded thread pile.
+    max_connections = 64
+
+    def __init__(self, *args, **kwargs):
+        self._connection_slots = threading.BoundedSemaphore(self.max_connections)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, connection, address):
+        if not self._connection_slots.acquire(blocking=False):
+            # Over the cap: drop the socket instead of queueing it in a new thread.
+            try:
+                self.shutdown_request(connection)
+            except OSError:
+                pass
+            return
+        try:
+            super().process_request(connection, address)
+        except BaseException:
+            self._connection_slots.release()
+            raise
+
+    def process_request_thread(self, connection, address):
+        try:
+            super().process_request_thread(connection, address)
+        finally:
+            self._connection_slots.release()
 
     def server_bind(self):
         if os.name == "nt":
@@ -4006,18 +4073,22 @@ RATE_LIMIT_PER_MINUTE = 30
 _TEST_RUN_LOCK = threading.Lock()
 _RATE = {"window": -1, "counts": {}}
 _MODEL_RATE = {"window": -1, "counts": {}}
+# ThreadingHTTPServer handles requests concurrently, so the minute window update is serialized;
+# without the lock two handlers could both read the same count and let the limit drift.
+_RATE_LOCK = threading.Lock()
 
 
 def _rate_ok(client, now=None, limit=RATE_LIMIT_PER_MINUTE, state=None):
     """Sliding minute window per client; a local user never needs a burst above this."""
     state = _RATE if state is None else state
     now = time.monotonic() if now is None else now
-    window = int(now // 60)
-    if state["window"] != window:
-        state["window"] = window
-        state["counts"].clear()
-    count = state["counts"].get(client, 0) + 1
-    state["counts"][client] = count
+    with _RATE_LOCK:
+        window = int(now // 60)
+        if state["window"] != window:
+            state["window"] = window
+            state["counts"].clear()
+        count = state["counts"].get(client, 0) + 1
+        state["counts"][client] = count
     return count <= limit
 
 
