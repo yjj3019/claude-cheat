@@ -307,4 +307,4 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 코드 주석 | `openrouterAdvisor.py`의 조건부 블록에 "User requirement R1" 명시 |
 | 문서 | README(한/영)에 원장 링크와 "위반 시 원복" 원칙 명시 |
 
-검증: Python **694개 수집(11 skip)**, R1 회귀 테스트 4 pass, 관련 런처 테스트 43 pass.
+검증: Python **694개 수집(11 skip) 전체 실행 OK**, Node **722 pass / 0 fail**, 대시보드 모듈 **262 pass**, R1 회귀 테스트 4 pass, 관련 런처 테스트 43 pass. 실제 Claude Code 세션을 새 실행기로 재시작한 뒤 `external`/`replacement` 라우팅을 확인하는 라이브 검증은 사용자 세션 재시작 후 별도로 수행합니다.
