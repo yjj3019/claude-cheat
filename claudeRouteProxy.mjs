@@ -2,7 +2,7 @@ import http from 'node:http';
 import { once } from 'node:events';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { appendFile, appendFileSync, readFileSync, rename, renameSync, statSync, unlink, unlinkSync, writeFile, writeFileSync } from 'node:fs';
-import { monitorEventLoopDelay } from 'node:perf_hooks';
+import { monitorEventLoopDelay, PerformanceObserver } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 // Monitoring: event-loop delay samples separate the proxy's own work from upstream latency.
@@ -283,10 +283,62 @@ if (routeLogPath) {
       writeMsAvg: stats.batches ? Number((stats.writeMsTotal / stats.batches).toFixed(2)) : 0 }),
   };
   console.error = (...args) => {
-    emit(...args);
-    routeMirror.enqueue(...args);
+    timeSync('diagnostics', () => {
+      emit(...args);
+      routeMirror.enqueue(...args);
+    });
   };
   schedule();
+}
+
+// Synchronous-work accounting: event-loop spikes are attributed to the phase that spent
+// the time, instead of guessing from timestamps alone. Keep the map tiny and bounded.
+const blockingPhases = new Map();
+function timeSync(name, operation) {
+  const started = performance.now();
+  try {
+    return operation();
+  } finally {
+    const elapsed = performance.now() - started;
+    const current = blockingPhases.get(name);
+    if (current === undefined) blockingPhases.set(name, { count: 1, maxMs: elapsed, totalMs: elapsed });
+    else {
+      current.count += 1;
+      current.totalMs += elapsed;
+      if (elapsed > current.maxMs) current.maxMs = elapsed;
+    }
+  }
+}
+function blockingSummary() {
+  return [...blockingPhases.entries()]
+    .sort((left, right) => right[1].maxMs - left[1].maxMs)
+    .slice(0, 6)
+    .map(([name, value]) => ({ name, count: value.count, maxMs: Number(value.maxMs.toFixed(2)),
+      avgMs: Number((value.totalMs / value.count).toFixed(2)) }));
+}
+
+const gcStats = { count: 0, maxMs: 0, totalMs: 0, recent: [] };
+try {
+  const observer = new PerformanceObserver(list => {
+    for (const entry of list.getEntries()) {
+      if (entry.entryType !== 'gc') continue;
+      const elapsed = Number(entry.duration) || 0;
+      gcStats.count += 1;
+      gcStats.totalMs += elapsed;
+      if (elapsed > gcStats.maxMs) gcStats.maxMs = elapsed;
+      gcStats.recent.push({ at: new Date(performance.timeOrigin + entry.startTime).toISOString(),
+        ms: Number(elapsed.toFixed(2)), kind: entry.detail?.kind ?? null });
+      if (gcStats.recent.length > 5) gcStats.recent.shift();
+    }
+  });
+  observer.observe({ entryTypes: ['gc'] });
+} catch {
+  // GC entries are optional; the rest of process health remains available.
+}
+function gcSummary() {
+  return { count: gcStats.count, maxMs: Number(gcStats.maxMs.toFixed(2)),
+    avgMs: gcStats.count ? Number((gcStats.totalMs / gcStats.count).toFixed(2)) : 0,
+    recent: gcStats.recent.slice() };
 }
 
 // Historical client alias only; the upstream model must be configured explicitly.
@@ -1234,6 +1286,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     uptimeMs: Date.now() - metrics.startedAt,
     process: processSnapshot(),
     routeLog: routeMirror ? routeMirror.stats() : { enabled: false },
+    blocking: blockingSummary(), gc: gcSummary(),
     requests: metrics.requests, ok: metrics.ok, failed: metrics.failed,
     // Accepted message requests (including body upload), excluding diagnostics/metrics.
     inflightRequests: inflight,
@@ -1288,8 +1341,9 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     if (!sync && flushInFlight) return;
     metricsDirty = false;
     // The minute history is live-session only; keep disk snapshots compact.
-    const { monitoringHistory: _liveHistory, tokenFlow: _liveTokenFlow, ...persisted } = metricsSnapshot();
-    const payload = JSON.stringify(persisted);
+    const { monitoringHistory: _liveHistory, tokenFlow: _liveTokenFlow, ...persisted } =
+      timeSync('metrics_serialize', () => metricsSnapshot());
+    const payload = timeSync('metrics_json', () => JSON.stringify(persisted));
     const seq = ++flushSeq;
     const paths = [metricsPath, instanceMetricsPath].filter(Boolean);
     if (sync) {
@@ -1549,7 +1603,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       if (bodyTimedOut) return;
       const raw = chunks.length === 1 ? chunks[0] : Buffer.concat(chunks);
       let body;
-      try { body = JSON.parse(raw.toString('utf8')); } catch { return reject(400, 'Invalid JSON'); }
+      try { body = timeSync('body_parse', () => JSON.parse(raw.toString('utf8'))); } catch { return reject(400, 'Invalid JSON'); }
       if (!body || typeof body !== 'object' || Array.isArray(body)) return reject(403, 'Unsupported request fields');
       const model = body.model;
       // Only sessions with a route log record the shape; it is a measurement, not routing input.

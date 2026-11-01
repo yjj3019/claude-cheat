@@ -1521,7 +1521,8 @@ test('process health is rendered separately from upstream performance', () => {
     pid: 1234, rssBytes: 120 * 1048576, heapUsedBytes: 40 * 1048576,
     eventLoopLagMs: { samples: 20, p50Ms: 2, p95Ms: 12.5, maxMs: 30 },
     eventLoopSpikes: [{ at: '2026-11-01T09:05:00.000Z', ms: 626.5 }] },
-    routeLog: { enabled: true, written: 42, dropped: 0, queuedLines: 0, queuedBytes: 0, writeMsMax: 1.25 } } }));
+    routeLog: { enabled: true, written: 42, dropped: 0, queuedLines: 0, queuedBytes: 0, writeMsMax: 1.25 },
+    gc: { count: 3, maxMs: 7.5 }, blocking: [{ name: 'body_parse', count: 2, maxMs: 4.5 }] } }));
   assert.match(inserted, /프로세스 상태/);
   assert.match(inserted, /120\.0 MB/);
   assert.match(inserted, /40\.0 MB/);
@@ -1530,6 +1531,8 @@ test('process health is rendered separately from upstream performance', () => {
   assert.match(inserted, /627ms/);
   assert.match(inserted, /라우트 로그 쓰기 max/);
   assert.match(inserted, /1\.3 ms/);
+  assert.match(inserted, /GC 3회/);
+  assert.match(inserted, /body_parse/);
   assert.doesNotMatch(inserted, /undefined/);
 });
 

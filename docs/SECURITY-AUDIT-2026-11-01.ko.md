@@ -392,3 +392,14 @@ DSH 게이트웨이·영속화·텔레메트리 설계를 참고해 프록시의
 - 프록시 라우트 로그는 10ms 비동기 배치·상한 큐로 기록하고 `/api/metrics`의 `routeLog`와 프로세스 카드에 writer max·큐·드롭을 노출합니다.
 
 검증: 라이브 `/api/snapshot` ETag + `curl If-None-Match` → **304**, 첫 응답 **MISS**·조건부 **HIT**. Python **709 tests OK**(11 skip), Node **724 pass**, 대시보드 모듈 **277 pass**, 프록시 벤치마크 PASS.
+
+## 26. 이벤트 루프 스파이크 원인 계측 (2026-11-02)
+
+비동기 writer 이후에도 남은 이벤트 루프 max 스파이크를 추정하지 않고 원인별로 분리하기 위해 다음을 추가했습니다.
+
+- `timeSync`로 `body_parse`, `diagnostics`(stderr 출력 + 라우트 로그 enqueue/redaction), `metrics_serialize`(스냅샷 구성), `metrics_json`의 횟수·평균·최대를 기록.
+- `PerformanceObserver` `gc` 엔트리로 GC 횟수·최대·최근 시각을 기록.
+- `/api/metrics`의 `blocking`·`gc`와 대시보드 프로세스 카드에 `GC n회 · max ... · 동기 블로킹 top`을 표시해 `eventLoopSpikes`와 대조.
+- 계측은 카운터/짧은 타이머만 사용하며 요청·응답 동작을 바꾸지 않습니다.
+
+검증: 통제 프록시에서 `diagnostics 0.16ms`, `body_parse 0.03ms` 수준 확인, GC 0회(소형 요청). Python **709 tests OK**(11 skip), Node **724 pass**, 대시보드 모듈 **277 pass**.

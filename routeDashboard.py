@@ -3376,6 +3376,12 @@ function renderProcessHealth(data) {
   const logLine = routeLog.enabled === true
     ? `<p class="hint">라우트 로그는 비동기 배치입니다: 큐 ${num(routeLog.queuedLines)}줄 · 누적 ${num(routeLog.written)}줄 · 드롭 ${num(routeLog.dropped)} · 쓰기 ${ms(routeLog.writeMsMax)}</p>`
     : '';
+  const gc = pm.gc || {};
+  const blocking = Array.isArray(pm.blocking) ? pm.blocking : [];
+  const topBlocking = blocking.slice(0, 2).map(item => `${esc(item.name)} ${ms(item.maxMs)}`).join(' · ');
+  const perfLine = (gc.count !== undefined || blocking.length)
+    ? `<p class="hint">GC ${num(gc.count)}회 · max ${ms(gc.maxMs)}${topBlocking ? ' · 동기 블로킹 ' + topBlocking : ''}</p>`
+    : '';
   grid.insertAdjacentHTML('beforeend', `<section class="card col-12"><header class="card-h">`
     + `<div><h2>프로세스 상태</h2><p class="sub">프록시 자체 부하 · 이벤트 루프 지연</p></div></header><div class="card-b">`
     + `<div class="metrics-strip">`
@@ -3385,7 +3391,7 @@ function renderProcessHealth(data) {
     + `<div class="m"><span class="k">이벤트 루프 지연 max</span><span class="v">${ms(lag.maxMs)}</span></div>`
     + (routeLog.enabled === true ? `<div class="m"><span class="k">라우트 로그 쓰기 max</span><span class="v">${ms(routeLog.writeMsMax)}</span></div>`
       + `<div class="m"><span class="k">라우트 로그 큐 · 드롭</span><span class="v">${num(routeLog.queuedLines)} · ${num(routeLog.dropped)}</span></div>` : '')
-    + `</div><p class="hint">이벤트 루프 지연은 타이머가 예정보다 늦게 실행된 시간입니다. 값이 크면 본문 파싱·검증·로그 같은 프록시 자체 작업이 요청 처리를 막고 있을 수 있으며, 업스트림 지연과는 별개입니다.</p>${logLine}${spikeLine}</div></section>`);
+    + `</div><p class="hint">이벤트 루프 지연은 타이머가 예정보다 늦게 실행된 시간입니다. 값이 크면 본문 파싱·검증·로그 같은 프록시 자체 작업이 요청 처리를 막고 있을 수 있으며, 업스트림 지연과는 별개입니다.</p>${logLine}${perfLine}${spikeLine}</div></section>`);
 }
 const renderGridWithProcess = renderGrid;
 renderGrid = function (data) {

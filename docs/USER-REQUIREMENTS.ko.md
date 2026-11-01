@@ -183,3 +183,23 @@
 - `LICENSE-REVIEW.md` — OpenCode MIT 참고 검토
 
 **위반 시 조치**: 조건부 폴링을 제거해 매 주기 전체 본문·DOM을 다시 보내도록 되돌리는 변경은 되돌립니다.
+
+## R16. 이벤트 루프 스파이크 원인 계측
+
+**요구**: 남은 이벤트 루프 지연이 어느 동기 구간에서 발생하는지 추정이 아니라 계측으로 확인할 수 있어야 합니다.
+
+**수용 기준**
+
+- 프록시가 `body_parse`, `diagnostics`(stderr+로그 enqueue), `metrics_serialize`, `metrics_json` 등 동기 구간의 횟수·최대·평균을 기록한다.
+- `PerformanceObserver`의 `gc` 엔트리로 GC 횟수·최대·최근 시각을 기록한다.
+- `/api/metrics`에 `blocking`(상위 구간)과 `gc`를 노출하고, 프로세스 카드에 `GC n회 · max ... · 동기 블로킹 구간 max`를 표시한다.
+- 계측 오버헤드는 요청당 수 마이크로초 수준이며 요청/응답을 변경하지 않는다.
+- `eventLoopSpikes` 시각과 함께 GC·블로킹 상위 구간을 대조해 다음 최적화 대상을 정한다.
+
+**회귀 감시**
+
+- `tests/metrics.test.mjs` — `blocking`·`gc` 형상
+- `tests/dashboard_dom.test.mjs` — 프로세스 카드의 GC/블로킹 표시
+- `routeDashboard.py`의 프로세스 카드, `claudeRouteProxy.mjs`의 `timeSync`·GC observer
+
+**위반 시 조치**: 원인 계측을 제거해 스파이크 원인을 다시 추정에 의존하도록 되돌리는 변경은 되돌립니다.
