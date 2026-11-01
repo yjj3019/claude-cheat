@@ -285,7 +285,8 @@ test('performance card shows measured throughput and completed-request failure r
   }});
   const html = render(data).get('grid').innerHTML;
   assert.match(html, /1\.00 건\/분/);
-  assert.match(html, /10\.0% \(5 \/ 50건\)/);
+  assert.match(html, /10\.0% \(5 \/ 50건 완료\)/);
+  assert.match(html, /완료 50건 · 진행/);
   assert.match(html, /10\.00 토큰\/초 \(2건\)/);
   assert.match(html, /첫 바이트는 첫 토큰과 다릅니다/);
 });
@@ -306,7 +307,7 @@ test('overview presents live model and key metrics before detailed insights', ()
   const html = render(data).get('grid').innerHTML;
   assert.ok(html.indexOf('한눈에 보기') < html.indexOf('인사이트'));
   assert.match(html, /로드된 외부 모델 · fixture\/model/);
-  assert.match(html, /10\.0% \(5 \/ 50건\)/);
+  assert.match(html, /10\.0% \(5 \/ 50건 완료\)/);
   assert.match(html, /10\.00 토큰\/초 \(2건\)/);
   assert.match(html, /2\.50초/);
 });
@@ -1298,7 +1299,7 @@ test('cancelled requests are excluded from the failure rate and each connection 
   const html = render(data).get('grid').innerHTML;
   // 3 successes, 3 failures of which 1 was cancelled: completed = 3 + 2, rate = 2/5.
   assert.match(html, /실패율 · 완료 응답 기준\(취소 제외\)/);
-  assert.match(html, /40\.0% \(2 \/ 5건\)/);
+  assert.match(html, /40\.0% \(2 \/ 5건 완료\)/);
   assert.match(html, /연결점별 결정 · 최근 60분/);
   assert.match(html, /Local 2건\(시도 실패 1\) qwen3 · OpenRouter 1건 · CLI 3건 · Plan 2건/);
   // A CLI display provider must not hide token usage or the normal usage card.
@@ -1518,11 +1519,14 @@ test('process health is rendered separately from upstream performance', () => {
   grid.insertAdjacentHTML = (position, html) => { inserted = html; };
   sandbox.render(fixture({ proxy_metrics: { stale: false, process: {
     pid: 1234, rssBytes: 120 * 1048576, heapUsedBytes: 40 * 1048576,
-    eventLoopLagMs: { samples: 20, p50Ms: 2, p95Ms: 12.5, maxMs: 30 } } } }));
+    eventLoopLagMs: { samples: 20, p50Ms: 2, p95Ms: 12.5, maxMs: 30 },
+    eventLoopSpikes: [{ at: '2026-11-01T09:05:00.000Z', ms: 626.5 }] } } }));
   assert.match(inserted, /프로세스 상태/);
   assert.match(inserted, /120\.0 MB/);
   assert.match(inserted, /40\.0 MB/);
   assert.match(inserted, /12\.5 ms/);
+  assert.match(inserted, /최근 100ms 이상 지연/);
+  assert.match(inserted, /627ms/);
   assert.doesNotMatch(inserted, /undefined/);
 });
 

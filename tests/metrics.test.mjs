@@ -106,6 +106,12 @@ test('metrics expose measured process health and event-loop delay', async () => 
     if (lag.samples > 0) {
       assert.ok(lag.p50Ms >= 0 && lag.p95Ms >= lag.p50Ms && lag.maxMs >= lag.p95Ms);
     }
+    assert.ok(Array.isArray(payload.process.eventLoopSpikes));
+    assert.ok(payload.process.eventLoopSpikes.length <= 5);
+    for (const spike of payload.process.eventLoopSpikes) {
+      assert.ok(Number.isFinite(Date.parse(spike.at)));
+      assert.ok(spike.ms >= 100);
+    }
   } finally {
     server.closeAllConnections();
     server.close();

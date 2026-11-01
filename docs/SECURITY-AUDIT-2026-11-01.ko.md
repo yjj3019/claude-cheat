@@ -239,7 +239,7 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 프록시 자체 부하 모니터링 | `/api/metrics`에 프로세스 상태(pid·RSS·힙·이벤트 루프 지연 p50/p95/max)를 추가하고 대시보드 **프로세스 상태** 카드로 표시. 이벤트 루프 p95 ≥250ms·RSS ≥1.5GiB는 능동 경고. 지표 파일 기록을 **비동기**로 바꿔 이벤트 루프 블로킹 제거(close/exit는 동기 최종 flush) | 기능 추가 |
 | 저장소 위생 | 추적되지 않던 `NUL` 잔여 파일 삭제 | 정리 |
 
-검증: Node **724 pass / 0 fail**(DOM 99 포함), Python **695개 수집(11 skip)**. 변경 모듈(`test_launcher_arguments`·`test_route_cli`·`test_route_dashboard`·`test_handover_contract`·`test_launcher_scripts`) 통과, 이전 flaky였던 `ConnectionTest.test_reasons_through_shim`은 새 상한에서 21초에 통과.
+검증: Node **724 pass / 0 fail**(DOM 99 포함), Python **696개 수집(11 skip)**. 변경 모듈(`test_launcher_arguments`·`test_route_cli`·`test_route_dashboard`·`test_handover_contract`·`test_launcher_scripts`) 통과, 이전 flaky였던 `ConnectionTest.test_reasons_through_shim`은 새 상한에서 21초에 통과.
 
 
 ## 13. 능동형 반응 (2026-11-01)
@@ -254,7 +254,7 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 연결 자동 복구 | `/api/snapshot` 실패 시 1·2·4·8·16초 지수 백오프로 재시도하고, 복구 시 토스트로 알림 | 기능 추가 |
 | 보안 경계 | 능동 점검은 로컬 상태만 읽고 쓰기·세션 제어를 하지 않음. 알림 권한 거부 시에도 배너·배지는 동작 | 문서화 |
 
-검증: Node **724 pass / 0 fail**(DOM 99 포함), Python **695개 수집(11 skip)**, 대시보드 모듈 263 pass. 라이브 대시보드에서 `proactive` 키·탭 배지·알림 버튼 서빙 확인.
+검증: Node **724 pass / 0 fail**(DOM 99 포함), Python **696개 수집(11 skip)**, 대시보드 모듈 264 pass. 라이브 대시보드에서 `proactive` 키·탭 배지·알림 버튼 서빙 확인.
 
 
 ## 14. 대시보드 헤더 레이아웃 (2026-11-01)
@@ -267,7 +267,7 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 1600px 이하 2행 | 브랜드+내비 1행, 액션(상태·알림·새로고침·도움말) 2행으로 분리. 720px 이하 기존 모바일 순서 유지 | 수정 |
 | 넓은 창 | 1600px 초과에서는 한 행 유지(내비 4개 라벨 한 줄) | 확인 |
 
-검증: 헤드리스 Edge 스크린샷 1087·1280·1500·1920px에서 라벨 줄바꿈 없음, 대시보드 모듈 263 pass.
+검증: 헤드리스 Edge 스크린샷 1087·1280·1500·1920px에서 라벨 줄바꿈 없음, 대시보드 모듈 264 pass.
 
 
 ## 15. 실행기 설치 자동화 (2026-11-01)
@@ -280,7 +280,7 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 안전 경계 | 명시적 `-Target`에는 적용하지 않고 `-NoPath`로 끌 수 있음(테스트로 사용자 PATH 불변 확인) | 확인 |
 | 문서 | `openClaude.ps1`이 아니라 `OpenClaude`(확장자 없이)·`OpenClaude.cmd`가 PATH 명령임을 README에 명시 | 문서 정정 |
 
-검증: 설치 테스트 11 pass(사용자 PATH 불변 포함), Python **695개 수집(11 skip)**.
+검증: 설치 테스트 11 pass(사용자 PATH 불변 포함), Python **696개 수집(11 skip)**.
 
 
 ## 16. 기본 OpenRouter 라우팅 회귀 복원 (2026-11-01)
@@ -293,7 +293,7 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 2026-10-28 | `e075542` | CLI 백엔드 통합 중 조건이 `if openrouter_compat:`로 좁혀져 일반 OpenRouter 세션이 실험 beta를 그대로 보내고 **모든 요청이 Plan으로 우회**(회귀) |
 | 2026-11-01 | 이번 수정 | `if openrouter_compat or provider == "openrouter" or (dual의 대체 provider가 openrouter)`로 복원. 일반 OpenRouter·OpenRouter 대체 dual 세션이 안정 프로토콜을 사용 |
 
-검증: `tests.test_openrouter_config`·`tests.test_dual_provider`·`tests.test_launcher_arguments`·`tests.test_local_config`·`ProactiveReactionTests` **116 pass**, 전체 Node **724 pass**, Python **695개 수집**(11 skip), 대시보드 모듈 **262 pass**. 대시보드의 `Plan 전용 기능으로 우회 중` 경고 문구도 재시작 안내로 수정.
+검증: `tests.test_openrouter_config`·`tests.test_dual_provider`·`tests.test_launcher_arguments`·`tests.test_local_config`·`ProactiveReactionTests` **116 pass**, 전체 Node **724 pass**, Python **696개 수집**(11 skip), 대시보드 모듈 **262 pass**. 대시보드의 `Plan 전용 기능으로 우회 중` 경고 문구도 재시작 안내로 수정.
 
 
 ## 17. 요구사항 보존 장치 (2026-11-01)
@@ -307,4 +307,16 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | 코드 주석 | `openrouterAdvisor.py`의 조건부 블록에 "User requirement R1" 명시 |
 | 문서 | README(한/영)에 원장 링크와 "위반 시 원복" 원칙 명시 |
 
-검증: Python **695개 수집(11 skip) 전체 실행 OK**, Node **724 pass / 0 fail**, 대시보드 모듈 **262 pass**, R1 회귀 테스트 4 pass, 관련 런처 테스트 43 pass. 실제 Claude Code 세션을 새 실행기로 재시작한 뒤 `external`/`replacement` 라우팅을 확인하는 라이브 검증은 사용자 세션 재시작 후 별도로 수행합니다.
+검증: Python **696개 수집(11 skip) 전체 실행 OK**, Node **724 pass / 0 fail**, 대시보드 모듈 **262 pass**, R1 회귀 테스트 4 pass, 관련 런처 테스트 43 pass. 실제 Claude Code 세션을 새 실행기로 재시작한 뒤 `external`/`replacement` 라우팅을 확인하는 라이브 검증은 사용자 세션 재시작 후 별도로 수행합니다.
+
+
+## 18. 대시보드 잔여 개선 4건 (2026-11-01)
+
+| 항목 | 변경 | 검증 |
+| --- | --- | --- |
+| 요청/완료 구분 | 요청 타일 문맥을 `완료 N건 · 진행 M건` 으로 표시하고, 실패율 분모에 `완료` 를 명시 | DOM 테스트(`완료 50건 · 진행`), PageTests |
+| 긴 한도 예상 | 잔여 한도 유지 기간이 365일 이상이면 `1년 이상` 으로 축약 | `test_very_long_headroom_is_reported_as_over_a_year` |
+| 헤더 요약 툴팁 | 한 줄로 잘린 헤더 요약의 전체 문장을 `title` 툴팁에 유지 | PageTests(`data.summary ? data.summary`) |
+| 이벤트 루프 max 추적 | 100ms 이상 지연을 100ms 샘플러로 기록(최대 5건, ISO 시각)하고 `/api/metrics` `process.eventLoopSpikes` 로 노출, 프로세스 카드에 최근 3건 표시 | `tests/metrics.test.mjs`, `tests/dashboard_dom.test.mjs` |
+
+검증: Node **724 pass / 0 fail**(DOM 99), Python **696 tests OK**(11 skip), 대시보드 모듈 **264 pass**. 프록시 스파이크 기록은 다음 새 세션부터 적용됩니다.

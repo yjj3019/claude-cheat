@@ -9,6 +9,20 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 // The histogram's timer is unref'ed, so it never keeps the process alive.
 const loopLag = monitorEventLoopDelay({ resolution: 10 });
 loopLag.enable();
+// Keep the time of the largest recent scheduling delays. The histogram exposes a max but
+// not when it happened; timestamps let the dashboard correlate a spike with a snapshot/GC.
+const loopLagSpikes = [];
+let lagDeadline = performance.now() + 100;
+const lagSampler = setInterval(() => {
+  const now = performance.now();
+  const late = Math.max(0, now - lagDeadline);
+  lagDeadline = now + 100;
+  if (late >= 100) {
+    loopLagSpikes.push({ at: new Date().toISOString(), ms: Number(late.toFixed(1)) });
+    if (loopLagSpikes.length > 5) loopLagSpikes.shift();
+  }
+}, 100);
+lagSampler.unref?.();
 
 // Diagnostics leave the process through one redaction pass: an upstream error body echoed
 // into a log line or an error response must never carry a credential. The tags stay stable
@@ -1115,7 +1129,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   const processSnapshot = () => {
     const memory = process.memoryUsage();
     return { pid: process.pid, rssBytes: memory.rss, heapUsedBytes: memory.heapUsed,
-      heapTotalBytes: memory.heapTotal, eventLoopLagMs: loopLagSummary() };
+      heapTotalBytes: memory.heapTotal, eventLoopLagMs: loopLagSummary(),
+      eventLoopSpikes: loopLagSpikes.slice() };
   };
   const publicMetricModel = value => validOpenRouterModel(value) &&
     !/^(?:sk-|xai-|bearer)/i.test(value) &&

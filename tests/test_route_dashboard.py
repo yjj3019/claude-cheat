@@ -1118,6 +1118,11 @@ class PageTests(unittest.TestCase):
         self.assertIn('[hidden]{display:none !important}', dash.PAGE_CSS)
         self.assertIn('peak > 0 ?', dash.PAGE)
         self.assertIn('관측값 없음(0)', dash.PAGE)
+        # The request tile distinguishes completed from in-flight and the full summary is in
+        # the tooltip that the one-line header truncates.
+        self.assertIn('overviewCompleted', dash.PAGE)
+        self.assertIn('건 완료', dash.PAGE)
+        self.assertIn('data.summary ? data.summary', dash.PAGE)
 
     def test_header_navigation_labels_never_wrap_inside_their_buttons(self):
         css = dash.PAGE_CSS
@@ -2484,6 +2489,15 @@ class InsightTests(unittest.TestCase):
         self.assertEqual(burn["level"], "critical")
         self.assertIn("0.8일", burn["detail"])
         self.assertIn("$4.80", burn["detail"])
+
+    def test_very_long_headroom_is_reported_as_over_a_year(self):
+        # 1,000+ day projections read as noise; keep the actionable wording bounded.
+        insights = dash.build_insights(self.routing(), self.usage(cost=0.01),
+                                       {"ok": True, "remaining_usd": 49.0, "limit_usd": 50}, None,
+                                       now=self.NOW)
+        speed = [item for item in insights if item["title"] == "사용 속도"][0]
+        self.assertIn("1년 이상", speed["detail"])
+        self.assertNotIn("약 2", speed["detail"])
 
     def test_low_cache_reuse_is_flagged(self):
         usage = self.usage(cost=1.0, external=[500_000, 20_000, 1_000, 0])
