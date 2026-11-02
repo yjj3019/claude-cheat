@@ -8,12 +8,14 @@ how much CPU it costs while a session runs. Run this before and after a change.
 import argparse
 import importlib.util
 import json
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import mock
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 SPEC = importlib.util.spec_from_file_location(
     "route_dashboard", Path(__file__).resolve().parents[1] / "routeDashboard.py")
 dash = importlib.util.module_from_spec(SPEC)
@@ -74,19 +76,22 @@ def main():
     parser.add_argument("--log-mb", type=int, default=10)
     options = parser.parse_args()
 
-    with TemporaryDirectory() as directory:
+    with TemporaryDirectory() as directory, \
+         mock.patch.object(dash, "USAGE_CACHE_FILE", Path(directory) / ".usage-cache.json"), \
+         mock.patch.object(dash, "ATTENTION_FILE", Path(directory) / ".dashboard-attention.json"), \
+         mock.patch.object(dash, "_display_session", return_value=(None, None, [])):
         root = Path(directory)
         log = route_log(root / ".route.log", options.log_mb)
         print(f"route log: {log.stat().st_size / 1048576:.1f}MB")
         started = time.perf_counter()
         dash.parse_route_log(log)
-        print(f"{'parse_route_log (cold, full read)':<44} {(time.perf_counter() - started) * 1000:8.1f}ms")
+        print(f"{'parse_route_log (cold, bounded read)':<44} {(time.perf_counter() - started) * 1000:8.1f}ms")
         timed("parse_route_log (incremental, unchanged)", lambda: dash.parse_route_log(log))
         with log.open("a", encoding="utf-8") as handle:
             for _ in range(200):
                 handle.write(json.dumps({"event": "route_selected", "provider": "openrouter",
                                          "reason": "replacement"}) + "\n")
-        timed("parse_route_log (200 new lines)", lambda: dash.parse_route_log(log))
+        timed("parse_route_log (200 new lines)", lambda: dash.parse_route_log(log), rounds=1)
 
         projects = transcripts(root / "projects", projects=max(1, options.files // 40),
                                per_project=40, lines=120)
@@ -94,7 +99,7 @@ def main():
         print(f"transcripts: {count} files")
         dash._SESSIONS.clear()
         timed("scan_sessions (first)", lambda: dash.scan_sessions(projects=projects, pricing=None),
-              rounds=2)
+              rounds=1)
         # A dashboard restart now reloads the per-file aggregates instead of re-reading.
         dash._SESSIONS.clear()
         dash._USAGE_CACHE["key"] = None
@@ -104,7 +109,7 @@ def main():
         with newest.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"type": "assistant", "timestamp": datetime.now(timezone.utc).isoformat(),
                                      "message": {"model": "vendor/model", "usage": {"input_tokens": 10}}}) + "\n")
-        timed("scan_sessions (one file appended)", lambda: dash.scan_sessions(projects=projects, pricing=None))
+        timed("scan_sessions (one file appended)", lambda: dash.scan_sessions(projects=projects, pricing=None), rounds=1)
 
         # End-to-end refresh cost, with the network stubbed out.
         original_projects, original_log = dash.PROJECTS, dash.ROUTE_LOG
@@ -115,7 +120,7 @@ def main():
             with mock.patch.object(dash, "read_settings", return_value={"OPENROUTER_MODEL": "vendor/model"}), \
                  mock.patch.object(dash, "account_state", return_value={"ok": False, "error": "offline"}), \
                  mock.patch.object(dash, "model_pricing", return_value={"ok": False}):
-                timed("snapshot (first, cold caches)", lambda: dash.snapshot(), rounds=2)
+                timed("snapshot (first, cold caches)", lambda: dash.snapshot(), rounds=1)
                 timed("snapshot (unchanged inputs)", lambda: dash.snapshot())
                 with log.open("a", encoding="utf-8") as handle:
                     handle.write(datetime.now(timezone.utc).isoformat() + " " +

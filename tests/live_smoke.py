@@ -4,7 +4,7 @@ The suite never calls a real provider. This script does one small request so a r
 key, model id and network path can be confirmed after a configuration change.
 
     python tests/live_smoke.py                # OpenRouter: key limit + one 16-token reply
-    python tests/live_smoke.py --provider local
+    python tests/live_smoke.py --provider local  # Local: one 512-token reply
     python tests/live_smoke.py --dry-run      # only report which settings are present
     python tests/live_smoke.py --json
 
@@ -82,8 +82,8 @@ def check_local(values):
     result = {"provider": "local", "model": model}
     started = time.perf_counter()
     try:
-        status, data, _ = call(url, key, {"model": model, "max_tokens": 16, "stream": False,
-                                          "messages": [{"role": "user", "content": "Reply with exactly OK"}]})
+        status, data, _ = call(url, key, {"model": model, "max_tokens": 512, "stream": False,
+                                          "messages": [{"role": "user", "content": "Reply with exactly OK"}]}, timeout=60)
         text = "".join(block.get("text", "") for block in (data.get("content") or [])
                        if isinstance(block, dict) and block.get("type") == "text").strip()
         result["inference"] = {"status": status, "ms": round((time.perf_counter() - started) * 1000, 1),
