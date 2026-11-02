@@ -32,3 +32,5 @@ openclaude.config.yaml.*
 .dashboard-attention.json.*.tmp
 .update-cache.json
 .update-cache.json.tmp
+.openclaude-update.lock
+.openclaude-update-incomplete

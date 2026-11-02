@@ -5,10 +5,8 @@ dashboard or launcher can always say which build is running. Update checks use
 ``git ls-remote`` — a read-only network call that never writes refs or objects — and
 every result is cached, so a polled dashboard never blocks on the network.
 
-Git startup costs about a second on Windows, so the hot path never runs git: the
-checkout facts are computed once in a background thread and invalidated by the mtime of
-``.git/HEAD`` and ``.git/index``. A blocking read is reserved for the explicit
-``--version`` command.
+Git startup costs about a second on Windows, so checkout facts are cached after the
+first background read. An explicit refresh or ``--version`` can read them again.
 
 Failure policy: a missing git, a detached checkout, a private remote or an offline
 machine degrades to ``unknown`` with the reason attached. Nothing here raises into a
@@ -78,7 +76,7 @@ def declared_version() -> str:
 
 
 def _git(args, timeout: int | None = None) -> tuple[int | None, str, str]:
-    """Run one read-only git command in the checkout.
+    """Run one git command in the checkout without opening a Windows console.
 
     Returns ``(exit_code, stdout, error)``; ``exit_code`` is ``None`` when git could not
     be started at all (not installed, not on PATH, timed out).
@@ -87,6 +85,7 @@ def _git(args, timeout: int | None = None) -> tuple[int | None, str, str]:
     try:
         completed = subprocess.run(command, capture_output=True, text=True, check=False,
                                    timeout=timeout or GIT_TIMEOUT_SECONDS,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                                    env={**os.environ, "GIT_TERMINAL_PROMPT": "0",
                                         "GIT_ASKPASS": "", "LC_ALL": "C"})
     except (OSError, subprocess.SubprocessError) as error:
@@ -203,8 +202,7 @@ def local_info(refresh: bool = False, blocking: bool = False) -> dict:
     with _LOCK:
         cached = _LOCAL["data"]
         age = time.monotonic() - _LOCAL["at"] if cached is not None else None
-        fresh = (cached is not None and not refresh and _LOCAL["signature"] == signature
-                 and age is not None and age < LOCAL_TTL_SECONDS)
+        fresh = cached is not None and not refresh
     if fresh:
         return {**cached, "cached": True, "age_seconds": round(age or 0, 1)}
     if blocking:

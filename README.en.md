@@ -449,6 +449,8 @@ The page shows no key, prompt or request body. It writes only `openclaude.config
 
 ### Editing settings and testing connections
 
+The settings page can show and restore the history of supported settings saved through the dashboard. Credentials, server addresses, executable paths, and security settings are excluded. If the settings file changes after the history was loaded, refresh it before restoring. Resetting a service removes its history. Direct file edits are not recorded.
+
 Settings live on a **separate page** (`http://127.0.0.1:8787/settings`) reached from the top navigation; both pages share one server and the write token from `write_url`.
 
 | Behaviour | Detail |
@@ -556,7 +558,11 @@ The report includes `state`, `provider`, `reason`, `detail`, **`model`**, `last_
 
 The dashboard header and the launcher's first line name the running build. The product version comes from `VERSION` (for example `1.0.0`) and the revision from git, so you see **`v1.0.0 (4148f2f)`**; uncommitted changes add a `*`.
 
-The update check uses **read-only `git ls-remote`** against the remote branch. It never writes refs or objects, and never pulls or fetches for you.
+An interactive `OpenClaude` launch checks the current `origin` tracking branch once. It applies a fast-forward only when the worktree is clean, no routed session is active, and the remote has a higher stable three-part `VERSION`. Local changes, untracked files, conflicts, in-progress Git operations, and incomparable versions cause the update to be skipped. A network failure keeps the current version; an incomplete update stops the launch for inspection.
+
+An interactive launch also starts the dashboard in the background or reuses its verified instance, then opens the monitoring page. An unverified port occupant is left alone. Help, version, setup, diagnostics, takeover, and print commands do not start the dashboard automatically.
+
+If an interrupted update leaves `.openclaude-update-incomplete`, automatic restarts and ordinary launches stop. Inspect and recover the checkout before removing that marker and starting again.
 
 ```powershell
 python routeDashboard.py --version           # summary plus a live remote check
@@ -566,18 +572,10 @@ python openrouterAdvisor.py --version        # same check from the launcher
 .\OpenClaude.ps1 -Version                    # identical
 ```
 
-| State | Meaning | Badge |
-| --- | --- | --- |
-| `current` | Local HEAD equals the remote HEAD | `pill-ok` |
-| `behind` | The remote has newer commits → `git pull` | `· 업데이트` |
-| `ahead` | Only the local branch moved → `git push` | `· 앞섬` |
-| `diverged` | Both sides have their own commits | `· 확인` |
-| `different` | The remote commit is not downloaded yet | `· 확인` |
-| `unknown` / `disabled` | Network/git/settings problem, or the check is off | 확인 불가 |
+An explicit `--version` check reports `current`, `behind`, `ahead`, `diverged`, `different`, `unknown`, or `disabled`. This explicit check is read-only.
 
-- The badge refreshes from `GET /api/version`, which **never waits for git or the network**: the first answer is `checking` and the real state follows on a later poll (`?refresh=1` re-arms it; clicking the badge does the same).
-- The last answer is persisted to `.update-cache.json` (git-ignored). The dashboard refreshes it; the launcher reads it at startup so a session never stalls behind a version probe.
-- `ROUTE_UPDATE_CHECK=0` turns the check off; `ROUTE_UPDATE_REMOTE` and `ROUTE_UPDATE_BRANCH` select another remote or branch. A failed check never blocks a session or a dashboard response.
+- The dashboard does not periodically query the remote. Its badge shows the local version; clicking it refreshes local information.
+- `ROUTE_UPDATE_CHECK=0` disables automatic updates. Remote and branch environment variables still apply to explicit `--version` checks; automatic updates are restricted to the current `origin` tracking branch.
 - `VERSION` is the release name: bump it when you release, and the dashboard, launcher and `--version` all report the same value.
 
 A running proxy exposes its own counters at `GET /api/metrics` (same session token required, loopback only): request count, external/Plan split, p50/p95 latency, retries, streams, circuit opens and bytes in/out. The dashboard authenticates this response with the handoff token before identifying a **current session**, and uses the counters from that verified proxy. The token, port and PID are not returned in the settings response.

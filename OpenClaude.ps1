@@ -54,6 +54,34 @@ if ($Setup) {
     & (Join-Path $PSScriptRoot 'OpenClaudeDashboard.ps1') -Open
     exit $LASTEXITCODE
 }
+# Startup checks apply only to an interactive routing session.
+if (-not ($CheckLocal -or $DiagnoseLocal -or $Takeover -or $Print)) {
+    if ($env:OPENCLAUDE_UPDATED -ne '1') {
+        & python (Join-Path $PSScriptRoot 'launcherStartup.py') --update
+        $startupExit = $LASTEXITCODE
+        if ($startupExit -eq 10) {
+            $previousUpdated = $env:OPENCLAUDE_UPDATED
+            $env:OPENCLAUDE_UPDATED = '1'
+            try {
+                & $PSCommandPath @PSBoundParameters
+                exit $LASTEXITCODE
+            } finally {
+                if ($null -eq $previousUpdated) { Remove-Item Env:OPENCLAUDE_UPDATED -ErrorAction SilentlyContinue }
+                else { $env:OPENCLAUDE_UPDATED = $previousUpdated }
+            }
+        }
+        if ($startupExit -ne 0) {
+            Write-Warning 'Automatic update could not safely complete; the session was not started.'
+            exit $startupExit
+        }
+    }
+    try {
+        & python (Join-Path $PSScriptRoot 'launcherStartup.py') --dashboard
+        if ($LASTEXITCODE -ne 0) { Write-Warning 'Dashboard could not be started; continuing with the Claude session.' }
+    } catch {
+        Write-Warning 'Dashboard could not be started; continuing with the Claude session.'
+    }
+}
 $routeArgs = @('--provider', $Provider.ToLowerInvariant())
 if ($Takeover) { $routeArgs += '--takeover' }
 if ($Print) { $routeArgs += @('--print', $Print) }

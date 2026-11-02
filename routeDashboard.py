@@ -53,6 +53,8 @@ except (ImportError, ValueError):
 
 
 ROOT = Path(__file__).resolve().parent
+UPDATE_LOCK_PATH = ROOT / "openclaude-update"
+UPDATE_INCOMPLETE = ROOT / ".openclaude-update-incomplete"
 ROUTE_LOG = ROOT / ".route.log"
 METRICS_FILE = ROOT / ".proxy-metrics.json"
 PROXY_FILE = ROOT / "claudeRouteProxy.mjs"
@@ -146,6 +148,7 @@ _SESSIONS = {}
 _ACCOUNT = {"at": 0.0, "data": None}
 _PRICING = {"at": 0.0, "data": None}
 _SNAPSHOT = {"at": 0.0, "data": None}
+_SNAPSHOT_ETAG_CACHE = None
 PRICING_TTL = 3600
 # A failed lookup is retried soon: one DNS blip must not freeze cost estimates for an hour.
 PRICING_ERROR_TTL = 60
@@ -2319,7 +2322,8 @@ def save_default_provider(provider):
                     raise ValueError("default_provider_not_configured")
             _validate_config(provider, values)
 
-    store.write_provider("routing", {"ROUTE_DEFAULT_PROVIDER": provider}, validate=validate_candidate)
+    store.write_provider("routing", {"ROUTE_DEFAULT_PROVIDER": provider}, validate=validate_candidate,
+                         record_history=True)
     return provider
 
 
@@ -2556,7 +2560,7 @@ def save_config(provider, values, clear=()):
 
     # Revalidate the exact candidate under the store lock: another save may have
     # changed complementary fields since preflight. Failure must precede backup/write.
-    _store(provider).write_provider(provider, updates, validate=validate_candidate)
+    _store(provider).write_provider(provider, updates, validate=validate_candidate, record_history=True)
     return config_snapshot()
 
 
@@ -3206,7 +3210,7 @@ def snapshot():
         "model": model,
         # Never blocks: the first render shows a pending state, then the background
         # checkout read and remote comparison fill it in on later polls.
-        "version": routeVersion.version_report(),
+        "version": {**routeVersion.version_report(include_update=False), "update": {"state": "disabled"}},
     }
 
 
@@ -3260,6 +3264,7 @@ def snapshot_etag(payload):
 
 def cached_snapshot():
     """Serve the last completed snapshot so a slow first scan never blocks the page."""
+    global _SNAPSHOT_ETAG_CACHE
     data = _SNAPSHOT.get("data")
     error = _SNAPSHOT.get("error")
     at = _SNAPSHOT.get("at")
@@ -3271,7 +3276,14 @@ def cached_snapshot():
         payload = {**data, "snapshot_age_seconds": age, "alerts": health + alerts}
         if error:
             payload["snapshot_error"] = error
-        payload["etag"] = snapshot_etag(payload)
+        # Published snapshots are replaced on refresh; only freshness alerts vary per request.
+        cached = _SNAPSHOT_ETAG_CACHE
+        if not health and not error and cached is not None and cached[0] is data:
+            payload["etag"] = cached[1]
+        else:
+            payload["etag"] = snapshot_etag(payload)
+            if not health and not error:
+                _SNAPSHOT_ETAG_CACHE = (data, payload["etag"])
         return payload
     now = datetime.now(timezone.utc)
     session, metrics = _live_session()
@@ -3676,7 +3688,7 @@ function versionTitle(version) {
   if (local.branch) parts.push(local.branch);
   if (local.commit_date) parts.push('커밋 ' + local.commit_date.slice(0, 16).replace('T', ' '));
   if (local.dirty) parts.push('커밋되지 않은 변경 있음');
-  parts.push('업데이트: ' + (VERSION_STATE[update.state] || update.state || '알 수 없음'));
+  parts.push('업데이트: ' + (VERSION_STATE[update.state] || update.state || '시작 시 확인'));
   if (update.behind_by) parts.push(update.behind_by + '개 커밋 뒤짐 → git pull');
   if (update.ahead_by) parts.push(update.ahead_by + '개 커밋 앞섬 → git push');
   if (update.checked_at) parts.push('확인 ' + update.checked_at.slice(0, 16).replace('T', ' '));
@@ -3688,7 +3700,7 @@ function renderVersion(version) {
   if (!pill) return;
   const local = (version || {}).local || {};
   const update = (version || {}).update || {};
-  const state = update.state || 'checking';
+  const state = update.state || (local.pending ? 'checking' : 'disabled');
   const suffix = state === 'behind' ? ' · 업데이트'
     : state === 'ahead' ? ' · 앞섬'
     : (state === 'diverged' || state === 'different') ? ' · 확인' : '';
@@ -3706,7 +3718,7 @@ async function loadVersion() {
     const version = await response.json();
     renderVersion(version);
     // The background checkout read and remote check land a moment after the first poll.
-    if (['checking', 'unknown'].includes(((version || {}).update || {}).state)) {
+    if (((version || {}).local || {}).pending || ['checking', 'unknown'].includes(((version || {}).update || {}).state)) {
       setTimeout(loadVersion, 15000);
     }
   } catch (error) { /* offline: keep the last text instead of a broken badge */ }
@@ -4833,6 +4845,46 @@ PAGE_CSS += """
 @media(max-width:760px){.attention-item{grid-template-columns:10px minmax(0,1fr)}.attention-actions{grid-column:2;justify-content:flex-start}}
 """
 
+SETTINGS_BODY += '''<section class="card" aria-labelledby="config-history-title">
+  <header class="card-h"><h2 id="config-history-title">설정 변경 이력</h2></header>
+  <div class="card-b"><p>인증정보, 주소, 실행 경로와 보안 설정은 기록하거나 복원하지 않습니다. 변경은 새 실행부터 적용됩니다.</p>
+  <button type="button" class="btn btn-sm" id="history-refresh">이력 조회</button>
+  <div id="config-history" role="status"></div></div></section>'''
+JS_SETTINGS += '''
+let configHistoryToken = '';
+async function loadConfigHistory() {
+  const box = document.getElementById('config-history');
+  try {
+    const response = await fetch('/api/config-history', {cache:'no-store', headers:{'x-dashboard-token':TOKEN}});
+    if (!response.ok) throw new Error('조회 실패');
+    const data = await response.json();
+    configHistoryToken = data.token;
+    const previous = {};
+    const rows = data.entries.map(entry => {
+      const old = previous[entry.provider];
+      previous[entry.provider] = entry.values;
+      const changes = Object.keys(entry.values).filter(key => !old || old[key] !== entry.values[key])
+        .map(key => `${esc(key)}: ${esc(old ? old[key] : '')} → ${esc(entry.values[key])}`).join(', ');
+      return `<li><b>#${entry.id} ${esc(entry.provider)}</b> ${changes || '변경 없음'} ` +
+        `<button type="button" class="btn btn-sm" data-revision="${entry.id}" data-provider="${esc(entry.provider)}">복원</button></li>`;
+    });
+    box.innerHTML = rows.length ? '<ol>' + rows.reverse().join('') + '</ol>' : '<p>기록된 이력이 없습니다.</p>';
+  } catch (_) { box.textContent = '이력을 불러오지 못했습니다.'; }
+}
+document.getElementById('history-refresh').addEventListener('click', loadConfigHistory);
+document.getElementById('config-history').addEventListener('click', async event => {
+  const button = event.target.closest('button[data-revision]');
+  if (!button || !confirm('이 revision의 기록된 설정만 복원합니까? 인증정보와 주소는 유지됩니다.')) return;
+  try {
+    const response = await fetch('/api/config-history-restore', {method:'POST',
+      headers:{'content-type':'application/json','x-dashboard-token':TOKEN},
+      body:JSON.stringify({provider:button.dataset.provider, revision:Number(button.dataset.revision), token:configHistoryToken})});
+    if (!response.ok) { const result = await response.json(); throw new Error(result.error); }
+    await loadConfig(true); await loadConfigHistory();
+  } catch (error) { document.getElementById('config-history').textContent = '복원 실패: ' + error.message + ' (이력을 다시 조회하세요)'; }
+});
+'''
+
 PAGE = _page("dashboard")
 SETTINGS_PAGE = _page("settings")
 BLACKBOX_PAGE = _page("blackbox")
@@ -4883,6 +4935,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "text/html; charset=utf-8", BLACKBOX_PAGE)
         elif path == "/usage":
             self._send(200, "text/html; charset=utf-8", USAGE_PAGE)
+        elif path == "/api/config-history":
+            if not self._authorized():
+                return self._send(403, "application/json; charset=utf-8", json.dumps({"error": "token_required"}))
+            try:
+                result = _store().history(TOKEN)
+            except (OSError, routeConfig.ConfigError):
+                return self._send(500, "application/json; charset=utf-8", json.dumps({"error": "history_unavailable"}))
+            return self._send(200, "application/json; charset=utf-8", json.dumps(result, ensure_ascii=False))
         elif path == "/api/config":
             if not self._authorized():
                 # Settings (even masked) belong to the session, exactly like /api/cli.
@@ -4979,7 +5039,8 @@ class Handler(BaseHTTPRequestHandler):
             # read and the remote comparison run in the background; ?refresh=1 re-arms them.
             refresh = parse_qs(urlsplit(self.path).query).get("refresh", ["0"])[0] in ("1", "true", "yes")
             try:
-                payload = routeVersion.version_report(refresh=refresh)
+                payload = {**routeVersion.version_report(refresh=refresh, include_update=False),
+                           "update": {"state": "disabled"}}
             except Exception:
                 return self._send(500, "application/json; charset=utf-8",
                                   json.dumps({"error": "version_failed"}))
@@ -5016,7 +5077,7 @@ class Handler(BaseHTTPRequestHandler):
         if not _host_allowed(self.headers.get("host")):
             return self._send(403, "application/json; charset=utf-8", json.dumps({"error": "host_rejected"}))
         path = self.path.split("?")[0]
-        if path not in ("/api/config", "/api/test", "/api/default-provider", "/api/config-reset", "/api/blackbox", "/api/select-session", "/api/attention"):
+        if path not in ("/api/config", "/api/config-history-restore", "/api/test", "/api/default-provider", "/api/config-reset", "/api/blackbox", "/api/select-session", "/api/attention"):
             return self._send(404, "application/json; charset=utf-8", json.dumps({"error": "not_found"}))
         if not self._authorized():
             return self._send(403, "application/json; charset=utf-8", json.dumps({"error": "token_required"}))
@@ -5101,6 +5162,38 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(409, "application/json; charset=utf-8", json.dumps({"error": "blackbox_failed"}))
             return self._send(200, "application/json; charset=utf-8", json.dumps(result, ensure_ascii=False))
         provider = payload.get("provider")
+        if path == "/api/config-history-restore":
+            revision = payload.get("revision")
+            token = payload.get("token")
+            if (provider not in (*CONFIG_FILES, "routing") or type(revision) is not int or revision < 1
+                    or not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{64}", token)):
+                return self._send(400, "application/json; charset=utf-8", json.dumps({"error": "invalid_restore"}))
+            store = _store(provider)
+            def validate_restore(candidate):
+                if provider == "routing":
+                    selected = candidate.get("ROUTE_DEFAULT_PROVIDER", "auto")
+                    if selected not in ("auto", "sonnet", *ROUTING_PROVIDERS):
+                        raise ValueError("invalid_default_provider")
+                    if selected in CONFIG_FILES:
+                        selected_values = store.read_provider(selected)
+                        if any(not selected_values.get(name) for name in CONFIG_FILES[selected]["required"]):
+                            raise ValueError("default_provider_not_configured")
+                        _validate_config(selected, selected_values)
+                else:
+                    if any(not candidate.get(name) for name in CONFIG_FILES[provider]["required"]):
+                        raise ValueError("missing_required_value")
+                    _validate_config(provider, candidate)
+            try:
+                store.write_provider(provider, {}, validate=validate_restore, restore_id=revision,
+                                     expected_token=token, history_key=TOKEN)
+            except routeConfig.ConfigError as error:
+                code = error.code if error.code in ("history_conflict", "history_not_found", "invalid_history") else "config_invalid"
+                return self._send(409, "application/json; charset=utf-8", json.dumps({"error": code}))
+            except ValueError as error:
+                return self._send(400, "application/json; charset=utf-8", json.dumps({"error": str(error)}))
+            except OSError:
+                return self._send(500, "application/json; charset=utf-8", json.dumps({"error": "write_failed"}))
+            return self._send(200, "application/json; charset=utf-8", json.dumps({"restored": True}))
         if path == "/api/default-provider":
             try:
                 saved = save_default_provider(provider)
@@ -5366,7 +5459,8 @@ def _stop_previous(port, path=None, timeout=5.0):
 AUTO_UPDATE_LOG = ROOT / ".auto-update.log"
 AUTO_UPDATE_INTERVAL_SECONDS = 60.0
 AUTO_UPDATE_POLL_SECONDS = 5.0
-DASHBOARD_SOURCE_FILES = (Path(__file__).resolve(), ROOT / "routeConfig.py", ROOT / "localProcessTree.py")
+DASHBOARD_SOURCE_FILES = (Path(__file__).resolve(), ROOT / "routeConfig.py", ROOT / "localProcessTree.py",
+                          ROOT / "routeVersion.py", ROOT / "VERSION")
 _AUTO_TAKEOVER_LAST = 0.0
 _AUTO_TAKEOVER_LOCK = threading.Lock()
 
@@ -5411,23 +5505,28 @@ def _auto_takeover_loop():
     while True:
         time.sleep(AUTO_UPDATE_POLL_SECONDS)
         try:
-            session, metrics = _live_session()
-            if not session:
-                continue
-            routing = _current_routing(parse_route_log(), session, metrics)
-            if auto_update_action(session, metrics, routing, _AUTO_TAKEOVER_LAST, time.monotonic()) != "takeover":
-                continue
-            with _AUTO_TAKEOVER_LOCK:
+            with routeConfig.Store(UPDATE_LOCK_PATH)._cross_process_lock(timeout=0.05):
+                if UPDATE_INCOMPLETE.exists():
+                    continue
+                session, metrics = _live_session()
+                if not session:
+                    continue
+                routing = _current_routing(parse_route_log(), session, metrics)
                 if auto_update_action(session, metrics, routing, _AUTO_TAKEOVER_LAST, time.monotonic()) != "takeover":
                     continue
-                _AUTO_TAKEOVER_LAST = time.monotonic()
-            _record_auto_update(f"proxy source is newer than the live proxy; requesting takeover on port {session.get('port')}")
-            flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            with AUTO_UPDATE_LOG.open("a", encoding="utf-8") as log:
-                subprocess.Popen(
-                    [sys.executable, str(ROOT / "openrouterAdvisor.py"), "--takeover"],
-                    cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                    creationflags=flags, close_fds=True)
+                with _AUTO_TAKEOVER_LOCK:
+                    if auto_update_action(session, metrics, routing, _AUTO_TAKEOVER_LAST, time.monotonic()) != "takeover":
+                        continue
+                    _AUTO_TAKEOVER_LAST = time.monotonic()
+                _record_auto_update(f"proxy source is newer than the live proxy; requesting takeover on port {session.get('port')}")
+                flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                with AUTO_UPDATE_LOG.open("a", encoding="utf-8") as log:
+                    subprocess.Popen(
+                        [sys.executable, str(ROOT / "openrouterAdvisor.py"), "--takeover"],
+                        cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                        creationflags=flags, close_fds=True)
+        except routeConfig.ConfigError:
+            continue
         except Exception as error:  # A watcher must never kill the dashboard.
             _record_auto_update(f"auto-update check failed: {type(error).__name__}: {error}")
 
@@ -5444,28 +5543,32 @@ def _auto_reload_loop(initial):
     while True:
         time.sleep(3)
         try:
-            current = source_fingerprint()
-        except OSError:
+            with routeConfig.Store(UPDATE_LOCK_PATH)._cross_process_lock(timeout=0.05):
+                if UPDATE_INCOMPLETE.exists():
+                    continue
+                current = source_fingerprint()
+                if current != initial:
+                    _record_auto_update("dashboard source changed; restarting the dashboard")
+                    os.environ["ROUTE_DASHBOARD_REEXEC"] = str(os.getpid())
+                    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                    with AUTO_UPDATE_LOG.open("a", encoding="utf-8") as log:
+                        subprocess.Popen(
+                            [sys.executable, str(Path(__file__).resolve()), *[arg for arg in sys.argv[1:] if arg != "--no-takeover"]],
+                            cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                            creationflags=flags, close_fds=True, env={**os.environ, "DASHBOARD_TOKEN": TOKEN})
+                    os._exit(0)
+        except (OSError, routeConfig.ConfigError):
             continue
-        if current != initial:
-            _record_auto_update("dashboard source changed; restarting the dashboard")
-            os.environ["ROUTE_DASHBOARD_REEXEC"] = str(os.getpid())
-            flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            with AUTO_UPDATE_LOG.open("a", encoding="utf-8") as log:
-                subprocess.Popen(
-                    [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
-                    cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                    creationflags=flags, close_fds=True)
-            os._exit(0)
 
 
-def serve(host="127.0.0.1", port=DEFAULT_PORT, refresh=3, allow_fallback=False, open_page=None):
+def serve(host="127.0.0.1", port=DEFAULT_PORT, refresh=3, allow_fallback=False, open_page=None, no_takeover=False):
     threading.Thread(target=_refresh_loop, args=(max(1, refresh),), daemon=True).start()
     threading.Thread(target=_auto_reload_loop, args=(source_fingerprint(),), daemon=True).start()
     threading.Thread(target=_auto_takeover_loop, daemon=True).start()
     threading.Thread(target=_usage_refresh_loop, daemon=True).start()
     # A previous dashboard keeps its port between restarts; take it over instead of moving.
-    _stop_previous(port)
+    if not no_takeover:
+        _stop_previous(port)
     fallback = None
     try:
         server = DashboardServer((host, port), Handler)
@@ -5944,6 +6047,7 @@ def main(argv=None):
     parser.add_argument("--pretty", action="store_true", help="Indent the status report")
     parser.add_argument("--allow-port-fallback", action="store_true",
                         help="Pick a free port instead of failing when the requested port is busy")
+    parser.add_argument("--no-takeover", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--stop", action="store_true",
                         help="Stop only the dashboard recorded in .dashboard.pid")
     parser.add_argument("--open", dest="open_page", nargs="?", const="settings", default=None,
@@ -5992,7 +6096,7 @@ def main(argv=None):
     if args.host not in ("127.0.0.1", "::1", "localhost"):
         raise SystemExit("Bind a loopback address only")
     serve(args.host, args.port, args.refresh, allow_fallback=args.allow_port_fallback,
-          open_page=args.open_page)
+          open_page=args.open_page, no_takeover=args.no_takeover)
     return 0
 
 

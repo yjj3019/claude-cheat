@@ -20,6 +20,9 @@ mapping to YAML keys lives in ``SECTIONS``. A service that has no section yet fa
 read-only, to its legacy dotenv file (``.env.openrouter`` / ``.env.local-llm``).
 """
 import contextlib
+import hashlib
+import hmac
+import json
 import os
 import random
 import re
@@ -56,6 +59,60 @@ _WRITE_LOCK = threading.Lock()
 # Characters that would break a line or are never meaningful in a setting; refused on write.
 FORBIDDEN = re.compile("[\x00-\x1f\x7f\u0085  ]")
 _BARE_BOOL = ("true", "false")
+
+# Explicitly exclude credentials, addresses, executable paths and security policy.
+HISTORY_FIELDS = {
+    "openrouter": ("model", "provider"),
+    "local": ("model",),
+    "cli": ("kind", "model", "timeout_s"),
+    "routing": ("default_provider",),
+}
+_HISTORY_PREFIX = "# openclaude-history-v1: "
+
+
+def _history(text):
+    entries = []
+    for line in _split_lines(text):
+        if not line.startswith(_HISTORY_PREFIX):
+            continue
+        try:
+            entry = json.loads(line[len(_HISTORY_PREFIX):])
+            provider = entry["provider"]
+            values = entry["values"]
+            if (set(entry) != {"id", "provider", "values"} or type(entry["id"]) is not int
+                    or entry["id"] <= (entries[-1]["id"] if entries else 0)
+                    or provider not in HISTORY_FIELDS or not isinstance(values, dict)
+                    or set(values) != set(HISTORY_FIELDS[provider])
+                    or any(not isinstance(v, str) or len(v) > 1024 or FORBIDDEN.search(v)
+                           for v in values.values())):
+                raise ValueError()
+        except (ValueError, TypeError, KeyError):
+            raise ConfigError("invalid_history") from None
+        entries.append(entry)
+    return entries
+
+
+def _history_values(text, provider):
+    document = parse(text)
+    error = document.first_error(provider)
+    if error:
+        raise error
+    values = document.sections.get(provider, {}).get("values", {})
+    return {key: values.get(key, "") for key in HISTORY_FIELDS[provider]}
+
+
+def _history_append(text, entries, provider, values):
+    entry = {"id": (entries[-1]["id"] if entries else 0) + 1,
+             "provider": provider, "values": values}
+    entries.append(entry)
+    eol = "\r\n" if "\r\n" in text else "\n"
+    if text and not text.endswith("\n"):
+        text += eol
+    return text + _HISTORY_PREFIX + json.dumps(entry, ensure_ascii=True, separators=(",", ":")) + eol
+
+
+def _history_token(raw, key):
+    return hmac.new(key.encode("utf-8"), raw or b"", hashlib.sha256).hexdigest()
 
 
 class ConfigError(ValueError):
@@ -353,7 +410,13 @@ class Store:
         except FileNotFoundError:
             return {}
 
-    def write_provider(self, provider, updates, validate=None):
+    def history(self, key):
+        with _WRITE_LOCK, self._cross_process_lock():
+            raw = self._read_bytes()
+            return {"entries": _history(self._decode(raw) or ""), "token": _history_token(raw, key)}
+
+    def write_provider(self, provider, updates, validate=None, *, record_history=False,
+                       restore_id=None, expected_token=None, history_key=None):
         """Apply updates atomically; optional validation sees the exact locked candidate before I/O."""
         spec = SECTIONS[provider]
         names = {name: key for key, name in spec["keys"].items()}
@@ -366,6 +429,18 @@ class Store:
             # Re-read inside the lock so a concurrent save is never overwritten with stale text.
             raw = self._read_bytes()
             original = self._decode(raw)
+            entries = _history(original or "") if record_history or restore_id is not None else []
+            if restore_id is not None:
+                if (not isinstance(history_key, str) or not isinstance(expected_token, str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", expected_token)
+                        or not hmac.compare_digest(_history_token(raw, history_key), expected_token)):
+                    raise ConfigError("history_conflict")
+                target = next((entry for entry in entries if entry["id"] == restore_id
+                               and entry["provider"] == provider), None)
+                if target is None:
+                    raise ConfigError("history_not_found")
+                yaml_updates = dict(target["values"])
+                record_history = True
             if original is None:
                 text = self._seed()
             else:
@@ -381,6 +456,10 @@ class Store:
                     for key, value in self._legacy_values(provider).items():
                         if key not in yaml_updates or yaml_updates[key] is None:
                             yaml_updates[key] = value
+            before = _history_values(text, provider) if record_history else None
+            if record_history and original is not None and provider not in parse(original).sections:
+                legacy = self._legacy_values(provider)
+                before = {key: legacy.get(key, "") for key in HISTORY_FIELDS[provider]}
             text = update_text(text, provider, yaml_updates)
             if validate is not None:
                 candidate = parse(text)
@@ -389,6 +468,12 @@ class Store:
                     raise error
                 validate({spec["keys"][key]: value
                           for key, value in candidate.sections[provider]["values"].items() if value != ""})
+            if record_history:
+                after = _history_values(text, provider)
+                if before != after:
+                    if not any(entry["provider"] == provider for entry in entries):
+                        text = _history_append(text, entries, provider, before)
+                    text = _history_append(text, entries, provider, after)
             self._atomic_write(text, raw, original is not None and raw.startswith(b"\xef\xbb\xbf"))
 
     def reset_provider(self, provider, scope):
@@ -407,6 +492,12 @@ class Store:
 
         def clean_yaml(raw, primary=False):
             text = self._decode(raw)
+            entries = _history(text)
+            if scope == "service":
+                keep = {entry["id"] for entry in entries if entry["provider"] != provider}
+                text = "".join(line for line in text.splitlines(keepends=True)
+                               if not line.startswith(_HISTORY_PREFIX)
+                               or json.loads(line[len(_HISTORY_PREFIX):])["id"] in keep)
             document = parse(text)
             if document.errors or any(entry["errors"] for entry in document.sections.values()):
                 raise ConfigError("reset_invalid_file")

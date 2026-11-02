@@ -1338,11 +1338,10 @@ def _self_test_isolated() -> None:
 def version_banner(notice: bool = True) -> str:
     """One startup line: the running build, plus any update the last check recorded.
 
-    Never waits for git or the network — a launcher must not stall behind a version
-    probe. The dashboard refreshes the persisted check; ``--version`` runs it live.
+    Never waits for git or the network; ``--version`` runs an explicit check.
     """
     try:
-        report = routeVersion.version_report(include_update=notice)
+        report = routeVersion.version_report(include_update=False)
     except Exception:  # noqa: BLE001 - a banner is never worth failing a launch
         return ""
     local = report.get("local") or {}

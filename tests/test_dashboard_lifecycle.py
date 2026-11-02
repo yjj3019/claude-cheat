@@ -53,6 +53,20 @@ class DashboardLifecycleTests(unittest.TestCase):
     def assert_no_stray_files(self):
         self.assertEqual(sorted(path.name for path in self.root.iterdir()), [".dashboard.pid"])
 
+    def test_reload_keeps_the_dashboard_token(self):
+        with mock.patch.dict(os.environ, {"ROUTE_DASHBOARD_AUTO_RELOAD": "1"}), \
+             mock.patch.object(dash, "AUTO_UPDATE_LOG", self.root / "reload.log"), \
+             mock.patch.object(dash, "UPDATE_INCOMPLETE", self.root / "missing-marker"), \
+             mock.patch.object(dash.routeConfig.Store, "_cross_process_lock", return_value=contextlib.nullcontext()), \
+             mock.patch.object(dash.time, "sleep"), \
+             mock.patch.object(dash, "source_fingerprint", return_value="changed"), \
+             mock.patch.object(dash, "_record_auto_update"), \
+             mock.patch.object(dash.subprocess, "Popen") as spawn, \
+             mock.patch.object(dash.os, "_exit", side_effect=RuntimeError("exit")):
+            with self.assertRaisesRegex(RuntimeError, "exit"):
+                dash._auto_reload_loop("original")
+        self.assertEqual(spawn.call_args.kwargs["env"]["DASHBOARD_TOKEN"], dash.TOKEN)
+
     # --- the record ----------------------------------------------------------
     def test_written_record_carries_the_identity_and_stays_reader_compatible(self):
         with mock.patch.object(dash, "process_identity", return_value=(os.getpid(), 987654321)):

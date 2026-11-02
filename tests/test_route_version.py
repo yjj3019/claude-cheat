@@ -109,6 +109,13 @@ class VersionModuleTests(unittest.TestCase):
     def write_version(self, text):
         (self.root / "VERSION").write_text(text, encoding="utf-8")
 
+    def test_git_runs_without_a_console_window(self):
+        completed = mock.Mock(returncode=0, stdout="ok\n", stderr="")
+        with mock.patch.object(version.subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True), \
+             mock.patch.object(version.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(version._git(["status"]), (0, "ok", ""))
+        self.assertEqual(run.call_args.kwargs["creationflags"], 0x08000000)
+
     # -- declared version ------------------------------------------------------------
     def test_declared_version_reads_the_file_and_normalises_a_v_prefix(self):
         self.assertEqual(version.declared_version(), "1.0.0")
@@ -151,7 +158,7 @@ class VersionModuleTests(unittest.TestCase):
         self.assertIn("not a git repository", data["error"])
         self.assertIsNone(data["commit"])
 
-    def test_local_info_caches_and_re_reads_when_head_or_index_moves(self):
+    def test_local_info_is_cached_until_explicit_refresh(self):
         git = FakeGit()
         with mock.patch.object(version, "_git", git), \
                 mock.patch.object(version, "_local_signature", return_value=(1, 2)):
@@ -165,7 +172,9 @@ class VersionModuleTests(unittest.TestCase):
         with mock.patch.object(version, "_git", git), \
                 mock.patch.object(version, "_local_signature", return_value=(9, 9)):
             version.local_info(blocking=True)
-        self.assertGreater(len(git.calls), calls_after_first, "a moved HEAD must be re-read")
+            self.assertEqual(len(git.calls), calls_after_first)
+            version.local_info(refresh=True, blocking=True)
+        self.assertGreater(len(git.calls), calls_after_first)
 
     def test_non_blocking_read_returns_a_placeholder_then_fills_in(self):
         started = threading.Event()
@@ -381,10 +390,10 @@ class DashboardVersionTests(unittest.TestCase):
         self.assertLess(elapsed, 0.8, "the endpoint blocked on the checkout read")
         payload = json.loads(body)
         self.assertEqual(payload["local"]["version"], "1.0.0")
-        self.assertEqual(payload["update"]["state"], "checking")
+        self.assertEqual(payload["update"]["state"], "disabled")
         self.assertIn("application/json", headers["content-type"])
 
-    def test_api_version_reports_an_update_once_the_check_lands(self):
+    def test_api_version_does_not_check_remote(self):
         git = FakeGit(remote_sha=REMOTE, behind=2)
         base = self.serve()
         with mock.patch.object(version, "_git", git), \
@@ -395,12 +404,12 @@ class DashboardVersionTests(unittest.TestCase):
             while time.time() < deadline:
                 _, body, _ = self.get(base + "/api/version")
                 payload = json.loads(body)
-                if payload["update"]["state"] == "behind":
+                if payload["local"].get("commit") == HEAD:
                     break
                 time.sleep(0.05)
-        self.assertEqual(payload["update"]["state"], "behind")
-        self.assertEqual(payload["update"]["behind_by"], 2)
         self.assertEqual(payload["local"]["commit"], HEAD)
+        self.assertEqual(payload["update"]["state"], "disabled")
+        self.assertFalse(any(call[0] == "ls-remote" for call in git.calls))
 
     def test_the_snapshot_carries_the_version_block(self):
         with mock.patch.object(dash, "scan_sessions", return_value=dash._empty_usage()), \
@@ -411,7 +420,7 @@ class DashboardVersionTests(unittest.TestCase):
                 mock.patch.object(dash, "read_settings", return_value={}):
             data = dash.snapshot()
         self.assertIn("local", data["version"])
-        self.assertIn("update", data["version"])
+        self.assertEqual(data["version"]["update"]["state"], "disabled")
 
     def test_status_report_reads_the_version_blocking_only_when_asked(self):
         with mock.patch.object(dash.routeVersion, "local_info", return_value={"label": "v1.0.0"}) as probe:

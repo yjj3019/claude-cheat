@@ -3843,6 +3843,28 @@ class CliAutoDetectFlowTests(unittest.TestCase):
                                          headers=self.headers, method="POST")
         return json.loads(opener.open(request, timeout=15).read().decode("utf-8"))
 
+    def test_history_api_restores_and_rejects_stale_revision(self):
+        import urllib.error
+        import urllib.request
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with self.assertRaises(urllib.error.HTTPError) as denied:
+            opener.open(self.base + "/api/config-history", timeout=15)
+        self.assertEqual(denied.exception.code, 403)
+        denied.exception.close()
+        self.post("/api/config", {"provider": "cli", "values": {"CLI_KIND": "claude", "CLI_MODEL": "first"}})
+        self.post("/api/config", {"provider": "cli", "values": {"CLI_MODEL": "second"}})
+        history = self.get("/api/config-history")
+        revision = next(entry["id"] for entry in history["entries"] if entry["values"].get("model") == "first")
+        self.post("/api/config", {"provider": "cli", "values": {"CLI_MODEL": "third"}})
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.post("/api/config-history-restore", {"provider": "cli", "revision": revision, "token": history["token"]})
+        self.assertEqual(error.exception.code, 409)
+        error.exception.close()
+        current = self.get("/api/config-history")
+        self.assertTrue(self.post("/api/config-history-restore", {"provider": "cli", "revision": revision,
+                                                                  "token": current["token"]})["restored"])
+        self.assertEqual(dash.read_settings("cli")["CLI_MODEL"], "first")
+
     def test_detected_cli_can_be_saved_and_selected_for_the_next_launch(self):
         rows = self.get("/api/cli")["kinds"]
         self.assertEqual(rows[0]["kind"], "claude")
@@ -3993,6 +4015,8 @@ class AutoUpdateTests(unittest.TestCase):
         self.assertIsNone(dash.auto_update_action(None, {"inflightRequests": 0}, stale, 0.0, 100.0))
 
     def test_source_fingerprint_tracks_content_changes(self):
+        self.assertIn(dash.ROOT / "routeVersion.py", dash.DASHBOARD_SOURCE_FILES)
+        self.assertIn(dash.ROOT / "VERSION", dash.DASHBOARD_SOURCE_FILES)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "source.py"
             path.write_text("one", encoding="utf-8")
@@ -4110,6 +4134,95 @@ class MultiSessionTests(unittest.TestCase):
         self.assertIn('session-path', dash.PAGE_CSS)
 
 class SnapshotCacheTests(unittest.TestCase):
+    def test_concurrent_refresh_does_not_reuse_an_old_etag(self):
+        import threading
+        state = {"data": {"alerts": [], "usage": {"total": 1}}, "at": time.monotonic(), "error": None}
+        entered, release = threading.Event(), threading.Event()
+        results = []
+        original = dash.snapshot_etag
+
+        def delayed(payload):
+            if payload["usage"]["total"] == 1:
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError("test synchronization failed")
+            return original(payload)
+
+        with mock.patch.object(dash, "_SNAPSHOT", state), \
+             mock.patch.object(dash, "_SNAPSHOT_ETAG_CACHE", None), \
+             mock.patch.object(dash, "snapshot_etag", side_effect=delayed):
+            worker = threading.Thread(target=lambda: results.append(dash.cached_snapshot()))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                state["data"] = {"alerts": [], "usage": {"total": 2}}
+                new = dash.cached_snapshot()
+            finally:
+                release.set()
+                worker.join(timeout=5)
+            self.assertFalse(worker.is_alive())
+            self.assertNotEqual(results[0]["etag"], new["etag"])
+            self.assertEqual(dash.cached_snapshot()["etag"], new["etag"])
+
+    def test_conditional_get_observes_new_snapshots_and_health(self):
+        import threading
+        state = {"data": {"alerts": [], "usage": {"total": 1}}, "at": time.monotonic(), "error": None}
+        with mock.patch.object(dash, "_SNAPSHOT", state), mock.patch.object(dash, "_SNAPSHOT_ETAG_CACHE", None):
+            server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+            try:
+                connection.request("GET", "/api/snapshot")
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                etag = response.getheader("ETag")
+                self.assertEqual(json.loads(response.read())["usage"]["total"], 1)
+                connection.request("GET", "/api/snapshot", headers={"If-None-Match": etag})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 304)
+                response.read()
+                state["data"] = {"alerts": [], "usage": {"total": 2}}
+                connection.request("GET", "/api/snapshot", headers={"If-None-Match": etag})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.read())["usage"]["total"], 2)
+                etag = response.getheader("ETag")
+                state["error"] = {"message": "Snapshot refresh failed", "at": "now"}
+                connection.request("GET", "/api/snapshot", headers={"If-None-Match": etag})
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.read())["alerts"][0]["code"], "snapshot_refresh_failed")
+            finally:
+                connection.close()
+                server.shutdown()
+                server.server_close()
+                worker.join(timeout=5)
+
+    def test_cached_etag_reuses_fresh_snapshot_and_invalidates_on_changes(self):
+        state = {"data": {"alerts": [], "usage": {"total": 1}}, "at": time.monotonic(), "error": None}
+        with mock.patch.object(dash, "_SNAPSHOT", state), \
+             mock.patch.object(dash, "_SNAPSHOT_ETAG_CACHE", None), \
+             mock.patch.object(dash, "snapshot_etag", wraps=dash.snapshot_etag) as digest:
+            first = dash.cached_snapshot()
+            second = dash.cached_snapshot()
+            self.assertEqual(first["etag"], second["etag"])
+            self.assertEqual(digest.call_count, 1)
+            state["data"] = {"alerts": [], "usage": {"total": 2}}
+            changed = dash.cached_snapshot()
+            self.assertNotEqual(first["etag"], changed["etag"])
+            self.assertEqual(changed["usage"]["total"], 2)
+            state["at"] = time.monotonic() - dash.SNAPSHOT_STALE_SECONDS - 1
+            stale = dash.cached_snapshot()
+            self.assertNotEqual(changed["etag"], stale["etag"])
+            self.assertEqual(stale["alerts"][0]["code"], "snapshot_stale")
+            state["error"] = {"message": "Snapshot refresh failed", "at": "now"}
+            failed = dash.cached_snapshot()
+            self.assertNotEqual(stale["etag"], failed["etag"])
+            self.assertEqual(failed["alerts"][0]["code"], "snapshot_refresh_failed")
+            state.update(at=time.monotonic(), error=None)
+            self.assertEqual(dash.cached_snapshot()["etag"], changed["etag"])
+
     def test_etag_ignores_clocks_and_sampling_noise(self):
         base = {"generated_at": "2026-11-02T00:00:00+00:00", "snapshot_age_seconds": 1.2,
                 "refresh_ms": 5000, "proxy_metrics": {"requests": 3, "uptimeMs": 1000,

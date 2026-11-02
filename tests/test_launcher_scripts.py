@@ -24,7 +24,7 @@ class LauncherEnvironmentTests(unittest.TestCase):
         literals = ",".join("'" + value.replace("'", "''") + "'" for value in values)
         result = self.run_script(
             "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
-            "function global:python { [Console]::WriteLine((ConvertTo-Json -InputObject @($args) -Compress)); $global:LASTEXITCODE = 0 }; "
+            "function global:python { if ($args[0] -like '*launcherStartup.py') { $global:LASTEXITCODE = 0; return }; [Console]::WriteLine((ConvertTo-Json -InputObject @($args) -Compress)); $global:LASTEXITCODE = 0 }; "
             f"& '{LAUNCHER}' -Provider CLI -CliArgs @({literals})")
         self.assertEqual(result.returncode, 0, result.stderr[-400:])
         arguments = json.loads(result.stdout.strip())
@@ -35,7 +35,7 @@ class LauncherEnvironmentTests(unittest.TestCase):
         for script in (LAUNCHER, ROOT / "startOpenClaude.ps1"):
             with self.subTest(script=script.name):
                 result = self.run_script(
-                    "function global:python { $global:LASTEXITCODE = 2 }; "
+                    "function global:python { if ($args[0] -like '*launcherStartup.py') { $global:LASTEXITCODE = 0; return }; $global:LASTEXITCODE = 2 }; "
                     f"& '{script}'; exit $LASTEXITCODE")
                 self.assertEqual(result.returncode, 2, result.stderr[-400:])
                 self.assertIn("exit code 2", result.stdout)
@@ -46,7 +46,7 @@ class LauncherEnvironmentTests(unittest.TestCase):
         for script in (LAUNCHER, ROOT / "startOpenClaude.ps1"):
             with self.subTest(script=script.name):
                 result = self.run_script(
-                    "function global:python { [Console]::WriteLine('claude auth login'); $global:LASTEXITCODE = 1 }; "
+                    "function global:python { if ($args[0] -like '*launcherStartup.py') { $global:LASTEXITCODE = 0; return }; [Console]::WriteLine('claude auth login'); $global:LASTEXITCODE = 1 }; "
                     f"& '{script}'; exit $LASTEXITCODE")
                 self.assertEqual(result.returncode, 1, result.stderr[-400:])
                 self.assertIn("claude auth login", result.stdout)
@@ -55,7 +55,7 @@ class LauncherEnvironmentTests(unittest.TestCase):
 
     def test_runtime_failure_keeps_its_original_exit_code(self):
         result = self.run_script(
-            "function global:python { $global:LASTEXITCODE = 7 }; "
+            "function global:python { if ($args[0] -like '*launcherStartup.py') { $global:LASTEXITCODE = 0; return }; $global:LASTEXITCODE = 7 }; "
             f"& '{LAUNCHER}'; exit $LASTEXITCODE")
         self.assertEqual(result.returncode, 7, result.stderr[-400:])
         self.assertIn("exited with code 7", result.stderr)
@@ -68,6 +68,26 @@ class LauncherEnvironmentTests(unittest.TestCase):
         self.assertIn("saved default", result.stdout)
         self.assertIn("Setup: .\\OpenClaude.ps1 -Setup", result.stdout)
         self.assertNotIn("connection_check", result.stdout)
+
+    def test_interactive_start_checks_update_then_starts_dashboard(self):
+        result = self.run_script(
+            "function global:python { if ($args[0] -like '*launcherStartup.py') { "
+            "[Console]::WriteLine($args[1]); $global:LASTEXITCODE = 0; return }; "
+            "[Console]::WriteLine('session'); $global:LASTEXITCODE = 0 }; "
+            f"& '{LAUNCHER}'")
+        self.assertEqual(result.returncode, 0, result.stderr[-400:])
+        self.assertEqual(result.stdout.splitlines(), ["--update", "--dashboard", "session"])
+
+    def test_updated_launcher_restarts_once_with_original_arguments(self):
+        result = self.run_script(
+            "function global:python { if ($args[0] -like '*launcherStartup.py') { "
+            "[Console]::WriteLine($args[1]); if ($args[1] -eq '--update') { $global:LASTEXITCODE = 10 } "
+            "else { $global:LASTEXITCODE = 0 }; return }; "
+            "[Console]::WriteLine(($args -join ' ')); $global:LASTEXITCODE = 0 }; "
+            f"& '{LAUNCHER}' -Provider CLI")
+        self.assertEqual(result.returncode, 0, result.stderr[-400:])
+        self.assertEqual(result.stdout.splitlines()[:2], ["--update", "--dashboard"])
+        self.assertIn("--provider cli", result.stdout)
 
     def test_stream_switch_does_not_leak_into_the_shell(self):
         # A fast failing check exercises the script without opening a session.
