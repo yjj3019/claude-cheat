@@ -24,6 +24,7 @@ import uuid
 import localProcessTree
 import routeConfig
 import routeCli
+import routeVersion
 import cliBackend
 from urllib.parse import urlsplit, urlunsplit
 import urllib.request
@@ -1140,6 +1141,11 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
     if print_prompt is not None:
         # The prompt itself travels on stdin (see run_cli), so only the mode flags stay in argv.
         print_args = ["-p"] + (["--output-format", "json"] if print_json else [])
+    # Say which build is running, plus any update the last check recorded, before session
+    # output starts. --print keeps stdout clean for machine consumption.
+    banner = version_banner()
+    if banner:
+        print(banner, file=sys.stderr if print_prompt is not None else sys.stdout, flush=True)
     claude = shutil.which("claude")
     if not claude:
         if isolated:
@@ -1329,6 +1335,30 @@ def _self_test_isolated() -> None:
     print("PASS: key parser, app-managed credits, Plan auth gate, native feature environment preservation, local/OpenRouter credential separation and launcher lifecycle")
 
 
+def version_banner(notice: bool = True) -> str:
+    """One startup line: the running build, plus any update the last check recorded.
+
+    Never waits for git or the network — a launcher must not stall behind a version
+    probe. The dashboard refreshes the persisted check; ``--version`` runs it live.
+    """
+    try:
+        report = routeVersion.version_report(include_update=notice)
+    except Exception:  # noqa: BLE001 - a banner is never worth failing a launch
+        return ""
+    local = report.get("local") or {}
+    label = local.get("label") or f"v{local.get('version') or '?'}"
+    update = report.get("update") or {}
+    state = update.get("state")
+    if state in ("behind", "diverged", "different"):
+        detail = (f"{update.get('behind_by')}개 커밋 뒤짐" if update.get("behind_by")
+                  else "원격과 다름")
+        return (f"OpenClaude {label} · 업데이트 있음({detail}) — "
+                f"git pull 후 다시 실행 (자세히: python routeDashboard.py --version)")
+    if state == "ahead":
+        return f"OpenClaude {label} · 로컬이 원격보다 앞섬({update.get('ahead_by')}개 커밋)"
+    return f"OpenClaude {label}"
+
+
 def main(argv=None) -> int:
     try:
         arguments = list(sys.argv[1:] if argv is None else argv)
@@ -1371,8 +1401,15 @@ Exit codes: 0 = success, 2 = usage/service choice required, others = failure.
                             help="Run one non-interactive turn through the proxy and exit (automation/CI)")
         parser.add_argument("--print-text", action="store_true",
                             help="With --print, keep the CLI's human output instead of JSON")
+        parser.add_argument("--version", action="store_true",
+                            help="Print the running version and update state, then exit")
         parser.add_argument("--cli-args-b64", default=None, help=argparse.SUPPRESS)
         options = parser.parse_args(arguments)
+        if options.version:
+            # The explicit command may wait: a person asked for the answer.
+            report = routeVersion.version_report(refresh=True, async_update=False, blocking=True)
+            print(routeVersion.summarize(report))
+            return 0
         if options.cli_args_b64 is not None:
             if native_args:
                 parser.error("Use either -- suffix or encoded CLI arguments, not both")

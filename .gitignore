@@ -30,3 +30,5 @@ openclaude.config.yaml.*
 .dashboard.session
 .dashboard-attention.json
 .dashboard-attention.json.*.tmp
+.update-cache.json
+.update-cache.json.tmp

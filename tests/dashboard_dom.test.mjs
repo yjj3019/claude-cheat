@@ -1592,3 +1592,84 @@ test('healthy attention state takes little space', () => {
   assert.match(html, /지금 조치할 항목이 없습니다/);
   assert.doesNotMatch(html, /data-attention-action/);
 });
+
+function versionFixture(update = {}, local = {}) {
+  return {
+    local: { label: 'v1.0.0 (4148f2f)', version: '1.0.0', branch: 'main',
+      commit_date: '2026-11-02T07:29:54+09:00', commit: '4148f2f819775b0c3e6fb178ea901851f32b5df0',
+      dirty: false, ...local },
+    update: { state: 'current', behind_by: 0, ahead_by: 0, checked_at: '2026-11-02T02:00:00+00:00',
+      remote_commit: null, error: null, ...update },
+  };
+}
+
+function loadVersionPage(payloads) {
+  const context = buildContext();
+  const sandbox = { ...context, globalThis: null };
+  sandbox.globalThis = sandbox;
+  const fetched = [];
+  const timers = [];
+  sandbox.fetch = async url => {
+    fetched.push(url);
+    // Only the version endpoint is under test; the page's own bootstrap calls stay inert.
+    if (!String(url).startsWith('/api/version')) return { ok: true, json: async () => ({}) };
+    const payload = payloads.length > 1 ? payloads.shift() : payloads[0];
+    return { ok: true, json: async () => payload };
+  };
+  sandbox.setTimeout = (fn, delay) => { timers.push(delay); return timers.length; };
+  vm.createContext(sandbox);
+  vm.runInContext(scriptBundle(), sandbox, { filename: 'dashboard.js' });
+  return { context, sandbox, fetched, timers };
+}
+
+test('the version badge names the build and flags an available update', async () => {
+  const { context, sandbox, fetched } = loadVersionPage([
+    versionFixture({ state: 'behind', behind_by: 2 }, { dirty: true })]);
+  await sandbox.loadVersion();
+  const pill = context.nodes.get('version-pill');
+  assert.equal(pill.textContent, 'v1.0.0 (4148f2f) · 업데이트');
+  assert.match(pill.className, /pill-warn/);
+  assert.equal(pill.dataset.state, 'behind');
+  assert.match(pill.title, /2개 커밋 뒤짐 → git pull/);
+  assert.match(pill.title, /커밋되지 않은 변경 있음/);
+  // The page also bootstraps config and its snapshot poll; only one version request is ours.
+  assert.deepEqual(fetched.filter(url => url.startsWith('/api/version')), ['/api/version']);
+});
+
+test('the version badge stays quiet when the checkout is current', async () => {
+  const { context, sandbox } = loadVersionPage([versionFixture()]);
+  await sandbox.loadVersion();
+  const pill = context.nodes.get('version-pill');
+  assert.equal(pill.textContent, 'v1.0.0 (4148f2f)');
+  assert.match(pill.className, /pill-ok/);
+  assert.equal(pill.dataset.state, 'current');
+});
+
+test('the version badge polls again while the answer is still pending', async () => {
+  const { context, sandbox, timers } = loadVersionPage([
+    versionFixture({ state: 'checking', checked_at: null }), versionFixture()]);
+  await sandbox.loadVersion();
+  assert.ok(timers.includes(15000), 'a pending answer must schedule another poll');
+  await sandbox.loadVersion();
+  assert.equal(context.nodes.get('version-pill').dataset.state, 'current');
+  assert.equal(timers.filter(delay => delay === 15000).length, 1, 'a known answer must stop polling');
+});
+
+test('clicking the version badge re-checks instead of trusting the cache', async () => {
+  const { context, sandbox, fetched } = loadVersionPage([versionFixture()]);
+  await sandbox.checkVersionNow();
+  assert.deepEqual(fetched.filter(url => url.startsWith('/api/version')), ['/api/version?refresh=1']);
+  assert.equal(context.nodes.get('version-pill').dataset.state, 'current');
+});
+
+test('the version badge never breaks the page when the endpoint is unreachable', async () => {
+  const context = buildContext();
+  const sandbox = { ...context, globalThis: null };
+  sandbox.globalThis = sandbox;
+  sandbox.fetch = async () => { throw new Error('offline'); };
+  vm.createContext(sandbox);
+  vm.runInContext(scriptBundle(), sandbox, { filename: 'dashboard.js' });
+  await sandbox.loadVersion();
+  await sandbox.checkVersionNow();
+  assert.equal(context.nodes.get('version-pill').textContent, '확인 실패');
+});

@@ -20,10 +20,13 @@ Continue with native Claude arguments while keeping the saved model backend.
 .\OpenClaude.ps1 -Takeover
 Replace the live proxy while keeping its service.
 .EXAMPLE
+.\OpenClaude.ps1 -Version
+Show the running version and whether the git remote has newer commits.
+.EXAMPLE
 .\OpenClaude.ps1 -Help
 Show options, examples and exit codes without launching a session.
 #>
-param([ValidateSet('Auto', 'OpenRouter', 'Local', 'CLI', 'Sonnet')][string]$Provider = 'Auto', [switch]$CheckLocal, [switch]$DiagnoseLocal, [switch]$LocalMode, [switch]$LocalCompat, [switch]$OpenRouterCompat, [switch]$Debug, [switch]$Stream, [switch]$Takeover, [switch]$Setup, [string]$Print, [switch]$Help, [string[]]$CliArgs = @())
+param([ValidateSet('Auto', 'OpenRouter', 'Local', 'CLI', 'Sonnet')][string]$Provider = 'Auto', [switch]$CheckLocal, [switch]$DiagnoseLocal, [switch]$LocalMode, [switch]$LocalCompat, [switch]$OpenRouterCompat, [switch]$Debug, [switch]$Stream, [switch]$Takeover, [switch]$Setup, [string]$Print, [switch]$Help, [switch]$Version, [string[]]$CliArgs = @())
 # Auto uses the saved default, or selects the only configured service in older settings.
 # An explicit -Provider overrides the saved default for this invocation only.
 # -Stream forwards provider frames as they validate (lower first-token latency) but a late
@@ -38,6 +41,11 @@ if ($CliArgs.Count -gt 0 -and ($Help -or $Setup -or $CheckLocal -or $DiagnoseLoc
 }
 if ($Help) {
     & python (Join-Path $PSScriptRoot 'openrouterAdvisor.py') --help
+    exit $LASTEXITCODE
+}
+# -Version reports the running build and the last git check; it starts no session.
+if ($Version) {
+    & python (Join-Path $PSScriptRoot 'openrouterAdvisor.py') --version
     exit $LASTEXITCODE
 }
 $ErrorActionPreference = 'Stop'

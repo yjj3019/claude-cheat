@@ -966,7 +966,7 @@ class StatusReportTests(unittest.TestCase):
             code = dash.main(["--status", "--offline"])
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(output.getvalue()), payload)
-        builder.assert_called_once_with(include_usage=False, offline=True)
+        builder.assert_called_once_with(include_usage=False, offline=True, block_version=True)
 
     def test_cli_pretty_and_usage_flags(self):
         payload = {"ok": False, "state": "plan", "alerts": [{"level": "warn", "title": "t", "detail": "d"}]}
@@ -975,7 +975,7 @@ class StatusReportTests(unittest.TestCase):
             code = dash.main(["--status", "--usage", "--pretty"])
         self.assertEqual(code, 2)
         self.assertIn("\n", output.getvalue())
-        builder.assert_called_once_with(include_usage=True, offline=False)
+        builder.assert_called_once_with(include_usage=True, offline=False, block_version=True)
 
 
 class TransitionTests(unittest.TestCase):
@@ -2590,8 +2590,12 @@ class SnapshotTests(unittest.TestCase):
                          ["account", "active_session", "alerts", "attention", "configured", "generated_at", "help",
                           "insights", "model", "pricing", "proactive", "provider", "providers",
                           "proxy_metrics", "proxy_modified_at", "proxy_stale", "refresh_ms",
-                          "routing", "selected_instance", "sessions", "summary", "usage"])
+                          "routing", "selected_instance", "sessions", "summary", "usage", "version"])
         self.assertEqual(data["model"], "vendor/model")
+        # The version block is served without waiting for git: an unread checkout reports
+        # its pending state instead of stalling the page.
+        self.assertIn("local", data["version"])
+        self.assertIn("update", data["version"])
         self.assertEqual(data["routing"]["state"], "unknown")
         self.assertEqual(data["alerts"], [])
         self.assertNotIn("sk-or", json.dumps(data))

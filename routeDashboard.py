@@ -38,6 +38,7 @@ from urllib.parse import parse_qs, urlsplit
 from pathlib import Path
 
 import routeConfig
+import routeVersion
 # Reuse the launcher's Windows process identity: a recorded pid is only a dashboard while
 # its creation time matches. Without the primitive (non-Windows) nothing can be verified,
 # so the identity helpers refuse every signal instead of falling back to a bare pid kill.
@@ -3203,6 +3204,9 @@ def snapshot():
         "proxy_modified_at": (stamp.isoformat(timespec="seconds") if (stamp := code_modified_at()) else None),
         "help": {"reasons": REASON_HELP, **HELP_SECTION},
         "model": model,
+        # Never blocks: the first render shows a pending state, then the background
+        # checkout read and remote comparison fill it in on later polls.
+        "version": routeVersion.version_report(),
     }
 
 
@@ -3652,6 +3656,82 @@ SETTINGS_BODY = "\n  <div class=\"alerts\" id=\"alerts\"></div>\n\n  <div class=
 
 JS_SHARED += "\nfunction routingStateText(routing) {\n  const state = routing.state || 'unknown';\n  if (state === 'external') return ({local:'Local LLM',openrouter:'OpenRouter',cli:'CLI'}[(routing.last || {}).provider] || '\uc678\ubd80 \uc11c\ube44\uc2a4') + ' \uc0ac\uc6a9 \uc911';\n  return stateText[state] || state;\n}\n"
 
+JS_SHARED += """
+// Version badge: which build is running, and whether the remote has newer commits.
+// /api/version answers without waiting for git or the network, so a first poll may say
+// 확인 중 and fill in the real answer a moment later.
+const VERSION_STATE = {current:'최신', behind:'업데이트 있음', ahead:'로컬이 앞섬',
+  diverged:'로컬/원격 분기', different:'원격과 다름', checking:'확인 중',
+  disabled:'확인 꺼짐', unknown:'확인 불가'};
+function versionTone(state) {
+  if (state === 'current') return 'pill-ok';
+  if (state === 'behind' || state === 'diverged' || state === 'different') return 'pill-warn';
+  return 'pill-mute';
+}
+function versionTitle(version) {
+  const local = (version || {}).local || {};
+  const update = (version || {}).update || {};
+  const parts = [];
+  if (local.label) parts.push(local.label);
+  if (local.branch) parts.push(local.branch);
+  if (local.commit_date) parts.push('커밋 ' + local.commit_date.slice(0, 16).replace('T', ' '));
+  if (local.dirty) parts.push('커밋되지 않은 변경 있음');
+  parts.push('업데이트: ' + (VERSION_STATE[update.state] || update.state || '알 수 없음'));
+  if (update.behind_by) parts.push(update.behind_by + '개 커밋 뒤짐 → git pull');
+  if (update.ahead_by) parts.push(update.ahead_by + '개 커밋 앞섬 → git push');
+  if (update.checked_at) parts.push('확인 ' + update.checked_at.slice(0, 16).replace('T', ' '));
+  if (update.error) parts.push('사유: ' + update.error);
+  return parts.join(' · ');
+}
+function renderVersion(version) {
+  const pill = document.getElementById('version-pill');
+  if (!pill) return;
+  const local = (version || {}).local || {};
+  const update = (version || {}).update || {};
+  const state = update.state || 'checking';
+  const suffix = state === 'behind' ? ' · 업데이트'
+    : state === 'ahead' ? ' · 앞섬'
+    : (state === 'diverged' || state === 'different') ? ' · 확인' : '';
+  pill.textContent = (local.label || 'v?') + suffix;
+  pill.className = 'pill ' + versionTone(state);
+  pill.dataset.state = state;
+  const title = versionTitle(version);
+  pill.title = title;
+  pill.setAttribute('aria-label', '버전 ' + (local.label || '?') + ' — ' + title);
+}
+async function loadVersion() {
+  try {
+    const response = await fetch('/api/version', {cache: 'no-store'});
+    if (!response.ok) return;
+    const version = await response.json();
+    renderVersion(version);
+    // The background checkout read and remote check land a moment after the first poll.
+    if (['checking', 'unknown'].includes(((version || {}).update || {}).state)) {
+      setTimeout(loadVersion, 15000);
+    }
+  } catch (error) { /* offline: keep the last text instead of a broken badge */ }
+}
+async function checkVersionNow() {
+  const pill = document.getElementById('version-pill');
+  if (pill) { pill.textContent = '확인 중…'; pill.className = 'pill pill-mute'; }
+  try {
+    const response = await fetch('/api/version?refresh=1', {cache: 'no-store'});
+    if (response.ok) renderVersion(await response.json());
+    setTimeout(loadVersion, 1500);
+    setTimeout(loadVersion, 6000);
+  } catch (error) {
+    if (pill) { pill.textContent = '확인 실패'; pill.title = '버전을 확인하지 못했습니다'; }
+  }
+}
+document.addEventListener('DOMContentLoaded', () => { loadVersion(); });
+"""
+
+PAGE_CSS += """
+button.pill{font:inherit;font-size:12px;cursor:pointer}
+button.pill:hover{border-color:var(--line-3);color:var(--fg)}
+#version-pill{font-family:var(--mono);font-size:11px;letter-spacing:-.2px;padding:0 10px}
+"""
+
 
 def _page(kind="dashboard"):
     dashboard = kind == "dashboard"
@@ -3664,7 +3744,11 @@ def _page(kind="dashboard"):
                                             ("settings", "/settings", "설정"),
                                             ("usage", "/usage", "사용량"),
                                             ("blackbox", "/blackbox", "블랙박스")))
-    actions = ('<span class="pill signal-neutral" id="live-pill" role="status" aria-label="라우팅 상태: 확인 중">'
+    # Present on every page: the badge answers "which build am I looking at".
+    version_pill = ('<button class="pill pill-mute" id="version-pill" type="button"'
+                    ' aria-label="버전 확인 중" title="버전 확인 중" onclick="checkVersionNow()">v…</button>')
+    actions = version_pill + (
+               '<span class="pill signal-neutral" id="live-pill" role="status" aria-label="라우팅 상태: 확인 중">'
                '<span class="signal-lamps" aria-hidden="true"><i class="signal-red-lamp"></i>'
                '<i class="signal-warn-lamp"></i><i class="signal-green-lamp"></i></span>'
                '<span id="live-text">확인 중</span></span>'
@@ -4885,6 +4969,17 @@ class Handler(BaseHTTPRequestHandler):
                            json.dumps(diagnostics_report(), ensure_ascii=False))
             except Exception:
                 self._send(500, "application/json; charset=utf-8", json.dumps({"error": "diagnostics_failed"}))
+        elif path == "/api/version":
+            # Cheap by construction: the first call answers "checking" while the checkout
+            # read and the remote comparison run in the background; ?refresh=1 re-arms them.
+            refresh = parse_qs(urlsplit(self.path).query).get("refresh", ["0"])[0] in ("1", "true", "yes")
+            try:
+                payload = routeVersion.version_report(refresh=refresh)
+            except Exception:
+                return self._send(500, "application/json; charset=utf-8",
+                                  json.dumps({"error": "version_failed"}))
+            return self._send(200, "application/json; charset=utf-8",
+                              json.dumps(payload, ensure_ascii=False))
         elif self.path.split("?")[0] == "/api/status":
             try:
                 self._send(200, "application/json; charset=utf-8",
@@ -5733,12 +5828,14 @@ def proactive_alerts(providers, session, metrics, routing_values=None, cli_value
     return alerts
 
 
-def status_report(include_usage=False, offline=False):
+def status_report(include_usage=False, offline=False, block_version=False):
     """Compact machine-readable status for scripts and agents.
 
     Routing state comes from ``.route.log``. Online checks also authenticate the
     loopback proxy and fetch the OpenRouter key limit when applicable; offline
     checks do neither. Token totals are opt-in because they scan transcripts.
+    ``block_version`` is for the CLI: git startup costs about a second on Windows,
+    so the HTTP handler leaves the version read on its background path.
     """
     now = datetime.now(timezone.utc)
     session, metrics = _live_session(offline=offline)
@@ -5788,6 +5885,8 @@ def status_report(include_usage=False, offline=False):
                                         if code_modified_at() else None)},
         "providers": provider_states(),
         "active_session": session,
+        # The HTTP path must never wait for git; an explicit CLI read passes block_version.
+        "version": routeVersion.local_info(blocking=block_version),
         "generated_at": now.isoformat(timespec="seconds"),
     }
     if include_usage:
@@ -5817,6 +5916,10 @@ def main(argv=None):
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port to listen on")
     parser.add_argument("--refresh", type=int, default=3, help="Seconds between background scans")
     parser.add_argument("--status", action="store_true", help="Print one JSON status report and exit")
+    parser.add_argument("--version", action="store_true",
+                        help="Print the running version and update state, then exit")
+    parser.add_argument("--json", action="store_true",
+                        help="With --version: print the full JSON document instead of a summary")
     parser.add_argument("--usage", action="store_true", help="Include token and cost totals (slower)")
     parser.add_argument("--offline", action="store_true", help="Skip OpenRouter calls and live proxy checks")
     parser.add_argument("--pretty", action="store_true", help="Indent the status report")
@@ -5854,8 +5957,17 @@ def main(argv=None):
             return 1
         print(json.dumps({"stopped": True, "pid": record["pid"], "port": record["port"]}))
         return 0
+    if args.version:
+        # The explicit command may wait: a person asked for the answer, not for a badge.
+        report = routeVersion.version_report(refresh=True, include_update=not args.offline,
+                                             async_update=False, blocking=True)
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False, indent=2 if args.pretty else None))
+        else:
+            print(routeVersion.summarize(report))
+        return 0
     if args.status:
-        report = status_report(include_usage=args.usage, offline=args.offline)
+        report = status_report(include_usage=args.usage, offline=args.offline, block_version=True)
         print(json.dumps(report, ensure_ascii=False, indent=2 if args.pretty else None))
         return status_exit_code(report)
     if args.host not in ("127.0.0.1", "::1", "localhost"):

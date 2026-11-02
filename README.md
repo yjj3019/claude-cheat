@@ -861,6 +861,34 @@ python routeDashboard.py --status --offline  # 외부 호출·현재 프록시 �
 
 실행 중인 프록시는 자체 카운터를 `GET /api/metrics`로 제공합니다(같은 세션 토큰 필요, 127.0.0.1 전용). 요청 수, 외부·Plan 경로 분포, p50/p95 지연, 재시도·스트림·회로 횟수, 송수신 바이트를 담습니다. 대시보드는 인수인계 파일의 토큰으로 이 응답을 확인한 경우에만 **현재 세션**으로 표시하며, 인증된 응답의 카운터를 사용합니다. 토큰·포트·PID는 설정 응답에 포함하지 않습니다.
 
+### 버전 확인과 업데이트 알림
+
+대시보드 상단과 실행기 시작 줄에 지금 실행 중인 빌드가 표시됩니다. 제품 버전은 `VERSION` 파일(예: `1.0.0`)에서, 리비전은 git에서 읽어 **`v1.0.0 (4148f2f)`**처럼 함께 보여 줍니다. 커밋되지 않은 변경이 있으면 `*`가 붙습니다.
+
+업데이트 여부는 **읽기 전용 `git ls-remote`**로 원격 브랜치의 커밋만 비교합니다. ref·object·작업 트리를 바꾸지 않고, 자동으로 pull/fetch하지도 않습니다.
+
+```powershell
+python routeDashboard.py --version           # 요약 + 지금 원격 확인
+python routeDashboard.py --version --json    # 전체 JSON(스크립트용)
+python routeDashboard.py --version --offline # 네트워크 확인 생략
+python openrouterAdvisor.py --version        # 실행기에서 같은 확인
+.\OpenClaude.ps1 -Version                    # 위와 동일
+```
+
+| 상태 | 의미 | 화면 표시 |
+| --- | --- | --- |
+| `current` | 로컬 HEAD = 원격 HEAD | `pill-ok` |
+| `behind` | 원격에 더 새 커밋이 있음 → `git pull` | `· 업데이트` |
+| `ahead` | 로컬만 앞섬 → `git push` | `· 앞섬` |
+| `diverged` | 양쪽에 커밋이 나뉨 | `· 확인` |
+| `different` | 원격 커밋이 로컬에 없음(fetch 전) | `· 확인` |
+| `unknown` / `disabled` | 네트워크·git·설정 문제, 확인 끔 | 확인 불가 |
+
+- 배지는 `GET /api/version`으로 갱신되며, **요청은 git·네트워크를 기다리지 않습니다**. 첫 조회는 `checking`이고 잠시 뒤 실제 값으로 바뀝니다(`?refresh=1`은 즉시 재확인). 배지를 클릭해도 다시 확인합니다.
+- 결과는 `.update-cache.json`(git 무시 대상)에 저장됩니다. 대시보드가 주기적으로 갱신하고, 실행기는 시작할 때 이 값을 읽어 지연 없이 안내합니다.
+- `ROUTE_UPDATE_CHECK=0`으로 확인을 끄고, `ROUTE_UPDATE_REMOTE`·`ROUTE_UPDATE_BRANCH`로 대상 원격·브랜치를 바꿉니다. 원격 확인이 실패해도 세션 시작과 대시보드 응답은 막지 않습니다.
+- 릴리스 기준은 `VERSION` 파일입니다. 릴리스할 때 `VERSION`을 올리면 대시보드·실행기·`--version`이 같은 이름을 씁니다.
+
 `.proxy-metrics.json`에 남은 카운터도 볼 수 있지만, 현재 프록시가 확인되지 않으면 **지난 실행 기록**으로 표시하고 현재 세션의 실패·지연 인사이트에 사용하지 않습니다. `proxy_stale`은 마지막 프록시 시작 로그의 코드와 현재 소스가 다른지를 뜻합니다. 이 값만으로 구버전 프록시가 지금 실행 중이라고 판단하지 않습니다.
 
 ### AI 디버깅용 상태 점검 API

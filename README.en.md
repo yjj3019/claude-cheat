@@ -548,6 +548,34 @@ python routeDashboard.py --status --offline  # skip OpenRouter calls
 
 The report includes `state`, `provider`, `reason`, `detail`, **`model`**, `last_event_age_seconds`, `window_counts`, `plan_reasons`, `failures`, `alerts` and `account`. A running dashboard serves the same document at `GET /api/status`. Neither path includes the key, prompts or request bodies.
 
+### Version and update notice
+
+The dashboard header and the launcher's first line name the running build. The product version comes from `VERSION` (for example `1.0.0`) and the revision from git, so you see **`v1.0.0 (4148f2f)`**; uncommitted changes add a `*`.
+
+The update check uses **read-only `git ls-remote`** against the remote branch. It never writes refs or objects, and never pulls or fetches for you.
+
+```powershell
+python routeDashboard.py --version           # summary plus a live remote check
+python routeDashboard.py --version --json    # full JSON document
+python routeDashboard.py --version --offline # skip the network
+python openrouterAdvisor.py --version        # same check from the launcher
+.\OpenClaude.ps1 -Version                    # identical
+```
+
+| State | Meaning | Badge |
+| --- | --- | --- |
+| `current` | Local HEAD equals the remote HEAD | `pill-ok` |
+| `behind` | The remote has newer commits → `git pull` | `· 업데이트` |
+| `ahead` | Only the local branch moved → `git push` | `· 앞섬` |
+| `diverged` | Both sides have their own commits | `· 확인` |
+| `different` | The remote commit is not downloaded yet | `· 확인` |
+| `unknown` / `disabled` | Network/git/settings problem, or the check is off | 확인 불가 |
+
+- The badge refreshes from `GET /api/version`, which **never waits for git or the network**: the first answer is `checking` and the real state follows on a later poll (`?refresh=1` re-arms it; clicking the badge does the same).
+- The last answer is persisted to `.update-cache.json` (git-ignored). The dashboard refreshes it; the launcher reads it at startup so a session never stalls behind a version probe.
+- `ROUTE_UPDATE_CHECK=0` turns the check off; `ROUTE_UPDATE_REMOTE` and `ROUTE_UPDATE_BRANCH` select another remote or branch. A failed check never blocks a session or a dashboard response.
+- `VERSION` is the release name: bump it when you release, and the dashboard, launcher and `--version` all report the same value.
+
 A running proxy exposes its own counters at `GET /api/metrics` (same session token required, loopback only): request count, external/Plan split, p50/p95 latency, retries, streams, circuit opens and bytes in/out. The dashboard authenticates this response with the handoff token before identifying a **current session**, and uses the counters from that verified proxy. The token, port and PID are not returned in the settings response.
 
 Counters retained in `.proxy-metrics.json` are shown as **previous run history** when no live proxy is verified; they do not generate current-session failure or latency insights. `proxy_stale` compares the last recorded proxy code with the current source. It does not prove that an old proxy is currently running.
