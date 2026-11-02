@@ -212,7 +212,7 @@
 **수용 기준**
 
 - `/api/snapshot`의 `attention`은 open/acknowledged/snoozed/resolved 상태와 `counts`를 포함한다.
-- 경고가 사라지면 자동으로 `resolved` 이력으로 이동하고, 건강한 상태는 한 줄로 접힌다.
+- 경고가 사라지면 자동으로 `resolved` 이력으로 이동한다. 조치할 항목이 없으면 메인 큐를 숨기고 확인·미룸·해결 이력은 활동 기록에 표시한다.
 - `POST /api/attention`은 세션 토큰을 요구하며 `ack`·`snooze`(5~1440분)·`resolve`·`reopen`을 지원한다.
 - 세션 요약에 `retry_health`(rate_limited/retried, 재시도·시도·회로·Retry-After)가 포함되고 세션 표에 표시된다.
 - 속도 제한은 능동 경고(`session_rate_limited`)로 승격되어 주의 큐에 들어간다.

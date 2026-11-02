@@ -1233,7 +1233,13 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   };
   const LATENCY_WINDOW = 512;
   const cliProcessTiming = [];
-  const routingTiming = { queueWait: [], externalAttempt: [], retryWait: [], plan: [], total: [] };
+  const routingTiming = { queueWait: [], externalAttempt: [], externalHeaders: [], externalFirstBody: [],
+    externalTimeout: [], retryWait: [], plan: [], total: [] };
+  const timeoutKinds = { deadline: 0, ceiling: 0 };
+  const timeoutStages = { headers: 0, body: 0, stream: 0 };
+  const localAttemptBuckets = Object.fromEntries(
+    ['small_solo', 'small_shared', 'medium_solo', 'medium_shared', 'large_solo', 'large_shared']
+      .map(name => [name, { attempts: 0, timeouts: 0 }]));
   const attemptCounts = { external: 0, plan: 0 };
   const recordTiming = (phase, elapsed) => {
     const samples = routingTiming[phase];
@@ -1300,6 +1306,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       ttfb: latencySummary(metrics.ttfb) },
     // Independent phase distributions, not additive percentiles. Total excludes inbound body parsing.
     routingTimingMs: Object.fromEntries(Object.entries(routingTiming).map(([name, values]) => [name, latencySummary(values)])),
+    externalTimeouts: { kinds: { ...timeoutKinds }, stages: { ...timeoutStages },
+      localAttempts: Object.fromEntries(Object.entries(localAttemptBuckets).map(([name, row]) => [name, { ...row }])) },
     attemptCounts: { ...attemptCounts },
     ...(provider === 'cli' ? { cliActivity: { ...cliActivity }, cliFailures: { ...cliFailures },
       cliUsage: { ...tokenFlow.cli }, cliProcessMs: latencySummary(cliProcessTiming) } : {}),
@@ -1994,10 +2002,19 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           client.signal.addEventListener('abort', cancel, { once: true });
           // Ordinary mode: attemptTimeoutMs bounds silence (headers and gaps between chunks), so long but live
           // generations survive; attemptCeilingMs bounds the total. Local/compat modes keep the fixed total limit.
-          let timer;
-          const arm = () => { clearTimeout(timer); timer = setTimeout(() => controller.abort('attempt_timeout'), attemptTimeoutMs); };
+          let timer, timeoutKind = null, receivedHeaders = false, receivedBody = false;
+          const attemptStarted = performance.now();
+          const localBucket = target.name === 'local'
+            ? `${raw.length <= 65536 ? 'small' : raw.length <= 262144 ? 'medium' : 'large'}_${localActive <= 1 ? 'solo' : 'shared'}`
+            : null;
+          const timeout = kind => {
+            if (controller.signal.aborted) return;
+            timeoutKind = kind;
+            controller.abort('attempt_timeout');
+          };
+          const arm = () => { clearTimeout(timer); timer = setTimeout(() => timeout('deadline'), attemptTimeoutMs); };
           arm();
-          const ceiling = noPlan ? undefined : setTimeout(() => controller.abort('attempt_timeout'), attemptCeilingMs);
+          const ceiling = noPlan ? undefined : setTimeout(() => timeout('ceiling'), attemptCeilingMs);
           let status, retryAfterMs = 0, congested = false;
           const finishAttempt = startPhase('externalAttempt');
           let finishCli = () => {};
@@ -2015,6 +2032,10 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               attemptCounts.external += 1;
               const response = await fetchImpl(target.url, { method: 'POST', headers,
                 body: externalPayload, redirect: 'error', signal: controller.signal });
+              if (!controller.signal.aborted) {
+                receivedHeaders = true;
+                recordTiming('externalHeaders', performance.now() - attemptStarted);
+              }
               status = response.status;
               if (target.name === 'cli' && status === 429) cliActivity.rejected += 1;
               if (!response.ok) {
@@ -2053,7 +2074,13 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               });
               const streaming = streamPassthrough && !forceJson && body.stream === true;
               const validated = await bufferedResponse(response, externalModel, model, forceJson ? false : body.stream,
-                controller.signal, () => { noteFirstByte(); if (!noPlan) arm(); }, target.openrouter,
+                controller.signal, () => {
+                  if (!receivedBody && !controller.signal.aborted) {
+                    receivedBody = true;
+                    recordTiming('externalFirstBody', performance.now() - attemptStarted);
+                  }
+                  noteFirstByte(); if (!noPlan) arm();
+                }, target.openrouter,
                 streaming ? onFrame : null, !compatProfile && !localOnly, streaming ? onDrain : null);
               if (compatProfile) {
                 const content = JSON.parse(validated.text).content;
@@ -2176,6 +2203,15 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             if ([400, 404, 413, 422].includes(status) || error?.message === 'Thinking response in ordinary mode') requestRejected = true;
             if (requestRejected || [401, 402, 403, 404, 405, 415].includes(status)) break;
           } finally {
+            if (localBucket) {
+              localAttemptBuckets[localBucket].attempts += 1;
+              if (timeoutKind) localAttemptBuckets[localBucket].timeouts += 1;
+            }
+            if (timeoutKind) {
+              timeoutKinds[timeoutKind] += 1;
+              timeoutStages[receivedBody ? 'stream' : receivedHeaders ? 'body' : 'headers'] += 1;
+              recordTiming('externalTimeout', performance.now() - attemptStarted);
+            }
             finishCli();
             finishAttempt();
             clearTimeout(timer);

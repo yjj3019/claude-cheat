@@ -91,6 +91,133 @@ test('metrics endpoint requires the session token', async () => {
   }
 });
 
+test('external timeouts distinguish deadline, ceiling and observed response stage', async () => {
+  for (const stage of ['headers', 'body', 'stream', 'ceiling']) {
+    const { server, base, metrics } = await start({
+      attemptTimeoutMs: stage === 'ceiling' ? 200 : 30,
+      attemptCeilingMs: stage === 'ceiling' ? 30 : 1000,
+      fetchImpl: async (url, request) => {
+        const body = JSON.parse(request.body);
+        if (!url.includes('openrouter.ai')) return new Response(JSON.stringify(message(body.model)),
+          { headers: { 'content-type': 'application/json' } });
+        if (stage === 'headers') return new Promise(() => {});
+        return new Response(new ReadableStream({
+          start(controller) { if (stage === 'stream') controller.enqueue(new TextEncoder().encode('{')); },
+        }), { headers: { 'content-type': 'application/json' } });
+      },
+    });
+    try {
+      await send(base);
+      const payload = await (await fetch(metrics, { headers: { 'x-local-route-token': NONCE } })).json();
+      assert.equal(payload.externalTimeouts.kinds[stage === 'ceiling' ? 'ceiling' : 'deadline'], 4);
+      assert.equal(payload.externalTimeouts.stages[stage === 'ceiling' ? 'body' : stage], 4);
+      assert.equal(payload.routingTimingMs.externalTimeout.count, 4);
+      assert.equal(payload.routingTimingMs.externalHeaders.count, stage === 'headers' ? 0 : 4);
+      assert.equal(payload.routingTimingMs.externalFirstBody.count, stage === 'stream' ? 4 : 0);
+    } finally {
+      server.closeAllConnections();
+      server.close();
+    }
+  }
+});
+
+test('local-only timeout keeps its fixed deadline after body progress', async () => {
+  let timer;
+  const { server, base, metrics } = await start({ provider: 'local', localOnly: true,
+    localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'local/model', attemptTimeoutMs: 50,
+    fetchImpl: async () => new Response(new ReadableStream({
+      start(controller) {
+        timer = setInterval(() => controller.enqueue(new TextEncoder().encode(' ')), 10);
+      },
+      cancel() { clearInterval(timer); },
+    }), { headers: { 'content-type': 'application/json' } }),
+  });
+  try {
+    await send(base);
+    const payload = await (await fetch(metrics, { headers: { 'x-local-route-token': NONCE } })).json();
+    assert.equal(payload.externalTimeouts.kinds.deadline, 1);
+    assert.equal(payload.externalTimeouts.stages.stream, 1);
+    assert.equal(payload.routingTimingMs.externalTimeout.count, 1);
+  } finally {
+    clearInterval(timer);
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test('concurrent attempts keep timeout measurements separate after a retry succeeds', async () => {
+  let slowAttempts = 0;
+  const { server, base, metrics } = await start({ attemptTimeoutMs: 40,
+    fetchImpl: async (_url, request) => {
+      const body = JSON.parse(request.body);
+      if (body.messages[0].content === 'slow' && slowAttempts++ === 0) return new Promise(() => {});
+      return new Response(JSON.stringify(message(body.model)), { headers: { 'content-type': 'application/json' } });
+    },
+  });
+  try {
+    assert.deepEqual(await Promise.all([send(base, { content: 'slow' }), send(base, { content: 'fast' })]), [200, 200]);
+    const payload = await (await fetch(metrics, { headers: { 'x-local-route-token': NONCE } })).json();
+    assert.deepEqual(payload.externalTimeouts.kinds, { deadline: 1, ceiling: 0 });
+    assert.deepEqual(payload.externalTimeouts.stages, { headers: 1, body: 0, stream: 0 });
+    assert.equal(payload.routingTimingMs.externalHeaders.count, 2);
+    assert.equal(payload.routingTimingMs.externalFirstBody.count, 2);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test('Local attempt buckets use input byte boundaries and the slot count at attempt start', async () => {
+  const { server, base, metrics } = await start({ provider: 'local', localOnly: true,
+    localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'local/model', attemptTimeoutMs: 200,
+    fetchImpl: async (_url, request) => {
+      const body = JSON.parse(request.body);
+      if (body.messages[0].content.startsWith('wait')) return new Promise(() => {});
+      return new Response(JSON.stringify(message(body.model)), { headers: { 'content-type': 'application/json' } });
+    },
+  });
+  const sendSized = async size => {
+    const empty = { model: MODEL, max_tokens: 32, stream: false, messages: [{ role: 'user', content: '' }] };
+    const overhead = Buffer.byteLength(JSON.stringify(empty));
+    return send(base, { content: 'x'.repeat(size - overhead) });
+  };
+  try {
+    for (const size of [65535, 65536, 65537, 262143, 262144, 262145]) {
+      assert.equal(await sendSized(size), 200);
+    }
+    await Promise.all([send(base, { content: 'wait1' }), send(base, { content: 'wait2' })]);
+    const payload = await (await fetch(metrics, { headers: { 'x-local-route-token': NONCE } })).json();
+    assert.deepEqual(payload.externalTimeouts.localAttempts, {
+      small_solo: { attempts: 3, timeouts: 1 }, small_shared: { attempts: 1, timeouts: 1 },
+      medium_solo: { attempts: 3, timeouts: 0 }, medium_shared: { attempts: 0, timeouts: 0 },
+      large_solo: { attempts: 1, timeouts: 0 }, large_shared: { attempts: 0, timeouts: 0 },
+    });
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test('Local retry is counted as a separate completed attempt', async () => {
+  let calls = 0;
+  const { server, base, metrics } = await start({ provider: 'local', localUrl: 'http://127.0.0.1:11434/v1/messages',
+    localModel: 'local/model', attemptTimeoutMs: 50,
+    fetchImpl: async (_url, request) => {
+      if (calls++ === 0) return new Promise(() => {});
+      const body = JSON.parse(request.body);
+      return new Response(JSON.stringify(message(body.model)), { headers: { 'content-type': 'application/json' } });
+    },
+  });
+  try {
+    assert.equal(await send(base), 200);
+    const payload = await (await fetch(metrics, { headers: { 'x-local-route-token': NONCE } })).json();
+    assert.deepEqual(payload.externalTimeouts.localAttempts.small_solo, { attempts: 2, timeouts: 1 });
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
 test('metrics expose measured process health and event-loop delay', async () => {
   const { server, metrics } = await start();
   try {
@@ -189,7 +316,9 @@ test('inflight counts only message requests and releases once after client cance
       assert.ok(Date.now() < deadline, 'cancelled request should release its slot');
       await new Promise(resolve => setTimeout(resolve, 5));
     }
-    assert.equal((await snapshot()).inflightRequests, 0);
+    const afterCancel = await snapshot();
+    assert.equal(afterCancel.inflightRequests, 0);
+    assert.deepEqual(afterCancel.externalTimeouts.kinds, { deadline: 0, ceiling: 0 });
   } finally {
     controller.abort();
     server.closeAllConnections();

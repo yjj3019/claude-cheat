@@ -414,7 +414,11 @@ The server-side checks are read-only: they never restart a session, write settin
 
 **Layout is fixed independently of content.** From 1400 px wide, the **overview** and **request flow** cards keep a fixed 560 px height; long model/state text truncates to one line, metric values ellipsize, and insights clamp to three lines. Changing token counts or sentences no longer pushes the charts and diagnostics up or down. Narrow screens keep automatic height for readability.
 
-**What needs a person comes first.** Alerts can be **acknowledged, snoozed for an hour, resolved or reopened**, with the human state persisted in `.dashboard-attention.json`. A cleared condition moves to history automatically; a healthy state takes one line. Per-session **retry health** (rate limit, retry count, Retry-After) separates upstream throttling from local load.
+**What needs a person comes first** when there are open alerts. Alerts can be **acknowledged, snoozed for an hour, resolved or reopened**, with the state persisted in `.dashboard-attention.json`. Acknowledged, snoozed and resolved items appear under **Usage and activity history**. Per-session **retry health** (rate limit, retry count, Retry-After) separates upstream throttling from local load.
+
+The diagnostics API aggregates timeout kinds and observed response stages in `metrics.externalTimeouts`. `routingTimingMs` includes `externalHeaders`, `externalFirstBody`, and `externalTimeout` distributions over at most 512 recent samples. A timeout after body progress can also reflect a slow client, so it does not by itself identify the upstream as the cause. New metrics start collecting after the proxy is restarted.
+
+`externalTimeouts.localAttempts` counts finished Local attempts (including client cancellations) and timeouts by input request size (up to 64 KiB, up to 256 KiB, or larger) and this proxy's occupied Local slots at attempt start (one or at least two). Retries are separate attempts; occupied slots include retry waits. These counts do not measure total server load or tokens.
 
 **Per-session monitoring** compares every live session: requests and requests/minute, external/Plan routes, failures/cancellations, in-flight/active/queued work, external p95, output tokens/second, input/output tokens, RSS and event-loop p95, and the last activity. A **load** badge appears when work is in flight/queued or event-loop p95 reaches 250 ms; the **show** button switches the detailed cards to that session.
 

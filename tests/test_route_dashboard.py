@@ -781,6 +781,10 @@ class DiagnosticsTests(unittest.TestCase):
     def test_timing_fields_are_allowlisted_and_invalid_values_are_not_exposed(self):
         metrics = self.live_proxy()
         metrics["attemptCounts"] = {"external": 5, "plan": -1, "secret": "private-attempt"}
+        metrics["externalTimeouts"] = {"kinds": {"deadline": 2, "ceiling": True, "secret": "private"},
+                                       "stages": {"headers": 1, "body": -1, "stream": 0},
+                                       "localAttempts": {"small_solo": {"attempts": 3, "timeouts": 1, "secret": "private"},
+                                                         "large_shared": {"attempts": True, "timeouts": -1}, "private": 2}}
         metrics["routingTimingMs"] = {
             "queueWait": {"count": 2, "p50": 10.5, "p95": 20, "max": 30, "secret": "private-timing"},
             "externalAttempt": {"count": 1, "p50": float("nan"), "p95": 3, "max": 4},
@@ -790,6 +794,12 @@ class DiagnosticsTests(unittest.TestCase):
             "private-field": "private-data"}
         report = dash.diagnostics_report()["metrics"]
         self.assertEqual(report["attemptCounts"], {"external": 5, "plan": None})
+        self.assertEqual(report["externalTimeouts"]["kinds"], {"deadline": 2, "ceiling": None})
+        self.assertEqual(report["externalTimeouts"]["stages"], {"headers": 1, "body": None, "stream": 0})
+        buckets = report["externalTimeouts"]["localAttempts"]
+        self.assertEqual(buckets["small_solo"], {"attempts": 3, "timeouts": 1})
+        self.assertEqual(buckets["large_shared"], {"attempts": None, "timeouts": None})
+        self.assertIsNone(buckets["medium_solo"])
         timing = report["routingTimingMs"]
         self.assertEqual(timing["queueWait"], {"count": 2, "p50": 10.5, "p95": 20, "max": 30})
         self.assertIsNone(timing["externalAttempt"])

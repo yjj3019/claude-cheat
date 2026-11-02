@@ -1581,16 +1581,21 @@ test('attention queue renders only actionable items with direct actions', () => 
   assert.match(html, /1시간 미루기/);
 });
 
-test('healthy attention state takes little space', () => {
+test('closed attention items move to activity history without occupying the main queue', () => {
   const { context, sandbox } = loadDashboard();
   sandbox.render(fixture({
     alerts: [], insights: [],
-    attention: { counts: { open: 0, critical: 0, warn: 0, acknowledged: 0, snoozed: 0, history: 0 },
-      items: [], acknowledged: [], snoozed: [], history: [] },
+    attention: { counts: { open: 0, critical: 0, warn: 0, acknowledged: 1, snoozed: 0, history: 1 },
+      items: [], acknowledged: [{ id: 'ack', title: '확인한 항목', state: 'acknowledged' }], snoozed: [],
+      history: [{ id: 'done', title: '해결된 항목', state: 'resolved' }] },
   }));
   const html = context.nodes.get('alerts').innerHTML;
-  assert.match(html, /지금 조치할 항목이 없습니다/);
-  assert.doesNotMatch(html, /data-attention-action/);
+  assert.equal(html, '');
+  const grid = context.nodes.get('grid').innerHTML;
+  assert.match(grid, /주의 항목 이력/);
+  assert.match(grid, /해결된 항목/);
+  assert.match(grid, /data-attention-action="reopen"/);
+  assert.doesNotMatch(grid, /data-attention-id="done"/);
 });
 
 function versionFixture(update = {}, local = {}) {

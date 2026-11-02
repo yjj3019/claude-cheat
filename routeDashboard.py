@@ -4748,27 +4748,26 @@ function renderAttentionQueue(data) {
   const attention = data.attention || {};
   const counts = attention.counts || {};
   const open = Array.isArray(attention.items) ? attention.items : [];
-  const acknowledged = Array.isArray(attention.acknowledged) ? attention.acknowledged : [];
-  const snoozed = Array.isArray(attention.snoozed) ? attention.snoozed : [];
-  const history = Array.isArray(attention.history) ? attention.history : [];
   const guide = data.configured ? '' : '<div class="attention-guide"><b>처음 설정이 필요합니다.</b> 설정에서 서비스와 모델을 저장한 뒤 새 세션을 시작하세요. <a class="btn btn-sm" href="/settings">설정 열기</a></div>';
-  if (!open.length && !acknowledged.length && !snoozed.length) {
-    host.innerHTML = `<section class="attention attention-quiet-card" aria-labelledby="attention-title">
-      <header class="attention-head"><div><h2 id="attention-title">지금 필요한 것</h2>
-      <p class="sub">사람이 결정해야 하는 항목만 표시합니다</p></div>
-      <span class="pill pill-ok">조치 없음</span></header>
-      <div class="card-b">${guide || '<div class="attention-quiet"><span class="attention-dot ok"></span>지금 조치할 항목이 없습니다. 건강한 상태는 공간을 차지하지 않습니다.</div>'}
-      ${history.length ? `<details class="attention-history"><summary>최근 해결 ${history.length}건</summary>${history.map(attentionItem).join('')}</details>` : ''}</div></section>`;
+  if (!open.length && !guide) {
+    host.innerHTML = '';
     return;
   }
-  const rest = acknowledged.length + snoozed.length;
   host.innerHTML = `<section class="attention" aria-labelledby="attention-title">
     <header class="attention-head"><div><h2 id="attention-title">지금 필요한 것</h2>
-    <p class="sub">${counts.critical ? '치명 ' + counts.critical + ' · ' : ''}조치 ${counts.open || open.length}건${rest ? ' · 낮은 우선순위 ' + rest + '건' : ''}</p></div>
+    <p class="sub">${counts.critical ? '치명 ' + counts.critical + ' · ' : ''}조치 ${open.length}건</p></div>
     <span class="pill ${counts.critical ? 'signal-red' : 'signal-warn'}">${counts.critical ? '확인 필요' : '주의'}</span></header>
-    <div class="card-b">${guide}<div class="attention-list">${open.map(attentionItem).join('')}</div>
-    ${rest ? `<details class="attention-history"><summary>확인함 ${acknowledged.length} · 미룸 ${snoozed.length}</summary>${[...acknowledged, ...snoozed].map(attentionItem).join('')}</details>` : ''}
-    ${history.length ? `<details class="attention-history"><summary>최근 해결 ${history.length}건</summary>${history.map(attentionItem).join('')}</details>` : ''}</div></section>`;
+    <div class="card-b">${guide}<div class="attention-list">${open.map(attentionItem).join('')}</div></div></section>`;
+}
+function attentionHistory(data) {
+  const attention = data.attention || {};
+  const pending = [...(attention.acknowledged || []), ...(attention.snoozed || [])];
+  const history = attention.history || [];
+  if (!pending.length && !history.length) return '';
+  return `<div class="card col-12"><div class="card-h"><h3>주의 항목 이력</h3></div><div class="card-b">
+    ${pending.map(attentionItem).join('')}
+    ${history.map(item => `<div class="attention-body"><b>${esc(item.title)}</b><p>${esc(item.detail || '')}</p><small>${esc(attentionAge(item))}${item.project ? ' · ' + esc(item.project) : ''} · 해결</small></div>`).join('')}
+  </div></div>`;
 }
 const renderAlertsLegacy = renderAlerts;
 renderAlerts = function (data) {
@@ -4810,8 +4809,14 @@ document.addEventListener('click', event => {
 });
 """
 
+JS_DASHBOARD = JS_DASHBOARD.replace(
+    "tokensCard + creditCard + shapesCard + transitionsCard + sessionsCard + recentCard)",
+    "tokensCard + creditCard + shapesCard + transitionsCard + sessionsCard + recentCard + attentionHistory(data))",
+    1,
+)
+
 PAGE_CSS += """
-.attention{margin-bottom:14px;border:1px solid var(--line);border-left:4px solid #d79b2b;border-radius:12px;background:var(--surface,#fff);overflow:hidden}
+.attention{margin-bottom:14px;border:1px solid var(--line);border-radius:12px;background:var(--surface,#fff);overflow:hidden}
 .attention.critical{border-left-color:#d05252}
 .attention-head{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 16px 0}
 .attention-head h2{margin:0;font-size:15px}.attention-head .sub{margin:2px 0 0;font-size:11.5px;color:var(--fg-4)}
@@ -5533,7 +5538,7 @@ def _diagnostic_timing(metrics):
     timing = metrics.get("routingTimingMs") if isinstance(metrics, dict) else None
     timing = timing if isinstance(timing, dict) else {}
     clean_timing = {}
-    for name in ("queueWait", "externalAttempt", "retryWait", "plan", "total"):
+    for name in ("queueWait", "externalAttempt", "externalHeaders", "externalFirstBody", "externalTimeout", "retryWait", "plan", "total"):
         row = timing.get(name)
         if not isinstance(row, dict):
             clean_timing[name] = None
@@ -5545,7 +5550,21 @@ def _diagnostic_timing(metrics):
             clean_timing[name] = {"count": 0, "p50": None, "p95": None, "max": None}
     attempts = metrics.get("attemptCounts") if isinstance(metrics, dict) else None
     attempts = attempts if isinstance(attempts, dict) else {}
-    return clean_timing, {name: count(attempts.get(name)) for name in ("external", "plan")}
+    timeouts = metrics.get("externalTimeouts") if isinstance(metrics, dict) else None
+    timeouts = timeouts if isinstance(timeouts, dict) else {}
+    def timeout_fields(group, names):
+        row = timeouts.get(group)
+        return {name: count(row.get(name)) for name in names} if isinstance(row, dict) else None
+    buckets = timeouts.get("localAttempts")
+    bucket_names = ("small_solo", "small_shared", "medium_solo", "medium_shared", "large_solo", "large_shared")
+    local_attempts = ({name: {key: count(buckets[name].get(key)) for key in ("attempts", "timeouts")}
+                       if isinstance(buckets.get(name), dict) else None for name in bucket_names}
+                      if isinstance(buckets, dict) else None)
+    return clean_timing, {name: count(attempts.get(name)) for name in ("external", "plan")}, {
+        "kinds": timeout_fields("kinds", ("deadline", "ceiling")),
+        "stages": timeout_fields("stages", ("headers", "body", "stream")),
+        "localAttempts": local_attempts,
+    }
 
 
 def _diagnostic_cli_metrics(metrics):
@@ -5685,7 +5704,7 @@ def diagnostics_report():
                 for key in ("requests", "failed", "aborted", "externalAttempts", "retries", "circuitOpens")}
     if counters["failed"] and counters["failed"] - (counters["aborted"] or 0) > 0:
         check("requests", "warning", "request_failures_recorded", "inspect_last_route")
-    timing_report, attempt_report = _diagnostic_timing(metrics)
+    timing_report, attempt_report, timeout_report = _diagnostic_timing(metrics)
     status = "error" if any(item["status"] == "error" for item in checks) else "degraded" if any(item["status"] == "warning" for item in checks) else "ok"
     return {
         "schema_version": 1, "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -5711,7 +5730,7 @@ def diagnostics_report():
                        "fallback_failure": last.get("detail") if current_session and last.get("reason") == "fallback"
                        and last.get("detail") in ("request", "provider", "rate_limit", "transient") else None},
         "metrics": {"source": "live_proxy" if metrics else "unavailable", **counters,
-                    "routingTimingMs": timing_report, "attemptCounts": attempt_report,
+                    "routingTimingMs": timing_report, "attemptCounts": attempt_report, "externalTimeouts": timeout_report,
                     **_diagnostic_cli_metrics(metrics if (session or {}).get("provider") == "cli" else None)},
         "snapshot": {"available": available, "age_seconds": age, "refresh_failed": refresh_failed},
         "next_check": {"method": "POST", "path": "/api/test", "provider": (session or {}).get("provider") or next_provider,
