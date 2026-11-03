@@ -2,7 +2,7 @@
 // metrics file must be replaced atomically so a reader never sees a half-written snapshot.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -10,6 +10,29 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const PROXY = pathToFileURL(fileURLToPath(new URL('../claudeRouteProxy.mjs', import.meta.url))).href;
 const LIMIT = 8 * 1024 * 1024;
+
+test('a failed route-log batch is retried and not lost once the disk recovers', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'route-log-'));
+  const missing = join(directory, 'not-yet');
+  const log = join(missing, '.route.log');
+  // The parent directory does not exist: the first append fails with ENOENT. The outbox pushes
+  // the batch back with backoff, so after the directory appears every line must be written.
+  const script = `import(${JSON.stringify(PROXY)}).then(async () => {
+    const { mkdirSync } = await import('node:fs');
+    for (let index = 0; index < 40; index += 1) console.error('line ' + index);
+    await new Promise(resolve => setTimeout(resolve, 120));
+    mkdirSync(${JSON.stringify(missing)});
+    await new Promise(resolve => setTimeout(resolve, 500));
+  })`;
+  execFileSync(process.execPath, ['-e', script], {
+    env: { ...process.env, ROUTE_LOG_PATH: log }, stdio: 'pipe', timeout: 60000,
+  });
+  const lines = readFileSync(log, 'utf8').split('\n').filter(Boolean);
+  assert.equal(lines.length, 41, 'the start marker and all 40 lines survive a transient failure');
+  for (let index = 0; index < 40; index += 1) {
+    assert.ok(lines.some(line => line.endsWith(`line ${index}`)), `line ${index} must be present`);
+  }
+});
 
 test('the route log rotates once it passes the size limit', () => {
   const directory = mkdtempSync(join(tmpdir(), 'route-log-'));

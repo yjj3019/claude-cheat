@@ -160,11 +160,15 @@ function stabilizeSystem(system) {
 
 // Diagnostic mirror: routing events also land in a file so a session can be explained afterwards.
 // The writer is a bounded write-behind queue: request handling never waits for disk I/O, and a
-// failing or slow disk can only drop diagnostic lines instead of stalling the event loop.
+// failing or slow disk can only drop diagnostic lines instead of stalling the event loop. A failed
+// batch is pushed back and retried with bounded backoff (an outbox) before it is ever dropped.
 const routeLogPath = process.env.ROUTE_LOG_PATH;
 const ROUTE_LOG_LIMIT = 8 * 1024 * 1024;
 const ROUTE_LOG_QUEUE_LINES = 4096;
 const ROUTE_LOG_QUEUE_BYTES = 2 * 1024 * 1024;
+const ROUTE_LOG_RETRY_MAX = 3;
+const ROUTE_LOG_RETRY_BASE_MS = 25;
+const ROUTE_LOG_RETRY_MAX_MS = 200;
 const routeInstanceId = typeof process.env.ROUTE_INSTANCE_ID === 'string' &&
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(process.env.ROUTE_INSTANCE_ID)
   ? process.env.ROUTE_INSTANCE_ID : null;
@@ -184,11 +188,11 @@ if (routeLogPath) {
     `${continued ? ' continued=1' : ''}${routeInstanceId ? ` instance=${routeInstanceId}` : ''}` +
     `${codeStamp ? ` code=${codeStamp}` : ''}${codeHash ? ` hash=${codeHash}` : ''} ---\n`;
   const bootMarker = startLine(false);
-  const stats = { written: 0, dropped: 0, errors: 0, rotations: 0, batches: 0,
+  const stats = { written: 0, dropped: 0, errors: 0, retries: 0, rotations: 0, batches: 0,
     writeMsTotal: 0, writeMsMax: 0, maxQueuedBytes: 0 };
   let queue = [bootMarker];
   let queuedBytes = Buffer.byteLength(bootMarker);
-  let writing = false, scheduled = false;
+  let writing = false, scheduled = false, consecutiveFailures = 0;
 
   const rotateIfNeeded = () => {
     try {
@@ -214,21 +218,39 @@ if (routeLogPath) {
     const started = performance.now();
     appendFile(routeLogPath, batch.join(''), { encoding: 'utf8' }, error => {
       const elapsed = performance.now() - started;
-      if (error) stats.errors += 1;
-      else stats.written += batch.length;
       stats.writeMsTotal += elapsed;
       stats.writeMsMax = Math.max(stats.writeMsMax, elapsed);
       stats.batches += 1;
       queuedBytes = Math.max(0, queuedBytes - bytes);
+      if (error) {
+        stats.errors += 1;
+        consecutiveFailures += 1;
+        if (consecutiveFailures <= ROUTE_LOG_RETRY_MAX) {
+          // Outbox retry: keep the batch (still within the queue bounds) and push it back with
+          // backoff instead of losing diagnostic lines to one transient I/O error.
+          if (queue.length + batch.length <= ROUTE_LOG_QUEUE_LINES) {
+            stats.retries += 1;
+            queue.unshift(...batch);
+            queuedBytes += bytes;
+            writing = false;
+            schedule(Math.min(ROUTE_LOG_RETRY_BASE_MS * (2 ** (consecutiveFailures - 1)), ROUTE_LOG_RETRY_MAX_MS));
+            return;
+          }
+        }
+        stats.dropped += batch.length;
+      } else {
+        stats.written += batch.length;
+        consecutiveFailures = 0;
+      }
       writing = false;
       if (queue.length) schedule();
     });
   };
 
-  const schedule = () => {
+  const schedule = (delayMs = 10) => {
     if (scheduled || writing) return;
     scheduled = true;
-    const timer = setTimeout(() => { scheduled = false; drain(); }, 10);
+    const timer = setTimeout(() => { scheduled = false; drain(); }, delayMs);
     timer.unref?.();
   };
 
@@ -277,7 +299,7 @@ if (routeLogPath) {
   routeMirror = {
     enqueue,
     stats: () => ({ enabled: true, written: stats.written, dropped: stats.dropped,
-      errors: stats.errors, rotations: stats.rotations, queuedLines: queue.length,
+      errors: stats.errors, retries: stats.retries, rotations: stats.rotations, queuedLines: queue.length,
       queuedBytes, maxQueuedBytes: stats.maxQueuedBytes, batches: stats.batches,
       writeMsMax: Number(stats.writeMsMax.toFixed(2)),
       writeMsAvg: stats.batches ? Number((stats.writeMsTotal / stats.batches).toFixed(2)) : 0 }),

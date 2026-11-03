@@ -3592,7 +3592,7 @@ function renderProcessHealth(data) {
   const ms = value => typeof value === 'number' && value >= 0 ? value.toFixed(1) + ' ms' : '—';
   const routeLog = pm.routeLog || {};
   const logLine = routeLog.enabled === true
-    ? `<p class="hint">라우트 로그는 비동기 배치입니다: 큐 ${num(routeLog.queuedLines)}줄 · 누적 ${num(routeLog.written)}줄 · 드롭 ${num(routeLog.dropped)} · 쓰기 ${ms(routeLog.writeMsMax)}</p>`
+    ? `<p class="hint">라우트 로그는 비동기 배치입니다: 큐 ${num(routeLog.queuedLines)}줄 · 누적 ${num(routeLog.written)}줄 · 드롭 ${num(routeLog.dropped)} · 재시도 ${num(routeLog.retries)} · 쓰기 ${ms(routeLog.writeMsMax)}</p>`
     : '';
   const gc = pm.gc || {};
   const blocking = Array.isArray(pm.blocking) ? pm.blocking : [];
