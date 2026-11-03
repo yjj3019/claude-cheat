@@ -74,21 +74,19 @@ test('CLI provider exposes only backend-reported model and measured usage',async
   assert.equal(m.configuration.usageMeasured,true);
 });
 
-test('CLI failures attempt once and preserve the original conversation on Plan',async t=>{
+test('CLI failures attempt once and never send the conversation to Plan',async t=>{
   const f=await fixture(t,()=>new Response('{"error":"not_logged_in"}',{status:400}));
   const body={model:SONNET,max_tokens:256,messages:[{role:'user',content:'fixture input'}],
     tools:[{name:'Skill',input_schema:{type:'object',properties:{skill:{type:'string'}}},defer_loading:true}]};
   const reply=await f.request(body);
-  assert.equal(reply.status,200);await reply.text();
-  assert.equal(f.calls.length,2);
+  assert.equal(reply.status,400);assert.match(await reply.text(),/cli_invalid_request/);
+  assert.equal(f.calls.length,1);
   assert.equal(f.calls[0].url,BRIDGE);
-  assert.equal(f.calls[1].url,'https://api.anthropic.com/v1/messages');
-  assert.deepEqual(f.calls[1].body,body);
   const m=await f.metrics();
   assert.equal(m.externalAttempts,1);
-  assert.equal(m.attempts,2);
+  assert.equal(m.attempts,1);
   assert.equal(m.retries,0);
-  assert.equal(m.routes.plan,1);
+  assert.equal(m.routes.plan,0);
 });
 
 test('native Plan models bypass the CLI backend',async t=>{

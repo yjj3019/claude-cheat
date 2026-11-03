@@ -37,14 +37,45 @@ async function startProxy(t, config = {}) {
   });
   await listenSafe(server);
   const base = `http://127.0.0.1:${server.address().port}`;
-  const send = (model, extra = {}) => fetch(`${base}/v1/messages`,
-    { method: 'POST', headers: HEADERS, body: requestBody({ model, ...extra }) });
-  const sendOk = async (model, extra) => {
-    const response = await send(model, extra);
+  const send = (model, extra = {}, headers = HEADERS) => fetch(`${base}/v1/messages`,
+    { method: 'POST', headers, body: requestBody({ model, ...extra }) });
+  const sendOk = async (model, extra, headers) => {
+    const response = await send(model, extra, headers);
     return { status: response.status, text: await response.text() };
   };
   return { send, sendOk };
 }
+
+test('alternate Local materializes compatible tools and leaves unknown native requests on Plan', async t => {
+  const calls = [];
+  const proxy = await startProxy(t, { ...altConfig, fetchImpl: async (url, init) => {
+    calls.push({ url, body: JSON.parse(init.body), headers: init.headers });
+    return Response.json(url === LOCAL_URL ? reply(ALT_MODEL) : url === EXTERNAL ? reply(PRIMARY_MODEL) : planReply());
+  } });
+  const tool = { name: 'mcp__fixture__echo', input_schema: { type: 'object' } };
+  const extra = { stream: true, metadata: { user_id: 'private-fixture' },
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' },
+      { type: 'tool_addition', tool: { type: 'tool_definition', definition: tool } }] }] };
+  const headers = { ...HEADERS, 'anthropic-beta': `${BETA},inline-tools-2026-09-15` };
+  const result = await proxy.sendOk(ALT_ALIAS, extra, headers);
+  assert.equal(result.status, 200);
+  assert.match(result.text, /message_stop/);
+  assert.equal(calls[0].url, LOCAL_URL);
+  assert.deepEqual(calls[0].body.tools, [tool]);
+  assert.deepEqual(calls[0].body.messages, [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }]);
+  assert.equal(calls[0].headers.authorization, 'Bearer local-secret-key');
+  assert.equal(calls[0].headers['anthropic-beta'], headers['anthropic-beta']);
+  assert.equal(calls[0].body.stream, false);
+  assert.equal(calls[0].body.metadata, undefined);
+  assert.equal((await proxy.sendOk(ALT_ALIAS, extra, { ...headers, 'anthropic-beta': `${BETA},unknown-feature-2099-01-01` })).status, 200);
+  assert.equal(calls[1].url, PLAN);
+  assert.deepEqual(calls[1].body.messages, extra.messages);
+  assert.equal((await proxy.sendOk(MODEL, extra, headers)).status, 200);
+  assert.equal(calls[2].url, EXTERNAL);
+  assert.deepEqual(calls[2].body.tools, [tool]);
+  assert.equal(calls[2].body.metadata, undefined);
+  assert.equal(calls[2].headers['anthropic-beta'], undefined);
+});
 
 test('the alternate model id routes to the alternate provider with its own credential', { timeout: 15000 }, async t => {
   const calls = [];
@@ -122,6 +153,62 @@ test('a local-primary session dispatches the OpenRouter alias to OpenRouter', { 
   assert.equal(primary.status, 200);
   assert.equal(calls[1].url, LOCAL_URL);
   assert.equal(calls[1].body.model, 'primary-local-model');
+});
+
+test('alternate OpenRouter receives validated inline tools without switching to Plan', async t => {
+  const calls = [];
+  const proxy = await startProxy(t, { provider: 'local', localUrl: LOCAL_URL,
+    localModel: 'primary-local-model', localKey: 'primary-local-key',
+    altProvider: 'openrouter', altModel: 'alt/or-model',
+    altKey: 'sk-or-alt0000000000000000000000000000000000000', altAlias: 'claude-route-openrouter',
+    fetchImpl: async (url, init) => { calls.push({ url, body: JSON.parse(init.body), headers: init.headers });
+      return Response.json(url === EXTERNAL ? reply('alt/or-model') : planReply()); } });
+  const tool = { name: 'fixture', input_schema: { type: 'object' } };
+  const extra = { messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' },
+    { type: 'tool_addition', tool: { type: 'tool_definition', definition: tool } }] }] };
+  const headers = { ...HEADERS, 'anthropic-beta': `${BETA},inline-tools-2026-09-15` };
+  assert.equal((await proxy.sendOk('claude-route-openrouter', extra, headers)).status, 200);
+  assert.deepEqual(calls.map(call => call.url), [EXTERNAL]);
+  assert.deepEqual(calls[0].body.tools, [tool]);
+  assert.deepEqual(calls[0].body.messages, [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }]);
+  assert.equal(calls[0].headers['anthropic-beta'], undefined);
+});
+
+test('OpenRouter inline conversion preserves strict validation and never retries failures on Plan', async t => {
+  const calls = [];
+  const proxy = await startProxy(t, { ...altConfig, fetchImpl: async url => {
+    calls.push(url);
+    return Response.json({ type: 'message', model: PRIMARY_MODEL, content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn' });
+  } });
+  const tool = { name: 'fixture', input_schema: { type: 'object' } };
+  const extra = { messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' },
+    { type: 'tool_addition', tool: { type: 'tool_definition', definition: tool } }] }] };
+  const headers = { ...HEADERS, 'anthropic-beta': `${BETA},inline-tools-2026-09-15` };
+  const result = await proxy.sendOk(MODEL, extra, headers);
+  assert.equal(result.status, 503);
+  assert.deepEqual(calls, [EXTERNAL, EXTERNAL, EXTERNAL, EXTERNAL]);
+});
+
+test('OpenRouter inline conversion rejects unsupported extensions and conflicting definitions', async t => {
+  const calls = [];
+  const proxy = await startProxy(t, { ...altConfig, fetchImpl: async (url, init) => {
+    calls.push({ url, body: JSON.parse(init.body) });
+    return Response.json(planReply());
+  } });
+  const tool = { name: 'fixture', input_schema: { type: 'object' } };
+  const messages = [{ role: 'user', content: [{ type: 'text', text: 'hello' },
+    { type: 'tool_addition', tool: { type: 'tool_definition', definition: tool } }] }];
+  const headers = { ...HEADERS, 'anthropic-beta': `${BETA},inline-tools-2026-09-15` };
+  for (const extra of [
+    { messages, output_config: { format: { type: 'json_schema', schema: { type: 'object' } } } },
+    { messages, tools: [{ ...tool, description: 'conflicting definition' }] },
+    { messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 'call_1', name: 'fixture', input: {},
+      provider_specific_fields: { opaque: true } }] }, ...messages] },
+  ]) {
+    assert.equal((await proxy.sendOk(MODEL, extra, headers)).status, 200);
+    assert.equal(calls.at(-1).url, PLAN);
+    assert.deepEqual(calls.at(-1).body.messages, extra.messages);
+  }
 });
 
 test('an alternate provider failure opens only its own breaker', { timeout: 20000 }, async t => {

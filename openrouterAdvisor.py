@@ -736,7 +736,7 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
     connection_result = check_cli_backend(_backend) if _backend is not None else check_connection(provider, config=config)
     if connection_result != 0:
         print(json.dumps({"event": "provider_connection_unavailable", "provider": provider,
-                          "action": "continue", "plan_fallback": not isolated and provider != "local"}), flush=True)
+                          "action": "continue", "plan_fallback": False}), flush=True)
     proxy_env.update(config, LOCAL_ROUTE_TOKEN=nonce, LOCAL_ROUTE_ONLY="1" if local_only else "0")
     if dual:
         proxy_env.update(dual)
@@ -1210,9 +1210,7 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
             except OSError:
                 raise startup_error("local_cli_start_failed") from None
     print(f"Sonnet replacement: {provider}. Opus/Haiku/Fable keep Claude Plan OAuth.")
-    print("Local failures stay on Local; native-only requests may still use Plan." if provider == "local" else
-          "One CLI backend attempt, then Plan fallback; backend tools are executed only by front Claude Code." if provider == "cli" else
-          "Initial request + 3 retries, then Plan fallback (subscription Sonnet); recovery checked on a later request.")
+    print("Provider failures return an error without Plan fallback; native-only requests may still use Plan.")
     print("Native-only features stay on Plan. Replacement replies are buffered until validated.")
     with routed_session(provider, debug=debug) as env:
         command = [claude, "--model", "sonnet"]

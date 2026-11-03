@@ -332,7 +332,7 @@ test('metrics identify the loaded routing configuration without credentials', as
     const response = await fetch(metrics, { headers: { 'x-local-route-token': NONCE } });
     const payload = await response.json();
     assert.deepEqual(payload.configuration, { provider: 'openrouter', model: 'metrics/model',
-      modelRedacted: false, alternate: null, planFallback: true });
+      modelRedacted: false, alternate: null, planFallback: false });
     assert.equal(payload.requests, 0, 'reading diagnostics must not perform inference');
     assert.doesNotMatch(JSON.stringify(payload), /metrics-nonce|sk-or-metrics|sk-ant-oat/);
   } finally {
@@ -404,13 +404,13 @@ test('counters follow the routes the proxy takes', async () => {
   }
 });
 
-test('a request that ends on Plan still shows the external attempt, without a first byte', async () => {
+test('a failed provider request still shows the external attempt without Plan or a first byte', async () => {
   const { server, base, metrics } = await start({ failAlways: true });
   try {
-    assert.equal(await send(base, { content: 'fallback' }), 200);
+    assert.equal(await send(base, { content: 'fallback' }), 503);
     const payload = await (await fetch(metrics, { headers: { 'x-local-route-token': NONCE } })).json();
-    assert.equal(payload.routes.external, 0, 'served by Plan');
-    assert.equal(payload.routes.plan, 1);
+    assert.equal(payload.routes.external, 0, 'no successful provider response');
+    assert.equal(payload.routes.plan, 0);
     assert.equal(payload.externalAttempts, 1, 'the OpenRouter attempt must be visible');
     assert.equal(payload.latencyMs.ttfb.count, 0, 'a discarded attempt must not report a first byte');
   } finally {

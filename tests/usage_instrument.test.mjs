@@ -33,7 +33,8 @@ async function setup(t, impl, options = {}) {
     localModel: model, retryDelayMs: 1, cooldownMs: 0, attemptTimeoutMs: 1000,
     instanceId, usageEventsPath: events, instanceMetricsPath: join(dir, 'metrics.json'), fetchImpl: impl, ...options });
   await listenSafe(server);
-  t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); await rm(dir, { recursive: true, force: true }); });
+  t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); });
   const url = `http://127.0.0.1:${server.address().port}`;
   return { events, instanceId, send: (payload, signal) => fetch(url + '/v1/messages', { method: 'POST', headers, body: JSON.stringify(payload), signal }),
     metrics: () => fetch(url + '/api/metrics', { headers }).then(r => r.json()) };
@@ -55,11 +56,11 @@ test('per-instance events record verified usage without contents or credentials'
   assert.equal((await f.metrics()).instanceId, f.instanceId);
 });
 
-test('Plan fallback records its final route without fabricating token usage or actual model', async t => {
+test('provider failure is attributed without fabricating token usage or actual model', async t => {
   const f = await setup(t, async url => url.includes('api.anthropic.com') ? Response.json(answer(body.model)) : new Response('fail', { status: 500 }));
   await (await f.send(body)).text();
   const [row] = await waitRows(f.events, 1);
-  assert.equal(row.provider, 'plan'); assert.equal(row.status, 'ok');
+  assert.equal(row.provider, 'local'); assert.equal(row.status, 'failed');
   assert.equal(row.usage_measured, false); assert.equal(row.input_tokens, null); assert.equal(row.output_tokens, null);
   assert.equal(row.reported_model, null);
 });
@@ -111,7 +112,7 @@ test('partial verified usage retains the available side', async t => {
 
 test('validated streams record reported usage once without inventing missing output', async t => {
   const frame = (type, fields) => `event: ${type}\ndata: ${JSON.stringify({type,...fields})}\n\n`;
-  for (const [passthrough, outputs, expected] of [[false,[7],7],[true,[0],0],[true,[undefined],null],[true,[2.5],null],[true,[3,7],7],[true,[3,undefined],null]]) {
+  for (const [passthrough, outputs, expected] of [[false,[7],7],[true,[0],0],[true,[undefined],null],[true,[3,7],7],[true,[3,undefined],null]]) {
     const frames = [frame('message_start',{message:{id:'msg_sse',role:'assistant',model,usage:{input_tokens:5,output_tokens:0}}}),
       frame('content_block_start',{index:0,content_block:{type:'text',text:''}}),
       frame('content_block_delta',{index:0,delta:{type:'text_delta',text:'PRIVATE-REPLY'}}),
@@ -128,6 +129,25 @@ test('validated streams record reported usage once without inventing missing out
     assert.equal(rows[0].output_tokens,expected);assert.equal(rows[0].usage_measured,true);
     assert.doesNotMatch(JSON.stringify(rows),/PRIVATE|sk-ant|nonce-fixture/);
   }
+});
+
+test('fractional streamed usage marks the response failed without recording partial usage', async t => {
+  const frame = (type, fields) => `event: ${type}\ndata: ${JSON.stringify({type,...fields})}\n\n`;
+  const frames = [frame('message_start',{message:{id:'msg_sse',role:'assistant',model,usage:{input_tokens:5,output_tokens:0}}}),
+    frame('content_block_start',{index:0,content_block:{type:'text',text:''}}),
+    frame('content_block_delta',{index:0,delta:{type:'text_delta',text:'PRIVATE-REPLY'}}),
+    frame('content_block_stop',{index:0}),
+    frame('message_delta',{delta:{stop_reason:'end_turn'},usage:{output_tokens:2.5}}),frame('message_stop',{})].join('');
+  const f = await setup(t, async()=>new Response(frames,{headers:{'content-type':'text/event-stream'}}),
+    {provider:'openrouter',key:'sk-or-fixture',openrouterModel:model,streamPassthrough:true});
+  const response = await f.send({...body,stream:true});
+  assert.equal(response.status, 200);
+  assert.match(await response.text(), /upstream stream failed/);
+  const [row] = await waitRows(f.events,1);
+  assert.equal(row.status,'failed');
+  assert.equal(row.usage_measured,false);
+  assert.equal(row.input_tokens,null);
+  assert.equal(row.output_tokens,null);
 });
 
 test('truncated streamed replies do not record partial usage', async t => {

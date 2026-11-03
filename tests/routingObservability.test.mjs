@@ -68,7 +68,7 @@ test('CLI process duration accepts only bounded numeric metadata on completed va
   assert.deepEqual((await f.metrics()).cliProcessMs, {count:1,p50:128.35,p95:128.35,max:128.35});
 });
 
-test('CLI failure categories and 429 count distinguish backend responses from Plan fallback', async t => {
+test('CLI failure categories and 429 count never trigger Plan fallback', async t => {
   const cases = [
     ['status429', () => new Response('', {status:429})],
     ['status4xx', () => new Response('', {status:400})],
@@ -81,17 +81,50 @@ test('CLI failure categories and 429 count distinguish backend responses from Pl
     await t.test(category, async sub => {
       const f = await fixture(sub, async url => url === PLAN ? Response.json(message(body.model)) : fail(),
         {provider:'cli', localModel:'cli/codex', cliKind:'codex', attemptTimeoutMs:30});
-      assert.equal((await f.send()).status, 200);
+      assert.equal((await f.send()).status, category === 'status4xx' ? 400 : category === 'status429' ? 429 : 503);
       const m = await f.metrics();
       assert.equal(m.cliFailures[category], 1);
       assert.equal(Object.values(m.cliFailures).reduce((a,b) => a+b, 0), 1);
       assert.equal(m.cliActivity.rejected, category === 'status429' ? 1 : 0);
       assert.equal(m.cliActivity.active, 0);
-      assert.equal(m.routes.plan, 1);
+      assert.equal(m.routes.plan, 0);
       assert.equal(m.cliUsage.responses, 0);
     });
   }
 });
+
+test('OpenRouter failures and cooldown do not send requests to Plan', async t => {
+  const calls = [];
+  const f = await fixture(t, async url => { calls.push(url); return new Response('private error', {status: 503}); },
+    { provider: 'openrouter', key: 'synthetic-key', openrouterModel: 'fixture/model', retryDelayMs: 0 });
+  const first = await f.send();
+  assert.equal(first.status, 503);
+  assert.match(await first.text(), /openrouter_upstream_error/);
+  assert.equal((await f.send()).status, 503);
+  assert.equal(calls.length, 4);
+  assert.ok(calls.every(url => url === 'https://openrouter.ai/api/v1/messages'));
+  const m = await f.metrics();
+  assert.equal(m.routes.plan, 0);
+  assert.equal(m.configuration.planFallback, false);
+});
+
+for (const [provider, options, reportedModel, limit] of [
+  ['openrouter', { provider: 'openrouter', key: 'synthetic-key', openrouterModel: 'fixture/model', retryDelayMs: 0 }, 'fixture/model', 4],
+  ['cli', { provider: 'cli', localModel: 'cli/codex', cliKind: 'codex', retryDelayMs: 0 }, 'cli/codex', 1],
+]) {
+  test(`${provider} output exhaustion does not mark the provider unavailable`, async t => {
+    let calls = 0;
+    const f = await fixture(t, async url => {
+      assert.notEqual(url, PLAN);
+      calls++;
+      return Response.json(calls <= limit ? { ...message(reportedModel, []), stop_reason: 'max_tokens' } : message(reportedModel));
+    }, options);
+    assert.equal((await f.send()).status, 503);
+    assert.equal((await f.metrics()).circuitOpens, 0);
+    assert.equal((await f.send()).status, 200);
+    assert.equal(calls, limit + 1);
+  });
+}
 
 test('Local failure records a bounded class without Plan or upstream content', async t => {
   const events = captureEvents(t);

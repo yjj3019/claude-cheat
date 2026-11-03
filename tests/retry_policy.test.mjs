@@ -85,11 +85,11 @@ test('a long Retry-After is clamped to the proxy retry cap instead of freezing t
       } });
     const started = Date.now();
     const response = await send(base);
-    assert.equal(response.status, 200, 'the route falls back to Plan after the retries');
+    assert.equal(response.status, 429, 'rate limiting is returned without Plan fallback');
     await response.text();
     const elapsed = Date.now() - started;
     assert.equal(externalStamps.length, 4, 'all four external attempts happen');
-    assert.equal(planCalls.length, 1);
+    assert.equal(planCalls.length, 0);
     assert.ok(elapsed >= 100, `the retries must actually wait the capped delay (${elapsed}ms)`);
     assert.ok(elapsed < 5000, `a 120s hint must not freeze the turn (${elapsed}ms)`);
     for (let index = 1; index < externalStamps.length; index += 1) {
@@ -123,7 +123,7 @@ test('a rate-limited provider keeps its status and wait on the client-facing fai
 test('an overloaded provider keeps 529 and an HTTP-date Retry-After reaches the client',
   { timeout: 15000 }, async t => {
     const headers = new Date(NOW + 90000).toUTCString();
-    const { base } = await startProxy(t, { retryMaxWaitMs: 20, now: () => NOW,
+    const { base, metrics } = await startProxy(t, { retryMaxWaitMs: 20, now: () => NOW,
       fetchImpl: async url => {
         if (url === PLAN) throw new Error('Plan route unavailable');
         return new Response('overloaded', { status: 529, headers: { 'retry-after': headers } });
@@ -133,6 +133,8 @@ test('an overloaded provider keeps 529 and an HTTP-date Retry-After reaches the 
     assert.equal(response.headers.get('retry-after'), '90', 'an HTTP-date hint becomes delta seconds');
     const body = await response.json();
     assert.equal(body.error.type, 'overloaded_error');
+    assert.equal((await metrics()).rateLimit.retryAfterMs, 90000);
+    assert.equal((await send(base)).status, 503, 'cooldown retains the overloaded provider wait');
   });
 
 test('a 4xx request-level rejection is not retried', { timeout: 15000 }, async t => {
@@ -144,9 +146,22 @@ test('a 4xx request-level rejection is not retried', { timeout: 15000 }, async t
       return new Response('bad request', { status: 400, headers: { 'retry-after': '5' } });
     } });
   const response = await send(base);
-  assert.equal(response.status, 200, 'the route falls back to Plan');
+  assert.equal(response.status, 400, 'the provider rejection is returned without Plan');
   await response.text();
   assert.equal(externalCalls.length, 1, 'a 400 must not be retried');
+});
+
+test('a later transport failure does not reuse an earlier OpenRouter rate limit', async t => {
+  let calls = 0;
+  const { base } = await startProxy(t, { retryMaxWaitMs: 1, fetchImpl: async url => {
+    assert.equal(url, EXTERNAL);
+    if (++calls === 1) return new Response('limited', { status: 429, headers: { 'retry-after': '120' } });
+    throw new Error('connection failed');
+  } });
+  const response = await send(base);
+  assert.equal(response.status, 503);
+  assert.equal(calls, 4);
+  assert.notEqual(response.headers.get('retry-after'), '120');
 });
 
 test('a 429 without Retry-After adds no invented wait', { timeout: 15000 }, async t => {
@@ -159,7 +174,7 @@ test('a 429 without Retry-After adds no invented wait', { timeout: 15000 }, asyn
     } });
   const started = Date.now();
   const response = await send(base);
-  assert.equal(response.status, 200);
+  assert.equal(response.status, 429);
   await response.text();
   assert.equal(externalStamps.length, 4);
   assert.ok(Date.now() - started < 1000, 'no magic delay may be invented for a bare 429');

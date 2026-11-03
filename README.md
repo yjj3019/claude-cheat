@@ -4,7 +4,7 @@
 
 Claude Code를 실행하면서 호환되는 Sonnet 요청을 **Local LLM, OpenRouter 또는 CLI 모델 백엔드**로 보내는 로컬 라우터입니다. 원본 Claude Sonnet을 프록시 없이 실행하는 선택지도 제공합니다.
 
-일반 라우팅은 미지원 요청을 Claude Plan으로 보낼 수 있습니다. Local 장애는 오류를 반환하며 OpenRouter·CLI 장애는 Plan으로 fallback할 수 있습니다. CLI를 선택해도 전면 실행과 도구 사용은 Claude Code가 담당합니다. Claude Code의 모든 기능이 외부 모델에서도 동일하게 작동한다고 보장하지는 않습니다. [호환성 및 검증 범위](docs/HARNESS-COMPATIBILITY-REVIEW.ko.md) · [요구사항 점검표](docs/REQUIREMENTS-AUDIT.ko.md) · [Claude Code 버전 기준선과 릴리스 체크리스트](docs/CLAUDE-CODE-COMPATIBILITY.ko.md)
+일반 라우팅은 미지원 요청을 Claude Plan으로 보낼 수 있습니다. Local·OpenRouter·CLI 장애는 Plan으로 전환하지 않고 오류를 반환합니다. CLI를 선택해도 전면 실행과 도구 사용은 Claude Code가 담당합니다. Claude Code의 모든 기능이 외부 모델에서도 동일하게 작동한다고 보장하지는 않습니다. [호환성 및 검증 범위](docs/HARNESS-COMPATIBILITY-REVIEW.ko.md) · [요구사항 점검표](docs/REQUIREMENTS-AUDIT.ko.md) · [Claude Code 버전 기준선과 릴리스 체크리스트](docs/CLAUDE-CODE-COMPATIBILITY.ko.md)
 
 | 실행 선택 | 용도 | 확인할 점 |
 | --- | --- | --- |
@@ -82,12 +82,12 @@ Claude Code — 기존 Plan 로그인·사용자 설정
 | Opus·Haiku·Fable | Anthropic | 저장된 Plan OAuth와 계정 사용량 |
 | Sonnet에 외부 미지원 기능·이력이 포함됨 | 원본 Plan Sonnet | Plan 계정 사용량 |
 | Local 장애·회로 차단·대기열 초과 | Local 오류 반환, 복구 후 재시도 | Plan 자동 사용 없음 |
-| OpenRouter·CLI 장애 후 fallback | 원본 Plan Sonnet | Plan 계정 사용량 |
+| OpenRouter·CLI 장애 | 선택한 제공자의 오류 반환 | Plan 자동 사용 없음 |
 
 - Fable을 별도로 차단하거나 크레딧 OFF 입력을 요구하지 않습니다. 모델 접근 권한과 추가 사용 크레딧은 Claude 앱·계정 설정에 따릅니다.
 - Anthropic용 유료 API 키로 자동 전환하는 경로는 없습니다. 다만 **계정에서 허용한 추가 사용 크레딧까지 라우터가 차단하는 것은 아닙니다.**
 - 외부 제공자에는 Plan OAuth·계정 헤더를 보내지 않고 제공자 전용 인증을 새로 구성합니다.
-- OpenRouter와 Local 사이를 자동으로 바꾸지 않습니다. Local 장애는 오류로 반환하고 OpenRouter·CLI 장애는 Plan Sonnet으로 fallback합니다. Opus·Haiku·Fable 및 외부 미지원 기능은 Local 세션에서도 Plan을 사용할 수 있습니다.
+- 제공자 장애 시 선택한 Local·OpenRouter·CLI를 다른 제공자나 Plan으로 자동 전환하지 않습니다. Opus·Haiku·Fable 및 외부 미지원 기능은 Plan을 사용할 수 있습니다.
 - 기존 MCP·플러그인·HUD·권한 설정을 사용합니다. 기존 서버의 인증 실패나 연결 장애를 자동으로 복구하는 기능은 아닙니다.
 
 ## 2. 준비와 설정 파일 위치
@@ -237,7 +237,7 @@ openrouter:
 
 `YOUR_OPENROUTER_API_KEY`를 본인의 실제 OpenRouter 키로 바꿉니다. `api_key`는 **라우터가 파일에서 읽는 항목**입니다. Claude Code의 전역 환경변수에 OpenRouter 키를 넣거나 Plan 로그인을 API 키 로그인으로 바꾸라는 뜻이 아닙니다. 키를 화면·로그·커밋에 공유하지 마세요.
 
-`model`에는 [OpenRouter 모델 목록](https://openrouter.ai/models)의 구체적인 모델 ID를 입력합니다. 기존에 키만 설정했다면 이 항목을 추가해야 합니다. 누락·빈 값·예제 플레이스홀더는 시작 오류로 종료하며 다른 모델이나 Plan으로 자동 대체하지 않습니다. 선택적인 `provider`에는 `open-inference/fp4` 같은 OpenRouter 상류 공급자 slug를 입력할 수 있습니다. 비워 두면 Auto로 OpenRouter가 공급자를 선택합니다. 지정하면 `only`로 제한하고 다른 OpenRouter 공급자로의 fallback을 허용하지 않습니다. 해당 공급자가 모델을 지원하지 않거나 사용할 수 없으면 실패할 수 있으며 기존 Claude Plan fallback 정책은 별개로 유지됩니다. 설정 화면에서 **OpenRouter 상류 공급자**를 비우면 Auto로 돌아갑니다. 새 세션 또는 takeover부터 적용되며, 모델 목록 확인만으로 특정 공급자의 사용 가능 여부를 증명하지 않습니다. 이 설정은 별도의 추론 옵션을 켜지 않습니다.
+`model`에는 [OpenRouter 모델 목록](https://openrouter.ai/models)의 구체적인 모델 ID를 입력합니다. 기존에 키만 설정했다면 이 항목을 추가해야 합니다. 누락·빈 값·예제 플레이스홀더는 시작 오류로 종료하며 다른 모델이나 Plan으로 자동 대체하지 않습니다. 선택적인 `provider`에는 `open-inference/fp4` 같은 OpenRouter 상류 공급자 slug를 입력할 수 있습니다. 비워 두면 Auto로 OpenRouter가 공급자를 선택합니다. 지정하면 `only`로 제한하고 다른 OpenRouter 공급자로의 fallback을 허용하지 않습니다. 해당 공급자가 모델을 지원하지 않거나 사용할 수 없으면 오류를 반환하며 Plan으로 전환하지 않습니다. 설정 화면에서 **OpenRouter 상류 공급자**를 비우면 Auto로 돌아갑니다. 새 세션 또는 takeover부터 적용되며, 모델 목록 확인만으로 특정 공급자의 사용 가능 여부를 증명하지 않습니다. 이 설정은 별도의 추론 옵션을 켜지 않습니다.
 
 모델 선택이 가능해도 모든 모델의 도구 호출과 네이티브 기능을 보장하지 않습니다. 선택 모델이 [Messages API](https://openrouter.ai/docs/api/api-reference/anthropic-messages/create-messages?explorer=true)와 필요한 도구 호출을 지원하는지 확인하세요. 응답의 모델 ID를 설정값과 정확히 비교하므로, 다른 ID로 응답하는 동적 별칭·프리셋은 실패할 수 있으며 미검증입니다. API 주소와 재시도 정책은 예제 파일에 고정값으로 구분했습니다.
 
@@ -326,7 +326,7 @@ Local 단독 일반 세션에서는 이 두 비활성화 스위치를 설정하�
 
 Claude Code 2.1.304 이상에서 `openclaude.config.yaml`의 같은 OpenRouter 키와 `openrouter.model`을 사용합니다. 주 모델·빠른 모델·하위 에이전트의 Claude 모델 선택을 모두 지정한 같은 OpenRouter 모델로 전달하며, Plan 로그인과 Plan fallback은 사용하지 않습니다. 기존 일반 실행과 Local 모드는 유지합니다.
 
-**일반 OpenRouter 세션도 옵션 없이 동작합니다.** `OpenClaude`(또는 `-Provider OpenRouter`)로 시작한 일반 세션은 실행기가 실험적 beta와 advisor 도구를 끄고 제공자의 안정 프로토콜로 시작하므로, 설정한 OpenRouter 모델로 라우팅됩니다. `-OpenRouterCompat`은 여기에 더해 **Plan 폴백까지 완전히 차단**할 때 사용합니다.
+**일반 OpenRouter 세션도 옵션 없이 동작합니다.** `OpenClaude`(또는 `-Provider OpenRouter`)로 시작한 일반 세션은 지원되는 요청을 설정한 OpenRouter 모델로 라우팅합니다. `-OpenRouterCompat`은 여기에 더해 **네이티브 예외의 Plan 전환도 차단**할 때 사용합니다.
 
 > 과거 `e075542`(CLI 백엔드 통합)에서 이 처리가 호환 모드에만 남도록 좁혀져 일반 OpenRouter 세션이 모든 요청을 Plan으로 보내는 회귀가 있었습니다. 기본 동작으로 복원했으며, 테스트가 다시 회귀하지 않도록 고정합니다.
 
@@ -338,7 +338,7 @@ LocalCompat과 같은 호환 처리로 플러그인·스킬·MCP·hooks·하위 
 
 모든 대화형 실행은 선택 제공자의 설정으로 최소 추론을 1회 점검한 뒤 결과를 출력합니다. 제한은 15초·출력 512토큰이며 OpenRouter 사용료가 발생할 수 있습니다. `connection_check`, `provider`, `inference_checked`, `model_confirmed`, `reply_confirmed`, `reason`과 필요한 HTTP `status`만 기록하고 주소·키·본문은 출력하지 않습니다.
 
-점검 실패도 CLI 진입을 계속합니다. 일반 Local 실행의 장애는 Plan으로 fallback하지 않지만 네이티브 기능과 Opus·Haiku·Fable은 Plan을 사용할 수 있습니다. `-LocalMode`·`-LocalCompat`·`-OpenRouterCompat`은 Plan을 차단합니다. 실패 시 `provider_connection_unavailable`의 `action`은 `continue`, `plan_fallback`은 해당 모드의 장애 fallback 정책을 표시합니다. 이후 요청에서 제공자 연결을 다시 시도할 수 있습니다. 설정 누락·잘못된 설정·CLI 실행 불가 같은 시작 오류는 별도로 종료합니다.
+점검 실패도 CLI 진입을 계속합니다. 일반 실행에서 제공자 장애는 Plan으로 fallback하지 않지만 네이티브 기능과 Opus·Haiku·Fable은 Plan을 사용할 수 있습니다. `-LocalMode`·`-LocalCompat`·`-OpenRouterCompat`은 Plan을 차단합니다. 실패 시 `provider_connection_unavailable`의 `action`은 `continue`, `plan_fallback`은 장애 fallback 정책을 표시합니다. 이후 요청에서 제공자 연결을 다시 시도할 수 있습니다. 설정 누락·잘못된 설정·CLI 실행 불가 같은 시작 오류는 별도로 종료합니다.
 
 `ready`는 모델 ID·정확한 점검 답변·정상 종료를 확인했다는 뜻입니다. `timeout`, `authentication_failed`, `http_error`, `connection_failed`는 접속 관련 실패이며, `reply_mismatch`, `incomplete_response`, `invalid_response`는 응답 검증 실패입니다. 특히 추론 모델이 512토큰을 소진하거나 다른 문구로 답하면 연결돼 있어도 점검은 실패할 수 있습니다. 이 점검이 전체 CLI 기능 호환성을 보증하지는 않습니다. 별도 `-CheckLocal`·`-DiagnoseLocal`의 진단 후 종료 동작은 유지합니다.
 
@@ -446,8 +446,9 @@ Both OpenRouter and Local settings are configured. Choose one explicitly:
 `openclaude.config.yaml`에 `routing: dual_provider: true`를 넣고 **두 서비스가 모두 설정돼 있으면**, 일반 세션이 Claude Code의 `/model` 목록에 다른 쪽 서비스를 항목 하나로 더 보여 줍니다(모델 id `claude-route-local` 또는 `claude-route-openrouter`, 예: `Local (qwen3-coder:latest)`).
 
 - 세션의 기본 provider(`-Provider`로 고른 쪽)는 그대로 기본값입니다. `/model`에서 다른 항목을 고른 **그 요청만** 다른 provider로 갑니다.
-- 네이티브 기능은 Plan(구독)으로 갑니다. Local 장애는 Plan으로 fallback하지 않고 OpenRouter 장애는 기존 fallback을 유지합니다. 다른 provider의 실패는 **그 provider의 서킷 브레이커**만 열고, 한쪽이 죽어도 다른 쪽 요청에는 영향이 없습니다.
+- 네이티브 기능은 Plan(구독)으로 갈 수 있습니다. Local·OpenRouter 장애는 Plan으로 fallback하지 않습니다. 실패는 **그 provider의 서킷 브레이커**만 열고, 한쪽이 죽어도 다른 쪽 요청에는 영향이 없습니다.
 - 다른 provider의 자격증명은 **프록시 프로세스에만** 전달되고 CLI 환경변수에는 절대 들어가지 않습니다. 라우팅 로그의 `route_selected`/`circuit_open`은 어느 provider로 갔는지 `provider` 필드로 알려 줍니다.
+- 대체 Local에도 일반 Local의 MCP·인라인 도구 호환 변환을 적용합니다. OpenRouter는 검증 가능한 인라인 도구 선언만 변환해 전송하며, 변환할 수 없는 네이티브 요청은 기존처럼 Plan을 사용할 수 있습니다.
 - `-LocalMode`·`-LocalCompat`·`-OpenRouterCompat` 같은 특수 모드는 요청을 재작성하고 Plan fallback을 끄므로 이 기능을 무시합니다(항목도 만들지 않습니다).
 - `/model` 항목은 세션 시작 시 환경변수(`ANTHROPIC_CUSTOM_MODEL_OPTION*`)로 주입되므로, 옵션을 바꾸면 세션을 다시 시작해야 보입니다. 항목 표시는 CLI 버전에 좌우되고(2.1.310에서 훅 확인), 프록시의 모델 id → provider 디스패치는 단위 테스트로 검증됩니다.
 - `-Takeover`로 세션을 넘길 때는 인수인계 기록에 이 구성(provider·별칭·모델 id, 자격증명 없음)이 함께 저장되고, 새 프록시가 같은 별칭을 계속 받아들일 수 없는 설정(기능 해제·대체 서비스 변경·provider 전환)이라면 드레인 전에 실행을 거부합니다. 실행 중인 CLI의 항목이 갑자기 403이 되는 일을 막기 위함이며, 대체 서비스 자격증명은 항상 현재 설정에서 다시 읽습니다.
@@ -527,20 +528,20 @@ Local 응답은 JSON으로 받아 설정한 모델을 검증한 뒤 CLI용 SSE�
 
 ## 5. 재시도·fallback·복구 원리
 
-아래 흐름의 Plan fallback은 OpenRouter·CLI에 적용됩니다. **Local은 같은 재시도·복구 절차를 사용하되 장애·대기열 초과 시 Plan 호출 대신 오류를 반환합니다.** Opus·Haiku·Fable과 Local이 처리하지 못하는 네이티브 요청은 여전히 Plan을 사용합니다.
+**Local·OpenRouter·CLI 장애와 대기열 초과는 Plan 호출 대신 오류를 반환합니다.** Opus·Haiku·Fable과 선택된 제공자가 처리하지 못하는 네이티브 요청은 여전히 Plan을 사용할 수 있습니다.
 
 ```text
 호환 Sonnet 요청
   → HTTP 제공자 최초 시도 + 재시도 3회 = 최대 4회 (CLI 백엔드는 1회)
-  → 401·402·403은 재시도 없이 Plan + 제공자 복구 대기; 400·404·405·413·415·422는 재시도 없이 해당 요청만 Plan(회로 대기 없음)
+  → 401·402·403은 재시도 없이 오류 + 제공자 복구 대기; 400·404·405·413·415·422는 재시도 없이 요청 오류(회로 대기 없음)
   → 408·429는 별도 일시 오류·제한 정책을 따름
-  → 외부로 보내는 요청에서 `metadata`(계정·세션 식별자)와 이전 응답의 서명된 thinking 블록은 제거, 일반 모드에서는 thinking을 요청하지 않음(외부 응답에 thinking이 오면 Local은 오류, OpenRouter는 Plan)
+  → 외부로 보내는 요청에서 `metadata`(계정·세션 식별자)와 이전 응답의 서명된 thinking 블록은 제거, 일반 모드에서는 thinking을 요청하지 않음(외부 응답에 thinking이 오면 오류)
   → Plan 전달은 스트림 요청의 헤더 120초·청크 간 무응답 300초를 넘기면 끊음, 요청 본문 상한은 32MiB
-  → 모두 실패하면 원본 Plan Sonnet으로 1회 전달
-  → 이후 30초 동안 들어오는 요청은 Plan로 전달
+  → 모두 실패하면 선택한 제공자의 오류 반환
+  → 이후 30초 동안 들어오는 요청도 복구 대기 오류 반환
   → 30초 후 호환되는 실제 요청 1개로 외부 복구 확인
       ├─ 성공: 외부 모델 사용 재개
-      └─ 실패: Plan fallback 및 대기 기간 재시작
+      └─ 실패: 오류 반환 및 대기 기간 재시작
 ```
 
 - CLI 백엔드는 위 CLI 절의 단일 시도·설정된 시간 제한을 사용합니다. HTTP 제공자의 일반 모드 외부 시도는 **무응답 30초**(헤더 대기·청크 간 간격)를 넘기면 실패하고, 응답이 계속 오는 동안은 최대 300초까지 기다립니다. Local 전용·compat 모드는 기존의 고정 총 시간 제한을 유지합니다. Plan 응답 시간이나 CLI 자체 재시도는 여기에 추가될 수 있습니다.
@@ -559,9 +560,10 @@ Local 응답은 JSON으로 받아 설정한 모델을 검증한 뒤 CLI용 SSE�
 
 - **회로 차단은 실패 원인을 구분합니다.** 전송 실패·타임아웃·5xx·408·검증 불가한 2xx는 제공자 장애로 보고 회로를 열며, 401·402·403은 제공자 설정 문제로 기존처럼 쿨다운합니다. 반면 429는 제공자가 알려준 `Retry-After`(최대 10분)을 쿨다운으로 사용하고, **요청 자체가 잘못된 4xx는 회로를 열지 않습니다**. half-open 복구 확인은 동시에 하나만 허용되며, 늦게 도착한 이전 시도의 성공·실패는 새 세대의 회로 상태를 덮어쓰지 않습니다.
 - 클라이언트가 요청 본문을 보내다 멈추면 **유휴 기준 타임아웃(기본 30초, `ROUTE_REQUEST_IDLE_TIMEOUT_MS`)** 후 연결을 끊고 점유한 턴을 반납합니다. 느리지만 계속 보내는 큰 업로드는 끊지 않습니다. 연결이 끊긴 요청은 업스트림 읽기·타이머를 정리하고 재시도하지 않습니다.
-- 대기 기간이 지나도 백그라운드 진단 요청은 보내지 않습니다. 다음 호환 요청으로 복구를 확인하는 동안 Local의 다른 요청은 오류를 반환하고, OpenRouter의 다른 요청은 Plan으로 보냅니다.
+- 대기 기간이 지나도 백그라운드 진단 요청은 보내지 않습니다. 다음 호환 요청으로 복구를 확인하는 동안 다른 요청은 오류를 반환합니다.
 - Plan 요청까지 실패하면 그 오류를 전달합니다. 다른 API 키·제공자로 연쇄 전환하거나 무한 반복하지 않습니다. CLI 자체의 재시도 표시는 라우터 내부의 재시도 횟수와 다를 수 있습니다.
 - 외부 응답은 완결성·실제 응답 모델·도구 JSON 등을 검증한 뒤 전달합니다. 외부 스트리밍 응답도 최대 32MiB까지 버퍼링하므로 첫 표시가 늦어질 수 있습니다. 실패한 부분 텍스트나 도구 호출을 전달한 뒤 중간에 Plan 응답을 이어 붙이지 않습니다.
+- `tool_use` 종료에 도구 호출이 없거나 `end_turn`에 도구 호출이 있으면 잘못된 응답으로 처리합니다. `max_tokens` 등 출력이 잘린 경우는 별도 종료 사유를 보존합니다. OpenRouter 사용량은 음수가 아닌 안전한 정수로 검증합니다.
 - 요청을 취소하면 재시도와 fallback도 중단합니다. 재시도된 외부 추론은 별도 사용량이 발생할 수 있습니다.
 - **Plan으로 보낼 때 도구 호출 id를 계약에 맞춥니다.** 외부 제공자가 만든 `Bash:0#abc` 같은 id는 Anthropic의 `^[a-zA-Z0-9_-]{1,64}$` 규칙을 벗어나 Plan 경로에서 400을 유발할 수 있습니다. 프록시는 Plan 전달 직전에 해당 id만 요청 단위로 재할당하고 `tool_use`↔`tool_result` 쌍을 유지하며, 이미 규칙에 맞는 id는 **바이트 그대로** 둡니다(프롬프트 캐시 보존). 외부 경로는 건드리지 않고, 빈 id는 업스트림 호출 없이 로컬 400으로 거부합니다.
 - Plan 전용 모델·토큰 수 계산처럼 외부가 표현할 수 없는 요청은 **처음부터 Plan로 우회**합니다. 라우팅 세션이 실험 beta를 끄므로 CLI는 advisor·inline 도구 요청을 만들지 않습니다. `system` 역할 컨텍스트 메시지(text 블록 포함)와 CLI가 상시 보내는 `interleaved-thinking-2025-05-14`·`effort-2025-11-24`·`context-1m-2025-08-07` beta는 모든 모드에서 허용합니다. 제공자가 붙인 `citations`는 응답에 포함되어 다음 요청 이력으로 다시 전송되므로 입력에서도 허용합니다. 이전 응답의 서명된 thinking 블록은 외부 사본에서만 제거하므로, 한 번 Plan으로 우회한 뒤에도 다음 요청은 다시 외부로 갈 수 있습니다. 이 우회는 외부 장애나 복구 성공으로 세지 않습니다.
@@ -579,7 +581,7 @@ Local 응답은 JSON으로 받아 설정한 모델을 검증한 뒤 CLI용 SSE�
 
 ## 5-1. 첫 토큰 지연 줄이기 (선택)
 
-기본 동작은 **응답 전체를 검증한 뒤** 한 번에 보내므로, 스트리밍 응답도 생성이 끝나야 화면에 나타납니다. 실패 시 Local은 오류를 반환하고 OpenRouter는 Plan으로 fallback할 수 있습니다.
+기본 동작은 **응답 전체를 검증한 뒤** 한 번에 보내므로, 스트리밍 응답도 생성이 끝나야 화면에 나타납니다. 제공자 실패 시 Plan으로 전환하지 않고 오류를 반환합니다.
 
 ```powershell
 .\OpenClaude.ps1 -Stream        # 프레임이 검증되는 즉시 전달 (TTFB 단축)
@@ -587,7 +589,7 @@ Local 응답은 JSON으로 받아 설정한 모델을 검증한 뒤 CLI용 SSE�
 
 | 모드 | 첫 토큰(TTFB) | 실패 시 동작 |
 | --- | --- | --- |
-| 기본(버퍼링) | 응답 완료 시점 (측정 782ms / 782ms) | 재시도 후 Local 오류 또는 OpenRouter Plan fallback |
+| 기본(버퍼링) | 응답 완료 시점 (측정 782ms / 782ms) | 재시도 후 선택한 제공자의 오류 반환 |
 | `-Stream`(옵트인) | 첫 유효 콘텐츠 즉시 (측정 **339ms** / 완료 772ms) | 첫 토큰 전에는 같은 정책, **이미 보낸 뒤면** 스트림을 오류로 종료 |
 
 - 전달은 **첫 유효 콘텐츠가 검증된 뒤** 시작합니다. 빈 응답·thinking 전용·깨진 도구 JSON도 같은 제공자별 실패 정책을 따릅니다.
@@ -612,8 +614,7 @@ Sonnet 선택과 HUD의 모델·비용 표시는 실제 외부 라우팅이나 �
 | --- | --- |
 | `route_selected` + `openrouter` 또는 `local` + `replacement` | 외부 응답 검증을 통과한 대체 경로 |
 | `route_selected` + `plan` + `native_feature` | 기존 기능·이력 등을 보존하기 위한 Plan 경로 |
-| `route_selected` + `plan` + `fallback` | 외부 시도 실패 후 Plan 경로 |
-| `route_selected` + `plan` + `circuit_open` | 외부 대기 기간 또는 복구 확인 중 Plan 경로 |
+| `route_selected` + `plan` + `fallback` 또는 `circuit_open` | 이전 버전에서 발생한 장애 우회 기록 |
 | `external_attempt_failed` | 외부 시도 실패; 시도 번호·상태·오류 분류 확인 |
 | `circuit_open` / `circuit_recovered` | 외부 장애 대기 시작 / 외부 복구 확인 |
 
@@ -656,7 +657,7 @@ Sonnet 선택과 HUD의 모델·비용 표시는 실제 외부 라우팅이나 �
 | 기본 서비스 미설정 | routing 기본값이 가리키는 서비스의 필수 값이 비었거나 설정을 읽지 못함 | 빨간 배너 + 탭 제목 `⛔`, 설정/재실행 명령 안내 |
 | 실행 서비스 선택 필요 | 설정된 서비스가 2개 이상인데 기본값이 `auto` | 배너 + 탭 제목 `⚠` |
 | 세션 서비스·CLI 설정 불일치 | 실행 중 세션 provider 또는 CLI 종류·모델이 저장값과 다름 | 배너 + `.\OpenClaude.ps1` 명령 복사 |
-| Plan 전용 기능으로 우회 중 | 외부 서비스가 설정됐는데 이 세션의 외부 시도가 0이고 모든 결정이 `native_feature` Plan | 배너 + `.\OpenClaude.ps1` 재시작 안내(기본 OpenRouter 세션은 실험 beta를 끄고 외부로 라우팅). Plan 폴백까지 끄려면 `-OpenRouterCompat` |
+| Plan 전용 기능으로 우회 중 | 외부 서비스가 설정됐는데 이 세션의 외부 시도가 0이고 모든 결정이 `native_feature` Plan | 배너와 네이티브 우회 사유 확인. 네이티브 예외까지 차단하려면 `-OpenRouterCompat` |
 | 연결 끊김 | `/api/snapshot` 요청 실패 | 1·2·4·8·16초 지수 백오프로 재시도하고 복구 시 토스트 |
 | 탭 제목 배지 | 경고/심각 항목 존재 | `⛔ n · …` 또는 `⚠ n · …` |
 | 데스크톱 알림 | 위 항목이 새로 발생 | **알림** 버튼으로 허용한 경우에만, 같은 원인은 1회 알림(해소 후 재발하면 다시 알림) |
@@ -914,7 +915,7 @@ curl.exe --fail --silent http://127.0.0.1:8787/api/diagnostics
 | `status` | `ok`, `degraded`, `error`; 진단 요청 성공 여부와 별개인 구성요소 상태 |
 | `checks[]` | `component`, `status`, 기계 판독용 `code`, 권장 조치 코드 `action` |
 | `configuration` | 저장된 기본값, 다음 실행 서비스, 설정된 모델, 서비스별 설정 완성 여부 |
-| `session` | 인증된 프록시의 존재와 실제 로드된 기본 모델, 대체 제공자, Plan fallback 정책 |
+| `session` | 인증된 프록시의 존재와 실제 로드된 기본 모델, 대체 제공자, 장애 시 Plan fallback 정책. 네이티브 예외는 별도 |
 | `last_route` | 최근 요청의 모델·시각·현재 세션 여부와 확인 가능한 fallback 오류 분류 (`fallback_failure`) |
 | `capabilities` | 자동 기능 검사는 하지 않아 도구·이미지·thinking·스트리밍·문맥 한도는 `unknown`. `tool_roundtrip_evidence`는 이 대시보드의 명시적 백엔드 검사 결과만 표시 |
 | `metrics` | 현재 프록시의 요청·실패·재시도·회로 개방 누적 수; 과거 파일을 현재 수치로 사용하지 않음 |
@@ -1067,7 +1068,7 @@ node --test tests/simulation.test.mjs                     # 위 시뮬레이터 
 | 장기 세션 | 120턴·247KB 이력 3.1ms (최적화 전 3.9ms) |
 | 본문 크기 | 1MB 7.7–8.9ms (약 120MB/s) · 새 프로세스 하네스 1MB 8.4–9.8ms |
 | 재시도 비용 | 1MB + 재시도 1회 10.7ms → 12.8ms(수정 전), 4회 실패 9.8ms → 12.1ms (약 17–19%↓) |
-| 회로 | 측정 당시: 실패 4회 → Plan fallback, 쿨다운 중 Plan, 복구 후 외부 복귀. 현재 Local은 실패를 반환 |
+| 회로 | 측정 당시: 실패 4회 → Plan fallback, 쿨다운 중 Plan, 복구 후 외부 복귀. 현재 제공자 장애는 오류를 반환 |
 | 장시간 소크 | 150,000요청 266MB · **1,200,000요청에서 RSS 1.09GB**(V8 힙 확장, 256MB 상한에서 통과 → 누수 아님) |
 | 세션 집계 캐시 | 재시작 시 콜드 스캔 **1,119ms → 20ms**(실데이터 357파일·464MB). `.usage-cache.json`(v5)에 파일별 집계·**크기·mtime·앞/뒤 4KB sha256 지문**·턴 소유권 원장을 저장해, 같은 크기로 덮어쓴 파일도 재스캔하고 바뀌지 않은 파일은 읽지 않습니다 |
 | 페이지 전송 | 39.3KB → **12.0KB**(gzip, `Accept-Encoding` 협상). 루프백 렌더 2.7ms/요청 |

@@ -196,15 +196,15 @@ const bypass = await send(phase2.base, 'simple', 0, `${BETA},future-native-2099-
 check(bypass.text.includes('"sim_upstream":"plan"'), 'unknown beta should reach Plan');
 const circuit = [];
 for (let i = 0; i < 3; i++) circuit.push(await send(phase2.base, 'circuit', i));
-check(circuit[0].status === 200 && circuit[0].text.includes('"sim_upstream":"plan"'),
-  'first failure should fall back to Plan');
-check(circuit[1].text.includes('"sim_upstream":"plan"'), 'cooldown should use Plan');
+check(circuit[0].status === 503 && !circuit[0].text.includes('"sim_upstream":"plan"'),
+  'provider failure must not fall back to Plan');
+check(circuit[1].status === 503 && !circuit[1].text.includes('"sim_upstream":"plan"'), 'cooldown must not use Plan');
 phase2.server.closeAllConnections();
 phase2.server.close();
 const replacementRoutes = routeLogs.filter(entry => entry.provider === 'openrouter').length;
 const planRoutes = routeLogs.filter(entry => entry.provider === 'plan').length;
 check(replacementRoutes >= results.length, `expected ${results.length} replacement routes, saw ${replacementRoutes}`);
-check(planRoutes >= 2, `expected Plan routes for bypass and cooldown, saw ${planRoutes}`);
+check(planRoutes >= 1, `expected a Plan route for the native bypass, saw ${planRoutes}`);
 
 // ---------- phase 3: long session with a growing transcript ----------
 const sessionProxy = await startProxy();

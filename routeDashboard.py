@@ -5922,16 +5922,16 @@ def proactive_alerts(providers, session, metrics, routing_values=None, cli_value
     # routing fault; native-only features keep such requests on Plan by design.
     routes = (metrics or {}).get("routes") if isinstance(metrics, dict) else None
     reasons = (metrics or {}).get("reasons") if isinstance(metrics, dict) else None
-    if session and session.get("provider") in ("openrouter", "local") and isinstance(routes, dict):
+    if session and session.get("provider") in ("openrouter", "local", "cli") and isinstance(routes, dict):
         plan_routes = routes.get("plan") if type(routes.get("plan")) is int else 0
         external_routes = routes.get("external") if type(routes.get("external")) is int else 0
         native = reasons.get("native_feature") if isinstance(reasons, dict) and type(reasons.get("native_feature")) is int else 0
         if plan_routes >= 5 and external_routes == 0 and native >= plan_routes:
             add("warn", "Plan 전용 기능으로 우회 중",
                 f"이 세션에서 외부 시도 없이 {plan_routes}건이 모두 Plan으로 처리됐습니다. "
-                "구버전 실행기로 시작한 세션이거나 실험적 beta·고급 도구 기능이 켜져 있으면 일반 모드에서는 OpenRouter로 보내지 않고 Plan을 유지합니다. "
-                "실행기를 재시작하면 기본 OpenRouter 세션이 실험 beta를 끄고 외부로 라우팅합니다(Plan 폴백까지 끄려면 -OpenRouterCompat).",
-                "session_plan_only", ".\\OpenClaude.ps1")
+                "요청 모델과 native_feature 세부 사유를 확인하세요. Opus·Haiku·Fable과 미지원 네이티브 요청은 Plan을 사용할 수 있습니다. "
+                "Local·OpenRouter 호환 모드는 네이티브 예외의 Plan 전환도 차단합니다.",
+                "session_plan_only")
     process_health = (metrics or {}).get("process") if isinstance(metrics, dict) else None
     if session and isinstance(process_health, dict):
         lag = process_health.get("eventLoopLagMs")

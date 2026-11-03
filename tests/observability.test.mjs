@@ -67,7 +67,7 @@ test('one turn tags every diagnostic line and metrics.last with the same traceId
         return new Response('upstream down', { status: 500 });
       } });
     const response = await proxy.send();
-    assert.equal(response.status, 200);
+    assert.equal(response.status, 503);
     await response.text();
     const entries = logs.entries();
     const attempts = entries.filter(entry => entry.event === 'external_attempt_failed');
@@ -77,14 +77,15 @@ test('one turn tags every diagnostic line and metrics.last with the same traceId
     assert.equal(attempts[0].attempt, 1);
     assert.equal(attempts[0].category, 'upstream');
     assert.ok(entries.some(entry => entry.event === 'circuit_open'));
-    assert.ok(entries.some(entry => entry.event === 'route_selected' && entry.provider === 'plan'));
+    assert.ok(entries.some(entry => entry.event === 'openrouter_mode_rejected'));
+    assert.equal(entries.some(entry => entry.event === 'route_selected' && entry.provider === 'plan'), false);
     const traceIds = new Set(entries.map(entry => entry.traceId));
     assert.equal(traceIds.size, 1, 'every line of one turn shares one traceId');
     const [traceId] = traceIds;
     assert.match(traceId, TRACE_ID);
     const payload = await proxy.metrics();
     assert.equal(payload.last.traceId, traceId, 'metrics.last carries the turn traceId');
-    assert.equal(payload.last.status, 200);
+    assert.equal(payload.last.status, 503);
   });
 
 test('a successful replacement turn logs its traceId and exposes it in metrics.last',
@@ -193,7 +194,7 @@ test('a credential in an upstream error body is redacted in the client body and 
         if (url === PLAN) return new Response(upstreamBody, { status: 429, headers: { 'content-type': 'application/json' } });
         return new Response('external failed', { status: 500 });
       } });
-    const response = await proxy.send();
+    const response = await proxy.send({ model: 'claude-opus-5-5' });
     assert.equal(response.status, 429, 'the Plan status is preserved');
     const clientBody = await response.text();
     for (const secret of [bearerSecret, bodySecret, CONFIGURED_KEY])
@@ -225,7 +226,7 @@ test('already-clean and already-tagged error text is relayed without double mask
         if (url === PLAN) return new Response(clean, { status: 429, headers: { 'content-type': 'application/json' } });
         return new Response('external failed', { status: 500 });
       } });
-    const response = await proxy.send();
+    const response = await proxy.send({ model: 'claude-opus-5-5' });
     assert.equal(response.status, 429);
     const text = await response.text();
     assert.equal(text, clean, 'clean, pre-tagged text is relayed byte-identically');
@@ -245,7 +246,7 @@ test('mixed secret and pre-tagged text keeps a single stable tag per value',
           { status: 400, headers: { 'content-type': 'text/plain' } });
         return new Response('external failed', { status: 500 });
       } });
-    const response = await proxy.send();
+    const response = await proxy.send({ model: 'claude-opus-5-5' });
     assert.equal(response.status, 400);
     const text = await response.text();
     assert.equal((text.match(/\[redacted:bearer-token\]/g) || []).length, 1);
@@ -265,7 +266,7 @@ test('an upstream error is logged as size metadata, never as a raw excerpt',
           { status: 429, headers: { 'content-type': 'application/json' } });
         return new Response('external failed', { status: 500 });
       } });
-    const response = await proxy.send();
+    const response = await proxy.send({ model: 'claude-opus-5-5' });
     assert.equal(response.status, 429);
     await response.text();
     // The body is scrubbed for the client but only its size reaches the log.
@@ -290,7 +291,7 @@ test('an oversized upstream error body is truncated and cancelled, never buffere
         if (url === PLAN) return new Response(upstreamBody, { status: 500, headers: { 'content-type': 'text/plain' } });
         return new Response('external failed', { status: 500 });
       } });
-    const response = await proxy.send();
+    const response = await proxy.send({ model: 'claude-opus-5-5' });
     assert.equal(response.status, 500);
     const text = await response.text();
     assert.equal(text.length, limit, 'only the bounded prefix is relayed');

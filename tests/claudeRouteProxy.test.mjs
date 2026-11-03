@@ -532,13 +532,123 @@ const complete = model => frame('message_start', { message: { ...META, model } }
   frame('content_block_stop', { index: 0 }) + frame('message_delta') + frame('message_stop');
 const native = (url, options) => url.startsWith('https://api.anthropic.com') ? jsonResponse(url, options) : null;
 
-test('upstream provider pins ordinary OpenRouter attempts without affecting Plan', async t => {
+for (const provider of ['local', 'openrouter', 'cli']) {
+  test(`${provider} accepts a tool argument containing a thinking type as ordinary data`, async t => {
+    const config = provider === 'local' ? { provider, localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-local' } :
+      provider === 'cli' ? { provider, cliKind: 'codex', localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'cli/codex' } : {};
+    const tool = { type: 'tool_use', id: 'fixture-call', name: 'Read', input: { type: 'thinking', text: 'data' } };
+    const { calls, request } = await fixture(t, (_url, options) => Response.json({ ...META, type: 'message',
+      model: JSON.parse(options.body).model, content: [tool], stop_reason: 'tool_use' }), config);
+    const response = await request(requestBody(SONNET, { tools: [{ name: 'Read', input_schema: { type: 'object' } }] }), { headers: proHeaders });
+    assert.equal(response.status, 200);
+    assert.deepEqual((await response.json()).content, [tool]);
+    assert.equal(calls.length, 1);
+    assert.notEqual(calls[0].url, proURL);
+  });
+}
+
+for (const provider of ['local', 'openrouter', 'cli']) {
+  test(`${provider} rejects a completed JSON response with an unacknowledged tool call`, async t => {
+    const config = provider === 'local' ? { provider, localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-local' } :
+      provider === 'cli' ? { provider, cliKind: 'codex', localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'cli/codex' } : {};
+    const tool = { type: 'tool_use', id: 'fixture-call', name: 'Read', input: {} };
+    const { calls, request } = await fixture(t, (_url, options) => Response.json({ ...META, type: 'message',
+      model: JSON.parse(options.body).model, content: [tool], stop_reason: 'end_turn' }), config);
+    const response = await request(requestBody(SONNET), { headers: proHeaders });
+    assert.equal(response.status, 503);
+    assert.ok(calls.every(call => call.url !== proURL));
+  });
+}
+
+test('output-limit responses with a tool block retain their truncation stop reason', async t => {
+  const tool = { type: 'tool_use', id: 'fixture-call', name: 'Read', input: {} };
+  const { calls, request } = await fixture(t, (_url, options) => Response.json({ ...META, type: 'message',
+    model: JSON.parse(options.body).model, content: [tool], stop_reason: 'max_tokens' }));
+  const response = await request(requestBody(SONNET), { headers: proHeaders });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).stop_reason, 'max_tokens');
+  assert.equal(calls.length, 1);
+});
+
+for (const provider of ['local', 'openrouter']) {
+  test(`${provider} accepts a thinking type inside an SSE tool input`, async t => {
+    const config = provider === 'local' ? { provider, localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-local' } : {};
+    const { calls, request } = await fixture(t, (_url, options) => {
+      const model = JSON.parse(options.body).model;
+      return sseResponse([frame('message_start', { message: { ...META, model } }) +
+        frame('content_block_start', { index: 0, content_block: { type: 'tool_use', id: 'fixture-call', name: 'Read', input: { type: 'thinking' } } }) +
+        frame('content_block_stop', { index: 0 }) + frame('message_delta', { delta: { stop_reason: 'tool_use' } }) + frame('message_stop')]);
+    }, config);
+    const response = await request(requestBody(SONNET, { stream: true }), { headers: proHeaders });
+    assert.equal(response.status, 200);
+    assert.match(await response.text(), /fixture-call/);
+    assert.equal(calls.length, 1);
+    assert.notEqual(calls[0].url, proURL);
+  });
+}
+
+test('OpenRouter rejects fractional token usage in a completed SSE message', async t => {
+  const { calls, request } = await fixture(t, (_url, options) => {
+    const model = JSON.parse(options.body).model;
+    return sseResponse([frame('message_start', { message: { ...META, model } }) +
+      frame('content_block_start', { index: 0, content_block: { type: 'text', text: 'done' } }) +
+      frame('content_block_stop', { index: 0 }) +
+      frame('message_delta', { delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1.5 } }) + frame('message_stop')]);
+  });
+  const response = await request(requestBody(SONNET, { stream: true }), { headers: proHeaders });
+  assert.equal(response.status, 503);
+  assert.ok(calls.every(call => call.url === externalURL));
+});
+
+for (const provider of ['local', 'openrouter', 'cli']) {
+  test(`${provider} rejects a JSON tool-use stop without a tool call`, async t => {
+    const config = provider === 'local' ? { provider, localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-local' } :
+      provider === 'cli' ? { provider, cliKind: 'codex', localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'cli/codex' } : {};
+    const { calls, request } = await fixture(t, (_url, options) => Response.json({ ...META, type: 'message',
+      model: JSON.parse(options.body).model, content: [{ type: 'text', text: 'done' }], stop_reason: 'tool_use' }), config);
+    const response = await request(requestBody(SONNET), { headers: proHeaders });
+    assert.equal(response.status, 503);
+    assert.ok(calls.every(call => call.url !== proURL));
+  });
+}
+
+for (const provider of ['local', 'openrouter']) {
+  test(`${provider} rejects an SSE tool-use stop without a tool call`, async t => {
+    const config = provider === 'local' ? { provider, localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-local' } : {};
+    const { calls, request } = await fixture(t, (_url, options) => {
+      const model = JSON.parse(options.body).model;
+      return sseResponse([frame('message_start', { message: { ...META, model } }) +
+        frame('content_block_start', { index: 0, content_block: { type: 'text', text: 'done' } }) +
+        frame('content_block_stop', { index: 0 }) + frame('message_delta', { delta: { stop_reason: 'tool_use' } }) + frame('message_stop')]);
+    }, config);
+    const response = await request(requestBody(SONNET, { stream: true }), { headers: proHeaders });
+    assert.equal(response.status, 503);
+    assert.ok(calls.every(call => call.url !== proURL));
+  });
+}
+
+for (const provider of ['local', 'openrouter']) {
+  test(`${provider} rejects a completed SSE response with an unacknowledged tool call`, async t => {
+    const config = provider === 'local' ? { provider, localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-local' } : {};
+    const { calls, request } = await fixture(t, (_url, options) => {
+      const model = JSON.parse(options.body).model;
+      return sseResponse([frame('message_start', { message: { ...META, model } }) +
+        frame('content_block_start', { index: 0, content_block: { type: 'tool_use', id: 'fixture-call', name: 'Read', input: {} } }) +
+        frame('content_block_stop', { index: 0 }) + frame('message_delta', { delta: { stop_reason: 'end_turn' } }) + frame('message_stop')]);
+    }, config);
+    const response = await request(requestBody(SONNET, { stream: true }), { headers: proHeaders });
+    assert.equal(response.status, 503);
+    assert.ok(calls.every(call => call.url !== proURL));
+  });
+}
+
+test('upstream provider pins ordinary OpenRouter attempts without Plan fallback', async t => {
   const { calls, request } = await fixture(t, (url, options) => native(url, options) || new Response('failure', { status: 500 }),
     { openrouterUpstreamProvider: 'open-inference/fp4' });
-  assert.equal((await request(requestBody(SONNET), { headers: proHeaders })).status, 200);
-  assert.equal(calls.length, 5);
+  assert.equal((await request(requestBody(SONNET), { headers: proHeaders })).status, 503);
+  assert.equal(calls.length, 4);
   for (const call of calls.slice(0, 4)) assert.deepEqual(call.parsedBody.provider, { only: ['open-inference/fp4'], allow_fallbacks: false });
-  assert.equal(calls.at(-1).parsedBody.provider, undefined);
+  assert.ok(calls.every(call => call.url === externalURL));
 });
 
 test('alternate OpenRouter applies the same upstream pin while Local does not', async t => {
@@ -581,22 +691,21 @@ for (const openrouterModel of [undefined, '', ' ', 'YOUR_MODEL', 'REPLACE_WITH_O
     assert.throws(() => createProxy({ key: KEY, nonce: NONCE, openrouterModel }), /OpenRouter model required/);
   });
 }
-test('configured OpenRouter model failures rewrite direct model aliases to Plan Sonnet', async t => {
+test('configured OpenRouter model failures never forward direct aliases to Plan', async t => {
   const model = 'vendor-a/model-a';
   const { calls, request } = await fixture(t, (url, options) => native(url, options) || new Response('fixture-failure', { status: 500 }), { openrouterModel: model });
-  assert.equal((await request(requestBody(model), { headers: proHeaders })).status, 200);
-  assert.equal(calls.length, 5);
-  assert.equal(calls.at(-1).url, proURL);
-  assert.equal(calls.at(-1).parsedBody.model, 'claude-sonnet-5-5');
+  assert.equal((await request(requestBody(model), { headers: proHeaders })).status, 503);
+  assert.equal(calls.length, 4);
+  assert.ok(calls.every(call => call.url === externalURL));
 });
 test('response model mismatch uses configured identity rather than accepting the former fixed model', async t => {
   const model = 'vendor-a/model-a';
   const { calls, request } = await fixture(t, (url, options) => native(url, options) || Response.json({
     type: 'message', model: DEEPSEEK, content: [{ type: 'text', text: 'fixture' }], stop_reason: 'end_turn' }), { openrouterModel: model });
-  assert.equal((await request(requestBody(SONNET), { headers: proHeaders })).status, 200);
-  assert.equal(calls.length, 5);
+  assert.equal((await request(requestBody(SONNET), { headers: proHeaders })).status, 503);
+  assert.equal(calls.length, 4);
   assert.ok(calls.slice(0, 4).every(call => call.parsedBody.model === model));
-  assert.equal(calls.at(-1).parsedBody.model, SONNET);
+  assert.ok(calls.every(call => call.url === externalURL));
 });
 
 for (const [label, content] of [
@@ -609,7 +718,7 @@ for (const [label, content] of [
   ['whitespace tool name', [{ type: 'tool_use', id: 'fixture-tool', name: ' ', input: {} }]],
 ]) {
   for (const format of ['json', 'sse']) {
-    test(`external ${format} ${label} rejects invalid output then forwards Pro unchanged`, async t => {
+    test(`external ${format} ${label} rejects invalid output without Plan`, async t => {
       const { calls, request } = await fixture(t, url => url === proURL
         ? new Response('native result', { status: 429, headers: { 'retry-after': '60' } })
         : format === 'json'
@@ -617,23 +726,19 @@ for (const [label, content] of [
           : sseResponse([contentStream(content)]));
       const original = requestBody(SONNET, { stream: format === 'sse' });
       const response = await request(original, { headers: proHeaders });
-      assert.equal(response.status, 429);
-      assert.equal(response.headers.get('retry-after'), '60');
-      assert.equal(await response.text(), 'native result');
+      assert.equal(response.status, 503);
+      assert.doesNotMatch(await response.text(), /native result/);
       // Ordinary SSE reasoning is now rejected at the first forbidden frame;
       // the existing request-rejection policy avoids repeating that unsupported response.
       const attempts = format === 'sse' && label.includes('thinking only') ? 1 : 4;
-      assert.equal(calls.length, attempts + 1);
-      assert.ok(calls.slice(0, attempts).every(call => call.url === externalURL));
-      assert.equal(calls.at(-1).url, proURL);
-      assert.deepEqual(calls.at(-1).parsedBody, original);
-      assert.equal(calls.at(-1).headers.authorization, OAUTH);
+      assert.equal(calls.length, attempts);
+      assert.ok(calls.every(call => call.url === externalURL));
     });
   }
 }
 
 for (const text of ['', ' \t\n']) {
-  test(`external SSE empty text delta ${JSON.stringify(text)} triggers fallback`, async t => {
+  test(`external SSE empty text delta ${JSON.stringify(text)} returns an error without Plan`, async t => {
     const events = frame('message_start') +
       frame('content_block_start', { index: 0, content_block: { type: 'text', text: '' } }) +
       frame('content_block_delta', { index: 0, delta: { type: 'text_delta', text } }) +
@@ -641,9 +746,10 @@ for (const text of ['', ' \t\n']) {
     const { calls, request } = await fixture(t, url => url === proURL
       ? new Response('native delta fallback') : sseResponse([events]));
     const response = await request(requestBody(SONNET, { stream: true }), { headers: proHeaders });
-    assert.equal(await response.text(), 'native delta fallback');
-    assert.equal(calls.length, 5);
-    assert.equal(calls.at(-1).url, proURL);
+    assert.equal(response.status, 503);
+    assert.doesNotMatch(await response.text(), /native delta fallback/);
+    assert.equal(calls.length, 4);
+    assert.ok(calls.every(call => call.url === externalURL));
   });
 }
 
@@ -674,18 +780,17 @@ for (const format of ['json', 'sse']) {
     }, { now: () => time, cooldownMs: 30 });
     const original = requestBody(SONNET, { stream: format === 'sse' });
     await (await request(original, { headers: proHeaders })).text();
-    assert.equal(calls.length, 5);
+    assert.equal(calls.length, 4);
     healthy = true;
     await (await request(original, { headers: proHeaders })).text();
-    assert.equal(calls.length, 6);
-    assert.equal(calls.at(-1).url, proURL);
+    assert.equal(calls.length, 4);
     time += 31;
     for (let i = 0; i < 2; i++) {
       const response = await request(original, { headers: proHeaders });
       assert.match(await response.text(), /fixture answer/);
       assert.equal(calls.at(-1).url, externalURL);
     }
-    assert.equal(calls.length, 8);
+    assert.equal(calls.length, 6);
   });
 }
 
@@ -1055,7 +1160,7 @@ for (const status of [400, 401, 402, 403, 404, 408, 422, 429, 500, 503]) {
 }
 
 for (const failure of ['http', 'network', 'json model', 'invalid json', 'stream json', 'timeout']) {
-  test(`external ${failure} gets initial plus three retries then original Sonnet Pro once`, async t => {
+  test(`external ${failure} gets initial plus three retries without Plan`, async t => {
     const { calls, request } = await fixture(t, (url, options) => {
       if (url === proURL) return jsonResponse(url, options);
       if (failure === 'http') return new Response('fixture secret provider text', { status: 429 });
@@ -1067,13 +1172,11 @@ for (const failure of ['http', 'network', 'json model', 'invalid json', 'stream 
     }, { attemptTimeoutMs: 10 });
     const body = requestBody(SONNET, { stream: failure === 'stream json' });
     const response = await request(body, { headers: proHeaders });
-    assert.equal(response.status, 200);
+    assert.equal(response.status, failure === 'http' ? 429 : 503);
     await response.text();
-    assert.equal(calls.length, 5);
+    assert.equal(calls.length, 4);
     assert.ok(calls.slice(0, 4).every(call => call.url === externalURL && call.headers.authorization === `Bearer ${KEY}`));
-    assert.equal(calls[4].url, proURL);
-    assert.deepEqual(calls[4].parsedBody, body);
-    assert.equal(calls[4].headers.authorization, OAUTH);
+    assert.ok(calls.every(call => call.url === externalURL));
   });
 }
 
@@ -1089,12 +1192,13 @@ for (const [name, events] of [
   ['partial event after stop', complete(DEEPSEEK) + 'data: {'],
   ['duplicate start', frame('message_start') + complete(DEEPSEEK)],
 ]) {
-  test(`SSE ${name} buffers all failed content and falls back to raw Pro`, async t => {
+  test(`SSE ${name} buffers failed content and returns an error without Plan`, async t => {
     const { calls, request } = await fixture(t, (url) => url === proURL ? new Response('raw pro fallback', { status: 429 }) : sseResponse([events]));
     const response = await request(requestBody(SONNET, { stream: true }), { headers: proHeaders });
-    assert.equal(response.status, 429);
-    assert.equal(await response.text(), 'raw pro fallback');
-    assert.equal(calls.length, 5);
+    assert.equal(response.status, 503);
+    assert.doesNotMatch(await response.text(), /raw pro fallback/);
+    assert.equal(calls.length, 4);
+    assert.ok(calls.every(call => call.url === externalURL));
   });
 }
 
@@ -1118,27 +1222,27 @@ for (const headers of [{}, { authorization: OAUTH }, { authorization: 'Bearer ap
 
 test('external exhaustion without valid saved OAuth never forwards credentials to Pro', async t => {
   const { calls, request } = await fixture(t, () => new Response('fail', { status: 500 }));
-  assert.equal((await request(requestBody(SONNET))).status, 403);
+  assert.equal((await request(requestBody(SONNET))).status, 503);
   assert.equal(calls.length, 4);
   assert.ok(calls.every(call => call.url === externalURL));
 });
 
-test('explicit DeepSeek failure uses configured native Sonnet fallback ID', async t => {
+test('explicit DeepSeek failure never uses the configured native Sonnet fallback ID', async t => {
   const fallbackModel = 'claude-sonnet-4-6';
   const { calls, request } = await fixture(t, (url, options) => native(url, options) || new Response('fail', { status: 500 }), { fallbackModel });
-  assert.equal((await request(requestBody(DEEPSEEK), { headers: proHeaders })).status, 200);
-  assert.equal(calls.at(-1).parsedBody.model, fallbackModel);
+  assert.equal((await request(requestBody(DEEPSEEK), { headers: proHeaders })).status, 503);
+  assert.ok(calls.every(call => call.url === externalURL));
 });
 
-test('failed Pro fallback does not loop or touch external again during cooldown', async t => {
+test('failed provider does not contact Plan or touch external again during cooldown', async t => {
   const { calls, request } = await fixture(t, () => new Response('raw failure', { status: 503 }));
   const response = await request(requestBody(SONNET), { headers: proHeaders });
   assert.equal(response.status, 503);
-  assert.equal(await response.text(), 'raw failure');
-  assert.equal(calls.length, 5);
+  assert.doesNotMatch(await response.text(), /raw failure/);
+  assert.equal(calls.length, 4);
   assert.equal((await request(requestBody(SONNET), { headers: proHeaders })).status, 503);
-  assert.equal(calls.length, 6);
-  assert.equal(calls.at(-1).url, proURL);
+  assert.equal(calls.length, 4);
+  assert.ok(calls.every(call => call.url === externalURL));
 });
 
 test('cooldown expires into one real half-open probe and valid completion restores external', async t => {
@@ -1152,17 +1256,17 @@ test('cooldown expires into one real half-open probe and valid completion restor
     return jsonResponse(url, options);
   }, { cooldownMs: 15, attemptTimeoutMs: 2000, now: () => time });
   await (await request(requestBody(SONNET), { headers: proHeaders })).text();
-  assert.equal(calls.length, 5);
+  assert.equal(calls.length, 4);
   await (await request(requestBody(SONNET), { headers: proHeaders })).text();
-  assert.equal(calls.length, 6);
+  assert.equal(calls.length, 4);
   time += 30;
   healthy = true;
   const probe = request(requestBody(SONNET), { headers: proHeaders });
   await entered;
   const concurrent = await request(requestBody(SONNET), { headers: proHeaders });
-  assert.equal(concurrent.status, 200);
+  assert.equal(concurrent.status, 503);
   await concurrent.text();
-  assert.equal(calls.at(-1).url, proURL);
+  assert.equal(calls.at(-1).url, externalURL);
   releaseProbe();
   assert.equal((await probe).status, 200);
   healthy = false;
@@ -1188,7 +1292,7 @@ test('one failed request does not abort another external attempt', async t => {
   await (await request(requestBody(SONNET), { headers: proHeaders })).text();
   pending();
   assert.equal((await held).status, 200);
-  assert.equal(calls.length, 6);
+  assert.equal(calls.length, 5);
 });
 
 for (const phase of ['fetch', 'body', 'retry delay']) {
@@ -1221,8 +1325,8 @@ test('attempt body timeout aborts reader even when mocked fetch ignores signal',
   const { calls, request } = await fixture(t, (url, options) => url === proURL ? jsonResponse(url, options) :
     new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(frame('message_start'))); }, cancel() { cancelled++; } }),
       { headers: { 'content-type': 'text/event-stream' } }), { attemptTimeoutMs: 10 });
-  assert.equal((await request(requestBody(SONNET, { stream: true }), { headers: proHeaders })).status, 200);
-  assert.equal(calls.length, 5);
+  assert.equal((await request(requestBody(SONNET, { stream: true }), { headers: proHeaders })).status, 503);
+  assert.equal(calls.length, 4);
   assert.equal(cancelled, 4);
 });
 
@@ -1314,15 +1418,15 @@ test('complete external SSE finishes at message_stop without upstream EOF', { ti
   assert.equal(cancelled, true);
 });
 
-test('aggregate response buffer is bounded at 32 MiB before fallback', async t => {
+test('aggregate response buffer is bounded at 32 MiB without Plan fallback', async t => {
   let cancelled = 0;
   const { calls, request } = await fixture(t, (url, options) => url === proURL ? jsonResponse(url, options) :
     new Response(new ReadableStream({ start(controller) {
       const chunk = new Uint8Array(8 * 1024 * 1024).fill(32);
       for (let i = 0; i < 5; i++) controller.enqueue(chunk);
     }, cancel() { cancelled++; } }), { headers: { 'content-type': 'application/json' } }), { attemptTimeoutMs: 2000 });
-  assert.equal((await request(requestBody(SONNET), { headers: proHeaders })).status, 200);
-  assert.equal(calls.length, 5);
+  assert.equal((await request(requestBody(SONNET), { headers: proHeaders })).status, 503);
+  assert.equal(calls.length, 4);
   assert.equal(cancelled, 4);
 });
 
@@ -1347,7 +1451,7 @@ test('functional native bypass during expired cooldown does not consume the heal
   assert.equal(calls.at(-1).url, proURL);
   await (await request(requestBody(SONNET), { headers: proHeaders })).text();
   assert.equal(calls.at(-1).url, externalURL);
-  assert.equal(calls.length, 7);
+  assert.equal(calls.length, 6);
 });
 
 test('failed half-open request renews cooldown and later real request retries recovery', async t => {
@@ -1356,14 +1460,14 @@ test('failed half-open request renews cooldown and later real request retries re
   await (await request(requestBody(SONNET), { headers: proHeaders })).text();
   time += 20;
   await (await request(requestBody(SONNET), { headers: proHeaders })).text();
-  assert.equal(calls.length, 10);
+  assert.equal(calls.length, 8);
   await (await request(requestBody(SONNET), { headers: proHeaders })).text();
-  assert.equal(calls.length, 11);
+  assert.equal(calls.length, 8);
   healthy = true;
   time += 20;
   await (await request(requestBody(SONNET), { headers: proHeaders })).text();
   assert.equal(calls.at(-1).url, externalURL);
-  assert.equal(calls.length, 12);
+  assert.equal(calls.length, 9);
 });
 
 test('local provider failures retry locally without forwarding to Plan', async t => {
@@ -1393,9 +1497,10 @@ for (const [label, middle] of [
     const events = frame('message_start') + middle + frame('message_delta') + frame('message_stop');
     const { calls, request } = await fixture(t, url => url === proURL ? new Response('native rejection', { status: 401 }) : sseResponse([events]));
     const response = await request(requestBody(SONNET, { stream: true }), { headers: proHeaders });
-    assert.equal(response.status, 401);
-    assert.equal(await response.text(), 'native rejection');
-    assert.equal(calls.length, 5);
+    assert.equal(response.status, 503);
+    assert.doesNotMatch(await response.text(), /native rejection/);
+    assert.equal(calls.length, 4);
+    assert.ok(calls.every(call => call.url === externalURL));
   });
 }
 
@@ -1435,9 +1540,10 @@ for (const [label, responseBody] of [
   test(`external JSON rejects ${label} before fallback`, async t => {
     const { calls, request } = await fixture(t, url => url === proURL ? new Response('raw native', { status: 429 }) : new Response(JSON.stringify(responseBody), { headers: { 'content-type': 'application/json' } }));
     const response = await request(requestBody(SONNET), { headers: proHeaders });
-    assert.equal(response.status, 429);
-    assert.equal(await response.text(), 'raw native');
-    assert.equal(calls.length, 5);
+    assert.equal(response.status, 503);
+    assert.doesNotMatch(await response.text(), /raw native/);
+    assert.equal(calls.length, 4);
+    assert.ok(calls.every(call => call.url === externalURL));
   });
 }
 
@@ -1550,31 +1656,28 @@ test('local credentials reject CRLF before constructing request headers', () => 
     localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'configured-model', localKey: 'synthetic\r\ninjected' }));
 });
 
-// Sonnet 5.5 rejects disabled thinking; never synthesize it during fallback.
+// Provider failures must not forward Sonnet thinking settings to Plan.
 for (const thinking of [undefined, { type: 'adaptive' }]) {
-  test(`Sonnet 5.5 fallback preserves ${thinking ? 'adaptive' : 'omitted'} thinking`, async t => {
+  test(`Sonnet 5.5 ${thinking ? 'adaptive' : 'omitted'} thinking does not cause failure fallback`, async t => {
     const body = requestBody('claude-sonnet-5-5', { max_tokens: 256,
       ...(thinking ? { thinking } : {}) });
     const raw = JSON.stringify(body, null, 2);
     const { calls, request } = await fixture(t, (url, options) =>
       native(url, options) || new Response('{}', { status: 503 }));
     const response = await request(undefined, { raw, headers: proHeaders });
-    assert.equal(response.status, 200);
-    assert.equal(calls.length, 5);
+    assert.equal(response.status, 503);
+    assert.equal(calls.length, 4);
     assert.equal(calls.filter(call => call.url === externalURL).length, 4);
-    assert.equal(calls.at(-1).url, proURL);
-    assert.equal(Buffer.from(calls.at(-1).body).toString(), raw);
-    assert.deepEqual(calls.at(-1).parsedBody, body);
-    assert.equal(Object.hasOwn(calls.at(-1).parsedBody, 'thinking'), Boolean(thinking));
+    assert.ok(calls.every(call => call.url === externalURL));
   });
 }
 
 test('request-level 4xx is not retried and does not open the provider circuit', async t => {
   const { calls, request } = await fixture(t, (url, options) => url === proURL ? jsonResponse(url, options) : new Response('bad', { status: 400 }));
   await (await request(requestBody(SONNET), { headers: proHeaders })).text();
-  assert.deepEqual(calls.map(call => call.url), [externalURL, proURL]);
+  assert.deepEqual(calls.map(call => call.url), [externalURL]);
   await (await request(requestBody(SONNET), { headers: proHeaders })).text();
-  assert.equal(calls[2].url, externalURL);
+  assert.equal(calls[1].url, externalURL);
 });
 
 for (const status of [401, 402, 403]) {
@@ -1582,24 +1685,24 @@ for (const status of [401, 402, 403]) {
     const { calls, request } = await fixture(t, (url, options) => url === proURL ? jsonResponse(url, options) : new Response('no', { status }), { now: () => 1000 });
     await (await request(requestBody(SONNET), { headers: proHeaders })).text();
     await (await request(requestBody(SONNET), { headers: proHeaders })).text();
-    assert.deepEqual(calls.map(call => call.url), [externalURL, proURL, proURL]);
+    assert.deepEqual(calls.map(call => call.url), [externalURL]);
   });
 }
 
-test('HTTP 404 falls back to Plan without opening the provider circuit', async t => {
+test('HTTP 404 reports an error without Plan or opening the provider circuit', async t => {
   // A renamed or deleted model is a configuration error: silencing the provider for the
   // whole cooldown would hide it, so only the request itself is rejected.
   const { calls, request } = await fixture(t, (url, options) => url === proURL ? jsonResponse(url, options) : new Response('no', { status: 404 }), { now: () => 1000 });
   await (await request(requestBody(SONNET), { headers: proHeaders })).text();
   await (await request(requestBody(SONNET), { headers: proHeaders })).text();
-  assert.deepEqual(calls.map(call => call.url), [externalURL, proURL, externalURL, proURL]);
+  assert.deepEqual(calls.map(call => call.url), [externalURL, externalURL]);
 });
 
 test('SSE response to a non-stream request is rejected and retried', async t => {
   const { calls, request } = await fixture(t, (url, options) => url === proURL ? jsonResponse(url, options) : sseResponse([complete(DEEPSEEK)]));
   await (await request(requestBody(SONNET, { stream: false }), { headers: proHeaders })).text();
   assert.equal(calls.filter(call => call.url === externalURL).length, 4);
-  assert.equal(calls.at(-1).url, proURL);
+  assert.ok(calls.every(call => call.url === externalURL));
 });
 
 test('stale in-flight failure does not reopen a recovered circuit', async t => {
@@ -1627,10 +1730,10 @@ test('ordinary mode never asks external for thinking and rejects a thinking repl
     content: [{ type: 'thinking', thinking: 'x', signature: 'external' }, { type: 'text', text: 'ok' }] });
   const { calls, request } = await fixture(t, (url, options) => url === proURL ? jsonResponse(url, options) : withThinking());
   await (await request(requestBody(SONNET, { thinking: { type: 'adaptive' } }), { headers: proHeaders })).text();
-  assert.deepEqual(calls.map(call => call.url), [externalURL, proURL]);
+  assert.deepEqual(calls.map(call => call.url), [externalURL]);
   assert.deepEqual(calls[0].parsedBody.thinking, { type: 'disabled' });
   await (await request(requestBody(SONNET), { headers: proHeaders })).text();
-  assert.equal(calls[2].url, externalURL);
+  assert.equal(calls[1].url, externalURL);
 });
 
 test('stalled Plan stream is cut after the idle timeout', async t => {
@@ -1733,11 +1836,11 @@ test('ordinary mode: a slow but live stream outlasts the silence limit', async t
   assert.deepEqual(calls.map(call => call.url), [externalURL]);
 });
 
-test('ordinary mode: the total ceiling still ends an endless trickle and falls back to Plan', async t => {
+test('ordinary mode: the total ceiling ends an endless trickle without Plan', async t => {
   const { calls, request } = await fixture(t, (url, options) => url === proURL ? jsonResponse(url, options) : trickleSse(40, 400),
     { attemptTimeoutMs: 150, attemptCeilingMs: 200, retryDelayMs: 0 });
   await (await request(requestBody(SONNET, { stream: true }), { headers: proHeaders })).text();
-  assert.equal(calls.at(-1).url, proURL);
+  assert.ok(calls.every(call => call.url === externalURL));
   assert.equal(calls.filter(call => call.url === externalURL).length, 4);
 });
 
@@ -1762,13 +1865,15 @@ test('Local-only HTTP 402 reports a billing-specific code without retry', async 
   assert.equal(calls.length, 1);
 });
 
-for (const [label, patch] of [['missing id', { id: undefined }], ['wrong role', { role: 'user' }], ['missing usage', { usage: undefined }]]) {
+for (const [label, patch] of [['missing id', { id: undefined }], ['wrong role', { role: 'user' }], ['missing usage', { usage: undefined }],
+  ['fractional tokens', { usage: { input_tokens: 1.5, output_tokens: 2 } }],
+  ['unsafe token count', { usage: { input_tokens: 1, output_tokens: Number.MAX_SAFE_INTEGER + 1 } }]]) {
   test(`OpenRouter reply with ${label} is rejected and retried`, async t => {
     const { calls, request } = await fixture(t, (url, options) => url === proURL ? jsonResponse(url, options) :
       Response.json({ ...META, type: 'message', model: DEEPSEEK, content: [{ type: 'text', text: 'x' }], stop_reason: 'end_turn', ...patch }));
     await (await request(requestBody(SONNET), { headers: proHeaders })).text();
     assert.equal(calls.filter(call => call.url === externalURL).length, 4);
-    assert.equal(calls.at(-1).url, proURL);
+    assert.ok(calls.every(call => call.url === externalURL));
   });
 }
 
@@ -1786,7 +1891,7 @@ test('SSE frame whose event name differs from its JSON type is rejected', async 
   const { calls, request } = await fixture(t, (url, options) => url === proURL ? jsonResponse(url, options) : sseResponse([wrong]));
   await (await request(requestBody(SONNET, { stream: true }), { headers: proHeaders })).text();
   assert.equal(calls.filter(call => call.url === externalURL).length, 4);
-  assert.equal(calls.at(-1).url, proURL);
+  assert.ok(calls.every(call => call.url === externalURL));
 });
 
 test('requests above the configured concurrency limit are rejected with retry-after', async t => {

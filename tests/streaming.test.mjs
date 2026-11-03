@@ -100,9 +100,10 @@ test('passthrough rejects empty tool identities before publishing', async () => 
   const { server, base } = await start({ passthrough: true, chunks, planCalls });
   try {
     const result = await request(base);
-    assert.match(result.body, /plan ok/);
+    assert.equal(result.status, 503);
+    assert.match(result.body, /openrouter_upstream_error/);
     assert.doesNotMatch(result.body, /tool_use/);
-    assert.ok(planCalls.length > 0);
+    assert.equal(planCalls.length, 0);
   } finally {
     server.closeAllConnections();
     server.close();
@@ -140,15 +141,15 @@ test('passthrough delivers the first token while the provider is still generatin
 
 test('passthrough keeps a recoverable failure recoverable before any token', async () => {
   // The wrong model is rejected on the first frame, so nothing has been sent and the
-  // normal retry + Plan fallback still happens.
+  // retries are allowed, but Plan is not contacted.
   const planCalls = [];
   const broken = [frame('message_start', { message: { ...META, model: 'other/model' } })];
   const { server, base } = await start({ passthrough: true, chunks: broken, planCalls });
   try {
     const result = await request(base);
-    assert.equal(result.status, 200);
-    assert.match(result.body, /plan ok/);
-    assert.equal(planCalls.length, 1);
+    assert.equal(result.status, 503);
+    assert.match(result.body, /openrouter_upstream_error/);
+    assert.equal(planCalls.length, 0);
   } finally {
     server.closeAllConnections();
     server.close();
@@ -165,8 +166,8 @@ test('ordinary passthrough rejects reasoning before publishing any external cont
   try {
     const result = await request(base);
     assert.doesNotMatch(result.body, /PRIVATE_REASONING|thinking_delta/);
-    assert.match(result.body, /plan ok/);
-    assert.equal(planCalls.length, 1);
+    assert.match(result.body, /openrouter_upstream_error/);
+    assert.equal(planCalls.length, 0);
   } finally { server.closeAllConnections(); server.close(); }
 });
 
@@ -186,6 +187,21 @@ test('passthrough stops on late forbidden thinking without forwarding it or repl
   } finally { server.closeAllConnections(); server.close(); }
 });
 
+test('passthrough reports a missing tool call after text was already delivered without replay', async () => {
+  const planCalls = [];
+  const chunks = frames('stream/model');
+  const deltaIndex = chunks.findIndex(chunk => chunk.includes('event: message_delta'));
+  chunks[deltaIndex] = frame('message_delta', { delta: { stop_reason: 'tool_use' } });
+  const { server, base } = await start({ passthrough: true, chunks, planCalls });
+  try {
+    const result = await request(base);
+    assert.equal(result.status, 200);
+    assert.match(result.body, /hello/);
+    assert.match(result.body, /upstream stream failed/);
+    assert.equal(planCalls.length, 0);
+  } finally { server.closeAllConnections(); server.close(); }
+});
+
 for (const passthrough of [false, true]) {
   test(`nonempty message_start content cannot bypass validation (passthrough ${passthrough})`, async () => {
     const planCalls = [];
@@ -196,8 +212,8 @@ for (const passthrough of [false, true]) {
     try {
       const result = await request(base);
       assert.doesNotMatch(result.body, /server_tool_use|unvalidated/);
-      assert.match(result.body, /plan ok/);
-      assert.equal(planCalls.length, 1);
+      assert.match(result.body, /openrouter_upstream_error/);
+      assert.equal(planCalls.length, 0);
     } finally { server.closeAllConnections(); server.close(); }
   });
 }
@@ -300,15 +316,15 @@ test('buffered mode accepts a mixed text and tool stream and keeps block order',
 });
 
 test('truncated tool JSON fails closed instead of publishing a partial tool call', async () => {
-  // Nothing was sent while buffering, so the normal retry and Plan fallback still apply.
+  // Nothing was sent while buffering, so retry is possible without switching providers.
   const planCalls = [];
   const { server, base } = await start({ chunks: TRUNCATED_TOOL, planCalls });
   try {
     const result = await request(base);
-    assert.equal(result.status, 200);
-    assert.match(result.body, /plan ok/);
+    assert.equal(result.status, 503);
+    assert.match(result.body, /openrouter_upstream_error/);
     assert.doesNotMatch(result.body, /a\.txt|tool_use/);
-    assert.equal(planCalls.length, 1);
+    assert.equal(planCalls.length, 0);
   } finally { server.closeAllConnections(); server.close(); }
 });
 

@@ -60,11 +60,11 @@ for (const status of [400, 404, 405, 413, 415, 422]) {
         return new Response('request rejected', { status });
       } });
     const first = await proxy.sendOk();
-    assert.equal(first.status, 200);
-    assert.match(first.text, /plan-ok/, 'the request falls back to Plan');
+    assert.equal(first.status, 400);
+    assert.match(first.text, /openrouter_invalid_request/);
     assert.equal(externalCalls.length, 1, 'a request-level 4xx is not retried');
     const second = await proxy.sendOk();
-    assert.equal(second.status, 200);
+    assert.equal(second.status, 400);
     assert.equal(externalCalls.length, 2, 'the next request must still reach the provider');
     const payload = await proxy.metrics();
     assert.equal(payload.circuitOpens, 0, 'the breaker must stay closed');
@@ -126,18 +126,18 @@ test('a 5xx opens the breaker and a later 4xx neither extends nor reopens it',
         return externalReply();
       } });
     const failed = await proxy.sendOk();
-    assert.equal(failed.status, 200);
-    assert.match(failed.text, /plan-ok/);
+    assert.equal(failed.status, 503);
+    assert.match(failed.text, /openrouter_upstream_error/);
     assert.equal(externalCalls.length, 4, 'the transient failure is retried');
     // During the cooldown the provider is bypassed.
     const cooling = await proxy.sendOk();
-    assert.match(cooling.text, /plan-ok/);
+    assert.match(cooling.text, /openrouter_cooldown/);
     assert.equal(externalCalls.length, 4);
     time += 101; // cooldown expired
     phase = 'request-level';
     const probe = await proxy.sendOk();
-    assert.equal(probe.status, 200);
-    assert.match(probe.text, /plan-ok/);
+    assert.equal(probe.status, 400);
+    assert.match(probe.text, /openrouter_invalid_request/);
     assert.equal(externalCalls.length, 5, 'the half-open probe reaches the provider once');
     // A 4xx probe result must not extend the old open timer: the next request may probe again.
     phase = 'healthy';
@@ -160,7 +160,7 @@ test('a 408 remains transient and is retried', { timeout: 15000 }, async t => {
     return new Response('timeout', { status: 408 });
   } });
   const first = await proxy.sendOk();
-  assert.match(first.text, /plan-ok/);
+  assert.match(first.text, /openrouter_upstream_error/);
   assert.equal(externalCalls, 4);
   const payload = await proxy.metrics();
   assert.equal(payload.circuitOpens, 1);
@@ -177,8 +177,8 @@ test('a 429 honors its Retry-After window for the cooldown', { timeout: 15000 },
       return new Response('slow down', { status: 429, headers: { 'retry-after': '2' } });
     } });
   const first = await proxy.sendOk();
-  assert.equal(first.status, 200);
-  assert.match(first.text, /plan-ok/);
+  assert.equal(first.status, 429);
+  assert.match(first.text, /openrouter_upstream_error/);
   assert.equal(externalCalls.length, 4, 'the 429 keeps the usual retry count');
   const payload = await proxy.metrics();
   assert.equal(payload.circuitOpens, 1);
@@ -187,11 +187,11 @@ test('a 429 honors its Retry-After window for the cooldown', { timeout: 15000 },
   // The operator's 100ms cooldown has elapsed, but the provider asked for 2s.
   time += 101;
   const during = await proxy.sendOk();
-  assert.match(during.text, /plan-ok/);
+  assert.match(during.text, /openrouter_cooldown/);
   assert.equal(externalCalls.length, 4, 'the breaker must wait the Retry-After window');
   time += 1898; // 2999ms: still inside the 2000ms window opened at now=1000
   const borderline = await proxy.sendOk();
-  assert.match(borderline.text, /plan-ok/);
+  assert.match(borderline.text, /openrouter_cooldown/);
   assert.equal(externalCalls.length, 4);
   time += 2; // 3001ms: window over
   healthy = true;
@@ -219,7 +219,7 @@ test('a huge Retry-After is bounded to ten minutes of cooldown', { timeout: 1500
   assert.equal(payload.rateLimit.retryAfterMs, 600000, 'the parsed hint is clamped');
   time = 600999; // just inside the 600s cap
   const during = await proxy.sendOk();
-  assert.match(during.text, /plan-ok/);
+  assert.match(during.text, /openrouter_cooldown/);
   assert.equal(externalCalls.length, 4);
   time = 601001; // past the cap
   healthy = true;
@@ -243,17 +243,17 @@ test('half-open admits exactly one probe and only a real success recovers the ci
         return externalReply();
       } });
     const failed = await proxy.sendOk();
-    assert.match(failed.text, /plan-ok/);
+    assert.match(failed.text, /openrouter_upstream_error/);
     assert.equal(externalCalls.length, 4);
     time += 101;
     phase = 'probe';
     const probe = proxy.send();
     await probeStarted;
     assert.equal(externalCalls.length, 5, 'the half-open probe reaches the provider');
-    // A concurrent request must not start a second probe; it takes the fallback path.
+    // A concurrent request must not start a second probe or switch providers.
     const concurrent = await proxy.sendOk();
-    assert.equal(concurrent.status, 200);
-    assert.match(concurrent.text, /plan-ok/, 'the Plan answer must not recover the provider circuit');
+    assert.equal(concurrent.status, 503);
+    assert.match(concurrent.text, /openrouter_recovery_in_progress/);
     assert.equal(externalCalls.length, 5, 'only one half-open probe may reach the provider');
     releaseProbe();
     const probeResponse = await probe;
@@ -319,8 +319,8 @@ test('a late stale success cannot close a breaker opened after it started',
     await staleStarted;
     // Another request opens the breaker while the stale request is still in flight.
     const failed = await proxy.sendOk();
-    assert.equal(failed.status, 200);
-    assert.match(failed.text, /plan-ok/);
+    assert.equal(failed.status, 503);
+    assert.match(failed.text, /openrouter_upstream_error/);
     assert.equal(externalCalls, 5, 'the stale request plus four failed attempts');
     releaseStale();
     const staleResponse = await stale;
@@ -328,7 +328,7 @@ test('a late stale success cannot close a breaker opened after it started',
     assert.match(await staleResponse.text(), /external-ok/);
     // The stale success belongs to the previous generation, so the breaker stays open.
     const cooling = await proxy.sendOk();
-    assert.match(cooling.text, /plan-ok/, 'the stale success must not close the new breaker');
+    assert.match(cooling.text, /openrouter_cooldown/, 'the stale success must not close the new breaker');
     assert.equal(externalCalls, 5);
     time += 101;
     phase = 'healthy';

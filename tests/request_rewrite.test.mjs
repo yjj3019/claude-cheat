@@ -171,22 +171,18 @@ test('an empty tool id is rejected locally with an Anthropic-shaped 400 and no u
     assert.match(error.error.message, /tool call id/i);
   });
 
-test('a Plan fallback request carries normalized ids while the external attempts stay untouched',
+test('provider failures keep tool ids untouched and never send a Plan fallback',
   { timeout: 15000 }, async t => {
     const proxy = await startProxy(t, { respond: ({ url }) => url === PLAN ? planReply() : new Response('down', { status: 500 }) });
     const body = { model: MODEL, max_tokens: 32, ...toolTurn('Bash:0#abc') };
     const response = await proxy.send(body);
-    assert.equal(response.status, 200);
+    assert.equal(response.status, 503);
     await response.text();
     const externalCalls = proxy.calls.filter(call => call.url === EXTERNAL);
     const planCalls = proxy.calls.filter(call => call.url === PLAN);
     assert.equal(externalCalls.length, 4);
-    assert.equal(planCalls.length, 1);
+    assert.equal(planCalls.length, 0);
     assert.equal(externalCalls[0].parsed.messages[1].content[0].id, 'Bash:0#abc', 'external attempts keep the raw id');
-    const planToolUse = planCalls[0].parsed.messages[1].content[0];
-    assert.match(planToolUse.id, TOOL_ID);
-    assert.notEqual(planToolUse.id, 'Bash:0#abc');
-    assert.equal(planCalls[0].parsed.messages[2].content[0].tool_use_id, planToolUse.id);
   });
 
 const FOOTER = '<total_tokens>1234 tokens left</total_tokens>';
@@ -229,9 +225,9 @@ test('Local and OpenRouter receive host access guidance without losing system in
     }
   });
 
-test('Plan fallback receives the original system without injected host guidance', { timeout: 15000 }, async t => {
+test('native Plan receives the original system without injected host guidance', { timeout: 15000 }, async t => {
   const proxy = await startProxy(t, { respond: ({url}) => url === PLAN ? planReply() : new Response('down', {status: 500}) });
-  const body = { model: MODEL, max_tokens: 64, system: 'Project: read-only.', messages: [{role:'user',content:'Inspect.'}] };
+  const body = { model: PRO_MODEL, max_tokens: 64, system: 'Project: read-only.', messages: [{role:'user',content:'Inspect.'}] };
   assert.equal((await proxy.send(body)).status, 200);
   assert.equal(proxy.calls.at(-1).url, PLAN);
   assert.deepEqual(proxy.calls.at(-1).parsed, body);

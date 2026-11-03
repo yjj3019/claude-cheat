@@ -281,7 +281,7 @@ class OpenRouterConfigTests(unittest.TestCase):
                 self.assertEqual(diagnostic["event"], "provider_connection_unavailable")
                 self.assertEqual(diagnostic["action"], "continue")
                 isolated = bool(flags.get("local_only") or flags.get("openrouter_compat"))
-                self.assertEqual(diagnostic["plan_fallback"], not isolated and provider != "local")
+                self.assertIs(diagnostic["plan_fallback"], False)
                 self.assertEqual(plan_auth.call_count, 0 if isolated else 1)
 
     def test_connection_check_is_provider_only_and_does_not_reread_snapshot(self):

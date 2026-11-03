@@ -19,6 +19,6 @@ test('simulator routes a small mixed load without violations', () => {
   assert.ok(summary.routes.replacement > 0);
   assert.ok(summary.latencyMs.p50 > 0);
   assert.equal(summary.circuit.bypass, 200);
-  assert.equal(summary.circuit.fallback, 200);
-  assert.equal(summary.circuit.cooldown, 200);
+  assert.equal(summary.circuit.fallback, 503);
+  assert.equal(summary.circuit.cooldown, 503);
 });

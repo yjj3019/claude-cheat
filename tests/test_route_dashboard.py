@@ -3973,18 +3973,19 @@ class ProactiveReactionTests(unittest.TestCase):
         self.assertEqual(alerts, [])
 
     def test_a_plan_only_session_with_a_configured_external_service_is_explained(self):
-        metrics = {"configuration": {"provider": "openrouter"},
-                   "routes": {"external": 0, "plan": 6}, "reasons": {"native_feature": 6}}
-        alerts = dash.proactive_alerts(
-            {"openrouter": True, "local": False, "cli": False},
-            {"provider": "openrouter"}, metrics,
-            routing_values={"ROUTE_DEFAULT_PROVIDER": "openrouter"})
-        codes = self.codes(alerts)
-        self.assertIn("session_plan_only", codes)
-        alert = next(item for item in alerts if item["code"] == "session_plan_only")
-        self.assertIn("재시작", alert["detail"])
-        self.assertIn("OpenRouterCompat", alert["detail"])
-        self.assertEqual(alert["command"], ".\\OpenClaude.ps1")
+        for provider in ("openrouter", "local", "cli"):
+            with self.subTest(provider=provider):
+                metrics = {"configuration": {"provider": provider},
+                           "routes": {"external": 0, "plan": 6}, "reasons": {"native_feature": 6}}
+                alerts = dash.proactive_alerts(
+                    {"openrouter": True, "local": True, "cli": True},
+                    {"provider": provider}, metrics,
+                    routing_values={"ROUTE_DEFAULT_PROVIDER": provider})
+                self.assertIn("session_plan_only", self.codes(alerts))
+                alert = next(item for item in alerts if item["code"] == "session_plan_only")
+                self.assertIn("native_feature", alert["detail"])
+                self.assertIn("네이티브 예외", alert["detail"])
+                self.assertNotIn("command", alert)
 
     def test_a_session_that_attempted_the_external_service_is_not_flagged(self):
         metrics = {"configuration": {"provider": "openrouter"},
