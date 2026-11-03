@@ -93,16 +93,15 @@ test('CLI failure categories and 429 count distinguish backend responses from Pl
   }
 });
 
-test('fallback records only a bounded failure class without upstream content', async t => {
+test('Local failure records a bounded class without Plan or upstream content', async t => {
   const events = captureEvents(t);
   const secret = 'PRIVATE-UPSTREAM-RESPONSE';
   const f = await fixture(t, async url => url === PLAN ? Response.json(message(body.model)) :
     new Response(secret, { status: 415 }));
-  assert.equal((await f.send()).status, 200);
+  assert.equal((await f.send()).status, 400);
   const m = await f.metrics();
-  assert.equal(m.last.reason, 'fallback');
-  assert.equal(m.last.fallbackFailure, 'request');
-  assert.equal(events.find(e => e.event === 'route_selected' && e.provider === 'plan').detail, 'request');
+  assert.equal(events.find(e => e.event === 'local_mode_rejected').detail, 'invalid_request');
+  assert.equal(events.some(e => e.event === 'route_selected' && e.provider === 'plan'), false);
   assert.ok(!JSON.stringify({ events, m }).includes(secret));
 });
 
@@ -151,7 +150,7 @@ test('upstream thrown properties cannot spoof trusted response diagnostics', asy
   assert.ok(!JSON.stringify(events).includes('PRIVATE-DATA'));
 });
 
-test('actual attempts and phase distributions include all failures, retries, and Plan fallback', async t => {
+test('actual attempts and phase distributions include Local failures and retries without Plan', async t => {
   const calls = [];
   const f = await fixture(t, async (url, options) => {
     calls.push(url); await delay(8);
@@ -159,18 +158,17 @@ test('actual attempts and phase distributions include all failures, retries, and
   });
   const empty = await f.metrics();
   assert.deepEqual(empty.routingTimingMs.total, { count: 0, p50: null, p95: null, max: null });
-  assert.equal((await f.send()).status, 200);
+  assert.equal((await f.send()).status, 503);
   const m = await f.metrics();
-  assert.deepEqual(calls, [LOCAL, LOCAL, LOCAL, LOCAL, PLAN]);
-  assert.deepEqual(m.attemptCounts, { external: 4, plan: 1 });
-  assert.deepEqual([m.attempts, m.externalAttempts, m.retries], [5, 1, 3]);
+  assert.deepEqual(calls, [LOCAL, LOCAL, LOCAL, LOCAL]);
+  assert.deepEqual(m.attemptCounts, { external: 4, plan: 0 });
+  assert.deepEqual([m.attempts, m.externalAttempts, m.retries], [4, 1, 3]);
   assert.deepEqual(Object.fromEntries(Object.entries(m.routingTimingMs).map(([key, value]) => [key, value.count])),
-    { queueWait: 1, externalAttempt: 4, retryWait: 3, plan: 1, total: 1 });
+    { queueWait: 1, externalAttempt: 4, externalHeaders: 4, externalFirstBody: 0, externalTimeout: 0, retryWait: 3, plan: 0, total: 1 });
   assert.ok(m.routingTimingMs.externalAttempt.p50 >= 5);
   assert.ok(m.routingTimingMs.retryWait.p50 >= 1);
-  assert.ok(m.routingTimingMs.plan.max >= 5);
-  assert.ok(m.routingTimingMs.total.max >= m.routingTimingMs.plan.max + m.routingTimingMs.externalAttempt.max);
-  assert.equal(m.latencyMs.plan.count, 1); // legacy latency still measures the complete fallback lifecycle
+  assert.ok(m.routingTimingMs.total.max >= m.routingTimingMs.externalAttempt.max);
+  assert.equal(m.latencyMs.plan.count, 0);
   assert.equal(m.latencyMs.external.count, 0);
 });
 

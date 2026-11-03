@@ -92,7 +92,7 @@ This workflow follows the relevant [CLI design guidance](https://github.com/curs
 With `routing: dual_provider: true` in `openclaude.config.yaml` and **both services configured**, an ordinary session lists the other service as one extra entry in Claude Code's `/model` picker (model id `claude-route-local` or `claude-route-openrouter`, for example `Local (qwen3-coder:latest)`).
 
 - The session's own provider (the one `-Provider` chose) stays the default. **Only requests** sent while the extra entry is selected go to the other provider.
-- Native features and Plan fallback still go to Plan (the subscription) as before. A failure opens **that provider's own circuit breaker**; one service going down does not affect requests to the other.
+- Native features still use Plan. Local failures return an error without Plan fallback; OpenRouter failures retain Plan fallback. A failure opens **that provider's own circuit breaker**, independently of the other service.
 - The other provider's credential reaches **only the proxy process**, never the CLI environment. The routing log's `route_selected`/`circuit_open` events carry a `provider` field saying where a request went.
 - Special modes (`-LocalMode`, `-LocalCompat`, `-OpenRouterCompat`) rewrite requests and disable Plan fallback, so they ignore this feature entirely (no extra entry is added).
 - The `/model` entry is injected at session start through `ANTHROPIC_CUSTOM_MODEL_OPTION*`, so changing the option requires restarting the session. Whether the picker shows the entry depends on the CLI version (the hook was confirmed in 2.1.310); the proxy's model-id-to-provider dispatch is covered by unit tests.
@@ -140,7 +140,7 @@ Pick OpenRouter, Local LLM or CLI in the **service** select box at the top; only
 
 Ordinary OpenRouter, Local and CLI launches preserve native Claude Code beta and advisor settings. Unsupported requests retain the original Plan route. Explicit compatibility and restricted profiles have separate policies.
 
-Ordinary Local-only-provider sessions do not set these switches and retain SSH/MCP, tool search, plugins, hooks, and user/project permission settings. Known deferred MCP tool and CLI control fields use the existing compatibility validator and buffered JSON transport, converted to CLI SSE when needed. Native `tool_addition` declarations move into the Local tool list while conversation content and tool results stay intact. Conflicting definitions and unknown shapes retain the original conversation and tool definitions on Plan. Only a null `tool_use.provider_specific_fields` value added to CLI history is normalized away on Local and Plan; objects and signatures are not removed by this rule. Cache boundaries can change with this translation. Unsupported native features, Opus/Haiku/Fable selections, and Local failures retain the existing Plan route. Ordinary external thinking remains disabled so Local signatures cannot contaminate Plan history.
+Ordinary Local-only-provider sessions do not set these switches and retain SSH/MCP, tool search, plugins, hooks, and user/project permission settings. Known deferred MCP tool and CLI control fields use the existing compatibility validator and buffered JSON transport, converted to CLI SSE when needed. Native `tool_addition` declarations move into the Local tool list while conversation content and tool results stay intact. Conflicting definitions and unknown shapes retain the original conversation and tool definitions on Plan. Only a null `tool_use.provider_specific_fields` value added to CLI history is normalized away on Local and Plan; objects and signatures are not removed by this rule. Cache boundaries can change with this translation. Unsupported native features and Opus/Haiku/Fable requests retain the existing Plan route; Local failures return an error without Plan fallback. Ordinary external thinking remains disabled so Local signatures cannot contaminate Plan history.
 
 Ordinary Local launches default to an 8,192-token output budget to reduce context overflows caused by native Sonnet output limits. An explicit positive whole-number `CLAUDE_CODE_MAX_OUTPUT_TOKENS` is preserved. Only this setting is passed per launch; user/project settings files are unchanged. Large inputs or explicit output limits can still exceed the model context. Use an ordinary launch to retain native client integrations; `-LocalMode` is a separate restricted mode that disables MCP.
 
@@ -151,17 +151,18 @@ Ordinary Local launches default to an 8,192-token output budget to reduce contex
 | Compatible Sonnet request | Configured OpenRouter model or local model |
 | Unsupported native Sonnet feature or conversation history | Original Plan Sonnet request, unchanged |
 | Opus, Haiku, Fable | Existing Plan OAuth path |
-| HTTP provider fails all four attempts, or CLI backend fails its single attempt | One request to the original Plan Sonnet model |
+| Local fails all attempts, is busy, or is in cooldown | Local error; no Plan failure fallback |
+| OpenRouter fails all attempts, or CLI backend fails its single attempt | One request to the original Plan Sonnet model |
 
 - OpenRouter uses the required `OPENROUTER_MODEL` setting, with no default model.
 - OpenRouter and Local are selected at launch; the router does not switch between them automatically. Select Sonnet in `/model` for eligible replacement requests.
 - HTTP providers receive the initial attempt plus three retries. CLI backends receive one attempt with their configured deadline. Ordinary HTTP attempts have a 30-second header/idle timeout and a 300-second total ceiling while data keeps arriving. Local-only and compatibility modes retain their existing fixed deadlines.
 - OpenRouter keeps its one-second default retry delay. Local congestion responses (429/503/529) and timeouts use exponential backoff based on 1/2/4 seconds plus small positive jitter, bounded by `ROUTE_RETRY_MAX_WAIT_MS` (10 seconds by default). Empty replies are not assumed to mean congestion. Plan response time and the CLI's own retries add to the wait; cancellation stops retries and fallback.
-- `Retry-After` accepts seconds or HTTP-date, bounded at ten minutes. A Local hint longer than the internal wait cap ends retries rather than retrying early, and also extends the circuit recovery wait. Ordinary mode falls back to Plan; modes without Plan return an error.
+- `Retry-After` accepts seconds or HTTP-date, bounded at ten minutes. A Local hint longer than the internal wait cap ends retries rather than retrying early, and also extends the circuit recovery wait. Local returns an error without Plan fallback.
 - The ordinary Local fast path keeps the original conversation. A compatibility copy is built only for potentially convertible native-feature exclusions, avoiding discarded history/tool copies. This reduces proxy work without changing model selection, token budgets or Plan eligibility; it does not repair empty server responses or speed up inference.
-- **Shared Local admission:** each proxy allows two active Local turns, eight queued turns, and at most 60 seconds in the queue. An active turn retains its slot across retries. Cancellation removes a queued turn. Queue overflow or timeout uses `local_busy`: ordinary mode routes to Plan, while modes without Plan return 503. Admission rejection does not count as an external attempt or open the circuit.
+- **Shared Local admission:** each proxy allows two active Local turns, eight queued turns, and at most 60 seconds in the queue. An active turn retains its slot across retries. Cancellation removes a queued turn. Queue overflow or timeout returns `local_busy` and 503 without Plan fallback. Admission rejection does not count as an external attempt or open the circuit.
 - The dashboard shows Local active/queued turns and cumulative admission rejections. The existing authenticated `/api/metrics` exposes `localAdmission`: `active`, `queued`, `rejected`, `concurrency`, `queueLimit`, `queueWaitMs`. Rejections accumulate only during the current proxy process.
-- This limits only traffic from this proxy, not other users or server-wide GPU load. Long parallel tasks can exceed the queue wait and use Plan. Conversation, tools and output token budgets are not silently shortened, and no inference probes or server polling are added. Restart the proxy to load the changed source.
+- This limits only traffic from this proxy, not other users or server-wide GPU load. Long parallel tasks can exceed the queue wait and return an error. Conversation, tools and output token budgets are not silently shortened. Restart the proxy to load the changed source.
 - The circuit breaker distinguishes causes: transport failures, timeouts, 5xx, 408 and unusable 2xx answers open it as provider faults; 401/402/403 keep their provider-wide cooldown; a 429 uses the parsed `Retry-After` (bounded at ten minutes) as its cooldown. 400/404/405/413/415/422 stop retries without opening the breaker; other request-level failures retain bounded retries and do not open it. 408 and 429 retain their separate transient and rate-limit policies. Exactly one half-open probe is admitted, and late completions from older generations cannot overwrite the newer circuit state.
 - A client that stalls mid-body is dropped after an idle timeout (30 seconds by default, `ROUTE_REQUEST_IDLE_TIMEOUT_MS`, `0` disables it), releasing its turn; slow but live uploads are not cut. A disconnected client's upstream read, timers and retry are released instead of retried.
 - After all four fail, the router forwards the original request to Plan Sonnet once. A Plan failure does not loop back to another provider or switch to an Anthropic API key.
@@ -339,7 +340,7 @@ Requires Claude Code 2.1.304 or newer and the same two `openclaude.config.yaml` 
 
 Responses are fully validated as JSON before conversion to client SSE. This mode uses one 120-second upstream attempt and a 30-second failure cooldown, with OpenRouter provider fallback disabled. Model identity, Messages/tool support and reasoning behavior still depend on the selected model; forwarding effort does not establish Sonnet-equivalent reasoning.
 
-Every interactive launch now makes one minimal provider-only inference check before opening the CLI: a 15-second deadline and a 512-token budget for HTTP providers; CLI backends use their configured deadline and native output constraints. OpenRouter charges may apply. Logs contain `connection_check`, provider, inference/model/reply booleans, a fixed reason and optional HTTP status, never endpoints, keys or response bodies. Check failure logs `provider_connection_unavailable` with `action: continue` and still opens the CLI. Ordinary mode retains Plan routing/fallback; explicit Local-only and compatibility modes retain their Plan block. Configuration errors and missing executables remain startup errors. Standalone `-CheckLocal` and `-DiagnoseLocal` still exit after diagnosis.
+Every interactive launch now makes one minimal provider-only inference check before opening the CLI: a 15-second deadline and a 512-token budget for HTTP providers; CLI backends use their configured deadline and native output constraints. OpenRouter charges may apply. Logs contain `connection_check`, provider, inference/model/reply booleans, a fixed reason and optional HTTP status, never endpoints, keys or response bodies. Check failure logs `provider_connection_unavailable` with `action: continue` and still opens the CLI. Ordinary Local sessions retain native Plan routing but do not fall back on Local failure; explicit Local-only and compatibility modes block Plan. Configuration errors and missing executables remain startup errors. Standalone `-CheckLocal` and `-DiagnoseLocal` still exit after diagnosis.
 
 `ready` confirms the configured model, exact diagnostic reply and normal completion. `timeout`, `authentication_failed`, `http_error` and `connection_failed` identify connection failures. `reply_mismatch`, `incomplete_response` and `invalid_response` identify response-validation failures: a reasoning model may exhaust this small budget or return extra text despite a working connection. The check does not prove complete CLI compatibility.
 
@@ -467,7 +468,7 @@ Settings live on a **separate page** (`http://127.0.0.1:8787/settings`) reached 
 
 ### Current model checks and duplicate selection
 
-Distinguish the configured model (settings for the next session), the connection-test model (the response model ID is checked against the requested ID), and the last routed model (recorded after response validation). An ordinary session can still start after a failed connection check, with a warning and Plan fallback available. Model-list metadata checks do not prove inference works.
+Distinguish the configured model (settings for the next session), the connection-test model (the response model ID is checked against the requested ID), and the last routed model (recorded after response validation). An ordinary session can still start after a failed connection check, with a warning; Local failures do not fall back to Plan. Model-list metadata checks do not prove inference works.
 
 The dashboard does not read Claude Code's current `/model` selection in real time. With no live session or no requests yet, settings and historical records are not proof of a current model connection. During a live session, it compares the latest authenticated proxy metrics with that session's logs rather than attributing an old session's route or code hash to the current proxy. The current-state card distinguishes the session provider, loaded primary model and last processed model. A Plan or dual-provider request whose model is not reported remains unknown rather than being guessed.
 
@@ -635,7 +636,7 @@ The UI tests execute the JavaScript embedded in the actual Python-generated page
 
 ## Lowering the first-token delay (optional)
 
-By default the proxy validates the **whole** reply before sending it, so a streamed answer appears only when generation finishes. That keeps the retry + Plan fallback guarantee but delays the first token.
+By default the proxy validates the **whole** reply before sending it, so a streamed answer appears only when generation finishes. Local failures return an error; OpenRouter can still fall back to Plan.
 
 ```powershell
 .\OpenClaude.ps1 -Stream        # forward frames as they validate (lower TTFB)
@@ -643,10 +644,10 @@ By default the proxy validates the **whole** reply before sending it, so a strea
 
 | Mode | First token (TTFB) | Behaviour on failure |
 | --- | --- | --- |
-| Default (buffered) | when the reply completes (measured 782ms / 782ms) | four attempts, then Plan fallback |
-| `-Stream` (opt-in) | first valid content (measured **339ms** / 772ms total) | before the first token: same fallback; **after** it: the stream ends with an error so output is never duplicated |
+| Default (buffered) | when the reply completes (measured 782ms / 782ms) | retries, then Local error or OpenRouter Plan fallback |
+| `-Stream` (opt-in) | first valid content (measured **339ms** / 772ms total) | before the first token: same provider policy; **after** it: the stream ends with an error |
 
-Forwarding starts only after the first valid content, so empty replies, thinking-only replies and broken tool JSON still fall back. Environment form: `$env:ROUTE_STREAM_PASSTHROUGH = '1'; OpenClaude.ps1`.
+Forwarding starts only after the first valid content; empty replies, thinking-only replies and broken tool JSON follow the same provider-specific failure policy. Environment form: `$env:ROUTE_STREAM_PASSTHROUGH = '1'; OpenClaude.ps1`.
 
 ## Understanding connection checks and troubleshooting
 
@@ -742,7 +743,7 @@ Reference numbers (this development machine, Node 24). Simulator and soak figure
 | Long session | 120 turns, 247KB history: 3.1ms (3.9ms before the fix) |
 | Body size | 1MB in 7.7–8.9ms (~120MB/s); fresh-process harness 1MB in 8.4–9.8ms |
 | Retry cost | 1MB + one retry 10.7ms vs 12.8ms before, four failures 9.8ms vs 12.1ms (~17–19% better) |
-| Circuit | 4 failures → Plan fallback, Plan during cooldown, external again after recovery |
+| Circuit | At measurement time: 4 failures → Plan fallback, then external after recovery; Local now returns an error |
 | Long soak | 150,000 requests at 266MB; **1.2M requests reached 1.09GB RSS** (V8 heap expansion — a 256MB cap run passes, so it is collectable) |
 | Session-cache restart | Cold scan **1,119ms → 20ms** on real data (357 files, 464MB): `.usage-cache.json` (v5) stores per-file aggregates with size, mtime and head/tail 4KB sha256 fingerprints plus the turn-ownership ledger, so an in-place rewrite is rescanned and unchanged files are not read |
 | Page transfer | 39.3KB → **12.0KB** with gzip when the client accepts it; loopback render 2.7ms per request |

@@ -1284,7 +1284,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       alternate: altExternalUrl === null ? null : {
         provider: altProvider, model: publicMetricModel(altModel), modelRedacted: publicMetricModel(altModel) === null,
       },
-      planFallback: !noPlan,
+      planFallback: !noPlan && provider !== 'local',
     },
     startedAt: new Date(metrics.startedAt).toISOString(),
     ...(usageId ? { instanceId: usageId, usageRecording: { ...usageState, enqueued: usageSeq,
@@ -1763,11 +1763,12 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       const oauthOK = /^Bearer\s+sk-ant-oat/.test(req.headers.authorization || '') && !req.headers['x-api-key'] &&
         (req.headers['anthropic-beta'] || '').includes('oauth-');
       const sendPro = async (reason = 'native_feature', detail) => {
+        const localFailureOnly = !noPlan && (altRequested ? altProvider : provider) === 'local' && reason !== 'native_feature';
         const betas = detail === 'unsupported_beta' ? unsupportedBetas(req.headers['anthropic-beta'], compatProfile) : [];
         const betaFeatures = betas.slice(0, 16).map(value =>
           /^[a-z][a-z0-9-]{0,63}-20\d{2}-[01]\d-[0-3]\d$/.test(value) &&
           !/(?:^|-)(?:sk|key|token|secret|password|bearer)(?:-|$)/.test(value) ? value : '[redacted]');
-        if (noPlan) {
+        if (noPlan || localFailureOnly) {
           if (reason === 'local_busy') {
             logEvent({ event: 'local_mode_rejected', provider: 'local', reason, code: 'local_busy' });
             return reject(503, '[local_busy] Local request queue is full or its wait expired. Retry shortly. Plan fallback disabled.',
@@ -1782,6 +1783,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               timeout: [`${errorPrefix}_timeout`, `${label} request timed out.`],
               authentication_failed: [`${errorPrefix}_authentication_failed`, `${label} server authentication failed. Check the ${label} API key and access permissions; restart the ${label} session after changing credentials.`],
               payment_required: [`${errorPrefix}_payment_required`, `${label} server rejected the request for billing or credit reasons. Check the ${label} account balance and limits; restart the ${label} session after changing them.`],
+              invalid_request: [`${errorPrefix}_invalid_request`, `${label} server rejected the request.`],
               empty_response: [`${errorPrefix}_empty_response`, `${label} server returned an empty response.`],
               upstream_error: [`${errorPrefix}_upstream_error`, `${label} server request failed. Check the ${errorPrefix} routing log.`],
             };
@@ -1796,11 +1798,14 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               ` Send a new request to check ${label} recovery.`;
             message = `[${code}] ${description}${retryHint} Plan fallback disabled.`;
           }
-          logEvent({ event: `${errorPrefix}_mode_rejected`, provider, reason, ...(detail ? { detail } : {}),
+          logEvent({ event: `${errorPrefix}_mode_rejected`, provider: localFailureOnly ? 'local' : provider, reason, ...(detail ? { detail } : {}),
             ...(code ? { code } : {}), ...(retryAfterSeconds !== undefined ? { retry_after_seconds: retryAfterSeconds } : {}),
             ...(previousErrorCode ? { previous_error_code: previousErrorCode } : {}),
             ...(betas.length ? { beta_features: betaFeatures, unsupported_beta_count: betas.length } : {}) });
-          return reject(400, message);
+          const status = localFailureOnly && ['fallback', 'circuit_open'].includes(reason)
+            ? ({ local_authentication_failed: 403, local_payment_required: 402, local_invalid_request: 400 }[code] || 503) : 400;
+          return reject(status, message,
+            localFailureOnly && retryAfterSeconds > 0 ? { 'retry-after': String(retryAfterSeconds) } : undefined);
         }
         if (!oauthOK) return reject(403, 'Saved subscription OAuth required');
         client.signal.throwIfAborted();
@@ -1990,7 +1995,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         if (credential) headers.authorization = `Bearer ${credential}`;
         const attempts = noPlan || provider === 'cli' ? 1 : 4;
         // Permanent 4xx will not change on retry; request-level ones must not open the provider-wide circuit.
-        let requestRejected = false;
+        let requestRejected = false, outputBudgetExhausted = false;
         for (let attempt = 0; attempt < attempts; attempt++) {
           if (target.name === 'local') { failureStatus = null; retryAfterHintMs = null; }
           metrics.attempts += 1;
@@ -2176,14 +2181,18 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
               'Empty message response': 'empty_response', 'Invalid message response': 'invalid_message',
               'Invalid stream metadata': 'invalid_stream_metadata', 'Expected JSON Local response': 'expected_json', 'Unsupported Local response content': 'unsupported_local_content',
               'Local thinking response disabled': 'thinking_response', 'Thinking response in ordinary mode': 'thinking_response', 'Unsupported Local response fields': 'unsupported_content_fields' }[error?.message];
+            // Exhausting this request's output budget does not establish a provider outage.
+            outputBudgetExhausted = target.name === 'local' && validation === 'empty_response' &&
+              emptyResponseDiagnostics.get(error)?.stop_reason === 'max_tokens';
             if (target.name === 'cli') {
               const category = controller.signal.reason === 'attempt_timeout' ? 'timeout' :
                 status === 429 ? 'status429' : status >= 400 && status < 500 ? 'status4xx' :
                 status >= 500 ? 'status5xx' : Number.isInteger(status) && status >= 200 && status < 300 ? 'validation' : 'connection';
               cliFailures[category] += 1;
             }
-            if (noPlan) localFailure = controller.signal.reason === 'attempt_timeout' ? 'timeout' :
-              status === 401 || status === 403 ? 'authentication_failed' : status === 402 ? 'payment_required' : validation === 'empty_response' ? 'empty_response' : 'upstream_error';
+            if (noPlan || target.name === 'local') localFailure = controller.signal.reason === 'attempt_timeout' ? 'timeout' :
+              status === 401 || status === 403 ? 'authentication_failed' : status === 402 ? 'payment_required' :
+              !noPlan && [400, 404, 405, 413, 415, 422].includes(status) ? 'invalid_request' : validation === 'empty_response' ? 'empty_response' : 'upstream_error';
             if (Number.isInteger(status)) failureStatus = status;
             failureClass = failureClassOf(status, controller.signal.reason === 'attempt_timeout');
             congested = target.name === 'local' &&
@@ -2234,9 +2243,9 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
             } finally { finishWait(); }
           }
         }
-        if (!requestRejected && failureClass !== 'request' && claimedGeneration === circuitState.generation) {
+        if (!requestRejected && !outputBudgetExhausted && failureClass !== 'request' && claimedGeneration === circuitState.generation) {
           circuitState.generation++;
-          if (noPlan) circuitState.lastLocalFailure = localFailure;
+          if (noPlan || target.name === 'local') circuitState.lastLocalFailure = localFailure;
           // A 429 states its own recovery window: honor the parsed Retry-After (bounded)
           // instead of the generic cooldown, so the provider is not hammered while it asked
           // to be left alone. Without a hint, the operator's cooldown still applies.
@@ -2256,7 +2265,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       if (!succeeded) {
         if (!noPlan && ['request', 'provider', 'rate_limit', 'transient'].includes(failureClass))
           fallbackFailure = failureClass;
-        await sendPro('fallback', noPlan ? localFailure : fallbackFailure || undefined);
+        await sendPro('fallback', noPlan || target.name === 'local' ? localFailure : fallbackFailure || undefined);
       }
     } catch {
       if (!client.signal.aborted) {

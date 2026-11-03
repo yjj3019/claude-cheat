@@ -134,18 +134,18 @@ test('an alternate provider failure opens only its own breaker', { timeout: 2000
       return Response.json(reply(PRIMARY_MODEL));
     } });
   const failed = await proxy.sendOk(ALT_ALIAS);
-  assert.equal(failed.status, 200);
-  assert.match(failed.text, /plan-ok/, 'the alias request falls back to Plan');
+  assert.equal(failed.status, 503);
+  assert.match(failed.text, /local_upstream_error/);
   assert.equal(urls.filter(url => url === LOCAL_URL).length, 4, 'the transient failure is retried');
-  assert.equal(planBodies.at(-1).model, 'claude-sonnet-5-5', 'the alias id never reaches Plan');
+  assert.equal(planBodies.length, 0);
   // The primary provider is untouched by the alternate breaker.
   const primary = await proxy.sendOk(MODEL);
   assert.equal(primary.status, 200);
   assert.match(primary.text, new RegExp(`"${MODEL}"`));
-  // While the alternate breaker is open the alias goes straight to Plan.
+  // While the alternate breaker is open the alias reports its Local cooldown.
   const during = await proxy.sendOk(ALT_ALIAS);
-  assert.equal(during.status, 200);
-  assert.match(during.text, /plan-ok/);
+  assert.equal(during.status, 503);
+  assert.match(during.text, /local_cooldown/);
   assert.equal(urls.filter(url => url === LOCAL_URL).length, 4, 'the open alternate breaker is not hammered');
 });
 
@@ -159,7 +159,7 @@ test('an alternate answer naming the wrong model is validated and never passed t
       return Response.json(reply(PRIMARY_MODEL));
     } });
   const result = await proxy.sendOk(ALT_ALIAS);
-  assert.equal(result.status, 200);
-  assert.match(result.text, /plan-ok/, 'a mismatched alternate model falls back to Plan');
+  assert.equal(result.status, 503);
+  assert.doesNotMatch(result.text, /plan-ok/);
   assert.equal(urls.filter(url => url === LOCAL_URL).length, 4, 'the mismatch is retried before the breaker opens');
 });

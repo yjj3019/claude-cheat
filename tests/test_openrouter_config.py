@@ -251,7 +251,7 @@ class OpenRouterConfigTests(unittest.TestCase):
         proxy.terminate.assert_called_once()
         proxy.stdin.close.assert_called_once()
 
-    def test_preflight_failure_continues_all_modes_with_original_plan_policy(self):
+    def test_preflight_failure_continues_all_modes_with_provider_plan_policy(self):
         modes = [("openrouter", {}), ("local", {}), ("local", {"local_only": True}),
                  ("local", {"local_only": True, "local_compat": True}), ("openrouter", {"openrouter_compat": True})]
         for provider, flags in modes:
@@ -281,7 +281,7 @@ class OpenRouterConfigTests(unittest.TestCase):
                 self.assertEqual(diagnostic["event"], "provider_connection_unavailable")
                 self.assertEqual(diagnostic["action"], "continue")
                 isolated = bool(flags.get("local_only") or flags.get("openrouter_compat"))
-                self.assertEqual(diagnostic["plan_fallback"], not isolated)
+                self.assertEqual(diagnostic["plan_fallback"], not isolated and provider != "local")
                 self.assertEqual(plan_auth.call_count, 0 if isolated else 1)
 
     def test_connection_check_is_provider_only_and_does_not_reread_snapshot(self):

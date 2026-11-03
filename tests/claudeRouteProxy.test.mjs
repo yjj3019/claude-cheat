@@ -1366,14 +1366,13 @@ test('failed half-open request renews cooldown and later real request retries re
   assert.equal(calls.length, 12);
 });
 
-test('local provider failures retry locally then forward exact native Sonnet once', async t => {
+test('local provider failures retry locally without forwarding to Plan', async t => {
   const { calls, request } = await fixture(t, (url, options) => url === proURL ? jsonResponse(url, options) : new Response('local unavailable', { status: 500 }),
     { provider: 'local', key: undefined, localUrl: 'http://[::1]:8080/v1/messages', localModel: 'local-fixture' });
-  assert.equal((await request(requestBody(SONNET), { headers: proHeaders })).status, 200);
-  assert.equal(calls.length, 5);
+  assert.equal((await request(requestBody(SONNET), { headers: proHeaders })).status, 503);
+  assert.equal(calls.length, 4);
   assert.ok(calls.slice(0, 4).every(call => call.url === 'http://[::1]:8080/v1/messages' && !call.headers.authorization));
-  assert.equal(calls.at(-1).url, proURL);
-  assert.equal(calls.at(-1).parsedBody.model, SONNET);
+  assert.equal(calls.some(call => call.url === proURL), false);
 });
 
 const toolStart = () => frame('content_block_start', { index: 0, content_block: { type: 'tool_use', id: 'tool_fixture', name: 'Read', input: {} } });

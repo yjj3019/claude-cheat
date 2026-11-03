@@ -77,7 +77,7 @@ test('Local queue wait defaults to 60 seconds and honors a bounded environment o
   }
 });
 
-test('Local queue bounds concurrency, rejects overflow to Plan and preserves token payload', async t => {
+test('Local queue bounds concurrency, rejects overflow without Plan and preserves token payload', async t => {
   const gate = deferred(); let localCalls = 0, planCalls = 0;
   const { send, metrics } = await fixture(t, async (url, options) => {
     if (url === PLAN) { planCalls++; return response(options); }
@@ -89,12 +89,12 @@ test('Local queue bounds concurrency, rejects overflow to Plan and preserves tok
   });
   const first = send(); await waitFor(() => localCalls === 1);
   const second = send(); await waitFor(async () => (await metrics()).localAdmission.queued === 1);
-  assert.equal((await send()).status, 200);
-  assert.equal(planCalls, 1); assert.equal(localCalls, 1);
+  assert.equal((await send()).status, 503);
+  assert.equal(planCalls, 0); assert.equal(localCalls, 1);
   gate.resolve(); await (await first).text(); await (await second).text();
   const m = await metrics();
   assert.deepEqual(m.localAdmission, { active: 0, queued: 0, rejected: 1, concurrency: 1, queueLimit: 1, queueWaitMs: 1000 });
-  assert.equal(m.reasons.local_busy, 1); assert.equal(m.circuitOpens, 0); assert.equal(localCalls, 2);
+  assert.equal(m.circuitOpens, 0); assert.equal(localCalls, 2);
 });
 
 test('Local queued cancellation removes its entry and releases active permits', async t => {
@@ -134,8 +134,8 @@ for (const status of [429, 503, 529]) {
       calls++; return new Response('busy', { status, headers: { 'retry-after': '120' } });
     }, { retryMaxWaitMs: 10, cooldownMs: 1 });
     await (await send()).text(); await (await send()).text();
-    assert.equal(calls, 1); assert.equal(plan, 2);
-    const m = await metrics(); assert.equal(m.retries, 0); assert.equal(m.reasons.circuit_open, 1);
+    assert.equal(calls, 1); assert.equal(plan, 0);
+    const m = await metrics(); assert.equal(m.retries, 0);
     assert.equal(m.localAdmission.active, 0); assert.equal(m.rateLimit.retryAfterMs, 120000);
   });
 }
@@ -151,7 +151,7 @@ test('Queued Local request rechecks a newly opened breaker', async t => {
   const second = send(); await waitFor(async () => (await metrics()).localAdmission.queued === 1);
   gate.resolve(); await (await first).text(); await (await second).text();
   assert.equal(calls, 1); assert.equal((await metrics()).localAdmission.active, 0);
-  assert.equal((await metrics()).reasons.circuit_open, 1);
+  assert.equal((await metrics()).circuitOpens, 1);
 });
 
 test('Local congestion retries back off while successful replies release capacity', async t => {
@@ -196,6 +196,51 @@ test('Empty Local responses retain validation retry policy without congestion ji
   await (await send()).text();
   assert.equal(calls, 4); assert.equal(randomCalls, 0); assert.equal((await metrics()).localAdmission.active, 0);
 });
+
+test('an empty max-token response does not block later Local requests', async t => {
+  let calls = 0, planCalls = 0;
+  const { send, metrics } = await fixture(t, async (url, options) => {
+    if (url === PLAN) { planCalls++; return response(options); }
+    calls++;
+    if (calls <= 4) return Response.json({ id: 'msg_empty', type: 'message', role: 'assistant', model: MODEL,
+      content: [], stop_reason: 'max_tokens', usage: { input_tokens: 1, output_tokens: 321 } });
+    return response(options);
+  });
+  assert.equal((await send()).status, 503);
+  assert.equal((await metrics()).circuitOpens, 0);
+  assert.equal((await send()).status, 200);
+  assert.equal(calls, 5);
+  assert.equal(planCalls, 0);
+});
+
+test('a later Local transport failure still opens the circuit after an empty max-token response', async t => {
+  let calls = 0;
+  const { send, metrics } = await fixture(t, async (url, options) => {
+    if (url === PLAN) return response(options);
+    if (++calls === 1) return Response.json({ id: 'msg_empty', type: 'message', role: 'assistant', model: MODEL,
+      content: [], stop_reason: 'max_tokens', usage: { input_tokens: 1, output_tokens: 321 } });
+    throw new Error('transport failure');
+  });
+  assert.equal((await send()).status, 503);
+  assert.equal((await metrics()).circuitOpens, 1);
+});
+
+for (const [upstreamStatus, expectedStatus, code] of [[400, 400, 'local_invalid_request'],
+  [401, 403, 'local_authentication_failed'], [402, 402, 'local_payment_required']]) {
+  test(`Local HTTP ${upstreamStatus} is reported without a Plan request`, async t => {
+    let planCalls = 0;
+    const { send } = await fixture(t, async url => {
+      if (url === PLAN) { planCalls++; throw new Error('unexpected Plan'); }
+      return new Response('private upstream error', { status: upstreamStatus });
+    });
+    const result = await send();
+    assert.equal(result.status, expectedStatus);
+    const text = await result.text();
+    assert.match(text, new RegExp(code));
+    assert.doesNotMatch(text, /private upstream error/);
+    assert.equal(planCalls, 0);
+  });
+}
 
 for (const [detail, upstream] of [
   ['missing_body', () => new Response(null)],

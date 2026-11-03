@@ -83,7 +83,7 @@ for (const localKey of [undefined, 'synthetic-local-key']) {
 }
 
 for (const format of ['json', 'sse']) {
-  test(`empty local HTTP ${format} retries, falls back, and recovers after cooldown`, { timeout: 5000 }, async t => {
+  test(`empty local HTTP ${format} retries, reports failure, and recovers after cooldown`, { timeout: 5000 }, async t => {
     let time = 1000, healthy = false;
     const f = await fixture(t, (_req, res) => {
       if (healthy) {
@@ -101,14 +101,13 @@ for (const format of ['json', 'sse']) {
         frame('message_delta', { delta: { stop_reason: 'end_turn' } }) + frame('message_stop'));
     }, { now: () => time, cooldownMs: 30 });
     const extra = { stream: format === 'sse' };
-    await (await f.request(extra)).text();
+    assert.equal((await f.request(extra)).status, 503);
     assert.equal(f.localCalls.length, 4);
-    assert.equal(f.proCalls.length, 1);
-    assert.deepEqual(f.proCalls[0].body, body(extra));
+    assert.equal(f.proCalls.length, 0);
     healthy = true;
-    await (await f.request(extra)).text();
+    assert.equal((await f.request(extra)).status, 503);
     assert.equal(f.localCalls.length, 4);
-    assert.equal(f.proCalls.length, 2);
+    assert.equal(f.proCalls.length, 0);
     time += 31;
     for (let i = 0; i < 2; i++) {
       const response = await f.request(extra);
@@ -120,7 +119,7 @@ for (const format of ['json', 'sse']) {
       }
     }
     assert.equal(f.localCalls.length, 6);
-    assert.equal(f.proCalls.length, 2);
+    assert.equal(f.proCalls.length, 0);
   });
 }
 
@@ -152,17 +151,15 @@ test('real chunked SSE preserves split tool JSON and restores the client model',
   assert.equal(f.proCalls.length, 0);
 });
 
-test('connection refusal makes four local attempts then one native fallback', { timeout: 5000 }, async t => {
+test('connection refusal makes four local attempts without Plan fallback', { timeout: 5000 }, async t => {
   const f = await fixture(t, (_req, res) => json(res, message()));
   await new Promise(resolve => f.local.close(resolve));
   const response = await f.request();
-  assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), message(SONNET));
+  assert.equal(response.status, 503);
+  assert.match(await response.text(), /local_upstream_error/);
   assert.equal(f.attempts.length, 4);
   assert.equal(f.localCalls.length, 0);
-  assert.equal(f.proCalls.length, 1);
-  assert.deepEqual(f.proCalls[0].body, body());
-  assert.equal(f.proCalls[0].headers.authorization, OAUTH);
+  assert.equal(f.proCalls.length, 0);
 });
 
 test('restored local HTTP gets one half-open probe and subsequent requests recover locally', { timeout: 5000 }, async t => {
@@ -177,24 +174,24 @@ test('restored local HTTP gets one half-open probe and subsequent requests recov
   }, { now: () => time, cooldownMs: 100, attemptTimeoutMs: 2000 });
   await (await f.request()).text();
   assert.equal(f.localCalls.length, 4);
-  assert.equal(f.proCalls.length, 1);
+  assert.equal(f.proCalls.length, 0);
   healthy = true;
   await (await f.request()).text();
   assert.equal(f.localCalls.length, 4);
-  assert.equal(f.proCalls.length, 2);
+  assert.equal(f.proCalls.length, 0);
   time += 101;
   const probe = f.request();
   await probeEntered;
   await (await f.request()).text();
   assert.equal(f.localCalls.length, 5, 'only one half-open local request');
-  assert.equal(f.proCalls.length, 3);
+  assert.equal(f.proCalls.length, 0);
   release();
   const recovered = await probe;
   assert.equal(recovered.status, 200);
   await recovered.text();
   await (await f.request()).text();
   assert.equal(f.localCalls.length, 6);
-  assert.equal(f.proCalls.length, 3);
+  assert.equal(f.proCalls.length, 0);
 });
 
 for (const format of ['json', 'sse']) {
@@ -206,16 +203,15 @@ for (const format of ['json', 'sse']) {
         frame('content_block_start', { index: 0, content_block: { type: 'tool_use', id: 'bad', name: 'UNSAFE_TOOL', input: {} } }));
     });
     const response = await f.request(format === 'sse' ? { stream: true } : undefined);
-    assert.equal(response.status, 200);
+    assert.equal(response.status, 503);
     const text = await response.text();
     assert.doesNotMatch(text, /UNSAFE_TOOL/);
-    assert.deepEqual(JSON.parse(text), message(SONNET));
     assert.equal(f.localCalls.length, 4);
-    assert.equal(f.proCalls.length, 1);
+    assert.equal(f.proCalls.length, 0);
   });
 }
 
-test('real HTTP stalled response times out four times and falls back', { timeout: 5000 }, async t => {
+test('real HTTP stalled response times out four times without Plan fallback', { timeout: 5000 }, async t => {
   const closed = [];
   const f = await fixture(t, (_req, res) => {
     closed.push(once(res, 'close'));
@@ -223,10 +219,10 @@ test('real HTTP stalled response times out four times and falls back', { timeout
     res.write('{');
   }, { attemptTimeoutMs: 100 });
   const response = await f.request();
-  assert.equal(response.status, 200);
+  assert.equal(response.status, 503);
   await response.text();
   assert.equal(f.localCalls.length, 4);
-  assert.equal(f.proCalls.length, 1);
+  assert.equal(f.proCalls.length, 0);
   await Promise.all(closed);
 });
 
@@ -406,15 +402,14 @@ for (const stream of [false, true]) {
   });
 }
 
-test('ordinary Local compatibility keeps failed requests recoverable on Plan without changing the native body', async t => {
+test('ordinary Local compatibility reports failed requests without Plan fallback', async t => {
   const f = await fixture(t, (_req,res) => {res.writeHead(400);res.end('{}');});
   const extra = {tools:[{name:'mcp__fixture__echo',defer_loading:true,input_schema:{type:'object'}}]};
   const response = await f.request(extra,undefined,'oauth-2025-04-20,advanced-tool-use-2025-11-20');
-  assert.equal(response.status,200);
+  assert.equal(response.status,400);
   await response.text();
   assert.equal(f.localCalls.length,1);
-  assert.equal(f.proCalls.length,1);
-  assert.deepEqual(f.proCalls[0].body,body(extra));
+  assert.equal(f.proCalls.length,0);
 });
 
 for (const fail of [false,true]) {
@@ -428,13 +423,12 @@ for (const fail of [false,true]) {
     const extra = {tools:[oldTool],messages:[{role:'user',content:[{type:'text',text:'fixture input'},
       {type:'tool_addition',tool:{type:'tool_definition',definition:loadedTool},cache_control:{type:'ephemeral'}}]}],stream:true};
     const response = await f.request(extra,undefined,'oauth-2025-04-20,inline-tools-2026-09-15');
-    assert.equal(response.status,200);
+    assert.equal(response.status,fail ? 400 : 200);
     await response.text();
     assert.equal(f.localCalls.length,1);
     assert.deepEqual(f.localCalls[0].body.messages,[{role:'user',content:[{type:'text',text:'fixture input'}]}]);
     assert.deepEqual(f.localCalls[0].body.tools,[{...loadedTool,cache_control:{type:'ephemeral'}}]);
-    assert.equal(f.proCalls.length,fail?1:0);
-    if (fail) assert.deepEqual(f.proCalls[0].body,body(extra));
+    assert.equal(f.proCalls.length,0);
   });
 }
 
@@ -470,15 +464,10 @@ for (const fail of [false,true]) {
     const extra = {messages:[{role:'user',content:'fixture input'},
       {role:'assistant',content:[tool]}, {role:'user',content:[{type:'tool_result',tool_use_id:'t1',content:'fixture output'}]}]};
     const response = await f.request(extra);
-    assert.equal(response.status,200);await response.text();
+    assert.equal(response.status,fail ? 400 : 200);await response.text();
     assert.equal(f.localCalls.length,1);
     assert.equal(Object.hasOwn(f.localCalls[0].body.messages[1].content[0],'provider_specific_fields'),false);
-    assert.equal(f.proCalls.length,fail?1:0);
-    if (fail) {
-      const expected=body(extra);
-      expected.messages=extra.messages.map((m,index)=> index===1?{...m,content:[{type:'tool_use',id:'t1',name:'mcp__fixture__echo',input:{}}]}:m);
-      assert.deepEqual(f.proCalls[0].body,expected);
-    }
+    assert.equal(f.proCalls.length,0);
     assert.equal(Object.hasOwn(tool,'provider_specific_fields'),true);
     assert.equal(tool.provider_specific_fields,null);
   });
