@@ -373,6 +373,7 @@ class DashboardVersionTests(unittest.TestCase):
                 self.assertIn("loadVersion", html)
 
     def test_api_version_answers_without_waiting_for_git(self):
+        declared_version = version.declared_version()
         def slow_read():
             time.sleep(1.5)
             return {"version": "1.0.0", "label": "v1.0.0 (abcdef0)", "commit": HEAD,
@@ -389,7 +390,7 @@ class DashboardVersionTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertLess(elapsed, 0.8, "the endpoint blocked on the checkout read")
         payload = json.loads(body)
-        self.assertEqual(payload["local"]["version"], "1.0.0")
+        self.assertEqual(payload["local"]["version"], declared_version)
         self.assertEqual(payload["update"]["state"], "disabled")
         self.assertIn("application/json", headers["content-type"])
 
