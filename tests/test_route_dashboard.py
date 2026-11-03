@@ -3996,6 +3996,33 @@ class ProactiveReactionTests(unittest.TestCase):
             routing_values={"ROUTE_DEFAULT_PROVIDER": "openrouter"})
         self.assertNotIn("session_plan_only", self.codes(alerts))
 
+    def test_repeated_failures_promote_a_session_to_failing(self):
+        # Under the threshold a retried session is still healthy; at it, it is named failing.
+        base = {"requests": 30, "ok": 28, "failed": 2, "aborted": 0,
+                "configuration": {"provider": "openrouter"}}
+        below = dash.proactive_alerts(
+            {"openrouter": True, "local": False, "cli": False},
+            {"provider": "openrouter"}, {**base, "retries": dash.RETRY_FAILURE_THRESHOLD - 1},
+            routing_values={"ROUTE_DEFAULT_PROVIDER": "openrouter"})
+        self.assertNotIn("session_repeated_failures", self.codes(below))
+        alerts = dash.proactive_alerts(
+            {"openrouter": True, "local": False, "cli": False},
+            {"provider": "openrouter"}, {**base, "retries": dash.RETRY_FAILURE_THRESHOLD},
+            routing_values={"ROUTE_DEFAULT_PROVIDER": "openrouter"})
+        self.assertIn("session_repeated_failures", self.codes(alerts))
+        alert = next(item for item in alerts if item["code"] == "session_repeated_failures")
+        self.assertEqual(alert["level"], "warn")
+        # One alert, even when the session is also rate limited: one next step per session.
+        limited = dash.proactive_alerts(
+            {"openrouter": True, "local": False, "cli": False},
+            {"provider": "openrouter"},
+            {**base, "retries": dash.RETRY_FAILURE_THRESHOLD,
+             "rateLimit": {"status": 429, "retryAfterMs": 1500,
+                           "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}},
+            routing_values={"ROUTE_DEFAULT_PROVIDER": "openrouter"})
+        self.assertNotIn("session_repeated_failures", self.codes(limited))
+        self.assertEqual(self.codes(limited).count("session_rate_limited"), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -4109,6 +4136,16 @@ class MultiSessionTests(unittest.TestCase):
         self.assertEqual(summary["retry_health"]["state"], "rate_limited")
         self.assertEqual(summary["retry_health"]["retries"], 2)
         self.assertEqual(summary["retry_health"]["retry_after_ms"], 1500)
+
+    def test_retry_health_distinguishes_retried_from_failing(self):
+        base = {"session": {"instance_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                            "provider": "openrouter", "started": "2026-11-02T00:00:00+00:00", "port": 1234},
+                 "metrics": {"retries": 1, "configuration": {"provider": "openrouter"}}}
+        self.assertEqual(dash._session_summary(base)["retry_health"]["state"], "retried")
+        over = {"session": dict(base["session"]),
+                "metrics": {**base["metrics"], "retries": dash.RETRY_FAILURE_THRESHOLD + 1}}
+        self.assertEqual(dash._session_summary(over)["retry_health"]["state"], "failing")
+        self.assertEqual(dash._session_summary(over)["retry_health"]["retries"], dash.RETRY_FAILURE_THRESHOLD + 1)
 
     def test_session_monitor_ui_is_present(self):
         self.assertIn('renderSessionMonitor', dash.PAGE)

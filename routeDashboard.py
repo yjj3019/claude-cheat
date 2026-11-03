@@ -2001,7 +2001,7 @@ def _session_summary(saved):
         if age is not None and 0 <= age <= window:
             retry_state = "rate_limited"
     if retry_state is None and retries:
-        retry_state = "retried"
+        retry_state = "failing" if retries >= RETRY_FAILURE_THRESHOLD else "retried"
     output_rate = (round(output_tokens * 1000 / elapsed_ms, 2)
                    if samples and output_tokens is not None and elapsed_ms else None)
     return {"instance_id": session.get("instance_id"),
@@ -2994,6 +2994,9 @@ ATTENTION_STATES = {"open", "acknowledged", "snoozed", "resolved"}
 ATTENTION_HISTORY_LIMIT = 100
 ATTENTION_HISTORY_SHOWN = 6
 ATTENTION_RESOLVE_MUTE_SECONDS = 3600
+# Consecutive-failure threshold for session RetryHealth. Under it a session is "retried";
+# meeting it promotes the session to "failing" so the monitor surfaces sustained trouble.
+RETRY_FAILURE_THRESHOLD = 3
 
 
 def _attention_iso(now=None):
@@ -4603,7 +4606,9 @@ function renderSessionMonitor(data) {
       <td><span class="session-dot"></span><strong>${esc(session.project || '정보 없음')}</strong>
         ${session.project_source === 'inferred' ? '<span class="chip">추정</span>' : ''}
         ${session.branch ? `<span class="chip">${esc(session.branch)}</span>` : ''}
-        ${session.retry_health && session.retry_health.state !== 'ok' ? `<span class="chip chip-warn">${session.retry_health.state === 'rate_limited' ? '속도 제한' : '재시도 이력 ' + num(session.retry_health.retries)}</span>` : ''}
+        ${session.retry_health && session.retry_health.state === 'rate_limited' ? `<span class="chip chip-warn">속도 제한</span>` : ''}
+        ${session.retry_health && session.retry_health.state === 'failing' ? `<span class="chip chip-warn">연속 실패 ${num(session.retry_health.retries)}회</span>` : ''}
+        ${session.retry_health && session.retry_health.state === 'retried' ? `<span class="chip">재시도 이력 ${num(session.retry_health.retries)}</span>` : ''}
         ${selected ? '<span class="chip chip-selected">표시 중</span>' : `<button type="button" class="btn btn-sm btn-ghost" data-session-select="${esc(session.instance_id)}">표시</button>`}
         <div class="session-path mono" title="${esc(session.cwd || '')}">${esc(session.cwd || '경로 미보고')}</div>
         <div class="session-service">${esc(names[session.provider] || session.provider || '?')} · :${esc(session.port)}</div></td>
@@ -5918,6 +5923,16 @@ def proactive_alerts(providers, session, metrics, routing_values=None, cli_value
                     f"최근 요청이 HTTP {rate_limit.get('status', 429)}로 제한되었습니다. 약 {wait}초 뒤 재시도하며, "
                     "계속되면 공급자 사용량과 모델을 확인하세요.",
                     "session_rate_limited")
+    # RetryHealth threshold: a session that has exhausted the retry budget is a person's
+    # problem, not a health row. rate_limited above is the sharper signal for 429; the
+    # count-based threshold catches repeated non-429 failures, so a one-off retry never warns.
+    retries = (metrics or {}).get("retries") if isinstance(metrics, dict) else None
+    if (isinstance(retries, int) and retries >= RETRY_FAILURE_THRESHOLD
+            and not any(alert.get("code") == "session_rate_limited" for alert in alerts)):
+        add("warn", "세션 연속 실패",
+            f"이 세션에서 공급자 재시도가 {retries}회 쌓였습니다. 실패가 이어지면 회로가 열려 요청이 거부되거나 "
+            "Plan으로 내려갑니다. 모델·키·한도를 확인하세요.",
+            "session_repeated_failures")
     # A configured external service whose session never attempted it is easy to misread as a
     # routing fault; native-only features keep such requests on Plan by design.
     routes = (metrics or {}).get("routes") if isinstance(metrics, dict) else None
