@@ -116,8 +116,8 @@
 
 - P0 **Attention-first 운영 큐**: 구현됨 — `POST /api/attention`, ack/snooze/resolve/reopen, 자동 해결 이력, 건강한 상태 접힘.
 - P1 **세션별 RetryHealth**: 부분 구현됨 — rate-limit/재시도/회로를 세션 표에 표시하고 속도 제한을 주의 큐로 승격.
-- P0 **Versioned 설정·정책**: 아직 미구현 — 다음 작업 후보.
-- P1 **알림 outbox**, **settings diff/rollback**: 아직 미구현.
+- P0 **Versioned 설정·정책**: 구현됨 — revision(id)별 설정 이력(`/api/config-history`, `routeConfig.Store.history`), UI의 이전→새 값 diff 표시, 토큰·revision 기반 rollback(`/api/config-history-restore`→`write_provider(restore_id=…)`), 커밋 전 검증(`validate` 콜백·`history_conflict` 갱신 충돌 차단). 인증정보·주소는 기록에서 제외. (2026-11-03 갱신: survey 작성 시점 이후 완료)
+- P1 **알림 outbox**, **settings diff/rollback**: 알림 outbox만 미구현 — diff/rollback은 위 Versioned 설정·정책으로 구현됨.
 
 ## 9. 라이선스
 

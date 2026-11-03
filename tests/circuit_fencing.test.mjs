@@ -24,6 +24,23 @@ const externalReply = () => Response.json(textReply(UPSTREAM_MODEL, 'external-ok
 const planReply = () => Response.json(textReply(MODEL, 'plan-ok'));
 const requestBody = (extra = {}) => JSON.stringify({ model: MODEL, max_tokens: 16, stream: false,
   messages: [{ role: 'user', content: 'hi' }], ...extra });
+const frame = (type, fields = {}) => `event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`;
+const startStream = () => {
+  const encoder = new TextEncoder();
+  return new Response(new ReadableStream({
+    async start(controller) {
+      controller.enqueue(encoder.encode(frame('message_start', { message: { id: 'msg_stream', type: 'message',
+        role: 'assistant', model: UPSTREAM_MODEL, usage: { input_tokens: 1, output_tokens: 1 } } })));
+      controller.enqueue(encoder.encode(frame('content_block_start', { index: 0,
+        content_block: { type: 'text', text: '' } })));
+      await new Promise(resolve => setTimeout(resolve, 20));
+      controller.enqueue(encoder.encode(frame('content_block_delta', { index: 0,
+        delta: { type: 'text_delta', text: 'hello' } })));
+      await new Promise(resolve => setTimeout(resolve, 20));
+      controller.error(new Error('socket reset'));
+    },
+  }), { headers: { 'content-type': 'text/event-stream' } });
+};
 
 async function startProxy(t, config = {}) {
   const server = createProxy({ key: 'sk-or-circuit', nonce: NONCE, openrouterModel: UPSTREAM_MODEL,
@@ -341,3 +358,27 @@ test('a late stale success cannot close a breaker opened after it started',
     const payload = await proxy.metrics();
     assert.equal(payload.circuitOpens, 1);
   });
+
+test('a broken passthrough stream opens the provider breaker', { timeout: 15000 }, async t => {
+  let time = 1000;
+  let externalCalls = 0;
+  const proxy = await startProxy(t, { now: () => time, cooldownMs: 100, streamPassthrough: true,
+    fetchImpl: async url => {
+      if (url === PLAN) return planReply();
+      externalCalls += 1;
+      return startStream();
+    } });
+  // The first request already forwarded frames, so it finishes with an in-stream error.
+  const first = await proxy.send({ stream: true });
+  const firstText = await first.text();
+  assert.equal(first.status, 200, firstText);
+  assert.match(firstText, /upstream stream failed/);
+  assert.equal(externalCalls, 1);
+  // The mid-stream failure is provider trouble: the next request must hit the cooldown.
+  const second = await proxy.sendOk({ stream: true });
+  assert.match(second.text, /openrouter_cooldown/);
+  assert.equal(externalCalls, 1, 'the cooldown must fence the provider after a broken stream');
+  assert.equal(second.status, 503);
+  const payload = await proxy.metrics();
+  assert.equal(payload.circuitOpens, 1);
+});

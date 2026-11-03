@@ -2183,11 +2183,20 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           } catch (error) {
             client.signal.throwIfAborted();
             // Headers on the wire means the client already has part of the answer: retrying
-            // would duplicate it and falling back is impossible, so finish the stream.
+            // would duplicate it and falling back is impossible, so finish the stream. The
+            // failure is still a provider failure: record it in the circuit so repeated
+            // mid-stream breaks fence the provider instead of being retried every request.
             if (error?.streamed || res.headersSent) {
-              // Headers are already on the wire, so retrying or falling back would corrupt
-              // the response; report the failure inside the stream and stop here.
               responseFailed = true;
+              if (!requestRejected && claimedGeneration === circuitState.generation) {
+                providerFailure = controller.signal.reason === 'attempt_timeout' ? 'timeout' : 'upstream_error';
+                failureClass = failureClassOf(status, controller.signal.reason === 'attempt_timeout');
+                circuitState.generation++;
+                circuitState.lastFailure = providerFailure;
+                circuitState.openUntil = now() + cooldownMs;
+                metrics.circuitOpens += 1;
+                logEvent({ event: 'circuit_open', provider: target.name, failure: failureClass });
+              }
               logEvent({ event: 'stream_broken', provider: target.name, category: 'upstream' });
               try {
                 res.write(`event: error\ndata: ${JSON.stringify({ type: 'error',
