@@ -65,8 +65,9 @@ class OpenRouterConfigError(ValueError):
             "Set a valid ANTHROPIC_AUTH_TOKEN and OPENROUTER_MODEL in openclaude.config.yaml "
             "(openrouter: api_key, model) beside openrouterAdvisor.py. "
             "No default model is selected. Values hidden. "
-            "Or run OpenClaude.ps1 -Setup (OpenClaudeDashboard.ps1), open http://127.0.0.1:8787/ "
-            "and fill the OpenRouter settings there.")
+            "Or run OpenClaude.ps1 -Setup (OpenClaudeDashboard.ps1); the dashboard auto-opens on its "
+            "token-backed write_url, and only that page can save settings. A plain http://127.0.0.1:8787/ "
+            "tab is read-only and rejects saves.")
 
 
 class PlanLoginError(RuntimeError):
@@ -1506,12 +1507,10 @@ Exit codes: 0 = success, 2 = usage/service choice required, others = failure.
             payload.update({"action": "open_dashboard", "dashboard": "http://127.0.0.1:8787/",
                             "command": f"powershell -File \"{ROOT / 'OpenClaudeDashboard.ps1'}\""})
             print("[setup required] openclaude.config.yaml (openrouter section) is missing or invalid", file=sys.stderr)
-            print(f"  powershell -File \"{ROOT / 'OpenClaudeDashboard.ps1'}\"   ->  http://127.0.0.1:8787/",
-                  file=sys.stderr)
-            print("  or run: OpenClaude.ps1 -Setup   (opens the settings page in your browser)",
-                  file=sys.stderr)
-            print("  fill the OpenRouter settings there, save, then run OpenClaude.ps1 again",
-                  file=sys.stderr)
+            print(f"  powershell -File \"{ROOT / 'OpenClaudeDashboard.ps1'}\"   (opens the dashboard on its write_url)", file=sys.stderr)
+            print("  or run: OpenClaude.ps1 -Setup   (opens the settings page in your browser)", file=sys.stderr)
+            print("  save the OpenRouter settings in THAT tab (a plain http://127.0.0.1:8787/ visit is read-only),", file=sys.stderr)
+            print("  then run OpenClaude.ps1 again", file=sys.stderr)
         print(json.dumps(payload), file=sys.stderr)
         return 1
     except (OSError, RuntimeError, EOFError, ValueError, subprocess.SubprocessError,
