@@ -2852,24 +2852,28 @@ def run_connection_test(provider, mode="metadata", values=None):
         if provider == "openrouter":
             key = values.get("ANTHROPIC_AUTH_TOKEN", "")
             model = values.get("OPENROUTER_MODEL", "")
-            if not key or not model:
+            if not key:
                 return {**base, "reason": "configuration_missing"}
-            if (not re.fullmatch(r"sk-or-[A-Za-z0-9_-]+", key)
-                    or not re.fullmatch(r"[A-Za-z0-9~@][A-Za-z0-9._:/@+~-]{0,255}", model)):
+            if not re.fullmatch(r"sk-or-[A-Za-z0-9_-]+", key):
                 return {**base, "reason": "invalid_configuration"}
             try:
-                _validate_config(provider, values)
+                _validate_config(provider, {**values, "OPENROUTER_MODEL": model or "vendor/model"})
             except ValueError:
                 return {**base, "reason": "invalid_configuration"}
-            headers["authorization"] = "Bearer " + key
             if mode == "metadata":
                 status, data = _http_json("https://openrouter.ai/api/v1/models",
                                           {"authorization": "Bearer " + key})
                 rows = data.get("data") if isinstance(data, dict) else None
                 ids = [row.get("id") for row in rows or [] if isinstance(row, dict)]
+                if not model:
+                    return {**base, "ok": False, "reason": "model_not_selected",
+                            "model": "", "model_count": len(ids)}
                 found = model in ids
                 return {**base, "ok": found, "reason": "model_found" if found else "model_not_found",
                         "model": model, "model_count": len(ids)}
+            if not model:
+                return {**base, "reason": "model_not_selected"}
+            headers["authorization"] = "Bearer " + key
             status, data = _http_json("https://openrouter.ai/api/v1/messages", headers,
                                       {"model": model, "max_tokens": 16, "stream": False,
                                        "provider": _openrouter_provider_policy(values),

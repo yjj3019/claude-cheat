@@ -1751,6 +1751,16 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["reason"], "model_found")
         self.assertNotIn("unsavedkey", json.dumps(result))
+        # A key alone must still list models so the user can pick an ID; a blank model
+        # reports model_not_selected instead of configuration_missing.
+        with mock.patch.object(dash, "_http_json", return_value=(200, {"data": [{"id": "vendor/a"}, {"id": "vendor/b"}]})) as request:
+            listed = dash.run_connection_test("openrouter", "metadata",
+                                             {"ANTHROPIC_AUTH_TOKEN": "sk-or-v1-unsavedkey1234"})
+        self.assertFalse(listed["ok"])
+        self.assertEqual(listed["reason"], "model_not_selected")
+        self.assertEqual(listed["model_count"], 2)
+        self.assertEqual(request.call_args.args[1]["authorization"], "Bearer sk-or-v1-unsavedkey1234")
+        self.assertNotIn("unsavedkey", json.dumps(listed))
         # A blank secret falls back to the stored value, so a saved key still works.
         self.put_openrouter("vendor/old", "sk-or-v1-storedkey1234")
         with mock.patch.object(dash, "_http_json", return_value=(200, {"data": [{"id": "vendor/c"}]})):
