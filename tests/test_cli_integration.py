@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Opt-in end-to-end check: one real Claude Code turn through the launcher and proxy.
 
     $env:CLAUDE_CHEAT_LIVE = '1'

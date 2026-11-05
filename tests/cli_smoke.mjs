@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // EXPERIMENTAL, opt-in: one real Claude Code print-mode turn through this proxy.
 // node tests/cli_smoke.mjs [--prompt "Reply with exactly OK"]
 // Makes real provider requests and may cost money. Not included in the default test suite.

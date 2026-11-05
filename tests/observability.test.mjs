@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Observability: one traceId correlates every diagnostic line of a turn, and one redaction
 // sink guarantees a credential can never leave through a log line or an error body.
 import assert from 'node:assert/strict';

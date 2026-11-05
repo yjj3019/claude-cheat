@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Parallel dashboard reads must agree: the shared route-log tail is the risky part."""
 import json
 import tempfile

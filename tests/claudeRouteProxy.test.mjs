@@ -1,8 +1,9 @@
+// SPDX-License-Identifier: MIT
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import test from 'node:test';
 import { listenSafe } from './listenSafe.mjs';
-import { createProxy, diagnoseLocal, DEEPSEEK } from '../claudeRouteProxy.mjs';
+import { createProxy, diagnoseLocal, DEEPSEEK, redactDiagnostic } from '../claudeRouteProxy.mjs';
 
 const diagnosticConfig = { localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'diagnostic-fixture', localKey: 'synthetic-local-key' };
 const diagnosticMessage = extra => ({ type: 'message', model: diagnosticConfig.localModel,
@@ -251,6 +252,20 @@ test('replacement route logs the model that actually served the request', async 
   assert.equal(selected.provider, 'openrouter');
   assert.equal(selected.reason, 'replacement');
   assert.equal(selected.model, DEEPSEEK);
+});
+
+test('redactDiagnostic round-trips common credential shapes in one pass (S3)', async () => {
+  const secrets = ['sk-ant-oat-dummy-secret-01234567', 'ghp_dummyGithubToken0123456789',
+    'github_pat_11ABCDEFGH0123456789abcdef', 'xai-dummyApiKey0123456789', 'AKIAIOSFODNN7EXAMPLE',
+    'sk-ant-dummy-klucz-01234567', 'my-verbatim-provider-secret-value'];
+  const line = secrets.join(' | ') + ' | Authorization: Bearer sk-ant-oat-bearer-dummy-012345';
+  const scrubbed = redactDiagnostic(line, [secrets[6]]);
+  for (const secret of secrets) assert.equal(scrubbed.includes(secret), false, `raw secret leaked: ${secret.slice(0, 12)}...`);
+  assert.equal(scrubbed.includes('Bearer [redacted:bearer-token]'), true);
+  assert.equal(scrubbed.includes('[redacted:provider-key]'), true);
+  const body = redactDiagnostic('{"error":{"x-api-key":"sk-ant-oat-json-dummy-012345"}}');
+  assert.equal(body.includes('sk-ant-oat-json-dummy-012345'), false);
+  assert.equal(body.includes('[redacted:api-key]'), true);
 });
 
 test('beta diagnostics show bounded feature identifiers and redact nonstandard or credential-like values', async t => {
@@ -1974,4 +1989,47 @@ test('rejected requests still carry the browser hardening headers', async t => {
   assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
   assert.equal(response.headers.get('referrer-policy'), 'no-referrer');
   assert.equal(response.headers.get('x-frame-options'), 'DENY');
+});
+
+test('api/metrics accepts a fields filter to shrink the polled payload', async t => {
+  const { request } = await fixture(t, jsonResponse);
+  const response = await request(undefined, { method: 'GET', path: '/api/metrics?fields=requests,ok,failed,unknown' });
+  const payload = await response.json();
+  assert.deepEqual(Object.keys(payload).sort(), ['failed', 'ok', 'requests']);
+  assert.equal(payload.ok, 0);
+  const full = await (await request(undefined, { method: 'GET', path: '/api/metrics' })).json();
+  assert.ok('startedAt' in full, 'no filter returns the full snapshot');
+});
+
+test('api/metrics reports upstream chunk cadence for streamed responses', async t => {
+  const parts = [frame('message_start'), frame('content_block_start', { index: 0, content_block: { type: 'text', text: '' } }),
+    frame('content_block_delta', { index: 0, delta: { type: 'text_delta', text: 'cod' } }),
+    frame('message_delta', { delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } }), frame('message_stop', {})];
+  const upstream = () => new Response(new ReadableStream({
+    async start(controller) {
+      const encoder = new TextEncoder();
+      for (const part of parts) { await new Promise(resolve => setTimeout(resolve, 5)); controller.enqueue(encoder.encode(part)); }
+      controller.close();
+    },
+  }), { headers: { 'content-type': 'text/event-stream' } });
+  const { request } = await fixture(t, upstream, { streamPassthrough: true });
+  const response = await request(requestBody(DEEPSEEK, { stream: true }), { headers: proHeaders });
+  assert.equal(response.status, 200);
+  const snapshot = await (await request(undefined, { method: 'GET', path: '/api/metrics' })).json();
+  const cadence = snapshot.latencyMs.chunkCadenceMs;
+  assert.ok(cadence && cadence.count >= 1, `inter-chunk gaps were sampled (got ${JSON.stringify(cadence)})`);
+  assert.ok(Number.isFinite(cadence.max) && Number.isFinite(cadence.p95), 'cadence summary carries numeric bounds');
+});
+
+test('the retry budget caps the aggregate backoff tail and reports it', async t => {
+  const { calls, request } = await fixture(t, () => new Response('still bad', { status: 503 }),
+    { retryDelayMs: 400, retryMaxWaitMs: 500, retryBudgetMs: 700 });
+  const started = Date.now();
+  const response = await request(requestBody(SONNET), { headers: proHeaders });
+  const elapsed = Date.now() - started;
+  assert.equal(response.status, 503);
+  assert.ok(elapsed < 1100, `aggregate retry wait ${elapsed}ms exceeded the P1 step budget`);
+  assert.equal(calls.length, 3, 'budget cuts the fourth attempt');
+  const metrics = await (await request(undefined, { method: 'GET', path: '/api/metrics' })).json();
+  assert.equal(metrics.retryBudgetExceeded >= 1, true, 'budget exhaustion is observable');
 });

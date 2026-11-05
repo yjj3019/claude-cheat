@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Local metadata checks use disposable loopback HTTP and synthetic credentials only."""
 
 import contextlib

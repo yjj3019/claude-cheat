@@ -1,3 +1,4 @@
+REM SPDX-License-Identifier: MIT
 @echo off
 rem Runs OpenClaude.ps1 even when the PowerShell execution policy blocks unsigned scripts.
 rem Routing session entry point for this checkout.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // The diagnostic log mirror must not grow without bound: it rotates at the limit, and the
 // metrics file must be replaced atomically so a reader never sees a half-written snapshot.
 import assert from 'node:assert/strict';

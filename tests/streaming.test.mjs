@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Streaming passthrough is opt-in: it trades guaranteed fallback for first-token latency.
 // The default keeps whole-body validation, which is what the rest of the suite assumes.
 import assert from 'node:assert/strict';

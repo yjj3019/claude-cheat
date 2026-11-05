@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Request lifecycle: a client that stalls mid-request must not hold the proxy's turn until
 // Node's long default timeout, and a handover must report its drained state before exiting.
 import assert from 'node:assert/strict';

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Windows process ownership tests: real proxy, synthetic CLI/upstream, no private settings."""
 
 import ctypes

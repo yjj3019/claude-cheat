@@ -1,4 +1,6 @@
+// SPDX-License-Identifier: MIT
 import http from 'node:http';
+import http2 from 'node:http2';
 import { once } from 'node:events';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { appendFile, appendFileSync, readFileSync, rename, renameSync, statSync, unlink, unlinkSync, writeFile, writeFileSync } from 'node:fs';
@@ -42,7 +44,8 @@ export function redactDiagnostic(text, secrets = []) {
       output = output.split(secret).join(REDACTED_PROVIDER_KEY);
   }
   output = output.replace(/Bearer[ \t]+(?!\[redacted:)[^\s"',}\]]+/gi, `Bearer ${REDACTED_BEARER}`);
-  output = output.replace(/\bsk-(?:ant-|or-)?[A-Za-z0-9._-]{4,}/g, REDACTED_API_KEY);
+  output = output.replace(/\bsk-(?:ant-|or-|proj-|admin-)?[A-Za-z0-9._-]{4,}/gi, REDACTED_API_KEY);
+  output = output.replace(/\b(?:ghp_|github_pat_|xai-|AKIA)[A-Za-z0-9_-]{8,}/g, REDACTED_API_KEY);
   output = output.replace(/("x-api-key"\s*:\s*")(?!\[redacted:)[^"]*(")/gi, `$1${REDACTED_API_KEY}$2`);
   output = output.replace(/(x-api-key\s*[:=]\s*)(?!\[redacted:)[^\s"',}]+/gi, `$1${REDACTED_API_KEY}`);
   return output;
@@ -216,7 +219,7 @@ if (routeLogPath) {
     const batch = queue.splice(0, 64);
     const bytes = batch.reduce((sum, line) => sum + Buffer.byteLength(line), 0);
     const started = performance.now();
-    appendFile(routeLogPath, batch.join(''), { encoding: 'utf8' }, error => {
+    appendFile(routeLogPath, batch.join(''), { encoding: 'utf8', mode: 0o600 }, error => {
       const elapsed = performance.now() - started;
       stats.writeMsTotal += elapsed;
       stats.writeMsMax = Math.max(stats.writeMsMax, elapsed);
@@ -286,7 +289,7 @@ if (routeLogPath) {
           text = startLine(true) + queue.join('');
         } catch {}
       }
-      appendFileSync(routeLogPath, text);
+      appendFileSync(routeLogPath, text, { mode: 0o600 });
       stats.written += queue.length;
       queue = [];
       queuedBytes = 0;
@@ -468,6 +471,64 @@ const SECURITY_HEADERS = {
   'x-frame-options': 'DENY',
 };
 const KEEP_ALIVE_TIMEOUT_MS = 5000;
+// One background HEAD per upstream origin, once per process, so the first real external/Plan
+// call reuses a warm DNS/TLS/connection instead of paying the handshake inside request latency.
+// It carries no credentials and never reaches a request handler; every failure is swallowed.
+// Disable with ROUTE_PREWARM=0; a custom fetchImpl (tests, bench) opts out by construction.
+const PREWARMED_ORIGINS = new Set();
+function prewarmOrigin(origin, impl = fetch) {
+  if (process.env.ROUTE_PREWARM === '0' || PREWARMED_ORIGINS.has(origin)) return;
+  PREWARMED_ORIGINS.add(origin);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3000);
+  timer.unref?.();
+  impl(origin, { method: 'HEAD', redirect: 'error', signal: controller.signal })
+    .then(() => { }).catch(() => { })
+    .finally(() => { clearTimeout(timer); controller.abort(); });
+}
+// ROUTE_UPSTREAM_H2=1 opts the default upstream client into per-origin HTTP/2 sessions
+// (h2 for https, h2c for plaintext), so concurrent external/Plan calls multiplex over one
+// connection with no HTTP/1.1 head-of-line blocking. Sessions are created lazily, evicted
+// after any session-level failure, and every outgoing call stays Response-compatible with
+// the http/1.1 path (redirect: errors reject, aborting the signal resets the stream).
+const H2_SESSIONS = new Map();
+const H2_FORBIDDEN = new Set(['connection', 'keep-alive', 'transfer-encoding', 'upgrade', 'proxy-connection', 'te', 'host']);
+function http2UpstreamFetch(input, options = {}) {
+  const url = typeof input === 'string' ? new URL(input) : input;
+  const entry = H2_SESSIONS.get(url.origin);
+  let session = entry;
+  if (!entry || entry.closed || entry.destroyed) {
+    session = http2.connect(url.origin);
+    const evict = () => { if (H2_SESSIONS.get(url.origin) === session) H2_SESSIONS.delete(url.origin); };
+    session.on('error', evict);
+    session.on('close', evict);
+    H2_SESSIONS.set(url.origin, session);
+  }
+  return new Promise((resolve, reject) => {
+    if (options.signal?.aborted) { reject(new Error('This operation was aborted')); return; }
+    const headers = { ':method': options.method || 'GET', ':path': url.pathname + url.search };
+    const source = options.headers;
+    for (const [name, value] of source?.entries ? [...source.entries()] : Object.entries(source || {})) {
+      const lower = String(name).toLowerCase();
+      if (!H2_FORBIDDEN.has(lower) && !lower.startsWith(':') && value !== undefined) headers[lower] = String(value);
+    }
+    const request = session.request(headers);
+    const abort = () => request.destroy();
+    options.signal?.addEventListener('abort', abort, { once: true });
+    let settled = false;
+    request.on('response', responseHeaders => {
+      const status = Number(responseHeaders[':status']);
+      if (status >= 300 && status < 400) { settled = true; request.destroy(); reject(new Error('URL redirect not supported')); return; }
+      const body = {}; for (const [name, value] of Object.entries(responseHeaders)) { if (!name.startsWith(':')) body[name] = value; }
+      settled = true;
+      resolve(new Response(request, { status, headers: body }));
+    });
+    request.on('error', error => { if (!settled) reject(error); });
+    const payload = options.body;
+    if (payload) request.write(payload);
+    request.end();
+  });
+}
 const BASIC_FIELDS = new Set(['model', 'messages', 'max_tokens', 'system', 'stream', 'temperature',
   'top_p', 'top_k', 'stop_sequences', 'tools', 'tool_choice', 'metadata', 'thinking', 'output_config', 'safeguards', 'cache_control']);
 const CONTENT_FIELDS = {
@@ -810,7 +871,7 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false)
   };
 }
 
-async function bufferedResponse(upstream, model, clientModel, stream, signal, onProgress, strictMeta = false, onFrame = null, rejectThinking = false, onDrain = null) {
+async function bufferedResponse(upstream, model, clientModel, stream, signal, onProgress, strictMeta = false, onFrame = null, rejectThinking = false, onDrain = null, onChunk = null) {
   if (!upstream.ok) throw new Error('External request failed');
   const sse = (upstream.headers.get('content-type') || '').includes('text/event-stream');
   if (!upstream.body) throw emptyResponseError('missing_body', sse ? 'sse' : 'json');
@@ -819,7 +880,7 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal, on
   const reader = upstream.body.getReader();
   const chunks = [];
   const output = [];
-  let size = 0, eventPending = '', forwarded = false;
+  let size = 0, eventPending = '', forwarded = false, lastChunkAtMs = null;
   const eventDecoder = new TextDecoder();
   const validator = sse ? streamValidator(model, clientModel, strictMeta, rejectThinking) : null;
   const cancel = () => { reader.cancel().catch(() => {}); };
@@ -864,6 +925,11 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal, on
       signal.throwIfAborted();
       if (done) break;
       onProgress?.();
+      if (onChunk) {
+        const now = performance.now();
+        if (lastChunkAtMs !== null) onChunk(now - lastChunkAtMs);
+        lastChunkAtMs = now;
+      }
       size += value.byteLength;
       if (size > MAX_RESPONSE) throw new Error('Response too large');
       if (!sse) chunks.push(Buffer.from(value));
@@ -1041,14 +1107,19 @@ export function parseRetryAfter(value, nowMs = Date.now()) {
   return Math.min(Math.max(at - reference, 0), RETRY_AFTER_MAX_MS);
 }
 
-export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrouter', openrouterModel, openrouterUpstreamProvider = '', localUrl,
+export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM_H2 === '1' ? http2UpstreamFetch : fetch, provider = 'openrouter', openrouterModel, openrouterUpstreamProvider = '', localUrl,
   localModel, localKey, localAllowRemote = false, localHttpUrl, cliKind = null, cliRequestedModel = null, localOnly = false, localCompat = false, openrouterCompat = false, fallbackModel = 'claude-sonnet-5-5', retryDelayMs = 1000,
-  cooldownMs = 30000, attemptTimeoutMs = localOnly || openrouterCompat ? 120000 : 30000, planHeaderMs = 120000, planIdleMs = 300000, attemptCeilingMs = 300000, now = Date.now,
+  cooldownMs = Number.isFinite(Number(process.env.ROUTE_COOLDOWN_MS))
+    ? Math.min(600000, Math.max(0, Number(process.env.ROUTE_COOLDOWN_MS))) : 30000, attemptTimeoutMs = localOnly || openrouterCompat ? 120000 : 30000, planHeaderMs = 120000, planIdleMs = 300000, attemptCeilingMs = 300000, now = Date.now,
+  // P1 step budget: the aggregate retry wait (backoff plus honored Retry-After hints) across one
+  // request must not exceed this; 0 disables the cap. Per-wait retryMaxWaitMs still applies.
+  retryBudgetMs = Number.isFinite(Number(process.env.ROUTE_RETRY_BUDGET_MS))
+    ? Math.min(600000, Math.max(0, Number(process.env.ROUTE_RETRY_BUDGET_MS))) : 60000,
   metricsPath = process.env.ROUTE_METRICS_PATH,
   instanceId = process.env.ROUTE_INSTANCE_ID,
   instanceMetricsPath = process.env.ROUTE_INSTANCE_METRICS_PATH,
   usageEventsPath = process.env.ROUTE_USAGE_EVENTS_PATH,
-  streamPassthrough = process.env.ROUTE_STREAM_PASSTHROUGH === '1',
+  streamPassthrough = process.env.ROUTE_STREAM_PASSTHROUGH,
   handoverTimeoutMs = Number(process.env.ROUTE_HANDOVER_TIMEOUT_MS) || 120000,
   // Idle, not total: a client may send for minutes as long as it keeps sending. 0 disables it.
   requestIdleTimeoutMs = Number.isFinite(Number(process.env.ROUTE_REQUEST_IDLE_TIMEOUT_MS))
@@ -1121,7 +1192,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     }
   }
   if (!isSonnet(fallbackModel)) throw new Error('Fallback must be a native Sonnet model');
-  for (const value of [retryDelayMs, cooldownMs, attemptTimeoutMs, planHeaderMs, planIdleMs, attemptCeilingMs])
+  for (const value of [retryDelayMs, cooldownMs, attemptTimeoutMs, planHeaderMs, planIdleMs, attemptCeilingMs, retryBudgetMs])
     if (!Number.isFinite(value) || value < 0) throw new Error('Invalid routing timeout');
   if (!Number.isFinite(requestIdleTimeoutMs) || requestIdleTimeoutMs < 0) throw new Error('Invalid request idle timeout');
   if (!Number.isFinite(retryMaxWaitMs) || retryMaxWaitMs < 0) throw new Error('Invalid retry wait');
@@ -1207,7 +1278,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   // Counters stay in memory and are written to a small file at most once a second, so the
   // dashboard can read routing load without talking to this process.
   const metrics = { startedAt: Date.now(), requests: 0, ok: 0, failed: 0, streams: 0, attempts: 0,
-    retries: 0, externalAttempts: 0, aborted: 0, bytesIn: 0, bytesOut: 0, circuitOpens: 0,
+    retries: 0, retryBudgetExceeded: 0, externalAttempts: 0, aborted: 0, bytesIn: 0, bytesOut: 0, circuitOpens: 0,
     routes: { external: 0, plan: 0 },
     reasons: {}, latency: { external: [], plan: [] }, ttfb: [], last: null };
   // Usage rows are tiny, contain no message content, and are buffered independently of
@@ -1262,6 +1333,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       .map(([minute, counts]) => ({ minute: new Date(minute * 60000).toISOString(), ...counts }));
   };
   const LATENCY_WINDOW = 512;
+  // Inter-arrival gaps between upstream chunks (SSE frames), a direct stream cadence signal.
+  const chunkCadence = [];
   const cliProcessTiming = [];
   const routingTiming = { queueWait: [], externalAttempt: [], externalHeaders: [], externalFirstBody: [],
     externalTimeout: [], retryWait: [], plan: [], total: [] };
@@ -1329,11 +1402,12 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
     requestAdmission: { active: requestActive, max: maxConcurrentRequests, inflightBytes,
       maxInflightBytes, rejected: requestAdmissionRejected },
     streams: metrics.streams, attempts: metrics.attempts, retries: metrics.retries,
+    retryBudgetExceeded: metrics.retryBudgetExceeded,
     routes: { ...metrics.routes }, externalAttempts: metrics.externalAttempts, aborted: metrics.aborted,
     reasons: { ...metrics.reasons },
     bytesIn: metrics.bytesIn, bytesOut: metrics.bytesOut, circuitOpens: metrics.circuitOpens,
     latencyMs: { external: latencySummary(metrics.latency.external), plan: latencySummary(metrics.latency.plan),
-      ttfb: latencySummary(metrics.ttfb) },
+      ttfb: latencySummary(metrics.ttfb), chunkCadenceMs: latencySummary(chunkCadence) },
     // Independent phase distributions, not additive percentiles. Total excludes inbound body parsing.
     routingTimingMs: Object.fromEntries(Object.entries(routingTiming).map(([name, values]) => [name, latencySummary(values)])),
     externalTimeouts: { kinds: { ...timeoutKinds }, stages: { ...timeoutStages },
@@ -1525,8 +1599,18 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
       return res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'Proxy is handing over' } }));
     }
     if (req.method === 'GET' && /^\/api\/metrics(?:\?.*)?$/.test(req.url)) {
+      // A ?fields=a,b filter shrinks the payload to the requested top-level keys; unknown keys
+      // are dropped, and no filter means the full snapshot.
+      let filtered = metricsSnapshot();
+      const fields = new URL(req.url, 'http://proxy').searchParams.get('fields');
+      if (fields) {
+        const keys = fields.split(',').map(name => name.trim()).filter(Boolean);
+        filtered = Object.fromEntries(keys
+          .filter(name => Object.prototype.hasOwnProperty.call(filtered, name))
+          .map(name => [name, filtered[name]]));
+      }
       res.writeHead(200, { ...SECURITY_HEADERS, 'content-type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify(metricsSnapshot()));
+      res.end(JSON.stringify(filtered));
       return;
     }
     if (req.method !== 'POST' || !/^\/v1\/messages(?:\/count_tokens)?(?:\?beta=true)?$/.test(req.url)) return reject(403, 'Endpoint blocked');
@@ -2023,6 +2107,10 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         if (target.name === 'local' || target.name === 'openrouter') {
           externalBody.system = withHostToolAccessGuidance(externalBody.system);
         }
+        // Keep client account/session identifiers off third-party providers: the count_tokens
+        // request body is assembled from the client message, and its metadata carries no
+        // upstream meaning (audit A2).
+        if (req.url.startsWith('/v1/messages/count_tokens')) delete externalBody.metadata;
         // Serialize once: the retry loop reuses the same payload, and a large history would
         // otherwise be stringified up to four times.
         const externalPayload = JSON.stringify(externalBody);
@@ -2041,7 +2129,7 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
         if (credential) headers.authorization = `Bearer ${credential}`;
         const attempts = noPlan || provider === 'cli' ? 1 : 4;
         // Permanent 4xx will not change on retry; request-level ones must not open the provider-wide circuit.
-        let requestRejected = false, outputBudgetExhausted = false;
+        let requestRejected = false, outputBudgetExhausted = false, retryBudgetLeft = retryBudgetMs;
         for (let attempt = 0; attempt < attempts; attempt++) {
           failureStatus = null; retryAfterHintMs = null;
           metrics.attempts += 1;
@@ -2123,7 +2211,8 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
                 res.once('drain', done);
                 res.once('close', done);
               });
-              const streaming = streamPassthrough && !forceJson && body.stream === true;
+              const passthroughEnabled = streamPassthrough === true || streamPassthrough === '1' || streamPassthrough === '2';
+              const streaming = passthroughEnabled && !forceJson && body.stream === true;
               const validated = await bufferedResponse(response, externalModel, model, forceJson ? false : body.stream,
                 controller.signal, () => {
                   if (!receivedBody && !controller.signal.aborted) {
@@ -2132,7 +2221,11 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
                   }
                   noteFirstByte(); if (!noPlan) arm();
                 }, target.openrouter,
-                streaming ? onFrame : null, !compatProfile && !localOnly, streaming ? onDrain : null);
+                streaming ? onFrame : null, !compatProfile && !localOnly, streaming ? onDrain : null,
+                gap => {
+                  chunkCadence.push(Number(gap.toFixed(2)));
+                  if (chunkCadence.length > LATENCY_WINDOW) chunkCadence.shift();
+                });
               if (compatProfile) {
                 const content = JSON.parse(validated.text).content;
                 if (content.some(block => Object.keys(block).some(name =>
@@ -2282,14 +2375,26 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
           // Do not hammer a shared Local server before its recovery hint expires. Long
           // waits go directly to the existing breaker/fallback instead of freezing a turn.
           if (target.name === 'local' && retryAfterMs > retryMaxWaitMs) break;
+          // P1 step budget: cap the aggregate retry wait (backoff plus honored hints) so a
+          // repeatedly failing provider cannot pin a turn for minutes; the failure below is
+          // reported with the last status and the circuit still opens.
+          let budgetExhausted = false;
+          if (attempt + 1 < attempts && retryBudgetMs > 0 && retryBudgetLeft <= 0) budgetExhausted = true;
+          if (budgetExhausted) {
+            metrics.retryBudgetExceeded += 1;
+            logEvent({ event: 'retry_budget_exhausted', provider: target.name, status: failureStatus ?? null });
+            break;
+          }
           if (attempt + 1 < attempts) {
             const backoff = congested ? retryDelayMs * (2 ** attempt) * (1 + Math.random() * 0.25) : retryDelayMs;
             const waitMs = Math.min(Math.max(backoff, retryAfterMs), retryMaxWaitMs);
+            const allowed = retryBudgetMs > 0 ? Math.min(waitMs, retryBudgetLeft) : waitMs;
+            if (allowed >= 0) retryBudgetLeft -= allowed;
             const finishWait = startPhase('retryWait');
             try {
               await abortable(new Promise(resolve => {
                 const done = () => { clearTimeout(timeout); client.signal.removeEventListener('abort', done); resolve(); };
-                const timeout = setTimeout(done, waitMs);
+                const timeout = setTimeout(done, Math.max(0, allowed));
                 client.signal.addEventListener('abort', done, { once: true });
               }), client.signal);
             } finally { finishWait(); }
@@ -2353,6 +2458,20 @@ export function createProxy({ key, nonce, fetchImpl = fetch, provider = 'openrou
   if (requestIdleTimeoutMs > 0) {
     server.headersTimeout = requestIdleTimeoutMs;
     server.connectionsCheckingInterval = Math.min(requestIdleTimeoutMs, 1000);
+  }
+  // Low-latency TCP posture (bench-perf round 2): Nagle off so small JSON/SSE frames are not
+  // held for the delayed-ACK window, and an OS-level keep-alive so a silently dead peer is
+  // detected before the first write to it stalls. Both are per-socket and change no semantics.
+  server.on('connection', socket => {
+    socket.setNoDelay?.(true);
+    socket.setKeepAlive?.(true, 15000);
+  });
+  // Bounds the whole request-receipt phase (body included) against Node's 300s default so a
+  // stalled client cannot pin a worker beyond the handover cap.
+  server.requestTimeout = Math.max(15000, (requestTotalTimeoutMs || 60000) + 5000);
+  if (fetchImpl === fetch || fetchImpl === http2UpstreamFetch) {
+    prewarmOrigin(new URL(provider !== 'openrouter' && localUrl ? localEndpoint(localUrl, false, '') : 'https://openrouter.ai/api/v1/messages', 'http://prewarm').origin, fetchImpl);
+    prewarmOrigin('https://api.anthropic.com', fetchImpl);
   }
   if (metricsPath || instanceMetricsPath) server.once('close', () => {
     if (flushTimer) clearTimeout(flushTimer);

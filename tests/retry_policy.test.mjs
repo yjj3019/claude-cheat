@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Retry policy: a provider wait is parsed once, honored briefly inside the proxy, and handed
 // to the client when the turn cannot be served — without inventing delays for a bare 429.
 import assert from 'node:assert/strict';

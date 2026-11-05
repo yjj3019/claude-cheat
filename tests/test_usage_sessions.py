@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Independent live-session pointers; all paths and credentials are synthetic."""
 import json
 from pathlib import Path

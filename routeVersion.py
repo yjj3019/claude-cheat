@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Version identity and update notices for OpenClaude.
 
 The product version comes from ``VERSION``; the exact revision comes from git, so a

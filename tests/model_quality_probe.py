@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Compatibility entry point for the opt-in backend probe."""
 from pathlib import Path
 import sys

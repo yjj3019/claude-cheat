@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Synthetic protocol and owned-process tests; never call an authenticated CLI."""
 import copy
 import http.client

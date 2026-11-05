@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Opt-in live check against the configured provider.
 
 The suite never calls a real provider. This script does one small request so a real

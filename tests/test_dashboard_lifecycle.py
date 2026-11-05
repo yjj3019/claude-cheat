@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Dashboard pid-record lifecycle: a signal is sent only to a provably matching process.
 
 Slow-path-free and mock-only: the identity query, the port probe and os.kill are all

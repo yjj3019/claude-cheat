@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """routeConfig: the strict YAML-subset settings file, its writer and the legacy .env fallback."""
 import importlib.util
 import os

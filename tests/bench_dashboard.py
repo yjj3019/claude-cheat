@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Measure the dashboard's per-refresh work: route log parsing and transcript scanning.
 
     python tests/bench_dashboard.py [--files 2000] [--log-mb 10]

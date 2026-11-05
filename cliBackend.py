@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """A loopback Messages adapter: the backend CLI plans, the front Claude Code executes tools."""
 import contextlib
 import hmac

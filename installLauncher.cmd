@@ -1,3 +1,4 @@
+REM SPDX-License-Identifier: MIT
 @echo off
 rem Runs the PowerShell installer even when the current PowerShell session blocks unsigned scripts.
 rem Usage: installLauncher.cmd [-Remove] [-Target <dir>]

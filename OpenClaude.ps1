@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 <#
 .SYNOPSIS
 Start Claude-Cheat with the saved default service, or override it for one session.

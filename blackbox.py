@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Bounded, opt-in local diagnostic recording; never expose recorded content through status."""
 import datetime
 import hashlib

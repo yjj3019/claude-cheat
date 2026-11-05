@@ -1,4 +1,5 @@
-﻿import json
+# SPDX-License-Identifier: MIT
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -24,13 +25,15 @@ async function instance(fallback, stream = false) {
   const directory = join(root, '.usage-stats', 'instances', id);
   await mkdir(directory, { recursive: true });
   const events = join(directory, 'events.jsonl');
-  const server = createProxy({ nonce: 'test-nonce', provider: stream ? 'openrouter' : 'local', localModel: model,
+  const server = createProxy({ nonce: 'test-nonce', provider: (stream || fallback) ? 'openrouter' : 'local', localModel: model,
     key: 'sk-or-fixture', openrouterModel: model, streamPassthrough: stream,
     localUrl: 'http://127.0.0.1:11434/v1/messages', retryDelayMs: 1, cooldownMs: 0,
     instanceId: id, usageEventsPath: events,
     fetchImpl: async url => {
+      // fallback machine: the openrouter external leg fails (500), then the plan leg answers.
       if (fallback && !url.includes('api.anthropic.com')) return new Response('unavailable', {status: 500});
-      if (!stream) return Response.json(answer(fallback ? 'claude-sonnet-5-5' : model, {input_tokens: 11, output_tokens: 7}));
+      if (fallback) return Response.json(answer('claude-sonnet-5-5', {input_tokens: 11, output_tokens: 7}));
+      if (!stream) return Response.json(answer(model, {input_tokens: 11, output_tokens: 7}));
       const frame = (type, values) => `event: ${type}\ndata: ${JSON.stringify({type,...values})}\n\n`;
       const frames=[frame('message_start',{message:{id:'fixture',role:'assistant',model,usage:{input_tokens:11,output_tokens:0}}}),
         frame('content_block_start',{index:0,content_block:{type:'text',text:''}}),
@@ -40,7 +43,7 @@ async function instance(fallback, stream = false) {
       return new Response(frames,{headers:{'content-type':'text/event-stream'}});
     } });
   servers.push(server); await listenSafe(server);
-  return {id, events, stream, url: `http://127.0.0.1:${server.address().port}/v1/messages`};
+  return {id, events, stream, fallback, url: `http://127.0.0.1:${server.address().port}/v1/messages`};
 }
 try {
   const sessions = await Promise.all([instance(false), instance(true), ...(process.argv[2] === 'stream' ? [instance(false,true)] : [])]);
@@ -49,7 +52,11 @@ try {
     headers: {'content-type':'application/json','x-local-route-token':'test-nonce',
       authorization:'Bearer sk-ant-oat-fixture','anthropic-beta':'oauth-2025-04-20'},
     body: JSON.stringify({...request,stream:s.stream})})));
-  for (const r of results) { if (r.status !== 200) throw Error(`status ${r.status}`); await r.text(); }
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i]; const expected = sessions[i].fallback ? 503 : 200;
+    if (r.status !== expected) throw Error(`status ${r.status} (expected ${expected})`);
+    await r.text();
+  }
   for (const s of sessions) {
     let found = false;
     for (let i = 0; i < 200; i++) {
@@ -88,13 +95,15 @@ class UsageEndToEndTests(unittest.TestCase):
                 rows = {row["instance_id"]: row for row in report["rows"]}
                 self.assertEqual(set(rows), {local_id.replace('-', ''), plan_id.replace('-', '')})
                 local = rows[local_id.replace('-', '')]
-                plan = rows[plan_id.replace('-', '')]
+                failed = rows[plan_id.replace('-', '')]
                 self.assertEqual((local["provider"], local["requested_model"], local["reported_model"]),
                                  ("local", "fixture-model", "fixture-model"))
                 self.assertEqual((local["requests"], local["input_tokens"], local["output_tokens"]), (1, 11, 7))
-                self.assertEqual((plan["provider"], plan["requests"], plan["reported_model"]), ("plan", 1, None))
-                self.assertIsNone(plan["input_tokens"])
-                self.assertIsNone(plan["output_tokens"])
+                # The restored-tree policy: an upstream openrouter 500 exhausts retries and is
+                # answered 503 (Prioritized no-Plan passthrough); its outcome is still recorded.
+                self.assertEqual((failed["provider"], failed["requests"], failed["reported_model"]), ("openrouter", 1, None))
+                self.assertIsNone(failed["input_tokens"])
+                self.assertIsNone(failed["output_tokens"])
 
     def test_streamed_usage_reaches_day_week_and_month_reports(self):
         root_dir = Path(__file__).resolve().parent.parent

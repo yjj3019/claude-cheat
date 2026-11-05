@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Handover: a running stream survives, the listener stops accepting, and the caller gets a
 // drained reply so a fresh proxy can bind the same port.
 import assert from 'node:assert/strict';

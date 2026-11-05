@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Request normalization: the Plan route only ever sees representable tool ids, while the
 // external route is untouched; the opt-in cache stabilizer peels only a trailing footer.
 import assert from 'node:assert/strict';

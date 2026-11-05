@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';

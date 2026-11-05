@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Fuzzer for the routing proxy: hostile bodies, paths and headers must never crash the
 // process, hang the client or return something that is not JSON.
 //

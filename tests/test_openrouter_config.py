@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """OpenRouter configuration uses synthetic keys and disposable files only."""
 import contextlib
 import io

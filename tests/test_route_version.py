@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Version identity, update comparison and the badge wiring.
 
 The update check is the only place this product talks to a git remote, so the tests pin

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 param([int]$Port = 8787, [int]$Refresh = 3, [switch]$Open)
 $ErrorActionPreference = 'Stop'
 $dashArgs = @('--port', $Port, '--refresh', $Refresh)

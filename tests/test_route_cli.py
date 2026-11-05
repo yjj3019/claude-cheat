@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """routeCli: binary validation, shim resolution, discovery, env allowlist, safe runs and the connection test."""
 import ctypes
 import json

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import { once } from 'node:events';
 
 // fetch (undici) refuses these ports per the WHATWG "bad port" list; an OS-assigned one would fail the request.

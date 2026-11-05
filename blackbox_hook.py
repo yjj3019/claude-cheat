@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Best-effort SessionStart hook: authenticated registration, no output or prompt access."""
 import json
 import os

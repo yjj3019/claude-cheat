@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 import tempfile
 import threading
 import unittest
@@ -51,6 +52,17 @@ class ConfigHistoryTests(unittest.TestCase):
         self.path.write_bytes(original + b'# openclaude-history-v1: invalid\n')
         with self.assertRaisesRegex(cfg.ConfigError, "invalid_history"):
             self.save("other/model")
+
+    def test_history_trail_is_bounded_to_the_cap(self):
+        # The in-memory trim alone used to leave the older lines in the file (S4), so the
+        # store must keep both the parsed trail and the file bounded at the configured cap.
+        for index in range(cfg.HISTORY_MAX_ENTRIES + 25):
+            self.save(f"model-{index:04d}")
+        entries = self.store.history("test-key")["entries"]
+        self.assertEqual(len(entries), cfg.HISTORY_MAX_ENTRIES)
+        self.assertEqual(entries[0]["id"], 27)
+        self.assertEqual(entries[-1]["id"], cfg.HISTORY_MAX_ENTRIES + 26)
+        self.assertEqual(self.path.read_text(encoding="utf-8").count(cfg._HISTORY_PREFIX), cfg.HISTORY_MAX_ENTRIES)
 
     def test_concurrent_saves_have_unique_revisions(self):
         failures = []

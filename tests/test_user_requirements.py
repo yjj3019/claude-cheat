@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Requirement R1: an ordinary OpenRouter session routes externally without an extra option.
 
 This file is a regression fence, not a general launcher test. If it fails, the change that

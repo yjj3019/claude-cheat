@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Fixture-only tests for bounded local statistics; no real session data."""
 import datetime as dt
 import contextlib
@@ -32,6 +33,17 @@ class UsageLedgerTests(unittest.TestCase):
         path = self.root / ".usage-stats" / "instances" / self.session / "events.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
+
+    def test_storage_uses_wal_journal_for_concurrent_readers_perf(self):
+        # ingest() opens the store for writing only when rows exist; that creation must enable
+        # WAL so the read-side dashboard never contends with the writer (audit perf: WAL/NORMAL).
+        connector = UsageLedger(self.root)
+        connector.ingest(self.session, [self.event()])
+        prop = connector._connect(create=False)
+        self.addCleanup(prop.close)
+        self.assertIsNotNone(prop)
+        self.assertEqual(prop.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+        self.assertEqual(prop.execute("PRAGMA synchronous").fetchone()[0], 1)
 
     def test_empty_report_does_not_create_files(self):
         data = self.ledger.report("day", self.now)

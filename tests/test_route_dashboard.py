@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Dashboard aggregation runs on synthetic logs and transcripts only."""
 import contextlib
 import importlib.util

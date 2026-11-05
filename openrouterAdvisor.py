@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Session-only Claude Code launcher and one stdio MCP advisor tool."""
 
 import http.client
@@ -1166,8 +1167,11 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
         command += print_args + native_args
         return run_cli(command, env, print_prompt)
     if isolated and Path(claude).suffix.lower() in (".cmd", ".bat"):
-        # shortcut: warn only; cmd.exe can mis-parse quotes/&/% in the workspace path or settings JSON passed through a shim.
-        # Upgrade to a hard error if an injection is ever reproduced.
+        # cmd.exe re-parses the composed command line; quotes/&/%/^ in the executable path can
+        # be split out of the launcher's control through a shim, so refuse those instead of
+        # passing them through (audit C5). A plain shim keeps working with a warning.
+        if any(char in claude for char in '&%^"'):
+            raise SystemExit(f"refusing {claude}: isolated modes need a native .exe when the path contains shell metacharacters")
         print("Warning: 'claude' resolves to a .cmd/.bat shim; prefer the native claude.exe for isolated modes.", file=sys.stderr)
     if isolated:
         print("OpenRouter compatibility mode: client integrations enabled. No Plan fallback." if openrouter_compat else

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Child process for tests/bench_proxy.mjs.
 //
 // The harness deliberately separates the proxy from the load generator: this process

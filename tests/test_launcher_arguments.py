@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Native host arguments and CLI backend boundaries, without using real credentials."""
 import base64
 import contextlib

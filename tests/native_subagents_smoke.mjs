@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Opt-in installed-Claude check; all model responses are synthetic loopback fixtures.
 // node tests/native_subagents_smoke.mjs [2|4]
 // This checks frontend orchestration, not a Local model's reasoning or Agent Teams.

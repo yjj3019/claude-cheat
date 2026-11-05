@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Runs the dashboard page script against a minimal DOM stub so the rendering layer is
 // covered without a browser: cards, alert de-duplication, summary and copy buttons.
 import assert from 'node:assert/strict';

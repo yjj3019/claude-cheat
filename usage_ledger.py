@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Local, idempotent request usage ledger. No prompts or tool content are stored."""
 import datetime as dt
 import json
@@ -47,6 +48,7 @@ def _model(value):
     if (not isinstance(value, str) or not MODEL_RE.fullmatch(value)
             or re.match(r"(?i)^(sk-|xai-|ghp_|github_pat_|bearer)", value)
             or re.search(r"(?i)(?:^|/)(?:gsk_[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{30,})(?:$|/)", value)
+            or re.search(r"(?i)AKIA[0-9A-Z]{16}", value)
             or re.search(r"^[A-Za-z]:|://|\\", value)):
         raise LedgerError("invalid_model")
     return value
@@ -133,6 +135,13 @@ class UsageLedger:
         try:
             uri = self.path.resolve().as_uri() + ("?mode=rw" if create else "?mode=ro")
             db = sqlite3.connect(uri, uri=True, timeout=0.2)
+            db.execute("PRAGMA busy_timeout=200")
+            if create:
+                db.execute("PRAGMA journal_mode=WAL")
+            # synchronous is connection-scoped, not persisted, so the perf posture must be
+            # (re)set on every rw connection; leaving it at the FULL default would defeat
+            # the WAL writer batching the write-ahead flush costs (S1).
+            db.execute("PRAGMA synchronous=NORMAL")
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if version == 0 and create:
                 if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").fetchone():

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Safety checks for the explicitly opted-in live CLI smoke entrypoint."""
 import contextlib
 import io

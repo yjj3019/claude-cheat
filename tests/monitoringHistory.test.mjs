@@ -1,4 +1,5 @@
-﻿import assert from 'node:assert/strict';
+// SPDX-License-Identifier: MIT
+import assert from 'node:assert/strict';
 import test from 'node:test';
 import {createProxy} from '../claudeRouteProxy.mjs';
 import {listenSafe} from './listenSafe.mjs';

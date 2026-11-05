@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Explicitly run two synthetic model calls; no project tools are executed.
 
 This probes a backend directly, not Claude Code or its proxy. It consumes model

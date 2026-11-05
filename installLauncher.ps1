@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 param([switch]$Remove, [string]$Target = (Join-Path $HOME '.local\bin'), [switch]$NoPath)
 # Installs bare commands that forward to this checkout:
 #   OpenClaude.cmd            -> routing session

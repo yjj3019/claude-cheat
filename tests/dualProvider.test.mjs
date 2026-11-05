@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Dual provider: the alternate model id selects the second provider for that request only,
 // the primary route is untouched, and each provider keeps its own breaker so one failing
 // service never makes the other look down.

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Provider choice: one configured service is selected, two require an explicit choice."""
 import contextlib
 import io

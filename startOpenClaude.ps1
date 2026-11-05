@@ -1,4 +1,5 @@
-﻿# Compatibility shim: the command is now OpenClaude.ps1.
+# SPDX-License-Identifier: MIT
+# Compatibility shim: the command is now OpenClaude.ps1.
 # Kept so existing shortcuts and notes keep working; it forwards every argument.
 $ErrorActionPreference = 'Stop'
 Write-Warning 'startOpenClaude.ps1 is now OpenClaude.ps1 - this shim forwards to it.'

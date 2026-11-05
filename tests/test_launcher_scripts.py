@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Launcher switches must not change the caller's environment after the run."""
 import os
 import base64

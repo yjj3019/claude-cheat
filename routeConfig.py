@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """One settings file for every provider: ``openclaude.config.yaml``.
 
 The file is a deliberately small YAML subset so the launcher and the dashboard can share one
@@ -68,6 +69,7 @@ HISTORY_FIELDS = {
     "routing": ("default_provider",),
 }
 _HISTORY_PREFIX = "# openclaude-history-v1: "
+HISTORY_MAX_ENTRIES = 200
 
 
 def _history(text):
@@ -105,6 +107,19 @@ def _history_append(text, entries, provider, values):
     entry = {"id": (entries[-1]["id"] if entries else 0) + 1,
              "provider": provider, "values": values}
     entries.append(entry)
+    # A long-running launcher can never accumulate an unbounded history trail in the file.
+    if len(entries) > HISTORY_MAX_ENTRIES:
+        drop = len(entries) - HISTORY_MAX_ENTRIES
+        del entries[:drop]
+        seen = 0
+        kept = []
+        for line in text.splitlines():
+            if line.startswith(_HISTORY_PREFIX):
+                seen += 1
+                if seen <= drop:
+                    continue
+            kept.append(line)
+        text = "\n".join(kept)
     eol = "\r\n" if "\r\n" in text else "\n"
     if text and not text.endswith("\n"):
         text += eol

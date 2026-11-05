@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Find, validate and safely run the codex, grok and claude CLIs for the dashboard connection test."""
 import json
 import math

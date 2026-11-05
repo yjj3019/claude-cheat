@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Contract tests for the launcher's side of the proxy handover (no real proxy needed).
 
 Covers the three defects that let a restart fail quietly: the client timeout drifting

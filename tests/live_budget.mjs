@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Opt-in diagnostic helper: this limits only calls made through this wrapper.
 // It does not restrict the CLI process, its descendants, or provider-side behavior.
 export function singleOpenRouterRequest(send) {

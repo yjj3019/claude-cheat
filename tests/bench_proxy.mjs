@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Reproducible performance harness for the claude-cheat request path.
 //
 //   node tests/bench_proxy.mjs --quick
@@ -47,7 +48,6 @@ const SOAK_PAYLOAD_KB = 64;
 const SOAK_WARMUP_MS = 1500;
 const RETRY_MODES = ['fail-first', 'fail-twice', 'fail-always'];
 const CALLS_PER_REQUEST = { 'fail-first': 2, 'fail-twice': 3, 'fail-always': 4 };
-const RETRY_OAUTH_ERROR = { type: 'error', error: { type: 'api_error', message: 'Saved subscription OAuth required' } };
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = resolve(HERE, '..');
@@ -416,6 +416,8 @@ export function parseArgs(argv = []) {
       case '--max-median-ms': set('maxMedianMs', number(value(index, arg), arg, 0)); index += 1; break;
       case '--max-spread-ratio': set('maxSpreadRatio', number(value(index, arg), arg, 1)); index += 1; break;
       case '--out': set('out', value(index, arg)); index += 1; break;
+      case '--drift-json': set('driftJson', value(index, arg)); index += 1; break;
+      case '--drift-max-ratio': set('driftMaxRatio', number(value(index, arg), arg, 1)); index += 1; break;
       default: throw new UsageError(`unknown option: ${arg}`);
     }
   }
@@ -432,6 +434,7 @@ export function resolveConfig(options) {
     soakSeconds: pick('soakSeconds', 0), soakConcurrency: pick('soakConcurrency', 8),
     maxRssGrowthMb: pick('maxRssGrowthMb', 192), maxHeapGrowthMb: pick('maxHeapGrowthMb', 12),
     maxMedianMs: pick('maxMedianMs', null), maxSpreadRatio: pick('maxSpreadRatio', null),
+    driftJson: pick('driftJson', null), driftMaxRatio: pick('driftMaxRatio', 1.4),
     out: pick('out', null) });
 }
 
@@ -647,7 +650,7 @@ async function runRetryProcess({ index, mode, config }) {
   const failures = [];
   try {
     const expected = mode === 'fail-always' ?
-      { status: 403, contentTypeIncludes: 'application/json', body: RETRY_OAUTH_ERROR } :
+      { status: 503, contentTypeIncludes: 'application/json' } :
       { status: 200, contentTypeIncludes: 'application/json', body: fixtureMessage(CLIENT_MODEL) };
     const workload = await runSequentialWorkload(worker, { name: `retry ${mode}`, kind: 'retry', bodyText,
       expected, warmup: 1, rounds: config.retryRounds, oauth });
@@ -927,7 +930,8 @@ function printUsage(message) {
     '  --soak-concurrency N     concurrent requests during the soak (1-64, default 8)',
     '  --max-rss-growth-mb N    soak RSS growth threshold after warmup (default 192)',
     '  --max-heap-growth-mb N   soak post-GC retained-heap growth threshold (default 12)',
-    '  --max-median-ms N        opt-in latency budget for the largest payload (default: none)',
+    '  --drift-json FILE        compare workload p90s against a previous result file (drift gate)',
+    '  --drift-max-ratio R      p90 drift threshold as a ratio (default 1.4)',    '  --max-median-ms N        opt-in latency budget for the largest payload (default: none)',
     '  --max-spread-ratio N     opt-in inter-process spread budget, max/min (default: none)',
     '  --out PATH               JSON result path (default .bench/proxy-<utc>.json)',
     '  --help, -h               show this help',
@@ -954,6 +958,10 @@ export async function main(argv = process.argv.slice(2)) {
     throw error;
   }
   if (config.help) { printUsage(); return EXIT.pass; }
+  if (config.driftJson) {
+    try { config = Object.freeze({ ...config, driftJson: JSON.parse(readFileSync(config.driftJson, 'utf8')) }); }
+    catch (error) { console.error(`cannot read --drift-json: ${error?.message || error}`); return EXIT.usage; }
+  }
 
   const startedAt = Date.now();
   const env = envInfo();
@@ -1016,6 +1024,19 @@ export async function main(argv = process.argv.slice(2)) {
 
   const verdict = evaluateVerdict({ correctnessFailures, workloads, retry: retryGroups, soak,
     thresholds: { maxMedianMs: config.maxMedianMs, maxSpreadRatio: config.maxSpreadRatio } });
+  // P1-2 drift gate: the p90 of each workload must stay within --drift-max-ratio of the p90
+  // recorded in the baseline file, so an unnoticed latency regression fails the run.
+  const driftBaseline = config.driftJson ?? null;
+  const driftFailures = [];
+  if (driftBaseline) {
+    for (const workload of workloads) {
+      const reference = driftBaseline.workloads?.find(item => item.name === workload.name);
+      if (reference && Number.isFinite(reference.p90Ms) && Number.isFinite(workload.p90Ms)
+        && workload.p90Ms > reference.p90Ms * (config.driftMaxRatio ?? 1.4)) {
+        driftFailures.push(`p90 ${workload.p90Ms}ms for ${workload.name} > ${config.driftMaxRatio ?? 1.4}x baseline ${reference.p90Ms}ms`);
+      }
+    }
+  }
   const durationMs = Date.now() - startedAt;
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const outPath = config.out ? resolve(process.cwd(), config.out) :
@@ -1030,13 +1051,29 @@ export async function main(argv = process.argv.slice(2)) {
       memoryEnd: process.memoryEnd, metrics: process.metrics, upstream: process.upstream,
       reportConfig: process.reportConfig })),
     retry: retryGroups, streaming, soak, verdict };
+  if (driftFailures.length) {
+    result.drift = { baseline: config.driftJson ? config.driftJson.baselineStamp ?? config.driftJson.generatedAt ?? 'external' : null,
+      maxRatio: config.driftMaxRatio ?? 1.4, failures: driftFailures };
+  }
+  const verdictOut = driftFailures.length
+    ? { ...verdict, exitCode: EXIT.fail, pass: false, failures: [...(verdict.failures ?? []), ...driftFailures] }
+    : verdict;
   mkdirSync(dirname(outPath), { recursive: true });
-  writeFileSync(outPath, `${JSON.stringify(result, null, 2)}\n`);
-  printSummary({ config, workloads, retry: retryGroups, streaming, soak, verdict,
+  writeFileSync(outPath, `${JSON.stringify({ schema: 'claude-cheat/bench-proxy/1', generatedAt: new Date().toISOString(),
+    durationMs, quick: config.quick, config, verdict: verdictOut,
+    env, source, git,
+    correctness: { ok: correctnessFailures.length === 0, validatedResponses: passedResponses,
+      failures: correctnessFailures },
+    workloads,
+    processes: perfProcesses.map(process => ({ index: process.index, memoryStart: process.memoryStart,
+      memoryEnd: process.memoryEnd, metrics: process.metrics, upstream: process.upstream,
+      reportConfig: process.reportConfig })),
+    retry: retryGroups, streaming, soak, verdict: verdictOut, drift: result.drift ?? null }, null, 2)}\n`);
+  printSummary({ config, workloads, retry: retryGroups, streaming, soak, verdict: verdictOut,
     correctnessCount: { ok: correctnessFailures.length === 0, validated: passedResponses,
       failures: correctnessFailures.length },
     outPath, durationMs });
-  return verdict.exitCode;
+  return verdictOut.exitCode;
 }
 
 if (import.meta.main) {

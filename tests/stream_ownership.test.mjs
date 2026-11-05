@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Stream ownership: a client that goes away must get every resource handed back — the
 // upstream reader, the attempt timers, the request accounting, and the inflight slot a
 // handover drains on. A client may leave before its request body is even complete.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Smoke test for the traffic simulator: a small mixed load must route every
 // scenario as expected, so routing regressions fail the ordinary suite too.
 import assert from 'node:assert/strict';

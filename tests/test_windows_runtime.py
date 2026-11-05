@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Windows runtime hardening: identity-checked tree kills and atomic JSON state writes.
 
 No real process is killed here: the identity query and the taskkill primitive are

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Loopback dashboard and settings for Claude-Cheat routing sessions.
 
 Read-only view built from data this launcher already produces:
@@ -2054,6 +2055,16 @@ def live_sessions(limit=MAX_LIVE_SESSIONS):
         port = record.get("port") if isinstance(record, dict) else None
         if type(port) is not int or port in seen or not _port_open(port):
             continue
+        started = record.get("started") if isinstance(record, dict) else None
+        if isinstance(started, str):
+            try:
+                ts = datetime.fromisoformat(started.replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) - ts > timedelta(days=7):
+                    continue  # orphan nonce from a long-dead session: never an attach candidate (audit C3)
+            except ValueError:
+                pass
         seen.add(port)
         session, metrics = _session_from_record(record)
         if session is None or not session.get("instance_id"):
@@ -3475,9 +3486,36 @@ def _refresh_loop(interval):
         time.sleep(interval)
 
 
+def _sweep_orphan_instances():
+    """Remove instance directories whose whole session is long dead (audit D5).
+
+    A dir is a removal candidate only when its newest handoff is older than 30 days and its
+    recorded port no longer answers, so a live takeover surface is never touched.
+    """
+    base = ROOT / ".usage-stats" / "instances"
+    cutoff = time.time() - 30 * 86400
+    try:
+        directories = [entry for entry in base.glob("*") if entry.is_dir()]
+    except OSError:
+        return
+    for directory in directories:
+        try:
+            if directory.stat().st_mtime >= cutoff:
+                continue
+            handoff = directory / "handoff.json"
+            record = json.loads(handoff.read_text(encoding="utf-8")) if handoff.is_file() else None
+            port = record.get("port") if isinstance(record, dict) else None
+            if isinstance(port, int) and _port_open(port):
+                continue
+            shutil.rmtree(directory, ignore_errors=True)
+        except (OSError, ValueError):
+            continue
+
+
 def _usage_refresh_loop():
     while True:
         _refresh_usage_stats()
+        _sweep_orphan_instances()
         time.sleep(_USAGE_REFRESH_SECONDS)
 
 
@@ -5440,7 +5478,12 @@ def _stop_previous(port, path=None, timeout=5.0):
     # An in-place auto-reload spawns the replacement as a child of the process it is
     # replacing; the normal own-tree guard would refuse to stop the old instance.
     forced = os.environ.pop("ROUTE_DASHBOARD_REEXEC", None)
-    if verdict != "verified" and forced != str(record.get("pid")):
+    # The re-exec token carries the pid and, when set by a current build, the record's started
+    # instant, so a recycled pid with an unrelated process cannot pass even on the forced path
+    # (audit C4/C8). Tokens from older builds (pid only) lose the forced bypass.
+    forced_pid, _, forced_started = (forced or "").partition(":")
+    forced_ok = forced_pid == str(record.get("pid")) and (not forced_started or forced_started == record.get("started"))
+    if verdict != "verified" and not forced_ok:
         print(json.dumps({"event": "dashboard_previous_instance_refused",
                           **_refusal_report(record, verdict)}), file=sys.stderr, flush=True)
         return False
@@ -5554,7 +5597,7 @@ def _auto_reload_loop(initial):
                 current = source_fingerprint()
                 if current != initial:
                     _record_auto_update("dashboard source changed; restarting the dashboard")
-                    os.environ["ROUTE_DASHBOARD_REEXEC"] = str(os.getpid())
+                    os.environ["ROUTE_DASHBOARD_REEXEC"] = f"{os.getpid()}:{(_read_pid_record(PID_FILE) or {}).get('started', '')}"
                     flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
                     with AUTO_UPDATE_LOG.open("a", encoding="utf-8") as log:
                         subprocess.Popen(

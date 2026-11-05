@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """The launcher installer is verified end to end: install, forward, remove.
 
 The forwarders are .cmd so they keep working in a terminal whose PowerShell execution

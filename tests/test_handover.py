@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """End-to-end takeover: a second process restarts the proxy on the same port.
 
     $env:CLAUDE_CHEAT_SLOW = '1'

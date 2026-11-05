@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Metrics endpoint and counters: the dashboard reads these to show routing load.
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';

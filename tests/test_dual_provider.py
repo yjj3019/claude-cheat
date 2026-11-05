@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Dual provider routing: the opt-in routing section, the launcher env it produces, and the
 guarantee that the alternate provider's credential reaches the proxy only, never the CLI."""
 

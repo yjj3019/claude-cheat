@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 import contextlib
 import io
 import json

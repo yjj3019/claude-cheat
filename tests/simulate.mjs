@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Synthetic traffic simulator for the routing proxy.
 //
 // Drives createProxy with a deterministic upstream so throughput, latency,

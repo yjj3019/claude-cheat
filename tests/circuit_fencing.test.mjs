@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Circuit breaker classification and fencing: only provider trouble may open the breaker,
 // a 429 names its own cooldown, and a late completion from an older generation must never
 // close, reopen, or otherwise overwrite the state a newer generation established.

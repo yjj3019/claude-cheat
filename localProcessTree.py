@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Own a Windows Local CLI process tree until its standalone launcher exits."""
 
 import ctypes

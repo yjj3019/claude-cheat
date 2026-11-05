@@ -1,3 +1,4 @@
+REM SPDX-License-Identifier: MIT
 @echo off
 rem Runs OpenClaudeDashboard.ps1 even when the PowerShell execution policy blocks unsigned scripts.
 rem Dashboard entry point for this checkout.

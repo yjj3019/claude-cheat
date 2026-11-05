@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Regression tests for the defects found in the source audit."""
 import io
 import json

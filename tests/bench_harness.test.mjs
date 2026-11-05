@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Regression tests for the performance harness itself (tests/bench_proxy.mjs).
 //
 // The harness is only trustworthy if its aggregation, correctness comparison, retry-count

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Fuzz the dashboard: hostile paths, bodies and framing must never break it.
 
     python -m unittest tests.test_fuzz_dashboard

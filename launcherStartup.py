@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Startup-only update and dashboard coordination for OpenClaude."""
 import subprocess
 import sys

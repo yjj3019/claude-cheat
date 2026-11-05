@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """Opt-in, one-request Codex backend smoke test; no project tools are executed.
 
 Run explicitly: python tests/live_cli_smoke.py --run
