@@ -166,6 +166,8 @@ Ordinary Local launches default to an 8,192-token output budget to reduce contex
 - The dashboard shows Local active/queued turns and cumulative admission rejections. The existing authenticated `/api/metrics` exposes `localAdmission`: `active`, `queued`, `rejected`, `concurrency`, `queueLimit`, `queueWaitMs`. Rejections accumulate only during the current proxy process.
 - This limits only traffic from this proxy, not other users or server-wide GPU load. Long parallel tasks can exceed the queue wait and return an error. Conversation, tools and output token budgets are not silently shortened. Restart the proxy to load the changed source.
 - The circuit breaker distinguishes causes: transport failures, timeouts, 5xx, 408 and unusable 2xx answers open it as provider faults; 401/402/403 keep their provider-wide cooldown; a 429 uses the parsed `Retry-After` (bounded at ten minutes) as its cooldown. 400/404/405/413/415/422 stop retries without opening the breaker; other request-level failures retain bounded retries and do not open it. 408 and 429 retain their separate transient and rate-limit policies. Exactly one half-open probe is admitted, and late completions from older generations cannot overwrite the newer circuit state.
+- **Low-latency TCP posture:** server sockets disable Nagle (`setNoDelay`) and enable keep-alive (initial 15s), and the request-receive ceiling sits below the turn ceiling. At startup, the external and Plan origins are pre-warmed once with a background HEAD (no credentials, failures ignored, `ROUTE_PREWARM=0` disables it). The bench harness includes a **p95 drift gate**: `--drift-json <previous result>` plus `--drift-max-ratio` (default 1.4) fail the run when a workload's p90 drifts past the baseline.
+- **HTTP/2 upstream (`ROUTE_UPSTREAM_H2=1`):** the default upstream client becomes a `node:http2` client with one multiplexed session per origin (h2 for https, h2c for plaintext), so concurrent turns share a connection without HTTP/1.1 head-of-line blocking. Redirects fail closed, and a failed session is evicted so the next call reconnects. Stream cadence is observable as `latencyMs.chunkCadenceMs` (count/p50/p95/max) in `/api/metrics`.
 - A client that stalls mid-body is dropped after an idle timeout (30 seconds by default, `ROUTE_REQUEST_IDLE_TIMEOUT_MS`, `0` disables it), releasing its turn; slow but live uploads are not cut. A disconnected client's upstream read, timers and retry are released instead of retried.
 - After all four fail, the router forwards the original request to Plan Sonnet once. A Plan failure does not loop back to another provider or switch to an Anthropic API key.
 - **Tool call ids are brought to the Anthropic contract on the Plan route.** An external provider may mint ids such as `Bash:0#abc` that the native route rejects. Just before a Plan request is forwarded, only those ids are remapped per request while `tool_use`/`tool_result` pairing is preserved; ids that already conform stay byte-identical so the prompt cache is unaffected. The external route is never rewritten, and an empty id is rejected locally with a 400 before any upstream call.
@@ -183,7 +185,11 @@ Proxy behavior can be tuned with these environment variables (the defaults are e
 | `ROUTE_LOCAL_QUEUE_WAIT_MS` | `60000` | Local admission wait, 0–60000 ms; expiry uses existing Plan/error policy. This is not an end-to-end inference deadline |
 | `ROUTE_RETRY_MAX_WAIT_MS` | `10000` | Cap on one in-proxy retry wait; a longer `Retry-After` goes to the client as a header |
 | `ROUTE_HANDOVER_TIMEOUT_MS` | `120000` | How long a handover waits for in-flight turns before reverting to serving (409) |
-| `ROUTE_STREAM_PASSTHROUGH` | off | `1` forwards validated frames immediately to cut the first-token delay |
+| `ROUTE_STREAM_PASSTHROUGH` | off | `1` forwards validated frames immediately (full); `2` only on verifiable paths (forceJson validation excluded); `0` explicit off. Default remains buffered |
+| `ROUTE_COOLDOWN_MS` | `30000` | Circuit cooldown (0–600000); a parsed `Retry-After` from a 429 takes precedence |
+| `ROUTE_RETRY_BUDGET_MS` | `60000` | Aggregate retry-wait budget per request (0–600000); `0` disables, exhaustion is observable via `retryBudgetExceeded` in `/api/metrics` |
+| `ROUTE_PREWARM` | on | `0` disables the one-time upstream origin pre-warm (HEAD) at startup |
+| `ROUTE_UPSTREAM_H2` | off | `1` switches the upstream client to per-origin `node:http2` sessions (multiplexing; h2 over https, h2c over plaintext) |
 | `ROUTE_STABILIZE_PROMPT_CACHE` | off | `1` peels the trailing `<total_tokens>…` footer from system text before the external request to keep the prefix cache (opt-in) |
 
 Routing metadata uses `route_selected` with provider `openrouter`, `local` or `plan`. Reason `replacement` identifies a validated external response; `native_feature` identifies a native-feature bypass; provider failures and cooldowns return errors without switching to Plan. `external_attempt_failed` records a failed attempt, and `circuit_open` / `circuit_recovered` report circuit transitions. These logs omit keys and request bodies; requests sent to external services may still contain conversation, code, tool definitions and results.
@@ -731,6 +737,7 @@ node tests/simulate.mjs                                   # mixed load, long ses
 node tests/simulate.mjs --requests 4000 --concurrency 48 --json
 node tests/bench_proxy.mjs --quick                        # fresh-process runs + correctness gates
 node tests/bench_proxy.mjs --soak-seconds 10              # time-based soak (child RSS, post-GC heap)
+node tests/bench_proxy.mjs --drift-json .bench\previous-result.json --drift-max-ratio 1.4   # workload p90 drift gate
 node --test tests/bench_harness.test.mjs                  # regression tests for the harness itself
 node --test tests/simulation.test.mjs                     # simulator smoke test
 ```

@@ -580,7 +580,11 @@ Local 응답은 JSON으로 받아 설정한 모델을 검증한 뒤 CLI용 SSE�
 | `ROUTE_LOCAL_QUEUE_WAIT_MS` | `60000` | Local 실행 자리 대기 상한(ms), 0~60000. 만료 시 Plan 우회 없이 오류. 실행 중 추론 시간과는 별개 |
 | `ROUTE_RETRY_MAX_WAIT_MS` | `10000` | 프록시 내부 재시도 1회 대기 상한. 긴 `Retry-After`는 클라이언트 응답 헤더로 전달 |
 | `ROUTE_HANDOVER_TIMEOUT_MS` | `120000` | 무중단 교체 시 진행 중 턴을 기다리는 상한. 초과하면 종료 대신 서비스 복귀(409) |
-| `ROUTE_STREAM_PASSTHROUGH` | (꺼짐) | `1`이면 검증되는 프레임을 즉시 전달해 첫 토큰 지연을 줄임 |
+| `ROUTE_STREAM_PASSTHROUGH` | (꺼짐) | `1` 전체, `2` 검증 가능한 경로에서만(강제 JSON 검증 경로 제외) 프레임을 즉시 전달. `0` 명시 해제. 기본은 버퍼링 |
+| `ROUTE_COOLDOWN_MS` | `30000` | 회로 차단 쿨다운(0~600000). 429의 `Retry-After`가 있으면 그 값이 우선 |
+| `ROUTE_RETRY_BUDGET_MS` | `60000` | 요청당 재시도 대기 합계 상한(0~600000). `0`이면 해제, 소진은 `/api/metrics`의 `retryBudgetExceeded`로 관측 |
+| `ROUTE_PREWARM` | 켜짐 | `0`이면 시작 시 업스트림 오리진 프리웜(HEAD 1회) 해제 |
+| `ROUTE_UPSTREAM_H2` | (꺼짐) | `1`이면 업스트림을 `node:http2` 세션으로(오리진별 멀티플렉싱, https h2 / 일반 텍스트 h2c) |
 | `ROUTE_STABILIZE_PROMPT_CACHE` | (꺼짐) | `1`이면 외부 전송 직전 system 끝의 `<total_tokens>…` 푸터를 제거해 prefix 캐시를 보존(opt-in) |
 
 ## 5-1. 첫 토큰 지연 줄이기 (선택)
@@ -1056,6 +1060,7 @@ node tests/simulate.mjs                                   # 혼합 트래픽 + �
 node tests/simulate.mjs --requests 4000 --concurrency 48 --json
 node tests/bench_proxy.mjs --quick                        # 새 프로세스 반복 측정 + 정확성 게이트
 node tests/bench_proxy.mjs --soak-seconds 10              # 시간 기준 소크(자식 프록시 RSS·GC 후 heap)
+node tests/bench_proxy.mjs --drift-json .bench\이전-결과.json --drift-max-ratio 1.4   # 워크로드 p90 드리프트 게이트
 node --test tests/bench_harness.test.mjs                  # 벤치 하네스 자체 회귀 테스트
 node --test tests/simulation.test.mjs                     # 위 시뮬레이터 스모크 테스트
 ```
