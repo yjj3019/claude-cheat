@@ -2,6 +2,8 @@
 
 **한국어** | [English](README.en.md) · [MIT License](LICENSE)
 
+**현재 버전: 1.0.5** — 대시보드 쓰기 주소(`#token=…`) 자동 오픈 · 키만으로 모델 목록 조회 · 저지연 TCP/HTTP/2/스트리밍 옵션. [릴리즈 이력](docs/HISTORY.ko.md)
+
 Claude Code를 실행하면서 호환되는 Sonnet 요청을 **Local LLM, OpenRouter 또는 CLI 모델 백엔드**로 보내는 로컬 라우터입니다. 원본 Claude Sonnet을 프록시 없이 실행하는 선택지도 제공합니다.
 
 일반 라우팅은 미지원 요청을 Claude Plan으로 보낼 수 있습니다. Local·OpenRouter·CLI 장애는 Plan으로 전환하지 않고 오류를 반환합니다. CLI를 선택해도 전면 실행과 도구 사용은 Claude Code가 담당합니다. Claude Code의 모든 기능이 외부 모델에서도 동일하게 작동한다고 보장하지는 않습니다. [호환성 및 검증 범위](docs/HARNESS-COMPATIBILITY-REVIEW.ko.md) · [요구사항 점검표](docs/REQUIREMENTS-AUDIT.ko.md) · [Claude Code 버전 기준선과 릴리스 체크리스트](docs/CLAUDE-CODE-COMPATIBILITY.ko.md)

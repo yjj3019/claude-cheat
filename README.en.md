@@ -6,6 +6,8 @@
 
 [MIT License](LICENSE) · [License selection review](LICENSE-REVIEW.md)
 
+**Current version: 1.0.5** — the dashboard auto-opens on its token-backed `#token=…` write_url, model lists load with a key alone, plus low-latency TCP/HTTP/2/streaming options. See the [release history (Korean)](docs/HISTORY.ko.md).
+
 A local router that preserves the existing Claude Code Plan login and settings while sending compatible Sonnet requests to the configured OpenRouter model, local LLM, or verified CLI model backend. The repository includes the launcher, proxy, and synthetic regression tests. It does not contain API keys, OAuth credentials, personal settings, or private diagnostic scripts.
 
 **Status: provider selection, retries, native Plan exceptions, and recovery are implemented. Provider failures do not fall back to Plan. Preserving every native feature while actually replacing the main Sonnet model is not fully achieved.**
@@ -38,7 +40,7 @@ Replace the placeholder with a real OpenRouter key. The file is read next to `op
 
 The old `.env.openrouter` / `.env.local-llm` files are **deprecated**. They are read, read-only, only for a service that has no section in the new file; the first save from the settings page moves both services' values into the new file and leaves the old files untouched. When the new file has a section for a service, only the new file is used for it.
 
-**Saving from the dashboard:** the settings page saves only when it is opened through the token-backed `#token=…` write_url that the dashboard prints and auto-opens. Visiting `http://127.0.0.1:8787/` directly is read-only and rejects saves with `token_required`.
+**Saving from the dashboard:** the settings page saves only when it is opened through the token-backed `#token=…` write_url that the dashboard prints and auto-opens (`OpenClaude` and the launcher both open it now). Visiting `http://127.0.0.1:8787/` directly is read-only and rejects saves with `token_required`. Model lists load with only the API key entered; until a model is selected the check reports `model_not_selected`, and a blocked network shows `connection_failed`.
 
 Set `model` to a concrete ID from the [OpenRouter model list](https://openrouter.ai/models). Existing key-only files must add it. Missing, empty, malformed or placeholder models fail startup without default-model selection or Plan fallback. Optionally set `provider` to an upstream slug such as `open-inference/fp4`; blank means Auto. A specified slug uses `only` and disables fallback to other OpenRouter providers. An unavailable or unsupported provider may fail; provider failures do not trigger Claude Plan fallback. Changes apply to new sessions or takeover. Model-list checks do not verify provider availability, and this setting does not enable reasoning. File settings are proxy-only; inherited OpenRouter environment values do not override this file.
 
