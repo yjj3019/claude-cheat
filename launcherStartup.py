@@ -10,6 +10,7 @@ import json
 import contextlib
 import stat
 from pathlib import Path
+from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parent
 _bootstrap_lock = None
@@ -178,10 +179,14 @@ def _update_locked(session_check=None):
 def dashboard():
     """Reuse a verified dashboard or start one without stopping any existing process."""
     port = dash.DEFAULT_PORT
+    # Open the token-backed write_url so the settings page can save; a plain
+    # http://127.0.0.1:<port>/ visit is read-only by design (token_required).
+    def open_write_url():
+        webbrowser.open(f"http://127.0.0.1:{port}/#token={quote(getattr(dash, 'TOKEN', ''), safe='')}")
     if dash._port_open(port):
         record = dash._read_pid_record()
         if record and record.get("port") == port and dash._verify_pid_record(record) == "verified":
-            webbrowser.open(f"http://127.0.0.1:{port}/")
+            open_write_url()
             return True
         print("OpenClaude: dashboard port is occupied by an unverified process.", file=sys.stderr)
         return False
@@ -198,7 +203,7 @@ def dashboard():
         record = dash._read_pid_record()
         if record and record.get("port") == port and dash._port_open(port):
             if record.get("pid") == process.pid or dash._verify_pid_record(record) == "verified":
-                webbrowser.open(f"http://127.0.0.1:{port}/")
+                open_write_url()
                 return True
         if process.poll() is not None and not dash._port_open(port):
             break

@@ -127,6 +127,8 @@ class StartupTests(unittest.TestCase):
         self.assertIn("--no-takeover", popen.call_args.args[0])
         self.assertEqual(popen.call_args.kwargs["env"]["DASHBOARD_TOKEN"], startup.dash.TOKEN)
         browser.assert_called_once()
+        # The browser must open the token-backed write_url, not the read-only page.
+        self.assertIn(f"#token={startup.dash.TOKEN}", browser.call_args.args[0])
 
     def test_existing_dashboard_reused_and_unknown_port_not_opened(self):
         record = {"pid": 1, "port": startup.dash.DEFAULT_PORT}
