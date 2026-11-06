@@ -1511,6 +1511,8 @@ Exit codes: 0 = success, 2 = usage/service choice required, others = failure.
             print("  or run: OpenClaude.ps1 -Setup   (opens the settings page in your browser)", file=sys.stderr)
             print("  save the OpenRouter settings in THAT tab (a plain http://127.0.0.1:8787/ visit is read-only),", file=sys.stderr)
             print("  then run OpenClaude.ps1 again", file=sys.stderr)
+            print("  Not using OpenRouter? Save CLI or Local settings in the setup page and set", file=sys.stderr)
+            print("  '기본 실행 서비스' to that service, then run OpenClaude with no extra options.", file=sys.stderr)
         print(json.dumps(payload), file=sys.stderr)
         return 1
     except (OSError, RuntimeError, EOFError, ValueError, subprocess.SubprocessError,
