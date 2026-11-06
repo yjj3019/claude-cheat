@@ -569,6 +569,38 @@ except ImportError:  # pragma: no cover
     yaml = None
 
 
+@unittest.skipUnless(os.name == "nt", "DPAPI is Windows-only")
+class SecretEncryptionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory())
+
+    def test_api_key_is_encrypted_in_file_and_roundtrips(self):
+        store = make_store(self.tmp)
+        store.write_provider("openrouter", {"OPENROUTER_MODEL": "v/m", "ANTHROPIC_AUTH_TOKEN": "sk-or-v1-secret-key-0000"})
+        raw = (Path(self.tmp) / "openclaude.config.yaml").read_text(encoding="utf-8")
+        self.assertNotIn("sk-or-v1-secret-key-0000", raw)
+        self.assertIn(cfg._SECRET_PREFIX, raw)
+        self.assertEqual(store.read_provider("openrouter")["ANTHROPIC_AUTH_TOKEN"], "sk-or-v1-secret-key-0000")
+
+    def test_plaintext_secret_still_reads_and_next_save_encrypts(self):
+        main = 'openrouter:\n  model: "v/m"\n  api_key: "sk-or-v1-legacy-plain-000"\n'
+        store = make_store(self.tmp, **{"openclaude.config.yaml": main})
+        self.assertEqual(store.read_provider("openrouter")["ANTHROPIC_AUTH_TOKEN"], "sk-or-v1-legacy-plain-000")
+        # Saving unrelated fields keeps the stored value, and a key save re-encrypts it.
+        store.write_provider("openrouter", {"OPENROUTER_MODEL": "v/m2"})
+        store.write_provider("openrouter", {"ANTHROPIC_AUTH_TOKEN": "sk-or-v1-legacy-plain-000"})
+        raw = (Path(self.tmp) / "openclaude.config.yaml").read_text(encoding="utf-8")
+        self.assertNotIn("sk-or-v1-legacy-plain-000", raw)
+        self.assertIn(cfg._SECRET_PREFIX, raw)
+
+    def test_corrupt_or_foreign_ciphertext_raises_clear_error(self):
+        main = 'openrouter:\n  model: "v/m"\n  api_key: "enc1:AA"\n'
+        store = make_store(self.tmp, **{"openclaude.config.yaml": main})
+        with self.assertRaises(cfg.ConfigError) as ctx:
+            store.read_provider("openrouter")
+        self.assertEqual(ctx.exception.code, "secret_decrypt_failed")
+
+
 @unittest.skipUnless(yaml, "PyYAML is not installed")
 class StandardYamlAgreementTests(unittest.TestCase):
     """The subset must mean the same thing to a real YAML parser, so hand edits and tools agree."""

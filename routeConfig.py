@@ -20,10 +20,12 @@ Callers keep using the historical environment-style names (``OPENROUTER_MODEL`` 
 mapping to YAML keys lives in ``SECTIONS``. A service that has no section yet falls back,
 read-only, to its legacy dotenv file (``.env.openrouter`` / ``.env.local-llm``).
 """
+import base64
 import contextlib
 import hashlib
 import hmac
 import json
+import logging
 import os
 import random
 import re
@@ -31,6 +33,74 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+
+# --- secret protection ------------------------------------------------------
+# API keys are stored encrypted (Windows DPAPI via stdlib ctypes) so the settings
+# file never holds a credential in plaintext. Stored values carry the "enc1:"
+# prefix; any other value (hand-edited, legacy example) is treated as plaintext
+# and is re-encrypted on the next save. On non-Windows systems encryption is
+# unavailable and values stay as-is with a one-time warning.
+_SECRET_PREFIX = "enc1:"
+_SECRET_KEY_FIELD = "api_key"
+_secret_warned = False
+
+
+def _dpapi(data, encrypt):
+    """CryptProtectData/CryptUnprotectData through ctypes; raises OSError when unavailable.
+
+    DPAPI binds the ciphertext to the Windows user account, so the file is
+    unreadable on other machines or after a reinstall.
+    """
+    import ctypes
+    import ctypes.wintypes
+
+    class _DataBlob(ctypes.Structure):
+        _fields_ = [("cbData", ctypes.wintypes.DWORD),
+                   ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    buffer = ctypes.create_string_buffer(data)
+    blob_in = _DataBlob(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char)))
+    blob_out = _DataBlob()
+    function = ctypes.windll.crypt32.CryptProtectData if encrypt else ctypes.windll.crypt32.CryptUnprotectData
+    try:
+        if not function(ctypes.byref(blob_in), None, None, None, None, 0x1, ctypes.byref(blob_out)):
+            raise OSError(ctypes.get_last_error())
+        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        if blob_out.pbData:
+            ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+
+
+def _encrypt_secret(value):
+    """Encrypt a credential for storage; returns the original when DPAPI is unavailable."""
+    global _secret_warned
+    if not value or value.startswith(_SECRET_PREFIX):
+        return value
+    if os.name != "nt":
+        if not _secret_warned:
+            _secret_warned = True
+            logging.getLogger("openclaude").warning(
+                "DPAPI unavailable on this OS; the API key stays plaintext in the settings file.")
+        return value
+    try:
+        return _SECRET_PREFIX + base64.b64encode(_dpapi(value.encode("utf-8"), True)).decode("ascii")
+    except Exception:
+        if not _secret_warned:
+            _secret_warned = True
+            logging.getLogger("openclaude").warning(
+                "DPAPI failed; the API key stays plaintext in the settings file.")
+        return value
+
+
+def _decrypt_secret(value):
+    """Decrypt a stored credential; plaintext (legacy/hand-written) passes through."""
+    if not isinstance(value, str) or not value.startswith(_SECRET_PREFIX):
+        return value
+    try:
+        return _dpapi(base64.b64decode(value[len(_SECRET_PREFIX):]), False).decode("utf-8")
+    except Exception as error:
+        raise ConfigError("secret_decrypt_failed") from error
+
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_NAME = "openclaude.config.yaml"
@@ -415,7 +485,7 @@ class Store:
             if provider in doc.sections:
                 # An empty value means "not set" (the shipped example and a cleared field both use it),
                 # so it never hides a built-in default such as the local Messages URL.
-                return {spec["keys"][key]: value
+                return {spec["keys"][key]: (_decrypt_secret(value) if key == _SECRET_KEY_FIELD else value)
                         for key, value in doc.sections[provider]["values"].items() if value != ""}
         legacy = self._legacy(provider)
         if legacy is None:
@@ -439,6 +509,8 @@ class Store:
         for name, value in updates.items():
             if name not in names:
                 raise ConfigError("unknown_key")
+            if names[name] == _SECRET_KEY_FIELD:
+                value = _encrypt_secret(value)
             yaml_updates[names[name]] = value
         with _WRITE_LOCK, self._cross_process_lock():
             # Re-read inside the lock so a concurrent save is never overwritten with stale text.
@@ -470,7 +542,7 @@ class Store:
                 if provider not in doc.sections:
                     for key, value in self._legacy_values(provider).items():
                         if key not in yaml_updates or yaml_updates[key] is None:
-                            yaml_updates[key] = value
+                            yaml_updates[key] = _encrypt_secret(value) if key == _SECRET_KEY_FIELD else value
             before = _history_values(text, provider) if record_history else None
             if record_history and original is not None and provider not in parse(original).sections:
                 legacy = self._legacy_values(provider)
@@ -481,7 +553,7 @@ class Store:
                 error = candidate.first_error(provider)
                 if error:
                     raise error
-                validate({spec["keys"][key]: value
+                validate({spec["keys"][key]: (_decrypt_secret(value) if key == _SECRET_KEY_FIELD else value)
                           for key, value in candidate.sections[provider]["values"].items() if value != ""})
             if record_history:
                 after = _history_values(text, provider)
