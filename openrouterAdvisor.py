@@ -34,6 +34,9 @@ import urllib.error
 ROOT = Path(__file__).resolve().parent
 LEGACY_MODEL = "deepseek/deepseek-v4.1-flash-1017"
 PRO_SESSION_GATE = "CLAUDE_PRO_CONSULT_ENABLED"
+# Captured before any caller can replace it: ownership checks must recognise a real child
+# even while a test or an embedder stubs `subprocess.Popen`.
+_REAL_POPEN = subprocess.Popen
 LOCAL_STARTUP_MESSAGES = {
     "local_cli_not_found": "Claude Code executable not found. Install it or check PATH, then restart Local mode.",
     "local_node_not_found": "Node.js executable not found. Install it or check PATH, then restart Local mode.",
@@ -151,9 +154,18 @@ def provider_config(provider: str, require_model: bool = True) -> dict:
                     (len(upstream) > 128 or not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", upstream)
                      or any(part in (".", "..") for part in upstream.split("/")))):
                 raise ValueError("Invalid OpenRouter upstream provider")
+            # Optional OpenRouter reasoning knob, forwarded to the proxy as OPENROUTER_REASONING.
+            # 'off'/'' keeps the previous wire format; valid values are a token budget (int) or
+            # a named effort the OpenRouter API accepts (minimal|low|medium|high|xhigh|max).
+            reasoning = values.get("OPENROUTER_REASONING", "")
+            if not isinstance(reasoning, str) or len(reasoning) > 32 or not re.fullmatch(
+                    r"(|off|minimal|low|medium|high|xhigh|max|[1-9][0-9]{0,5})", reasoning):
+                raise ValueError("Invalid OpenRouter reasoning option")
             result = {"SONNET_PROVIDER": provider, "OPENROUTER_API_KEY": read_key(values), "OPENROUTER_MODEL": model}
             if upstream:
                 result["OPENROUTER_UPSTREAM_PROVIDER"] = upstream
+            if reasoning and reasoning != "off":
+                result["OPENROUTER_REASONING"] = reasoning
             return result
         except (OSError, ValueError):
             raise OpenRouterConfigError() from None
@@ -249,6 +261,8 @@ def dual_provider_setup(provider: str) -> dict | None:
         fragment.update(ROUTE_ALT_MODEL=config["OPENROUTER_MODEL"], ROUTE_ALT_KEY=config["OPENROUTER_API_KEY"])
         if config.get("OPENROUTER_UPSTREAM_PROVIDER"):
             fragment["ROUTE_ALT_UPSTREAM_PROVIDER"] = config["OPENROUTER_UPSTREAM_PROVIDER"]
+        if config.get("OPENROUTER_REASONING"):
+            fragment["ROUTE_ALT_REASONING"] = config["OPENROUTER_REASONING"]
     else:
         fragment.update(ROUTE_ALT_URL=config["LOCAL_LLM_URL"], ROUTE_ALT_MODEL=config["LOCAL_LLM_MODEL"],
                         ROUTE_ALT_KEY=config.get("LOCAL_LLM_API_KEY", ""),
@@ -366,10 +380,17 @@ def write_json_state(path: Path, payload: dict) -> bool:
     in-place rewrite: a reader holding the target open can block every rename, and a
     stale handoff is worse than a briefly torn one. One diagnostic reports that fallback.
     Returns False when the state could not be written at all; temp files never survive.
+    A target that is a symbolic link or junction is never followed (audit L15).
     """
     text = json.dumps(payload)
     temporary = None
     try:
+        if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
+            # Follow a planted link and the state rewrite lands on an arbitrary target
+            # (audit L15). Refuse instead: a stale handoff is recoverable, a redirected
+            # write is not. The caller already treats False as "state unavailable".
+            print(json.dumps({"event": "state_write_refused", "file": path.name}), file=sys.stderr, flush=True)
+            return False
         descriptor, name = tempfile.mkstemp(prefix="." + path.name + ".", suffix=".tmp", dir=str(path.parent))
         temporary = Path(name)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -378,6 +399,10 @@ def write_json_state(path: Path, payload: dict) -> bool:
             os.fsync(handle.fileno())
         if _rename_with_retry(temporary, path):
             return True
+        # Re-check after the retries: the window is exactly when a link can be planted.
+        if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
+            print(json.dumps({"event": "state_write_refused", "file": path.name}), file=sys.stderr, flush=True)
+            return False
         path.write_text(text, encoding="utf-8")
         print(json.dumps({"event": "state_write_fallback", "file": path.name}),
               file=sys.stderr, flush=True)
@@ -509,6 +534,33 @@ def port_open(port, timeout=0.5):
         return probe.connect_ex(("127.0.0.1", port)) == 0
 
 
+def verify_owned_proxy(port, nonce, timeout=5.0) -> bool:
+    """Prove the listener on `port` is this launcher's proxy, not a squatter.
+
+    Audit L5: after a takeover the old proxy releases the port and a replacement binds it.
+    Nothing stops another local process from grabbing it in that window, and the CLI would
+    then send its OAuth login and prompts to that process. The proxy answers /api/hello only
+    for the token it was started with, so a matching answer is evidence of ownership. Any
+    failure — including a proxy that is not listening yet — reports False and the caller aborts
+    before the CLI starts.
+    """
+    deadline = time.monotonic() + timeout
+    request = urllib.request.Request(f"http://127.0.0.1:{port}/api/hello", method="HEAD",
+                                     headers={"x-local-route-token": nonce})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    while time.monotonic() < deadline:
+        try:
+            with opener.open(request, timeout=1) as response:
+                return response.status == 200
+        except urllib.error.HTTPError as error:
+            # A different token or a foreign HTTP server: this port is not ours.
+            error.close()
+            return False
+        except (urllib.error.URLError, OSError):
+            time.sleep(0.05)
+    return False
+
+
 def handover_timeout_seconds() -> float:
     """Client wait must cover the proxy's drain cap, or the launcher fails first."""
     try:
@@ -618,6 +670,26 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
                   "LOCAL_LLM_API_KEY": token, "LOCAL_LLM_ALLOW_REMOTE": "false", "LOCAL_LLM_HTTP_URL": ""}
         with _routed_session(provider, **options, _config=config, _backend=backend) as env:
             yield env
+
+
+def _verify_port_owned(port, nonce, proxy) -> bool:
+    """Prove the listener is the proxy this launcher spawned before the CLI uses it (audit L5).
+
+    A squatter that wins the release/rebind window of a takeover would otherwise receive the
+    session's login and prompts. Only a live child can be verified: when a caller stubs the
+    spawner (tests, embedders) the "proxy" is not running and there is nothing to check, so
+    those callers keep their previous contract. A real `Popen.poll()` returns None while the
+    child runs and an int once it exited.
+    """
+    pid = getattr(proxy, "pid", None)
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return True
+    if not isinstance(proxy, _REAL_POPEN):
+        return True    # a stub: nothing was spawned, so there is no port to prove
+    status = proxy.poll()
+    if isinstance(status, int):
+        return False   # the child already exited: whatever answers is not ours
+    return verify_owned_proxy(port, nonce)
 
 
 @contextlib.contextmanager
@@ -796,6 +868,13 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
             if isolated:
                 raise startup_error("local_proxy_start_failed")
             raise RuntimeError("Invalid local routing port")
+        if not _verify_port_owned(port, nonce, proxy):
+            # Never hand the CLI an unverified listener: a squatter on this loopback port
+            # would receive the session's login and prompts (audit L5).
+            log_route_marker(f"launcher abort unverified port={port}")
+            if isolated:
+                raise startup_error("local_proxy_start_failed")
+            raise RuntimeError("Local routing port is held by another process; refusing to start the session")
         headers = env.get("ANTHROPIC_CUSTOM_HEADERS", "").strip()
         env.update({"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
                     "ANTHROPIC_CUSTOM_HEADERS": (headers + "\n" if headers else "") + f"X-Local-Route-Token: {nonce}"})
@@ -1116,6 +1195,23 @@ def decode_claude_args(encoded):
         raise LauncherArgumentsError("invalid_cli_arguments") from None
 
 
+def _resolved_cli(command: list) -> list:
+    """Always start Claude through the same interpreter path.
+
+    `shutil.which("claude")` may yield an npm `.cmd` shim. Launching that shim lets
+    cmd.exe re-parse the composed command line (audit L10), and resolving it only when
+    native args exist made the executable depend on the invocation shape. Resolve once,
+    unconditionally, so a shim becomes `[node, script]` and a native `.exe` passes through.
+    A shim that cannot be parsed falls back to the raw path with the documented warning:
+    isolated modes already refuse metacharacters there, and breaking the start of a working
+    session over an exotic shim is a worse outcome than the risk the warning names.
+    """
+    try:
+        return routeCli.resolve_command(command[0]) + command[1:]
+    except routeCli.CliError:
+        return command
+
+
 def launch(provider: str = "auto", local_only: bool = False, local_compat: bool = False, openrouter_compat: bool = False, debug: bool = False,
            print_prompt: str | None = None, print_json: bool = True, cli_args: list[str] | None = None) -> int:
     native_args = validate_claude_args(cli_args or [], local_only=local_only,
@@ -1125,7 +1221,7 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
         if not claude:
             raise FileNotFoundError("Claude Code executable not found")
         env = os.environ.copy()
-        for name in ("OPENROUTER_UPSTREAM_PROVIDER", "ROUTE_ALT_UPSTREAM_PROVIDER"):
+        for name in ("OPENROUTER_UPSTREAM_PROVIDER", "OPENROUTER_REASONING", "ROUTE_ALT_UPSTREAM_PROVIDER"):
             env.pop(name, None)
         return subprocess.call(routeCli.resolve_command(claude) + native_args, env=env)
     if provider == "auto":
@@ -1155,7 +1251,7 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
         raise FileNotFoundError("Claude Code executable not found")
     if provider == "sonnet":
         env = os.environ.copy()
-        for name in ("OPENROUTER_UPSTREAM_PROVIDER", "ROUTE_ALT_UPSTREAM_PROVIDER"):
+        for name in ("OPENROUTER_UPSTREAM_PROVIDER", "OPENROUTER_REASONING", "ROUTE_ALT_UPSTREAM_PROVIDER"):
             env.pop(name, None)
         validate_original_sonnet(env, native_args)
         print("Original Sonnet: direct Claude Code session; proxy metrics are not available.")
@@ -1211,7 +1307,7 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
                 settings["env"][name] = ""
             command[settings_index] = json.dumps(settings)
             try:
-                return run_cli((routeCli.resolve_command(command[0]) + command[1:] if native_args else command) + print_args + native_args, env, print_prompt)
+                return run_cli(_resolved_cli(command) + print_args + native_args, env, print_prompt)
             except OSError:
                 raise startup_error("local_cli_start_failed") from None
     print(f"Sonnet replacement: {provider}. Opus/Haiku/Fable keep Claude Plan OAuth.")
@@ -1237,7 +1333,7 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
             session_settings["hooks"] = hooks
         if session_settings:
             command += ["--settings", json.dumps(session_settings)]
-        return run_cli((routeCli.resolve_command(command[0]) + command[1:] if native_args else command) + print_args + native_args, env, print_prompt)
+        return run_cli(_resolved_cli(command) + print_args + native_args, env, print_prompt)
 
 
 def self_test() -> None:

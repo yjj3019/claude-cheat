@@ -390,6 +390,15 @@ const validUpstreamProvider = value => typeof value === 'string' && value.length
   (value === '' || (/^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*(?![\s\S])/.test(value) &&
     value.split('/').every(segment => segment !== '.' && segment !== '..')));
 const openrouterProvider = slug => slug ? { only: [slug], allow_fallbacks: false } : { allow_fallbacks: false };
+// OpenRouter reasoning: enabled requests reasoning_tokens (Anthropic-compatible upstreams
+// answer with reasoning_details). Off keeps the body untouched, matching the previous wire format.
+const openrouterReasoning = effort => {
+  if (effort === 'off' || effort === '' || effort === null || effort === undefined) return null;
+  if (effort === 'max') return { effort: 'max' };
+  if (effort === 'xhigh' || effort === 'high' || effort === 'medium' || effort === 'low' || effort === 'minimal') return { effort };
+  const tokens = Number(effort);
+  return Number.isSafeInteger(tokens) && tokens > 0 ? { max_tokens: tokens } : null;
+};
 const SEGMENT = String.raw`(?:[A-Za-z0-9_\-~:@+][A-Za-z0-9_\-.~:@+]{0,199}|\.[A-Za-z0-9_\-~:@+][A-Za-z0-9_\-.~:@+]{0,198}|\.\.[A-Za-z0-9_\-.~:@+]{1,198})`;
 const PATTERNS = new Map([
   [String.raw`^(?!\.\.?(?:\/|$))[A-Za-z0-9_\-.~:@+]{1,200}$`, `^${SEGMENT}$`],
@@ -994,7 +1003,12 @@ function jsonMessageStream(text, requireMeta = true) {
   if (!message || typeof message !== 'object' || !Array.isArray(message.content))
     throw new Error('Invalid message response');
   const frame = (type, fields = {}) => `event: ${type}\ndata: ${JSON.stringify({ type, ...fields })}\n\n`;
-  let output = frame('message_start', { message: { ...message, content: [], stop_reason: null, stop_sequence: null,
+  // Provider-only top-level fields such as OpenRouter reasoning_details must survive the
+  // JSON→SSE reassembly, or a client that requested reasoning over a forced-JSON turn
+  // silently loses the very payload it asked for.
+  const passthrough = {};
+  if (Array.isArray(message.reasoning_details)) passthrough.reasoning_details = message.reasoning_details;
+  let output = frame('message_start', { message: { ...message, ...passthrough, content: [], stop_reason: null, stop_sequence: null,
     usage: { ...message.usage, output_tokens: 0 } } });
   message.content.forEach((block, index) => {
     const initial = block.type === 'text' ? { ...block, text: '' } : block.type === 'thinking' ?
@@ -1150,8 +1164,13 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
   onHandover = null,
   // Optional second provider for ordinary sessions: a request whose model equals altAlias
   // goes to that provider instead of the session's primary one. Absent = single provider.
-  altProvider = null, altModel, altUrl, altKey, altAllowRemote = false, altHttpUrl = '', altAlias }) {
+  altProvider = null, altModel, altUrl, altKey, altAllowRemote = false, altHttpUrl = '', altAlias, altReasoning = '',
+  // Audit-safe OpenRouter reasoning knob: '' (unset) keeps the previous wire format; the
+  // launcher forwards a validated value from OPENROUTER_REASONING only in ordinary mode.
+  openrouterReasoning: openrouterReasoningOption = '' }) {
   if (!validUpstreamProvider(openrouterUpstreamProvider)) throw new Error('Invalid OpenRouter upstream provider');
+  if (openrouterReasoningOption !== '' && openrouterReasoning(openrouterReasoningOption) === null)
+    throw new Error('Invalid OpenRouter reasoning option');
   if (typeof localOnly !== 'boolean' || (localOnly && provider !== 'local')) throw new Error('Local-only mode requires local provider');
   if (typeof localCompat !== 'boolean' || (localCompat && (!localOnly || provider !== 'local')))
     throw new Error('Local compatibility requires Local-only mode');
@@ -1172,7 +1191,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
   // Dual provider is an ordinary-session feature only: local-only and compatibility modes
   // rewrite requests and disable Plan fallback, so a second provider there would bypass
   // those guarantees. The alias is the exact model id the CLI must send to select it.
-  let altExternalUrl = null;
+  let altExternalUrl = null, altUpstreamProvider = '';
   if (altProvider !== null) {
     if (localOnly || localCompat || openrouterCompat) throw new Error('Alternate provider requires an ordinary session');
     if (!['openrouter', 'local'].includes(altProvider) || altProvider === provider) throw new Error('Invalid alternate provider');
@@ -1183,6 +1202,8 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
     if (altProvider === 'openrouter') {
       if (!validOpenRouterModel(altModel) || typeof altKey !== 'string' || !/^sk-or-[A-Za-z0-9_-]+$/.test(altKey))
         throw new Error('Alternate OpenRouter configuration required');
+      if (altReasoning !== '' && openrouterReasoning(altReasoning) === null)
+        throw new Error('Invalid alternate OpenRouter reasoning option');
       altExternalUrl = 'https://openrouter.ai/api/v1/messages';
     } else {
       if (typeof altModel !== 'string' || !altModel.trim()) throw new Error('Alternate Local model required');
@@ -1400,7 +1421,9 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
     // Accepted message requests (including body upload), excluding diagnostics/metrics.
     inflightRequests: inflight,
     requestAdmission: { active: requestActive, max: maxConcurrentRequests, inflightBytes,
-      maxInflightBytes, rejected: requestAdmissionRejected },
+      maxInflightBytes, rejected: requestAdmissionRejected,
+      rejectedConcurrency: requestAdmissionRejectedConcurrency,
+      rejectedBytes: requestAdmissionRejectedBytes },
     streams: metrics.streams, attempts: metrics.attempts, retries: metrics.retries,
     retryBudgetExceeded: metrics.retryBudgetExceeded,
     routes: { ...metrics.routes }, externalAttempts: metrics.externalAttempts, aborted: metrics.aborted,
@@ -1480,8 +1503,13 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
   // Admission is claimed before a message body is buffered: the semaphore bounds turns that
   // are concurrently parsing/routing, and the byte budget bounds their combined bodies.
   let requestActive = 0, inflightBytes = 0, requestAdmissionRejected = 0;
+  let requestAdmissionRejectedConcurrency = 0, requestAdmissionRejectedBytes = 0;
   const acquireRequestAdmission = () => {
-    if (requestActive >= maxConcurrentRequests) { requestAdmissionRejected += 1; return null; }
+    if (requestActive >= maxConcurrentRequests) {
+      requestAdmissionRejected += 1;
+      requestAdmissionRejectedConcurrency += 1;
+      return null;
+    }
     requestActive += 1;
     let bytes = 0, released = false;
     return {
@@ -1705,16 +1733,22 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
         // Reject an oversized declaration before reading a byte; the per-chunk checks below
         // remain the authority for chunked bodies and for a lying Content-Length.
         if (Number.isFinite(declaredLength) && declaredLength > bodyCap) return reject(413, 'Request too large');
-        if (Number.isFinite(declaredLength) && declaredLength > 0 && admission.wouldExceed(declaredLength))
+        if (Number.isFinite(declaredLength) && declaredLength > 0 && admission.wouldExceed(declaredLength)) {
+          requestAdmissionRejected += 1;
+          requestAdmissionRejectedBytes += 1;
           return reject(503, '[inflight_budget] Proxy in-flight request byte budget is exhausted. Retry shortly.',
             { 'retry-after': '1' });
+        }
         for await (const chunk of req) {
           armIdle();
           size += chunk.length;
           if (size > bodyCap) return reject(413, 'Request too large');
-          if (!admission.reserve(chunk.length))
+          if (!admission.reserve(chunk.length)) {
+            requestAdmissionRejected += 1;
+            requestAdmissionRejectedBytes += 1;
             return reject(503, '[inflight_budget] Proxy in-flight request byte budget is exhausted. Retry shortly.',
               { 'retry-after': '1' });
+          }
           chunks.push(chunk);
         }
       } finally {
@@ -2097,7 +2131,14 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
         // Ordinary mode: external thinking blocks would pin the next turn to Plan (unsigned history), so never request them.
         if (!compatProfile) externalBody.thinking = { type: 'disabled' };
         if (externalBody.tools) externalBody.tools = externalBody.tools.map(tool => ({ ...tool, input_schema: compatibleSchema(tool.input_schema) }));
-        if (target.openrouter) externalBody.provider = openrouterProvider(openrouterUpstreamProvider);
+        if (target.openrouter) {
+          // The alt OpenRouter path inherits the session's pin/reasoning unless it carries
+          // its own (matching how the launcher always fills the alt upstream value).
+          externalBody.provider = openrouterProvider(altRequested ? (altUpstreamProvider || openrouterUpstreamProvider) : openrouterUpstreamProvider);
+          // Reasoning stays opt-in: an unset option leaves the request exactly as before.
+          const reasoning = openrouterReasoning(altRequested ? (altReasoning || openrouterReasoningOption) : openrouterReasoningOption);
+          if (reasoning) externalBody.reasoning = reasoning;
+        }
         // Opt-in prefix-cache stabilization: only the very last system text block may lose a
         // trailing, unfenced token-count footer. User/assistant content is never touched.
         if (stabilizePromptCache && externalBody.system !== undefined) {
@@ -2489,7 +2530,8 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const config = { key: process.env.OPENROUTER_API_KEY, openrouterModel: process.env.OPENROUTER_MODEL,
     openrouterUpstreamProvider: process.env.SONNET_PROVIDER === 'local' && process.env.ROUTE_ALT_PROVIDER === 'openrouter'
-      ? process.env.ROUTE_ALT_UPSTREAM_PROVIDER : process.env.OPENROUTER_UPSTREAM_PROVIDER, nonce: process.env.LOCAL_ROUTE_TOKEN,
+      ? process.env.ROUTE_ALT_UPSTREAM_PROVIDER : process.env.OPENROUTER_UPSTREAM_PROVIDER,
+    openrouterReasoning: process.env.OPENROUTER_REASONING || '', nonce: process.env.LOCAL_ROUTE_TOKEN,
     provider: process.env.SONNET_PROVIDER || 'openrouter', localUrl: process.env.LOCAL_LLM_URL,
     localModel: process.env.LOCAL_LLM_MODEL, localKey: process.env.LOCAL_LLM_API_KEY,
     cliKind: process.env.CLI_KIND, cliRequestedModel: process.env.CLI_MODEL,
@@ -2505,10 +2547,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     maxConnections: process.env.ROUTE_MAX_CONNECTIONS || undefined,
     altProvider: process.env.ROUTE_ALT_PROVIDER || null, altModel: process.env.ROUTE_ALT_MODEL, altUrl: process.env.ROUTE_ALT_URL,
     altKey: process.env.ROUTE_ALT_KEY, altAllowRemote: process.env.ROUTE_ALT_ALLOW_REMOTE === 'true', altHttpUrl: process.env.ROUTE_ALT_HTTP_URL,
+    altReasoning: process.env.ROUTE_ALT_REASONING || '',
     altAlias: process.env.ROUTE_ALT_ALIAS };
-  for (const name of ['OPENROUTER_API_KEY', 'OPENROUTER_MODEL', 'OPENROUTER_UPSTREAM_PROVIDER', 'LOCAL_ROUTE_TOKEN', 'LOCAL_ROUTE_ONLY', 'LOCAL_ROUTE_COMPAT', 'OPENROUTER_ROUTE_COMPAT', 'SONNET_PROVIDER', 'LOCAL_LLM_URL',
+  for (const name of ['OPENROUTER_API_KEY', 'OPENROUTER_MODEL', 'OPENROUTER_UPSTREAM_PROVIDER', 'OPENROUTER_REASONING', 'LOCAL_ROUTE_TOKEN', 'LOCAL_ROUTE_ONLY', 'LOCAL_ROUTE_COMPAT', 'OPENROUTER_ROUTE_COMPAT', 'SONNET_PROVIDER', 'LOCAL_LLM_URL',
     'LOCAL_LLM_MODEL', 'LOCAL_LLM_API_KEY', 'LOCAL_LLM_ALLOW_REMOTE', 'LOCAL_LLM_HTTP_URL', 'LOCAL_LLM_MODELS_URL', 'ROUTE_METRICS_PATH', 'ROUTE_INSTANCE_ID', 'ROUTE_INSTANCE_METRICS_PATH', 'ROUTE_USAGE_EVENTS_PATH', 'ROUTE_ALT_PROVIDER', 'ROUTE_ALT_MODEL', 'ROUTE_ALT_URL',
-    'ROUTE_ALT_KEY', 'ROUTE_ALT_ALLOW_REMOTE', 'ROUTE_ALT_HTTP_URL', 'ROUTE_ALT_ALIAS', 'ROUTE_ALT_UPSTREAM_PROVIDER', 'CLI_KIND', 'CLI_MODEL', 'CLI_TIMEOUT_S',
+    'ROUTE_ALT_KEY', 'ROUTE_ALT_ALLOW_REMOTE', 'ROUTE_ALT_HTTP_URL', 'ROUTE_ALT_ALIAS', 'ROUTE_ALT_UPSTREAM_PROVIDER', 'ROUTE_ALT_REASONING', 'CLI_KIND', 'CLI_MODEL', 'CLI_TIMEOUT_S',
     'ROUTE_MAX_CONCURRENT_REQUESTS', 'ROUTE_MAX_INFLIGHT_BYTES', 'ROUTE_REQUEST_TOTAL_TIMEOUT_MS', 'ROUTE_MAX_CONNECTIONS']) delete process.env[name];
   if (process.argv.slice(2).includes('--check-connection')) {
     try {

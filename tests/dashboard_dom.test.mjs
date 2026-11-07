@@ -116,6 +116,25 @@ test('usage statistics distinguish unreported tokens and show observed session s
   assert.match(context.nodes.get('usage-status').textContent,/누락/);
 });
 
+test('usage telemetry exposes host resources, complete-session admission reasons and coverage', () => {
+  const context=buildContext(); const sandbox={...context,globalThis:null}; sandbox.globalThis=sandbox;
+  vm.createContext(sandbox); vm.runInContext(ASSETS.usage,sandbox,{filename:'usage.js'});
+  sandbox.renderUsage({status:'ready',report:{rows:[]},sessions:[],aggregate_sessions:{active_instances:40,observed_instances:40,
+    partial:false,requests:80,inflight:3,rss_bytes:4000000,admission_active:3,admission_max:128,
+    admission_inflight_bytes:8192,admission_max_bytes:67108864,admission_rejected_concurrency:9,
+    admission_rejected_bytes:2,local_rejected:4,cli_rejected:1,
+    metric_coverage:{requests:{reported:40,active:40,observed:40},rss_bytes:{reported:40,active:40,observed:40}},by_provider:{}},
+    host_resources:{sampled_at:new Date().toISOString(),source:'windows_api',cpu_percent:55,memory_percent:70,
+      memory_used_bytes:700,memory_available_bytes:300,error:null,cpu_error:null,memory_error:null}});
+  const html=context.nodes.get('usage-grid').innerHTML;
+  assert.match(html,/40개 인증 실행기/);
+  assert.match(html,/55%/); assert.match(html,/70%/);
+  assert.match(html,/요청 동시 3\/128/);
+  assert.match(html,/동시 429 9 · 본문 예산 503 2/);
+  assert.match(html,/Local 대기 4 · CLI 429 1/);
+  assert.match(html,/요청 40\/40 · RSS 40\/40/);
+});
+
 test('usage warns about legacy unverified model provenance only when present', () => {
   const context=buildContext(); const sandbox={...context,globalThis:null}; sandbox.globalThis=sandbox;
   vm.createContext(sandbox); vm.runInContext(ASSETS.usage,sandbox,{filename:'usage.js'});
@@ -399,6 +418,7 @@ test('CLI live metrics show measured usage coverage and distinguish failures fro
   const html = render(data).get('grid').innerHTML;
   assert.match(html, /CLI 프록시 진행 1건 · 백엔드 동시 한도 4/);
   assert.match(html, /CLI 별도 대기열 없음/);
+  assert.match(html, /CLI 시도 실패 횟수이며 Plan 우회 요청 수와 다릅니다/);
   assert.match(html, /CLI 토큰 사용량 추이/);
   assert.match(html, /1 \/ 3건 \(33\.3%\)/);
   assert.match(html, /0 · 1건/); // measured zero differs from unreported
@@ -1321,7 +1341,7 @@ test('connection summary says no events were recorded instead of printing zeros'
 test('shared error and test text cover backend failures and store rate limits', () => {
   assert.match(ASSETS.settings, /rate_limited:'저장 요청이 많습니다/);
   assert.match(ASSETS.settings, /backend_version_unverified:'CLI 버전이 검증 목록에 없어/);
-  assert.match(ASSETS.settings, /grok \(미검증 · 실행 불가\)/);
+  assert.match(ASSETS.settings, /grok \(1\.0\.77 검증 · 격리 제한\)/);
 });
 
 

@@ -33,6 +33,44 @@ class LauncherArgumentsTests(unittest.TestCase):
             self.assertEqual(called.call_args.kwargs["env"], env)
             self.assertEqual(json.loads(config.read_text(encoding="utf-8"))["enabledPlugins"], {"fixture": True})
 
+    def test_every_mode_resolves_the_cmd_shim_the_same_way(self):
+        """Audit L10: resolution must not depend on whether native args were supplied."""
+        auth = {"loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "pro"}
+        version = mock.Mock(stdout="2.1.312 (Claude Code)", returncode=0)
+        def spawn(*_args, **_kwargs):
+            process = mock.MagicMock()
+            process.stdout.readline.return_value = '{"port":12345}\n'
+            return process
+        for provider, flags in (("local", {}), ("openrouter", {}), ("sonnet", {}),
+                                ("local", {"local_only": True}), ("openrouter", {"openrouter_compat": True})):
+            for native in ([], ["--resume", "fixture"]):
+                if native and flags.get("local_only") and not flags.get("local_compat"):
+                    continue  # LocalMode rejects native arguments by design.
+                with self.subTest(provider=provider, flags=flags, native=native):
+                    with tempfile.TemporaryDirectory() as directory, \
+                         mock.patch.object(route, "ROOT", Path(directory)), \
+                         mock.patch.object(route.Path, "cwd", return_value=Path(directory)), \
+                         mock.patch.object(route.Path, "home", return_value=Path(directory)), \
+                         mock.patch.dict(os.environ, {}, clear=True), \
+                         mock.patch.object(route.shutil, "which", return_value="fixture.cmd"), \
+                         mock.patch.object(route.routeCli, "resolve_command",
+                                           return_value=["node", "fixture.js"]) as resolved, \
+                         mock.patch.object(route.routeCli, "probe_version", return_value={"ok": True, "version": "2.1.312"}), \
+                         mock.patch.object(route.subprocess, "run", return_value=version), \
+                         mock.patch.object(route, "run_owned", return_value=auth), \
+                         mock.patch.object(route, "provider_config", return_value={"OPENROUTER_MODEL": "fixture/model"}), \
+                         mock.patch.object(route, "dual_provider_setup", return_value=None), \
+                         mock.patch.object(route, "check_connection", return_value=0), \
+                         mock.patch.object(route, "prepare_blackbox_hook", return_value=None), \
+                         mock.patch.object(route.subprocess, "Popen", side_effect=spawn), \
+                         mock.patch.object(route, "run_cli", return_value=0) as ran:
+                        self.assertEqual(route.launch(provider, cli_args=native, **flags), 0)
+                    resolved.assert_called_once_with("fixture.cmd")
+                    command = ran.call_args.args[0]
+                    self.assertEqual(command[:2], ["node", "fixture.js"],
+                                     "a .cmd shim must never be the executed program")
+                    self.assertNotIn("fixture.cmd", command)
+
     def test_original_advisor_respects_explicit_choice_and_detects_versions(self):
         with mock.patch.object(route.routeCli, "probe_version", return_value={"ok": True, "version": "2.1.312"}) as probe:
             self.assertEqual(route.original_sonnet_advisor(["fixture"], {}, ["--advisor", "off"]), [])

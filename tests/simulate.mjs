@@ -39,13 +39,18 @@ const check = (condition, message) => { if (!condition) violations.push(message)
 
 function jsonReply(model, source) {
   return Response.json({ ...META, type: 'message', model, content: [{ type: 'text', text: 'ok' }],
-    stop_reason: 'end_turn', sim_upstream: source });
+    stop_reason: 'end_turn', sim_upstream: source,
+    // Exercise the pass-through of provider-only fields (e.g. OpenRouter reasoning_details).
+    reasoning_details: source === 'external' ? [{ type: 'reasoning.text', text: 'sim', format: 'anthropic-claude' }] : undefined });
 }
 
 function sseReply(model, source, withTool = false) {
   const frames = [
     `event: message_start\ndata: ${JSON.stringify({ type: 'message_start',
-      message: { ...META, model, sim_upstream: source } })}\n\n`,
+      message: { ...META, model, sim_upstream: source,
+        // Real reasoning upstreams deliver the details on message_start (OpenRouter
+        // buffers them into the first frame); the pass-through must keep them.
+        ...(source === 'external' ? { reasoning_details: [{ type: 'reasoning.text', text: 'sim', format: 'anthropic-claude' }] } : {}) } })}\n\n`,
     `event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: 0,
       content_block: withTool ? { type: 'tool_use', id: 'tool_sim', name: 'Read', input: {} }
         : { type: 'text', text: '' } })}\n\n`,
@@ -70,9 +75,11 @@ const scenarioOf = body => {
 
 function makeUpstream(mode) {
   const retried = new Set();
+  const seen = makeUpstream.seen ??= [];
   return async (url, options) => {
     const body = JSON.parse(options.body);
     const scenario = scenarioOf(body);
+    seen.push({ url, provider: body.provider, reasoning: body.reasoning, key: body.messages?.[0]?.content });
     await new Promise(resolve => setTimeout(resolve, LATENCY[scenario] || 1));
     if (url === PLAN) return jsonReply(body.model, 'plan');
     if (url !== EXTERNAL) throw new Error(`unexpected upstream ${url}`);
@@ -99,6 +106,7 @@ async function startProxy(options = {}) {
   // turn into 429 responses.
   const server = createProxy({ key: KEY, nonce: NONCE, openrouterModel: 'sim/model', retryDelayMs: 0,
     cooldownMs: 50, attemptTimeoutMs: 2000, fetchImpl: makeUpstream('mixed'),
+    openrouterUpstreamProvider: 'sim-provider/slug', openrouterReasoning: '8192',
     maxConcurrentRequests: 64, maxConnections: 1024, ...options });
   await listenSafe(server);
   return { server, base: `http://127.0.0.1:${server.address().port}/v1/messages` };
@@ -179,6 +187,19 @@ check(metrics.ok >= results.length, `metrics ok ${metrics.ok}`);
 check(metrics.streams >= perScenario, `metrics streams ${metrics.streams}`);
 check(metrics.bytesIn > 0 && metrics.bytesOut > 0, 'metrics bytes not counted');
 check((metrics.latencyMs.external.count || 0) > 0, 'metrics latency not recorded');
+
+// The upstream records what the proxy actually sent: the pinned provider slug and the
+// requested reasoning budget must reach every external request (retry 429s excluded).
+const seen = makeUpstream.seen ?? [];
+const external = seen.filter(entry => entry.url === EXTERNAL);
+const providerPinned = external.filter(entry =>
+  entry.provider?.only?.[0] === 'sim-provider/slug' && entry.provider.allow_fallbacks === false);
+const reasoningSent = external.filter(entry => entry.reasoning?.max_tokens === 8192);
+const reasoningDetailsPassed = results.filter(result => result.status === 200 && result.text.includes('"reasoning_details"'));
+check(providerPinned.length >= results.length, `provider pin reached ${providerPinned.length} of ${results.length} requests`);
+check(reasoningSent.length >= results.length, `reasoning reached ${reasoningSent.length} of ${results.length} requests`);
+check(reasoningDetailsPassed.length >= Math.floor(results.length * 0.9),
+  `reasoning_details passed through ${reasoningDetailsPassed.length} of ${results.length} responses`);
 
 for (const result of results) {
   check(result.status === 200, `${result.scenario}: status ${result.status}`);

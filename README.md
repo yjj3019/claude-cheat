@@ -12,7 +12,7 @@ Claude Code를 실행하면서 호환되는 Sonnet 요청을 **Local LLM, OpenRo
 | --- | --- | --- |
 | **Local LLM** | 직접 운영하거나 공유하는 모델 서버 사용 | 서버 주소·모델·필요한 인증 설정 |
 | **OpenRouter** | OpenRouter가 제공하는 모델 사용 | API 키와 별도 사용 요금 |
-| **CLI** | 지원되는 Claude Code 또는 Codex CLI를 모델 백엔드로 사용 | 설치·로그인과 지원 버전 확인. Grok은 현재 지원되지 않음 |
+| **CLI** | 지원되는 Claude Code·Codex·Grok CLI를 모델 백엔드로 사용 | 설치·로그인과 지원 버전 확인. Grok 1.0.77 검증(웹검색·서브에이전트 차단, 파일시스템·터미널 도구 제거, 구조화 출력) |
 | **원본 Sonnet** | Claude Code를 프록시 없이 직접 실행 | Claude 로그인과 계정 정책 적용 |
 
 ## 빠른 시작
@@ -235,7 +235,9 @@ openrouter:
 
 `YOUR_OPENROUTER_API_KEY`를 본인의 실제 OpenRouter 키로 바꿉니다. `api_key`는 **라우터가 파일에서 읽는 항목**입니다. Claude Code의 전역 환경변수에 OpenRouter 키를 넣거나 Plan 로그인을 API 키 로그인으로 바꾸라는 뜻이 아닙니다. 키를 화면·로그·커밋에 공유하지 마세요.
 
-`model`에는 [OpenRouter 모델 목록](https://openrouter.ai/models)의 구체적인 모델 ID를 입력합니다. 기존에 키만 설정했다면 이 항목을 추가해야 합니다. 누락·빈 값·예제 플레이스홀더는 시작 오류로 종료하며 다른 모델이나 Plan으로 자동 대체하지 않습니다. 선택적인 `provider`에는 `open-inference/fp4` 같은 OpenRouter 상류 공급자 slug를 입력할 수 있습니다. 비워 두면 Auto로 OpenRouter가 공급자를 선택합니다. 지정하면 `only`로 제한하고 다른 OpenRouter 공급자로의 fallback을 허용하지 않습니다. 해당 공급자가 모델을 지원하지 않거나 사용할 수 없으면 오류를 반환하며 Plan으로 전환하지 않습니다. 설정 화면에서 **OpenRouter 상류 공급자**를 비우면 Auto로 돌아갑니다. 새 세션 또는 takeover부터 적용되며, 모델 목록 확인만으로 특정 공급자의 사용 가능 여부를 증명하지 않습니다. 이 설정은 별도의 추론 옵션을 켜지 않습니다.
+`model`에는 [OpenRouter 모델 목록](https://openrouter.ai/models)의 구체적인 모델 ID를 입력합니다. 기존에 키만 설정했다면 이 항목을 추가해야 합니다. 누락·빈 값·예제 플레이스홀더는 시작 오류로 종료하며 다른 모델이나 Plan으로 자동 대체하지 않습니다. 선택적인 `provider`에는 `open-inference/fp4` 같은 OpenRouter 상류 공급자 slug를 입력할 수 있습니다. 비워 두면 Auto로 OpenRouter가 공급자를 선택합니다. 지정하면 `only`로 제한하고 다른 OpenRouter 공급자로의 fallback을 허용하지 않습니다. 해당 공급자가 모델을 지원하지 않거나 사용할 수 없으면 오류를 반환하며 Plan으로 전환하지 않습니다. 설정 화면에서 **OpenRouter 상류 공급자**를 비우면 Auto로 돌아갑니다. 새 세션 또는 takeover부터 적용되며, 모델 목록 확인만으로 특정 공급자의 사용 가능 여부를 증명하지 않습니다.
+
+선택적인 `reasoning`(2026-11-07 추가)은 OpenRouter에 추론 파라미터를 요청합니다. 비우거나 `off`면 요청 본문에 `reasoning`을 넣지 않습니다(이전 동작). `8192` 같은 양의 정수는 추론 토큰 예산(`reasoning.max_tokens`)으로, `low|medium|high|xhigh|max|minimal`은 명명된 effort(`reasoning.effort`)로 전달됩니다. 일반(ordinary) OpenRouter 세션의 외부 요청에만 적용되며, Plan·Local·CLI 경로와 호환 모드에는 영향이 없습니다. 응답의 `reasoning_details`는 검증 없이 그대로 Claude Code로 전달되고, Claude Code가 이를 해석할 수 있다면 표시됩니다. 공급자가 해당 모델의 reasoning을 지원하지 않으면 OpenRouter가 무시하거나 오류를 반환할 수 있으며, 이 경우 `reasoning`을 비우세요. 듀얼 공급자 세션에서도 OpenRouter 쪽에 같은 설정이 적용됩니다.
 
 모델 선택이 가능해도 모든 모델의 도구 호출과 네이티브 기능을 보장하지 않습니다. 선택 모델이 [Messages API](https://openrouter.ai/docs/api/api-reference/anthropic-messages/create-messages?explorer=true)와 필요한 도구 호출을 지원하는지 확인하세요. 응답의 모델 ID를 설정값과 정확히 비교하므로, 다른 ID로 응답하는 동적 별칭·프리셋은 실패할 수 있으며 미검증입니다. API 주소와 재시도 정책은 예제 파일에 고정값으로 구분했습니다.
 
@@ -709,7 +711,7 @@ Plan 경로의 HTTP-date `Retry-After`는 클라이언트가 읽을 수 있는 �
 
 ### 메뉴 감사와 OpenRouter 상류 공급자 (2026-11-01)
 
-OpenRouter 설정에 `provider`(상류 공급자 slug) 항목이 추가되었습니다. 지정하면 OpenRouter에서 `only`로 제한하고 다른 OpenRouter 공급자로의 fallback을 허용하지 않으며, 비우면 Auto입니다. 새 세션 또는 `-Takeover`부터 적용되고, 모델 목록 확인만으로 특정 공급자의 사용 가능성을 증명하지는 않습니다. 실행할 수 없는 Grok 백엔드는 CLI 선택 단계부터 "(미검증 · 실행 불가)"로 표시합니다.
+OpenRouter 설정에 `provider`(상류 공급자 slug) 항목이 추가되었습니다. 지정하면 OpenRouter에서 `only`로 제한하고 다른 OpenRouter 공급자로의 fallback을 허용하지 않으며, 비우면 Auto입니다. 새 세션 또는 `-Takeover`부터 적용되고, 모델 목록 확인만으로 특정 공급자의 사용 가능성을 증명하지는 않습니다. Grok 백엔드(2026-11-07)는 1.0.77 침투 테스트 후 활성화됐습니다: `-p <프롬프트>` 단일 턴, 웹 검색·서브에이전트 차단, `--disallowed-tools`로 파일시스템·터미널 빌트인 도구 15종 제거(쓰기·터미널 시도가 "cannot"으로 거부됨을 실측), JSON 구조화 출력. Grok은 `--safe-mode`·stdin 프롬프트가 없어 프롬프트가 argv에 실립니다(짧은 백엔드 프롬프트만), 그리고 `--always-approve`·`--permission-mode bypassPermissions` 같은 우회 플래그는 어댑터가 절대 붙이지 않습니다.
 
 네 화면(대시보드·설정·사용량·블랙박스)의 구조와 문구를 실제 API 응답과 대조해 점검했습니다([메뉴 감사](docs/DASHBOARD-MENU-AUDIT.ko.md)). 프록시 이벤트가 없는 구간은 0건이 아니라 "최근 60분 이벤트 없음"으로 표시하고, 헤더·범례·지표 이름의 "외부 서비스"를 "외부 모델"로 통일했으며, 도움말 HTTP API 목록을 UI가 실제 호출하는 13개 엔드포인트로 보완했습니다. 설정 화면은 저장 429(`rate_limited`)와 CLI 백엔드 응답 코드를 한국어로 안내하고, 블랙박스는 기록 시작 시각과 폐기 건수를 표시합니다. 모니터링 지표의 계산 기준과 반영 상태는 [모니터링 감사](docs/DASHBOARD-MONITORING-AUDIT.ko.md)에 정리했습니다.
 

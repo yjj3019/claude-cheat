@@ -24,10 +24,19 @@ import routeCli
 
 MAX_BYTES = 4 * 1024 * 1024
 HEADER_TIMEOUT_SECONDS = 10
+# Audit L7: a connection without a valid token used to hold one of the 16 slots for the
+# full header timeout, so a tokenless slowloris could pin every slot in 10s cycles. The
+# real backend client sends its Authorization header immediately, so the pre-auth phase
+# gets its own much shorter deadline; it is extended only after authentication succeeds.
+PRE_AUTH_TIMEOUT_SECONDS = 3
 BODY_TIMEOUT_SECONDS = 10
 READ_POLL_SECONDS = .2
 MAX_CONNECTIONS = 16
-VERIFIED_VERSIONS = {"codex": {"0.165.0"}, "claude": {"2.1.312"}, "grok": set()}
+# Versions that passed the live round-trip (tool-free "Reply with exactly OK" via the
+# isolated adapter command) and the feature-flag survey below. A version not listed here
+# fails closed until it is re-verified against that same procedure.
+VERIFIED_VERSIONS = {"codex": {"0.165.0", "0.166.0"}, "claude": {"2.1.312", "2.1.319"},
+                     "grok": {"1.0.77"}}
 SCHEMA = {"type": "object", "additionalProperties": False, "required": ["text", "tool_calls"],
           "properties": {"text": {"type": "string"}, "tool_calls": {"type": "array", "items": {
               "type": "object", "additionalProperties": False, "required": ["name", "arguments_json"],
@@ -36,6 +45,13 @@ CODEX_DISABLED = ("shell_tool unified_exec apps plugins hooks multi_agent browse
                   "browser_use_full_cdp_access computer_use view_image image_generation skill_search memories "
                   "sleep_tool code_mode_host code_mode_interrupt tool_suggest in_app_browser enable_mcp_apps "
                   "codex_apps_mcp_2026_07_28 code_mode").split()
+# Grok builtins that can touch the filesystem, run commands or mutate state (surveyed from
+# `grok -p "list your builtin tools"` against 1.0.77). Search/personal tools stay available:
+# the backend's job is a model reply, and denied tools made the CLI answer "cannot" for a
+# write/terminal attempt (penetration test P12, 2026-11-07).
+GROK_DENIED_TOOLS = ("run_terminal_command,kill_command_or_subagent,search_replace,read_file,list_dir,"
+                     "grep,todo_write,get_command_or_subagent_output,scheduler_create,scheduler_delete,"
+                     "scheduler_list,monitor,search_tool,use_tool,workflow")
 
 
 class BackendError(ValueError):
@@ -187,6 +203,18 @@ def _reported(result):
 def parse_output(kind, text):
     if not isinstance(text, str):
         raise BackendError("invalid_response")
+    if kind == "grok":
+        result = _json(text)
+        if not isinstance(result, dict) or result.get("stopReason") != "end_turn":
+            raise BackendError("cli_failed")
+        # --json-schema puts the schema-shaped answer under `text` as a JSON string.
+        value = result["text"] if isinstance(result.get("text"), str) else None
+        value = _json(value) if value is not None else None
+        if not isinstance(value, dict):
+            raise BackendError("cli_failed")
+        model = result.get("model") if isinstance(result.get("model"), str) else None
+        usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+        return value, model, usage
     if kind == "codex":
         events = [_json(line) for line in text.splitlines() if line.strip()]
         if not events or any(not isinstance(e, dict) or e.get("type") in ("error", "turn.failed") for e in events):
@@ -393,6 +421,22 @@ class Backend:
                 if native_effort:
                     argv += ["-c", "model_reasoning_effort=" + json.dumps(native_effort)]
                 argv += ["-"]
+            elif self.kind == "grok":
+                # Grok 1.0.77 headless mode: `-p/--single` takes the prompt as its VALUE
+                # (not the Claude Code flag style), and it has no --safe-mode/--settings
+                # equivalent. Containment (verified 2026-11-07 against 1.0.77):
+                # --disable-web-search/--no-subagents block those surfaces, and
+                # --disallowed-tools removes every builtin filesystem/execution tool —
+                # a write/terminal attempt then answers "cannot" instead of executing.
+                # The CLI refuses unknown flags, so a future removal fails closed.
+                argv = self.command + ["-p", prompt, "--output-format", "json",
+                                       "--disable-web-search", "--no-subagents",
+                                       "--disallowed-tools", GROK_DENIED_TOOLS,
+                                       "--json-schema", json.dumps(SCHEMA)]
+                if self.model:
+                    argv += ["-m", self.model]
+                # The prompt travels in argv here: Grok has no stdin prompt mode, so the
+                # prompt stays out of process listings only for the other kinds.
             else:
                 argv = self.command + ["-p", "--output-format", "json", "--safe-mode", "--strict-mcp-config",
                                        "--mcp-config", '{"mcpServers":{}}', "--disable-slash-commands",
@@ -427,7 +471,9 @@ def serve(values):
     class RequestReader(io.RawIOBase):
         def __init__(self, connection):
             self.connection = connection
-            self.deadline = time.monotonic() + HEADER_TIMEOUT_SECONDS
+            # Unauthenticated connections get the short pre-auth bound (audit L7);
+            # do_POST extends the deadline once the token is verified.
+            self.deadline = time.monotonic() + min(HEADER_TIMEOUT_SECONDS, PRE_AUTH_TIMEOUT_SECONDS)
 
         def readable(self):
             return True
@@ -499,6 +545,9 @@ def serve(values):
             expected = "Bearer " + token
             if not hmac.compare_digest(self.headers.get("Authorization", "").encode("utf-8"), expected.encode("ascii")):
                 return self.send(403, {"error": "forbidden"})
+            # Authenticated: release the pre-auth bound and grant the full header budget.
+            # The header deadline still applies to anything read after this point.
+            self.request_reader.deadline = time.monotonic() + HEADER_TIMEOUT_SECONDS
             if self.path != "/v1/messages":
                 return self.send(404, {"error": "not_found"})
             try:

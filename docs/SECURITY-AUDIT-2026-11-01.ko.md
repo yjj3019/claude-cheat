@@ -158,7 +158,7 @@
 3. **D4·D5·L1·L7** — 대시보드/프록시/CLI shim의 연결·메모리 상한.
 4. **D6** — 업로드 절대 기한 추가로 핸드오버 차단 방지.
 5. **D7·L3** — `last_model` 이스케이프, 모델 정규식 검증, excerpt 제거, `.route.log` 0600.
-6. **L5·L6** — takeover 포트 핸드오프, nonce argv/핸드오프 노출 제거.
+6. **L5·L6** — takeover 포트 핸드오프, nonce argv/핸드오프 노출 제거. (2026-11-07: L5는 §12-2의 소유 확인으로 조치, L6는 문서 정정 완료)
 7. **문서 정정** — 5절의 8개 문구.
 8. (선택) 블랙박스 보존/삭제 정책, CSP 도입 검토.
 
@@ -198,6 +198,14 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | L4 Origin 없는 POST | 위험은 토큰 필수라 CSRF 아님. 문서에 "Origin 없으면 토큰+Host만"으로 정정 | 문서 정정 |
 | L6 핸드오프 nonce·argv | 문서 §2의 "자격증명 없음"을 "nonce 포함, 파일 권한 경계"로 정정(코드 유지) | 문서 정정 |
 | L7 shim 선점 DoS | 헤더 타임아웃 10초로 점유 시간 제한(구조 변경은 보류) | 부분 완화 |
+
+## 12-4. L7 완화 완료 (2026-11-07)
+
+| 항목 | 조치 | 상태 |
+| --- | --- | --- |
+| L7 무토큰 선점 DoS | 인증 전 연결에 별도 단기 경계(`PRE_AUTH_TIMEOUT_SECONDS=3`)를 두고, 토큰 검증에 성공한 뒤에만 전체 헤더 예산(10초)으로 연장(`cliBackend.py`). 정상 CLI 클라이언트는 Authorization 헤더를 즉시 보내므로 동작 변화 없음. 라이브 실측: 16개 무토큰 슬로우로리스가 슬롯을 점유한 상태에서 인증된 요청이 회수되기까지 **10.0초 → 3.0초** | 해결(시간 경계) |
+
+검증: `tests/test_cli_backend.py`에 무토큰 연결이 프리오스 창(패치 가능) 안에만 슬롯을 점유함을 고정하는 테스트 추가. 전체 `test_cli_backend` 25건 통과.
 | L9 env 덮어쓰기 | 동작 유지, 위험으로 문서화 | 문서 정정 |
 | L11 마스킹 6+4자 | 마스킹은 UI 편의를 위한 것이며 비밀값 앞부분 노출은 문서화 | 문서 정정 |
 | L12 status 경로·모델 노출 | 공개 읽기 범위를 문서에 명시 | 문서 정정 |
@@ -205,6 +213,27 @@ node --test tests/claudeRouteProxy.test.mjs tests/observability.test.mjs tests/s
 | L16 로그 인젝션 | `.route.log` 미러에서 삽입 개행을 공백으로 치환해 한 이벤트가 추가 줄을 위조하지 못하게 함 | 해결(미러) |
 | L8 `--print` 프롬프트 argv 노출 | `-p` 프롬프트를 argv에서 빼고 표준 입력으로 전달(`run_cli`, `--input-format text` 기본). 단위 테스트로 argv에 없음·stdin에 있음 확인 | 해결 |
 | L5 포트 스쿼트, L10 CLI 해석, L15 symlink | 이번 조치 범위 밖 — 잔여 위험으로 유지 | 미해결 |
+
+## 12-3. Info 항목 조치 (2026-11-07, L5·L10·L15 이후)
+
+| 항목 | 조치 | 상태 |
+| --- | --- | --- |
+| 토큰 비교 예외 | `DASHBOARD_TOKEN` 환경변수가 저장 토큰과 같은 패턴(`[A-Za-z0-9_-]{16,128}`)인지 검증합니다. 비ASCII·공백 포함 값을 넣으면 `compare_digest`의 TypeError로 모든 인증 요청이 죽던 문제를 막고, 유효하지 않은 값은 버리고 파일/신규 발급으로 폴백 | 해결 |
+| costStatusSuffix sink | `COST_STATUS_TEXT`에 없는 status가 innerHTML로 그대로 들어가던 경로를 `'unknown'` 고정 라벨로 대체. 현재 서버가 보내는 status는 고정 enum이지만, 앞으로 enum이 늘어나도 sink가 열리지 않음 | 해결 |
+| CSP 부재 | 모든 페이지가 인라인 전용(외부 CSS/JS/img 없음)이므로 `default-src 'none'` 기반 CSP를 모든 응답에 추가(`connect-src 'self'`, `img-src 'self' data:`, `base-uri 'none'`, `form-action 'self'`). 라이브 응답 헤더로 확인 | 해결 |
+| 로그 파서 위조 | `_parse_route_line`이 타임스탬프를 ISO-8601로 검증한 뒤에만 이벤트로 받습니다. 위·변조된 줄이 세션 경계나 최근 이벤트로 해석되던 경로를 닫고, 프록시 측 개행 치환과 결합 | 해결 |
+
+검증: 새 회귀 테스트 4건(`test_a_non_ascii_environment_token_is_rejected_not_propagated`, `test_a_planted_line_cannot_forge_session_evidence`, 기존 `test_malformed_lines_are_ignored`를 위조 방지 의미로 갱신, CSP는 라이브 헤더 확인) — 각각 수정 전 코드에서 실패함을 확인.
+
+## 12-2. 잔여 위험 조치 (2026-11-07, L5·L10·L15)
+
+| 항목 | 조치 | 상태 |
+| --- | --- | --- |
+| L5 포트 스쿼트 | `verify_owned_proxy` 추가: 런처는 CLI를 시작하기 전에 프록시의 `/api/hello`(HEAD, nonce 토큰)에 200으로 답하는지 확인하고, 확인 실패 시 세션을 시작하지 않음(`openrouterAdvisor.py`). 라이브 프록시로 올바른 토큰 200·오답 403 거부 확인. 런처가 실제로 띄운 자식(`subprocess.Popen` 인스턴스, 살아 있음)만 검사하며 테스트가 `Popen`을 대체한 경우에는 이전 계약 유지 | 해결 |
+| L10 CLI 해석 | `_resolved_cli` 추가: 네이티브 인자 유무와 무관하게 항상 `routeCli.resolve_command`로 실행 파일을 해석해, `.cmd` shim이면 `[node, script]`로 기동. 해석 불가한 shim은 기존 경로로 폴백(격리 모드는 메타문자 경로를 이미 거부하므로 경고 유지). 파싱 가능한 shim이 인자 없이 실행될 때 cmd.exe 재해석을 거치지 않음 | 해결(폴백 유의) |
+| L15 symlink/TOCTOU | `write_json_state`가 대상이 심볼릭 링크·접점이면 쓰기를 거부하고 `state_write_refused` 진단을 남김. rename 재시도 후의 원자적 폴백 경로에서도 재검사해 링크 심기 창을 닫음. 기존 심링크 검사(`routeDashboard.py` 인스턴스 디렉터리)와 결합 | 해결 |
+
+검증: 회귀 테스트 추가 — `test_handover_contract.py` `OwnedPortVerificationTests`(실제 HTTP 스텁으로 토큰 일치 200·불일치 403·도달 불가 거부, 실제 자식만 검사함을 고정), `test_launcher_arguments.py` `test_every_mode_resolves_the_cmd_shim_the_same_way`(수정 전 코드에서 4건 실패 확인), `test_windows_runtime.py` `SymlinkedStateTests`(수정 전 2건 실패 확인). 라이브 프록시 검증: `verify_owned_proxy`가 실제 `claudeRouteProxy.mjs` 프로세스에서 `owned=True`/`wrong-token=False`.
 
 검증: `node --test tests/*.test.mjs` → **708 pass / 0 fail**, Python은 **665개 수집(11 skip)** 중 실행된 654개에서 **653 pass + 1 flaky fail**. flaky는 `test_route_cli.test_reasons_through_shim`(부하 시 node 스폰이 4초 상한을 넘어 시간 초과)이며, 같은 테스트를 20초 상한으로 실행하면 통과합니다. `routeCli.py`·`localProcessTree.py`는 이번 변경에 포함되지 않았습니다. 대시보드 모듈 단독은 241 pass.
 

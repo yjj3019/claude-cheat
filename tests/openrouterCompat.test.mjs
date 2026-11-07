@@ -49,6 +49,34 @@ test('OpenRouter compatibility and connection diagnostic honor an explicit upstr
   await assert.rejects(checkConnection({ provider: 'openrouter', key: KEY, openrouterModel: MODEL, openrouterUpstreamProvider: 'invalid slug' }), /Invalid OpenRouter upstream provider/);
 });
 
+test('OpenRouter reasoning is opt-in, mapped to the API shape, and off leaves the body untouched', async t => {
+  // Unset: the request body must be exactly as before (no reasoning key at all).
+  const plain = await session(t, () => reply(), { openrouterReasoning: '' });
+  assert.equal((await plain.send()).status, 200);
+  assert.equal('reasoning' in plain.calls[0].parsed, false);
+
+  for (const [option, expected] of [
+    ['8192', { max_tokens: 8192 }], ['high', { effort: 'high' }], ['max', { effort: 'max' }],
+    ['minimal', { effort: 'minimal' }], ['xhigh', { effort: 'xhigh' }]]) {
+    const s = await session(t, () => reply(), { openrouterReasoning: option });
+    const r = await s.send();
+    assert.equal(r.status, 200); await r.text();
+    assert.deepEqual(s.calls[0].parsed.reasoning, expected, `option ${option}`);
+  }
+  // A response carrying reasoning_details must pass validation untouched.
+  const detailed = await session(t, () => reply({ reasoning_details: [{ type: 'reasoning.text', text: 'fixture', format: 'anthropic-claude' }] }),
+    { openrouterReasoning: 'high' });
+  const answer = await detailed.send({ stream: false });
+  assert.equal(answer.status, 200);
+  const body = await answer.text();
+  assert.match(body, /reasoning_details/);
+
+  await assert.rejects(() => session(t, () => reply(), { openrouterReasoning: 'sometimes' }),
+    /Invalid OpenRouter reasoning option/);
+  await assert.rejects(() => session(t, () => reply(), { openrouterReasoning: '0' }),
+    /Invalid OpenRouter reasoning option/);
+});
+
 test('OpenRouter compatibility keeps extensions and opaque metadata while dropping signed reasoning', async t => {
   const s = await session(t);
   const fields = { context_management: { edits: [{ type: 'clear_thinking_20251015', keep: 'all' }] },

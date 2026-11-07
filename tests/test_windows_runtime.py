@@ -320,5 +320,48 @@ class AtomicJsonStateTests(unittest.TestCase):
         self.assertEqual(payload["proxy_pid"], 2)
 
 
+@unittest.skipUnless(os.name == "nt", "Windows symbolic links need privilege")
+class SymlinkedStateTests(unittest.TestCase):
+    """Audit L15: a planted link must never redirect the atomic rewrite."""
+
+    def setUp(self):
+        self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.target = self.directory / "outside.json"
+        self.target.write_text(json.dumps({"port": 1111}), encoding="utf-8")
+        self.handoff = self.directory / ".session-handoff.json"
+        self.real_link = True
+        try:
+            os.symlink(self.target, self.handoff)
+        except (OSError, NotImplementedError):
+            # A standard account without Developer Mode cannot create links, but the
+            # guard itself must still work: exercise it through the same predicate.
+            self.real_link = False
+            self.enterContext(mock.patch.object(Path, "is_symlink", lambda _self: _self == self.handoff,
+                                                create=True))
+
+    def test_symlinked_target_is_refused_and_left_untouched(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            written = route.write_json_state(self.handoff, {"port": 2222, "nonce": "fresh"})
+        self.assertFalse(written, "the writer must report that state was not stored")
+        self.assertEqual(json.loads(self.target.read_text(encoding="utf-8")), {"port": 1111},
+                         "the link target must not be rewritten")
+        events = [json.loads(line) for line in stderr.getvalue().splitlines() if line.strip()]
+        self.assertEqual(events, [{"event": "state_write_refused", "file": ".session-handoff.json"}])
+        expected = [".session-handoff.json", "outside.json"] if self.real_link else ["outside.json"]
+        self.assertEqual(sorted(path.name for path in self.directory.iterdir()), expected,
+                         "no temp file or replacement may be left behind")
+
+    def test_in_place_fallback_also_refuses_a_link(self):
+        def denied(source, target):
+            raise rename_error(32, target)
+
+        stderr = io.StringIO()
+        with mock.patch.object(route.os, "replace", side_effect=denied), contextlib.redirect_stderr(stderr):
+            written = route.write_json_state(self.handoff, {"port": 3333})
+        self.assertFalse(written)
+        self.assertEqual(json.loads(self.target.read_text(encoding="utf-8")), {"port": 1111})
+
+
 if __name__ == "__main__":
     unittest.main()

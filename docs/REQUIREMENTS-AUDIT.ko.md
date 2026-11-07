@@ -25,13 +25,13 @@
 
 ## 2026-10-29 Agent Teams·병렬 기능 보존 재점검
 
-원본 Claude Code를 실행하고 설정을 유지하는 것은 전체 기능 동등성의 증명이 아닙니다. Agent Teams의 생성·메시지·완료, 병렬 subagent와 SSH/MCP·Skills·Plugins·hooks의 조합을 최신 실행에서 전수 검증하지 않았습니다. 일반 Local 모드의 프록시 동시2/대기8/5초 정책은 정상 병렬 작업도 Plan으로 우회시킬 수 있습니다. 명시적 LocalMode의 background 제한과 compat 모드의 환경·모델 재설정도 구분해야 합니다.
+원본 Claude Code를 실행하고 설정을 유지하는 것은 전체 기능 동등성의 증명이 아닙니다. Agent Teams의 생성·메시지·완료, 병렬 subagent와 SSH/MCP·Skills·Plugins·hooks의 조합을 최신 실행에서 전수 검증하지 않았습니다. 일반 Local 모드의 프록시 동시2/대기8 정책은 정상 병렬 작업이 대기 시간(기본 60초)을 넘기면 `local_busy` 503 오류를 반환합니다. Plan으로 우회하지는 않지만(`tests/localAdmission.test.mjs`가 확인), 지연된 병렬 작업은 재시도가 필요할 수 있습니다. 명시적 LocalMode의 background 제한과 compat 모드의 환경·모델 재설정도 구분해야 합니다.
 
 [DeepSeek Harness·OpenCode 정밀 비교](HARNESS-COMPATIBILITY-REVIEW.ko.md)에 고정 커밋, 코드·테스트 근거, 모드별 제약, 우선순위와 합격 기준을 기록했습니다. 보완안은 아직 런타임에 적용하지 않았습니다.
 
 ## 남은 확인 사항
 
-- Grok은 자체 도구를 완전히 비활성화하는 실행 프로필이 검증될 때까지 백엔드 실행을 거부합니다.
+- Grok(2026-11-07 침투 테스트 갱신): 1.0.77의 실왕복("Reply with exactly OK" → "OK", JSON 구조화 출력)이 검증되어 백엔드가 활성화됐습니다. 어댑터는 `-p <프롬프트>` 단일 턴에 `--disable-web-search`·`--no-subagents`를 붙이고, `--disallowed-tools`로 파일시스템·터미널 빌트인 도구 15종(run_terminal_command·search_replace·read_file 등)을 제거합니다. 침투 테스트 결과: 파일 쓰기·터미널 실행 시도가 도구 제거 후 "cannot"으로 거부되고 파일이 생성되지 않았으며, 서브에이전트는 NO_SUBAGENT, 웹 검색은 NO_WEB으로 거부됐습니다. `--always-approve`·`--permission-mode` 우회 플래그는 어댑터가 붙이지 않습니다(정적 확인). `--safe-mode`·stdin 프롬프트·`--effort`는 Grok에 없어 프롬프트가 argv에 실립니다(짧은 백엔드 프롬프트만). 환경 변수 허용목록에서 ANTHROPIC_*·OPENROUTER_* 비밀은 전달되지 않습니다. 향후 Grok 버전은 같은 절차로 재검증 전까지 실패 닫기(fail-closed)됩니다.
 - 최신 전면 Claude Code 인증 점검은 로그인되지 않은 상태였습니다. 인증 파일은 변경하지 않았으며 사용자 로그인 없이 최신 런처의 실제 전체 대화를 완료했다고 주장하지 않습니다.
 - 합성 테스트는 네트워크 오류·취소·모델 보고·도구 왕복의 계약을 확인합니다. 모든 모델과 모든 Claude 고유 기능의 동일성을 증명하지 않습니다.
 - 소스 변경 전 시작한 사용자 프록시는 최신 코드가 아닙니다. 대시보드 갱신만으로 해당 프로세스의 코드가 교체되지는 않습니다.
@@ -46,7 +46,7 @@
 
 ## 후속 구현·검증 (2026-10-29)
 
-앞선 표와 5초 대기 설명은 최초 조사 시점의 기록입니다. 사용자 승인에 따라 Local 큐 대기를 기본 60초로 변경했습니다. `ROUTE_LOCAL_QUEUE_WAIT_MS`로 0~60000ms 범위에서 설정하며 동시 실행 2개·대기 8개는 유지합니다. 큐 만료·포화 시 기존 Plan/오류 정책을 적용합니다. 이는 추론과 재시도를 포함한 전체 응답 기한이 아닙니다. 실행 중인 프록시에는 재시작 후 적용됩니다.
+앞선 표와 5초 대기 설명은 최초 조사 시점의 기록입니다. 사용자 승인에 따라 Local 큐 대기를 기본 60초로 변경했습니다. `ROUTE_LOCAL_QUEUE_WAIT_MS`로 0~60000ms 범위에서 설정하며 동시 실행 2개·대기 8개는 유지합니다. 큐 만료·포화 시 Plan 폴백 없이 `local_busy` 503(`Retry-After: 1`)을 반환합니다. 이는 추론과 재시도를 포함한 전체 응답 기한이 아닙니다. 실행 중인 프록시에는 재시작 후 적용됩니다.
 
 호환 실행 경로에서 명시된 Agent Teams·subagent·작업 목록·background·IDE·plugin·skill 환경 선호를 보존합니다. 인증 격리와 명시적 제한 LocalMode는 유지합니다. Claude 자체 관리 명령을 모델 연결 검사 없이 전달하도록 보완했으나, `--bg` 이후 프록시 수명 문제까지 해결한 것은 아닙니다.
 

@@ -99,6 +99,23 @@ class OpenRouterConfigTests(unittest.TestCase):
             self.write_yaml(base + suffix)
             self.assertNotIn("OPENROUTER_UPSTREAM_PROVIDER", route.provider_config("openrouter"))
 
+    def test_reasoning_validation_and_default_off(self):
+        base = 'openrouter:\n  model: "vendor/model"\n  api_key: "sk-or-synthetic-key"\n'
+        # Accepted: unset, explicit off, a token budget, a named effort.
+        for value, expected in (("", None), ("off", None), ("8192", "8192"), ("high", "high"), ("max", "max")):
+            with self.subTest(value=value):
+                self.write_yaml(base + f'  reasoning: "{value}"\n')
+                config = route.provider_config("openrouter")
+                if expected is None:
+                    self.assertNotIn("OPENROUTER_REASONING", config)
+                else:
+                    self.assertEqual(config["OPENROUTER_REASONING"], expected)
+        for value in ("sometimes", "0", "-5", "1.5", "x" * 33, "OFF"):
+            with self.subTest(value=value):
+                self.write_yaml(base + f'  reasoning: "{value}"\n')
+                with self.assertRaises(route.OpenRouterConfigError):
+                    route.provider_config("openrouter")
+
     def test_upstream_passes_only_to_proxy_and_alternate(self):
         self.write_yaml('openrouter:\n  model: "vendor/model"\n  api_key: "sk-or-synthetic-key"\n  provider: "open-inference/fp4"\nlocal:\n  model: "local-model"\nrouting:\n  dual_provider: true\n')
         os.environ.update(OPENROUTER_UPSTREAM_PROVIDER="ambient", ROUTE_ALT_UPSTREAM_PROVIDER="ambient")

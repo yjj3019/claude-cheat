@@ -1931,6 +1931,10 @@ test('requests above the configured concurrency limit are rejected with retry-af
   assert.equal(second.headers.get('x-content-type-options'), 'nosniff');
   assert.equal(second.headers.get('x-frame-options'), 'DENY');
   assert.match((await second.json()).error.message, /route_busy/);
+  const metrics = await (await fetch(base + '/api/metrics', { headers: { 'x-local-route-token': NONCE } })).json();
+  assert.equal(metrics.requestAdmission.rejected, 1);
+  assert.equal(metrics.requestAdmission.rejectedConcurrency, 1);
+  assert.equal(metrics.requestAdmission.rejectedBytes, 0);
   release();
   const firstResponse = await first;
   assert.equal(firstResponse.status, 200);

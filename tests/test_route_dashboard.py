@@ -153,6 +153,8 @@ class RouteLogTests(unittest.TestCase):
 
     def test_malformed_lines_are_ignored(self):
         self.log.write_text(
+            # A planted line with a bogus stamp must not become an event: the parser
+            # proves the stamp parses as ISO-8601 before trusting anything else.
             "not-a-timestamp {\"event\": \"route_selected\", \"provider\": \"plan\"}\n"
             "2026-10-25T02:00:00Z {broken json\n"
             "2026-10-25T02:00:00Z --- proxy start ---\n"
@@ -160,13 +162,25 @@ class RouteLogTests(unittest.TestCase):
             encoding="utf-8")
         events = dash.parse_route_log()
         self.assertEqual([event["event"] for event in events],
-                         ["route_selected", "proxy_start", "proxy_start"])
-        self.assertNotIn("code", events[1])
-        self.assertEqual(events[2]["code"], "2026-10-25T02:30:00.000Z")
+                         ["proxy_start", "proxy_start"])
+        self.assertNotIn("code", events[0])
+        self.assertEqual(events[1]["code"], "2026-10-25T02:30:00.000Z")
         state = dash.routing_state(events)
         self.assertEqual(state["proxy_code"], "2026-10-25T02:30:00.000Z")
 
-    def test_restart_does_not_reuse_previous_route_as_current_evidence(self):
+    def test_a_planted_line_cannot_forge_session_evidence(self):
+        # Audit Info: every event's ts must parse as ISO-8601. A line with a non-ISO
+        # stamp would otherwise become an event that steers session boundaries.
+        now = datetime(2026, 10, 25, 3, 0, 0, tzinfo=timezone.utc)
+        self.log.write_text(
+            "bogus}stamp " + json.dumps({"event": "route_selected", "provider": "openrouter"}) + "\n"
+            + route_line(now.isoformat(), {"event": "route_selected", "provider": "openrouter"}),
+            encoding="utf-8")
+        events = dash.parse_route_log()
+        self.assertEqual(len(events), 1, "the planted line must not become an event")
+        self.assertEqual(events[0]["event"], "route_selected")
+        state = dash.routing_state(events, now=now)
+        self.assertEqual(state["state"], "external")
         now = datetime(2026, 10, 25, 3, 0, 0, tzinfo=timezone.utc)
         old = {"event": "route_selected", "provider": "openrouter", "model": "vendor/old",
                "ts": (now - timedelta(seconds=2)).isoformat()}
@@ -1206,6 +1220,19 @@ class TokenPersistenceTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"DASHBOARD_TOKEN": "env-token-1234567890"}):
                 self.assertEqual(dash._load_or_create_token(path), "env-token-1234567890")
             self.assertFalse(path.exists())
+
+    def test_a_non_ascii_environment_token_is_rejected_not_propagated(self):
+        # `secrets.compare_digest` raises TypeError on non-ASCII str, and an env token
+        # becomes an HTTP header value: an invalid value must fall back to the file or a
+        # fresh token instead of making every authorized request die without a 403.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / ".dashboard.token"
+            for value in ("비ASCII-토큰-값", "tok en-with-space-123456", "x" * 200):
+                with self.subTest(value=value):
+                    with mock.patch.dict(os.environ, {"DASHBOARD_TOKEN": value}):
+                        token = dash._load_or_create_token(path)
+                    self.assertRegex(token, r"^[A-Za-z0-9_-]{16,128}$")
+                    self.assertNotEqual(token, value)
 
 
 class ProxyStaleTests(unittest.TestCase):
@@ -2316,7 +2343,7 @@ class UsageStatsTests(unittest.TestCase):
                 self.end_headers()
                 self.wfile.write(json.dumps({"instanceId": instance, "configuration": {"provider": "local", "model": "fixture"},
                                              "requests": 7, "failed": 1, "inflightRequests": 2,
-                                             "localAdmission": {"queued": 1}, "routingTimingMs": {"total": {"p95": 50}}}).encode())
+                                             "process": {"rssBytes": 1048576}, "localAdmission": {"queued": 1}, "routingTimingMs": {"total": {"p95": 50}}}).encode())
         server = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
@@ -2327,7 +2354,7 @@ class UsageStatsTests(unittest.TestCase):
                 sessions, partial = dash._usage_live_sessions(Path(directory))
                 self.assertFalse(partial)
                 self.assertEqual(len(sessions), 1)
-                self.assertEqual((sessions[0]["status"], sessions[0]["inflight"], sessions[0]["queued"]), ("active", 2, 1))
+                self.assertEqual((sessions[0]["status"], sessions[0]["inflight"], sessions[0]["queued"], sessions[0]["rss_bytes"]), ("active", 2, 1, 1048576))
                 self.assertEqual((sessions[0]["requested_model"], sessions[0]["reported_model"]), ("fixture", None))
                 self.assertNotIn(secret, json.dumps(sessions))
         finally:
@@ -2356,13 +2383,72 @@ class UsageStatsTests(unittest.TestCase):
                 folder.mkdir(parents=True)
                 (folder / "handoff.json").write_text(json.dumps({"instance_id": instance, "provider": "local",
                     "port": 1234, "nonce": instance}), encoding="utf-8")
-            first, partial = dash._usage_live_sessions(Path(directory))
-            second, partial2 = dash._usage_live_sessions(Path(directory))
+            first, partial = dash._usage_live_sessions(Path(directory), limit=32)
+            second, partial2 = dash._usage_live_sessions(Path(directory), limit=32)
             self.assertTrue(partial and partial2)
             self.assertEqual(len(first), 32)
             self.assertNotIn(ids[-1], [row["instance_id"] for row in first])
             self.assertIn(ids[-1], [row["instance_id"] for row in second])
             self.assertEqual(first[0]["recording"], {"enabled": True, "dropped": 2, "errors": 1, "pending": 3})
+
+    def test_default_live_scan_aggregates_more_than_thirty_two_instances(self):
+        import uuid
+        class Response:
+            status = 200
+            def __init__(self, instance): self.instance = instance
+            def read(self, _size):
+                return json.dumps({"instanceId":self.instance,"configuration":{"provider":"local"},
+                    "requests":1,"failed":0,"inflightRequests":0,"process":{"rssBytes":100}}).encode()
+        class Connection:
+            def __init__(self, _host, port, timeout): self.instance = None
+            def request(self, _method, _path, headers): self.instance = headers["x-local-route-token"]
+            def getresponse(self): return Response(self.instance)
+            def close(self): pass
+        with (tempfile.TemporaryDirectory() as directory,
+              mock.patch.object(dash.http.client, "HTTPConnection", Connection),
+              mock.patch.object(dash, "_USAGE_SCAN_OFFSET", 0)):
+            base = Path(directory) / ".usage-stats" / "instances"
+            for number in range(1, 41):
+                instance = str(uuid.UUID(int=number))
+                folder = base / instance
+                folder.mkdir(parents=True)
+                (folder / "handoff.json").write_text(json.dumps({"instance_id":instance,"provider":"local",
+                    "port":10000+number,"nonce":instance}), encoding="utf-8")
+            sessions, partial = dash._usage_live_sessions(Path(directory))
+        self.assertFalse(partial)
+        self.assertEqual(len(sessions), 40)
+        with mock.patch.object(dash, "_USAGE_STATS", {"sessions_partial":partial}):
+            aggregate = dash._aggregate_live_metrics(sessions)
+        self.assertEqual(aggregate["requests"], 40)
+        self.assertEqual(aggregate["rss_bytes"], 4000)
+
+    def test_live_metrics_instance_mismatch_marks_aggregate_partial(self):
+        import uuid
+        actual = str(uuid.UUID(int=401))
+        wrong = str(uuid.UUID(int=402))
+        class Response:
+            status = 200
+            def read(self, _size):
+                return json.dumps({"instanceId": wrong, "configuration": {"provider": "local"}}).encode()
+        class Connection:
+            def __init__(self, *_args, **_kwargs): pass
+            def request(self, *_args, **_kwargs): pass
+            def getresponse(self): return Response()
+            def close(self): pass
+        with (tempfile.TemporaryDirectory() as directory,
+              mock.patch.object(dash.http.client, "HTTPConnection", Connection)):
+            folder = Path(directory) / ".usage-stats" / "instances" / actual
+            folder.mkdir(parents=True)
+            (folder / "handoff.json").write_text(json.dumps({"instance_id":actual,"provider":"local",
+                "port":1234,"nonce":"synthetic-token"}), encoding="utf-8")
+            sessions, partial = dash._usage_live_sessions(Path(directory))
+        self.assertTrue(partial)
+        self.assertEqual(sessions, [{"instance_id":actual,"provider":"local","status":"unknown"}])
+        with mock.patch.object(dash, "_USAGE_STATS", {"sessions_partial":partial}):
+            aggregate = dash._aggregate_live_metrics(sessions)
+        self.assertTrue(aggregate["partial"])
+        self.assertEqual(aggregate["active_instances"], 0)
+        self.assertIsNone(aggregate["rss_bytes"])
 
     def test_empty_historical_instances_do_not_hide_active_instance(self):
         import uuid
@@ -2424,7 +2510,9 @@ class UsageStatsTests(unittest.TestCase):
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         base = f"http://127.0.0.1:{port}"
         cached = {"at": 1, "reports": {"day": {"rows": [], "coverage": "collected_only"}},
-                  "sessions": [], "sessions_partial": False, "collection": None, "error": None}
+                  "sessions": [], "sessions_partial": False, "aggregate_sessions": {"active_instances": 2, "rss_bytes": 300},
+                  "host_resources": {"cpu_percent": 42.0, "memory_percent": 73.0, "error": None},
+                  "collection": None, "error": None}
         try:
             with opener.open(base + "/usage", timeout=10) as response:
                 page = response.read().decode("utf-8")
@@ -2440,6 +2528,8 @@ class UsageStatsTests(unittest.TestCase):
                     payload = json.loads(response.read())
                 self.assertEqual(payload["status"], "ready")
                 self.assertEqual(payload["report"]["rows"], [])
+                self.assertEqual(payload["aggregate_sessions"], {"active_instances": 2, "rss_bytes": 300})
+                self.assertEqual(payload["host_resources"]["cpu_percent"], 42.0)
                 request = urllib.request.Request(base + "/api/usage-stats?period=bad", headers={"x-dashboard-token": dash.TOKEN})
                 with self.assertRaises(urllib.error.HTTPError) as invalid:
                     opener.open(request, timeout=10)
@@ -2456,16 +2546,23 @@ class UsageStatsTests(unittest.TestCase):
             def __init__(self, _root): pass
             def collect(self): calls.append("collect"); return {"pending": False, "errors": []}
             def report(self, period): return {"period": period, "rows": []}
-        state = {"at": 0.0, "reports": {}, "sessions": [], "error": None, "collection": None, "sessions_partial": False}
+        state = {"at": 0.0, "reports": {}, "sessions": [], "error": None, "collection": None,
+                 "sessions_partial": False, "host_resources": {}, "aggregate_sessions": {}}
         with mock.patch.object(dash, "_USAGE_STATS", state), mock.patch.dict(sys.modules, {"usage_ledger": types.SimpleNamespace(UsageLedger=Ledger)}), \
-                mock.patch.object(dash, "_usage_live_sessions", return_value=([], False)):
+                mock.patch.object(dash, "_usage_live_sessions", return_value=([{"status":"active","provider":"cli","requests":2,"failed":0,"inflight":1,"rss_bytes":500}], False)), \
+                mock.patch.object(dash, "_sample_host_resources", return_value={"cpu_percent":42.0,"memory_percent":70.0,"error":None}):
             dash._refresh_usage_stats(now=100)
             dash._refresh_usage_stats(now=105)
             self.assertEqual(calls, ["collect"])
             self.assertEqual(set(state["reports"]), {"day", "week", "month"})
+            self.assertEqual(state["host_resources"]["cpu_percent"], 42.0)
+            self.assertEqual(state["aggregate_sessions"]["active_instances"], 1)
+            self.assertEqual(state["aggregate_sessions"]["rss_bytes"], 500)
             Ledger.collect = lambda self: (_ for _ in ()).throw(ValueError("private secret"))
             dash._refresh_usage_stats(now=111)
             self.assertEqual(state["error"], "collection_failed")
+            self.assertEqual(state["host_resources"]["cpu_percent"], 42.0)
+            self.assertEqual(state["aggregate_sessions"]["active_instances"], 1)
             self.assertNotIn("private", json.dumps(state))
 
 
@@ -2608,8 +2705,8 @@ class SnapshotTests(unittest.TestCase):
              mock.patch.object(dash, "read_settings", return_value={"OPENROUTER_MODEL": "vendor/model", "ROUTE_DEFAULT_PROVIDER": "openrouter"}):
             data = dash.snapshot()
         self.assertEqual(sorted(data),
-                         ["account", "active_session", "alerts", "attention", "configured", "generated_at", "help",
-                          "insights", "model", "pricing", "proactive", "provider", "providers",
+                         ["account", "active_session", "aggregate_sessions", "alerts", "attention", "configured", "generated_at", "help",
+                          "host_resources", "insights", "model", "pricing", "proactive", "provider", "providers",
                           "proxy_metrics", "proxy_modified_at", "proxy_stale", "refresh_ms",
                           "routing", "selected_instance", "sessions", "summary", "usage", "version"])
         self.assertEqual(data["model"], "vendor/model")
@@ -2706,6 +2803,8 @@ class CliSettingsTests(unittest.TestCase):
                     "elapsed_ms": 1200, "stdout": "SHOULD NOT LEAK"}
 
         fake.validate_binary, fake.detect_all, fake.connection_test = validate_binary, detect_all, connection_test
+        # Native model catalog probes are opt-in per test; default fixtures model missing binaries.
+        fake.find_binary = lambda kind: None
         self.fake = fake
         self.enterContext(mock.patch.dict(sys.modules, {"routeCli": fake}))
 
@@ -2846,8 +2945,28 @@ class CliSettingsTests(unittest.TestCase):
             self.assertEqual(dash.model_catalog("cli", kind="codex")["error"], "cache_invalid")
             path.unlink()
             self.assertEqual(dash.model_catalog("cli", kind="codex")["error"], "cache_unavailable")
-        self.assertEqual(dash.model_catalog("cli", kind="grok")["error"], "not_supported")
+        self.assertEqual(dash.model_catalog("cli", kind="claude")["error"], "not_found")
+        self.assertEqual(dash.model_catalog("cli", kind="grok")["error"], "not_found")
         self.assertEqual(dash.model_catalog("cli", kind="unknown")["error"], "invalid_cli_kind")
+
+    def test_native_cli_catalogs_return_model_ids_for_claude_and_grok(self):
+        self.fake.find_binary = lambda kind: {"path": f"C:/bin/{kind}.exe"}
+        self.fake.resolve_command = lambda path: [path]
+        self.fake.child_env = lambda kind: {"PATH": "safe"}
+        outputs = [
+            {"timed_out": False, "exit_code": 0,
+             "stdout": b"| Fable 5.1 | `claude-fable-5-1` |\\n| Sonnet 5.5 | `claude-sonnet-5-5` |"},
+            {"timed_out": False, "exit_code": 0,
+             "stdout": b"Available models:\\n  * grok-4.7 (default)\\n  - grok-4.7-build-fast\\n  - grok-4.6"}]
+        self.fake.run_safely = mock.Mock(side_effect=outputs)
+        claude = dash.model_catalog("cli", kind="claude")
+        grok = dash.model_catalog("cli", kind="grok")
+        self.assertEqual([row["id"] for row in claude["models"]],
+                         ["claude-fable-5-1", "claude-sonnet-5-5"])
+        self.assertEqual([row["id"] for row in grok["models"]],
+                         ["grok-4.7", "grok-4.7-build-fast", "grok-4.6"])
+        self.assertEqual(self.fake.run_safely.call_count, 2)
+        self.assertTrue(claude["ok"] and grok["ok"])
 
     def test_the_detection_endpoint_needs_the_session_token(self):
         import threading
@@ -3908,6 +4027,132 @@ class CliAutoDetectFlowTests(unittest.TestCase):
         self.assertEqual(launcher_view.read_provider("routing")["ROUTE_DEFAULT_PROVIDER"], "cli")
 
 
+class HostResourceMonitoringTests(unittest.TestCase):
+    def test_linux_meminfo_parser_reports_total_and_available_as_bytes(self):
+        import builtins
+        source = "MemTotal:       1024 kB\nMemFree:         128 kB\nMemAvailable:    768 kB\n"
+        real_open = builtins.open
+        def fake_open(path, *args, **kwargs):
+            if path == "/proc/meminfo":
+                return io.StringIO(source)
+            return real_open(path, *args, **kwargs)
+        with mock.patch.object(dash.os, "name", "posix"), mock.patch.object(dash.sys, "platform", "linux"), \
+             mock.patch("builtins.open", side_effect=fake_open):
+            self.assertEqual(dash._host_memory(), (1024*1024, 768*1024))
+
+    def test_linux_cpu_counters_do_not_double_count_guest_ticks(self):
+        import builtins
+        # user=100,idle=100, guest=900. Guest is included in user; CPU usage must be 0%,
+        # not 45% from incorrectly summing the guest field a second time.
+        real_open = builtins.open
+        def fake_open(path, *args, **kwargs):
+            if path == "/proc/stat":
+                return io.StringIO("cpu 100 0 0 100 0 0 0 0 900 900\n")
+            return real_open(path, *args, **kwargs)
+        with (mock.patch.object(dash.os, "name", "posix"),
+              mock.patch.object(dash.sys, "platform", "linux"),
+              mock.patch("builtins.open", side_effect=fake_open)):
+            self.assertEqual(dash._host_cpu_counters(), (100, 200))
+
+    def test_linux_cpu_interval_percent_and_threshold_streak(self):
+        with mock.patch.object(dash.os, "name", "posix"), mock.patch.object(dash.sys, "platform", "linux"), \
+             mock.patch.object(dash, "_host_memory", return_value=(1000, 50)), \
+             mock.patch.object(dash, "_host_cpu_counters", side_effect=[(1,200),(2,300),(3,400)]), \
+             mock.patch.object(dash, "_HOST_METRICS", {"sampled_at":None,"cpu_percent":None,
+                 "memory_total_bytes":None,"memory_available_bytes":None,"memory_used_bytes":None,
+                 "memory_percent":None,"cpu_high_streak":0,"memory_high_streak":0,"source":None,"error":"not_sampled"}), \
+             mock.patch.object(dash, "_HOST_CPU_PREVIOUS", (0,100)):
+            first = dash._sample_host_resources(now=datetime(2026, 11, 7, tzinfo=timezone.utc))
+            second = dash._sample_host_resources(now=datetime(2026, 11, 7, 0, 0, 10, tzinfo=timezone.utc))
+        self.assertEqual(first["cpu_percent"], 99.0)
+        self.assertEqual(first["cpu_high_streak"], 1)
+        self.assertEqual(second["cpu_high_streak"], 2)
+        self.assertEqual(second["memory_high_streak"], 2)
+        self.assertEqual(second["memory_used_bytes"], 950)
+
+    def test_cpu_failure_does_not_hide_host_memory_sample(self):
+        with (mock.patch.object(dash, "_host_cpu_counters", side_effect=OSError("no cpu")),
+              mock.patch.object(dash, "_host_memory", return_value=(1000, 100)),
+              mock.patch.object(dash, "_HOST_METRICS", {"cpu_high_streak":0,"memory_high_streak":0}),
+              mock.patch.object(dash, "_HOST_CPU_PREVIOUS", None)):
+            sample = dash._sample_host_resources(now=datetime(2026, 11, 7, tzinfo=timezone.utc))
+        self.assertIsNone(sample["cpu_percent"])
+        self.assertEqual(sample["cpu_error"], "host_cpu_unavailable")
+        self.assertEqual(sample["memory_percent"], 90.0)
+        self.assertIsNone(sample["memory_error"])
+
+    def test_memory_failure_does_not_hide_host_cpu_sample(self):
+        with (mock.patch.object(dash, "_host_cpu_counters", return_value=(1,200)),
+              mock.patch.object(dash, "_host_memory", side_effect=OSError("no memory")),
+              mock.patch.object(dash, "_HOST_METRICS", {"cpu_high_streak":0,"memory_high_streak":0}),
+              mock.patch.object(dash, "_HOST_CPU_PREVIOUS", (0,100))):
+            sample = dash._sample_host_resources(now=datetime(2026, 11, 7, tzinfo=timezone.utc))
+        self.assertEqual(sample["cpu_percent"], 99.0)
+        self.assertIsNone(sample["memory_percent"])
+        self.assertEqual(sample["memory_error"], "host_memory_unavailable")
+
+    def test_aggregate_counts_only_authenticated_active_instances(self):
+        rows = [
+            {"provider":"local","status":"active","requests":5,"failed":1,"inflight":2,"rss_bytes":100},
+            {"provider":"cli","status":"active","requests":7,"failed":2,"inflight":1,"rss_bytes":200},
+            {"provider":"openrouter","status":"unknown","requests":99,"failed":99,"inflight":0,"rss_bytes":999},
+        ]
+        with mock.patch.object(dash, "_USAGE_STATS", {"sessions_partial": True}):
+            aggregate = dash._aggregate_live_metrics(rows)
+        self.assertEqual(aggregate["active_instances"], 2)
+        self.assertEqual(aggregate["observed_instances"], 3)
+        self.assertTrue(aggregate["partial"])
+        self.assertIsNone(aggregate["requests"])
+        self.assertIsNone(aggregate["failed"])
+        self.assertIsNone(aggregate["inflight"])
+        self.assertIsNone(aggregate["rss_bytes"])
+        self.assertIsNone(aggregate["by_provider"]["local"]["rss_bytes"])
+        self.assertIsNone(aggregate["by_provider"]["openrouter"]["rss_bytes"],
+                          "no authenticated active instance must be unknown, not zero")
+
+    def test_partial_metric_coverage_does_not_masquerade_as_complete_sum(self):
+        rows = [
+            {"provider":"local","status":"active","requests":5,"failed":1,"inflight":2,"rss_bytes":100},
+            {"provider":"cli","status":"active","requests":7,"failed":None,"inflight":1,"rss_bytes":None},
+        ]
+        with mock.patch.object(dash, "_USAGE_STATS", {"sessions_partial": False}):
+            aggregate = dash._aggregate_live_metrics(rows)
+        self.assertEqual(aggregate["requests"], 12)
+        self.assertIsNone(aggregate["failed"])
+        self.assertIsNone(aggregate["rss_bytes"])
+        self.assertEqual(aggregate["metric_coverage"]["rss_bytes"], {"reported":1,"active":2,"observed":2})
+        self.assertIsNone(aggregate["by_provider"]["cli"]["rss_bytes"])
+
+    def test_usage_dashboard_surface_exposes_unknown_host_and_aggregate_copy(self):
+        self.assertIn("host_resources", dash.USAGE_PAGE)
+        self.assertIn("aggregate_sessions", dash.USAGE_PAGE)
+        self.assertIn("host.cpu_error", dash.USAGE_PAGE)
+        self.assertIn("host.memory_error", dash.USAGE_PAGE)
+        self.assertIn("GPU", dash.USAGE_PAGE)
+        self.assertIn("telemetryCard", dash.JS_USAGE)
+
+    def test_host_pressure_warns_only_after_two_samples_and_never_guesses_when_unknown(self):
+        session = {"provider":"local"}
+        resources = {"error":None,"cpu_percent":96.0,"memory_percent":93.0,
+                     "cpu_high_streak":1,"memory_high_streak":1}
+        with mock.patch.object(dash, "_USAGE_STATS", {"host_resources":resources}):
+            one_sample = dash.proactive_alerts({"openrouter":False,"local":True,"cli":False},
+                session,{"configuration":{"provider":"local"}},routing_values={"ROUTE_DEFAULT_PROVIDER":"local"})
+        self.assertNotIn("host_cpu_pressure", [a.get("code") for a in one_sample])
+        resources["cpu_high_streak"] = resources["memory_high_streak"] = 2
+        with mock.patch.object(dash, "_USAGE_STATS", {"host_resources":resources}):
+            two_samples = dash.proactive_alerts({"openrouter":False,"local":True,"cli":False},
+                session,{"configuration":{"provider":"local"}},routing_values={"ROUTE_DEFAULT_PROVIDER":"local"})
+        codes=[a.get("code") for a in two_samples]
+        self.assertIn("host_cpu_pressure", codes)
+        self.assertIn("host_memory_pressure", codes)
+        resources["cpu_error"] = resources["memory_error"] = "host_metrics_unavailable"
+        with mock.patch.object(dash, "_USAGE_STATS", {"host_resources":resources}):
+            unknown = dash.proactive_alerts({"openrouter":False,"local":True,"cli":False},
+                session,{"configuration":{"provider":"local"}},routing_values={"ROUTE_DEFAULT_PROVIDER":"local"})
+        self.assertNotIn("host_cpu_pressure", [a.get("code") for a in unknown])
+
+
 class ProactiveReactionTests(unittest.TestCase):
     """The snapshot must surface actionable problems without the user opening diagnostics."""
 
@@ -3972,6 +4217,44 @@ class ProactiveReactionTests(unittest.TestCase):
             routing_values={"ROUTE_DEFAULT_PROVIDER": "openrouter"})
         self.assertIn("proxy_event_loop_lag", self.codes(alerts))
         self.assertIn("proxy_memory_high", self.codes(alerts))
+
+    def test_request_admission_rejections_raise_a_provider_scoped_warning(self):
+        for provider in ("openrouter", "local", "cli"):
+            with self.subTest(provider=provider):
+                metrics = {"configuration": {"provider": provider},
+                           "requestAdmission": {"active": 0, "max": 32, "rejected": 7,
+                                                "rejectedConcurrency": 7, "rejectedBytes": 0}}
+                alerts = dash.proactive_alerts(
+                    {"openrouter": True, "local": True, "cli": True},
+                    {"provider": provider}, metrics,
+                    routing_values={"ROUTE_DEFAULT_PROVIDER": provider})
+                match = next(a for a in alerts if a.get("code") == "request_admission_concurrency")
+                self.assertEqual(match["level"], "warn")
+                self.assertIn("7", match["detail"])
+
+    def test_byte_budget_rejections_are_distinct_from_concurrency_burst(self):
+        metrics = {"configuration": {"provider": "openrouter"},
+                   "requestAdmission": {"rejected": 4, "rejectedConcurrency": 1, "rejectedBytes": 3,
+                                        "inflightBytes": 8 * 1024 * 1024,
+                                        "maxInflightBytes": 8 * 1024 * 1024}}
+        alerts = dash.proactive_alerts(
+            {"openrouter": True, "local": False, "cli": False},
+            {"provider": "openrouter"}, metrics,
+            routing_values={"ROUTE_DEFAULT_PROVIDER": "openrouter"})
+        by_code = {item["code"]: item for item in alerts}
+        self.assertIn("request_admission_concurrency", by_code)
+        self.assertIn("request_admission_bytes", by_code)
+        self.assertIn("429", by_code["request_admission_concurrency"]["detail"])
+        self.assertIn("503", by_code["request_admission_bytes"]["detail"])
+
+    def test_zero_request_admission_rejections_raise_no_warning(self):
+        metrics = {"configuration": {"provider": "openrouter"},
+                   "requestAdmission": {"active": 1, "max": 32, "rejected": 0}}
+        alerts = dash.proactive_alerts(
+            {"openrouter": True, "local": False, "cli": False},
+            {"provider": "openrouter"}, metrics,
+            routing_values={"ROUTE_DEFAULT_PROVIDER": "openrouter"})
+        self.assertNotIn("request_admission_concurrency", self.codes(alerts))
 
     def test_a_healthy_proxy_process_raises_nothing(self):
         metrics = {"configuration": {"provider": "openrouter"},

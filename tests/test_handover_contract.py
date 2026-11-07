@@ -241,5 +241,98 @@ class TakeoverGuardTests(unittest.TestCase):
         marker.assert_called_once()
 
 
+class OwnedPortVerificationTests(unittest.TestCase):
+    """Audit L5: never start the CLI against a loopback port this launcher cannot prove."""
+
+    def _serve(self, status):
+        handler = type("_Hello", (_Canned,), {"status": status, "body": b""})
+        handler.do_HEAD = _Canned.do_POST
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_address[1]
+
+    def test_a_proxy_that_accepts_the_launch_token_is_ours(self):
+        port = self._serve(200)
+        self.assertTrue(advisor.verify_owned_proxy(port, "fixture-nonce", timeout=2))
+
+    def test_a_foreign_listener_on_the_port_is_rejected(self):
+        port = self._serve(403)
+        self.assertFalse(advisor.verify_owned_proxy(port, "fixture-nonce", timeout=2),
+                         "a 403 answer means another program holds the port")
+
+    def test_an_unreachable_port_is_rejected_after_the_wait(self):
+        def refused(*_args, **_kwargs):
+            raise OSError("connection refused")
+
+        with mock.patch.object(advisor.urllib.request, "urlopen", side_effect=refused):
+            self.assertFalse(advisor.verify_owned_proxy(49999, "fixture-nonce", timeout=0.2))
+
+    def test_the_launcher_aborts_before_handing_an_unverified_port_to_the_cli(self):
+        class LiveProxy(advisor.subprocess.Popen):
+            """A real Popen subclass: `_verify_port_owned` only trusts real children."""
+
+            def __init__(self, *args, **kwargs):
+                self.pid = 4242
+                self.stdout = mock.MagicMock()
+                self.stdout.readline.return_value = '{"port":49999}\n'
+                self.stdin = mock.MagicMock()
+
+            def poll(self, *_args):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, *_args, **_kwargs):
+                return 0
+
+            def kill(self):
+                pass
+
+        proxy = LiveProxy()
+        auth = {"loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "pro"}
+        with mock.patch.object(advisor.subprocess, "Popen", return_value=proxy), \
+             mock.patch.object(advisor, "verify_owned_proxy", return_value=False) as owned, \
+             mock.patch.object(advisor.shutil, "which", return_value="node"), \
+             mock.patch.object(advisor, "run_owned", return_value=auth), \
+             mock.patch.object(advisor, "provider_config", return_value={"OPENROUTER_MODEL": "fixture/model"}), \
+             mock.patch.object(advisor, "check_connection", return_value=0), \
+             mock.patch.object(advisor, "log_route_marker"), \
+             mock.patch.object(advisor, "write_handoff") as handoff:
+            with self.assertRaises(RuntimeError) as caught:
+                with advisor._routed_session("openrouter", _config={"OPENROUTER_MODEL": "fixture/model"}):
+                    self.fail("an unverified port must never reach the session body")
+        self.assertIn("another process", str(caught.exception))
+        owned.assert_called_once()          # a live child is always verified
+        handoff.assert_not_called()
+
+    def test_a_stubbed_spawner_keeps_its_previous_contract(self):
+        # Tests and embedders replace Popen to model other failures; they never bound a port,
+        # so the ownership probe must not be forced onto them (it would fail on every stub).
+        stub = mock.Mock()
+        self.assertTrue(advisor._verify_port_owned(49999, "nonce", stub))
+        with mock.patch.object(advisor, "verify_owned_proxy") as probe:
+            advisor._verify_port_owned(49999, "nonce", stub)
+        probe.assert_not_called()
+
+    def _popen_shaped(self, poll_status):
+        """An object that is a real Popen subclass instance without starting a process."""
+        proxy = advisor.subprocess.Popen.__new__(advisor.subprocess.Popen)
+        proxy.pid = 4242
+        proxy.poll = lambda *_a: poll_status
+        return proxy
+
+    def test_a_dead_child_never_proves_ownership(self):
+        with mock.patch.object(advisor, "verify_owned_proxy") as probe:
+            self.assertFalse(advisor._verify_port_owned(49999, "nonce", self._popen_shaped(1)))
+        probe.assert_not_called()
+
+    def test_a_live_child_is_verified_against_the_proxy(self):
+        with mock.patch.object(advisor, "verify_owned_proxy", return_value=True) as probe:
+            self.assertTrue(advisor._verify_port_owned(49999, "nonce", self._popen_shaped(None)))
+        probe.assert_called_once_with(49999, "nonce")
+
 if __name__ == "__main__":
     unittest.main()

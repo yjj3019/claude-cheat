@@ -18,6 +18,10 @@ openrouter:
   # Optional upstream provider slug (e.g. open-inference/fp4); empty = Auto.
   # A selection is strict: other OpenRouter providers are not used.
   provider: ""
+  # Optional OpenRouter reasoning request; empty or "off" = not requested (previous behaviour).
+  # A positive integer is a reasoning token budget (e.g. 8192); low|medium|high|xhigh|max|minimal
+  # request a named effort. Ordinary OpenRouter sessions only; the API may ignore it per provider.
+  reasoning: ""
   # Required: an OpenRouter API key (sk-or-...), not an Anthropic or Local server key.
   api_key: ""
 

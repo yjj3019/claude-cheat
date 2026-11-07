@@ -283,6 +283,43 @@ class BackendTest(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(errors, [])
 
+    def test_tokenless_connection_holds_its_slot_only_for_the_preauth_window(self):
+        """Audit L7: a slowloris without a token must not pin a slot for the full budget."""
+        instance = self.construct()
+        with patch.object(backend, "Backend", return_value=instance), \
+             patch.object(backend, "PRE_AUTH_TIMEOUT_SECONDS", 1), backend.serve({}) as (_, url, token):
+            parsed = urlsplit(url)
+            client = socket.create_connection((parsed.hostname, parsed.port), timeout=5)
+            client.sendall(b"POST /v1/messages HTTP/1.1\r\nHost: localhost\r\n")  # no token, incomplete
+            # Keep dribbling so the socket never looks idle either.
+            stop, freed = threading.Event(), threading.Event()
+            def drip():
+                while not stop.wait(.05):
+                    try:
+                        client.sendall(b" ")
+                    except OSError:
+                        freed.set()
+                        return
+            sender = threading.Thread(target=drip, daemon=True)
+            sender.start()
+            probe = socket.create_connection((parsed.hostname, parsed.port), timeout=5)
+            deadline = time.time() + 5
+            while time.time() < deadline and not freed.is_set():
+                # Once the dribbler's slot is reclaimed, a new connection is accepted
+                # and answered; while it is pinned, this probe gets nothing back.
+                probe.sendall(b"POST /v1/messages HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                probe.settimeout(.3)
+                try:
+                    if probe.recv(64):
+                        break
+                except (socket.timeout, OSError):
+                    continue
+            stop.set()
+            freed.set()
+            sender.join(3)
+            client.close()
+            probe.close()
+
     def test_shutdown_cancels_slow_drip_headers_and_body(self):
         for phase in ("headers", "body"):
             with self.subTest(phase=phase):
