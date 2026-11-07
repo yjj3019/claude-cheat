@@ -1155,6 +1155,8 @@ class PageTests(unittest.TestCase):
         self.assertIn('Stable dashboard geometry', dash.PAGE_CSS)
         self.assertIn('height:560px', dash.PAGE_CSS)
         self.assertIn('-webkit-line-clamp:3', dash.PAGE_CSS)
+        self.assertIn('white-space:normal;overflow-wrap:anywhere', dash.PAGE)
+        self.assertNotIn('.ov-tile .c{font-size:10.5px;color:var(--fg-4);margin-top:3px;white-space:nowrap', dash.PAGE)
         self.assertIn('라우트 로그 쓰기 max', dash.PAGE)
         self.assertIn('pm.routeLog', dash.PAGE)
 
@@ -2115,6 +2117,7 @@ class ModelCatalogTests(unittest.TestCase):
         }
         self.enterContext(mock.patch.object(dash, "CONFIG_FILES", self.files))
         self.enterContext(mock.patch.object(dash, "_MODELS_CACHE", {}))
+        self.enterContext(mock.patch.object(dash, "_PROVIDER_ENDPOINTS_CACHE", {}))
         (self.root / "openclaude.config.yaml").write_text(
             'openrouter:\n  api_key: "sk-or-v1-abcdefghijkl"\n  model: "vendor/a"\n', encoding="utf-8")
 
@@ -2133,6 +2136,145 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertEqual(catalog["models"][1]["completion_usd_per_m"], 1.5)
         self.assertNotIn("sk-or", json.dumps(catalog))
         self.assertTrue(request.call_args.args[1]["authorization"].startswith("Bearer sk-or-"))
+
+    def test_provider_endpoint_catalog_uses_model_specific_openrouter_metadata(self):
+        payload = {"data": {"endpoints": [
+            {"tag":"open-inference/fp4","provider_name":"OpenInference","quantization":"fp4",
+             "context_length":1048576,"pricing":{"prompt":"0.000000006","completion":"0.0000005"}},
+            {"tag":"open-inference/fp4","provider_name":"duplicate","context_length":10},
+            {"tag":"bad/../slug","provider_name":"invalid"},
+            {"tag":"vendor/other","provider_name":"Vendor X","context_length":1000},
+        ]}}
+        with mock.patch.object(dash, "_http_json", return_value=(200, payload)) as request:
+            result = dash.provider_endpoint_catalog("deepseek/deepseek-v4.1-flash-1017", now=1000)
+        self.assertTrue(result["ok"])
+        self.assertEqual([row["slug"] for row in result["endpoints"]], ["open-inference/fp4", "vendor/other"])
+        self.assertEqual(result["endpoints"][0]["name"], "OpenInference")
+        self.assertEqual(result["endpoints"][0]["variant"], "fp4")
+        self.assertEqual(result["endpoints"][0]["context_length"], 1048576)
+        self.assertEqual(result["endpoints"][0]["prompt_usd_per_m"], 0.006)
+        self.assertEqual(request.call_args.args[0], "https://openrouter.ai/api/v1/models/deepseek/deepseek-v4.1-flash-1017/endpoints")
+        self.assertNotIn("authorization", request.call_args.args[1])
+
+    def test_provider_endpoint_catalog_is_model_keyed_cached_and_rejects_bad_model(self):
+        payload = {"data":{"endpoints":[{"tag":"openai/gpt-oss","provider_name":"OpenAI"}]}}
+        with mock.patch.object(dash, "_http_json", return_value=(200, payload)) as request:
+            first = dash.provider_endpoint_catalog("vendor/model-a", now=1000)
+            second = dash.provider_endpoint_catalog("vendor/model-a", now=1010)
+            third = dash.provider_endpoint_catalog("vendor/model-b", now=1011)
+            bad = dash.provider_endpoint_catalog("../evil", now=1012)
+        self.assertFalse(first.get("cached"))
+        self.assertTrue(second["cached"])
+        self.assertNotEqual(first["model"], third["model"])
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(bad["error"], "invalid_model")
+
+    def test_provider_endpoint_cache_expires_and_refetches(self):
+        payload={"data":{"endpoints":[{"tag":"provider/one","provider_name":"Provider"}]}}
+        with mock.patch.object(dash, "_http_json", return_value=(200,payload)) as request:
+            dash.provider_endpoint_catalog("vendor/model", now=1000)
+            fresh = dash.provider_endpoint_catalog("vendor/model", now=1000 + dash.PROVIDER_ENDPOINTS_TTL + 1)
+        self.assertFalse(fresh.get("cached"))
+        self.assertEqual(request.call_count, 2)
+
+    def test_provider_endpoint_refresh_bypasses_fresh_cache(self):
+        payload={"data":{"endpoints":[{"tag":"provider/one","provider_name":"Provider"}]}}
+        with mock.patch.object(dash, "_http_json", return_value=(200,payload)) as request:
+            dash.provider_endpoint_catalog("vendor/model", now=1000)
+            result = dash.provider_endpoint_catalog("vendor/model", refresh=True, now=1001)
+        self.assertFalse(result.get("cached"))
+        self.assertEqual(request.call_count, 2)
+
+    def test_provider_endpoint_cache_is_bounded_and_evicts_least_recently_used(self):
+        payload={"data":{"endpoints":[{"tag":"provider/one","provider_name":"Provider"}]}}
+        with mock.patch.object(dash, "_http_json", return_value=(200,payload)) as request:
+            for index in range(dash.PROVIDER_ENDPOINTS_CACHE_MAX + 1):
+                dash.provider_endpoint_catalog(f"vendor/model-{index}", now=1000 + index)
+            before = request.call_count
+            dash.provider_endpoint_catalog("vendor/model-0", now=2000)
+        self.assertEqual(len(dash._PROVIDER_ENDPOINTS_CACHE), dash.PROVIDER_ENDPOINTS_CACHE_MAX)
+        self.assertEqual(request.call_count, before + 1)
+
+    def test_provider_endpoint_catalog_caps_rows_and_marks_truncation(self):
+        rows=[{"tag":f"provider/{index}","provider_name":f"Provider {index}"}
+              for index in range(dash.PROVIDER_ENDPOINTS_MAX_ROWS + 3)]
+        with mock.patch.object(dash, "_http_json", return_value=(200,{"data":{"endpoints":rows}})):
+            result=dash.provider_endpoint_catalog("vendor/model", now=1000)
+        self.assertEqual(len(result["endpoints"]), dash.PROVIDER_ENDPOINTS_MAX_ROWS)
+        self.assertTrue(result["truncated"])
+
+    def test_provider_endpoint_catalog_network_failure_is_manual_fallback_and_not_cached(self):
+        with mock.patch.object(dash, "_http_json", side_effect=TimeoutError("private endpoint detail")) as request:
+            result=dash.provider_endpoint_catalog("vendor/model", now=1000)
+            self.assertEqual(result["error"], "connection_failed")
+            self.assertNotIn("private endpoint detail", json.dumps(result))
+            dash.provider_endpoint_catalog("vendor/model", now=1001)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(result["endpoints"], [])
+
+    def test_provider_endpoint_picker_keeps_auto_manual_and_stale_model_guard(self):
+        page=dash.SETTINGS_PAGE
+        self.assertIn("'OPENROUTER_UPSTREAM_PROVIDER'", page)
+        self.assertIn("'provider_endpoint'", page)
+        self.assertIn("Auto · OpenRouter 자동 선택", page)
+        self.assertIn("직접 입력", page)
+        self.assertIn("providerEndpointSequences.get(field) !== sequence", page)
+        self.assertIn("model.value.trim() !== modelId", page)
+        self.assertIn("/api/provider-endpoints?model=", page)
+
+    def test_provider_endpoint_catalog_rejects_nonfinite_or_negative_prices(self):
+        payload={"data":{"endpoints":[
+            {"tag":"provider/nonfinite","provider_name":"Provider","pricing":{"prompt":"Infinity","completion":"NaN"}},
+            {"tag":"provider/negative","provider_name":"Provider","pricing":{"prompt":"-0.01","completion":"-2"}},
+            {"tag":"provider/free","provider_name":"Provider","pricing":{"prompt":"0","completion":"0"}},
+        ]}}
+        with mock.patch.object(dash, "_http_json", return_value=(200,payload)):
+            result=dash.provider_endpoint_catalog("vendor/model",now=1000)
+        self.assertEqual(result["endpoints"][0]["prompt_usd_per_m"],None)
+        self.assertEqual(result["endpoints"][0]["completion_usd_per_m"],None)
+        self.assertEqual(result["endpoints"][1]["prompt_usd_per_m"],None)
+        self.assertEqual(result["endpoints"][2]["prompt_usd_per_m"],0.0)
+        self.assertNotRegex(json.dumps(result,allow_nan=False), r"\b(?:NaN|Infinity)\b")
+
+    def test_provider_endpoint_display_labels_strip_unicode_controls(self):
+        payload={"data":{"endpoints":[{"tag":"provider/safe","provider_name":"Good\u202EresreveD","quantization":"fp4\u202E"}]}}
+        with mock.patch.object(dash, "_http_json", return_value=(200,payload)):
+            result=dash.provider_endpoint_catalog("vendor/model",now=1000)
+        row=result["endpoints"][0]
+        self.assertNotIn("\u202e",row["name"].lower())
+        self.assertNotIn("\u202e",row["variant"].lower())
+        self.assertEqual(row["slug"],"provider/safe")
+
+    def test_provider_endpoint_catalog_sanitizes_http_errors(self):
+        import urllib.error
+        private_url = "https://provider.invalid/path-secret"
+        error = urllib.error.HTTPError(private_url, 503, "unavailable", {}, None)
+        with mock.patch.object(dash, "_http_json", side_effect=error):
+            result = dash.provider_endpoint_catalog("vendor/model")
+        self.assertEqual(result["error"], "http_error")
+        self.assertEqual(result["status"], 503)
+        self.assertNotIn(private_url, json.dumps(result))
+
+    def test_provider_endpoint_api_requires_token_and_returns_catalog(self):
+        import threading, urllib.error, urllib.request
+        server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as denied:
+                urllib.request.urlopen(base + "/api/provider-endpoints?model=vendor%2Fmodel", timeout=10)
+            self.assertEqual(denied.exception.code, 403)
+            denied.exception.close()
+            with mock.patch.object(dash, "provider_endpoint_catalog", return_value={"ok":True,"model":"vendor/model","endpoints":[{"slug":"provider/x","name":"Provider X"}]}):
+                request=urllib.request.Request(base+"/api/provider-endpoints?model=vendor%2Fmodel",
+                    headers={"x-dashboard-token":dash.TOKEN})
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    payload=json.loads(response.read())
+            self.assertEqual(payload["model"], "vendor/model")
+            self.assertEqual(payload["endpoints"][0]["slug"], "provider/x")
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_local_endpoint_is_derived_from_the_messages_url(self):
         url, _ = dash._models_endpoint("local", {"LOCAL_LLM_URL": "http://127.0.0.1:11434/v1/messages"})
@@ -2324,6 +2466,28 @@ class ModelCatalogTests(unittest.TestCase):
                 with opener.open(request, timeout=10) as response:
                     self.assertEqual(response.status, 200)
                     self.assertEqual(json.loads(response.read())["ok"], True)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_provider_endpoint_api_requires_token_and_passes_model_only(self):
+        import threading, urllib.error, urllib.request
+        server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            url = f"http://127.0.0.1:{port}/api/provider-endpoints?model=vendor%2Fmodel"
+            with self.assertRaises(urllib.error.HTTPError) as denied:
+                opener.open(url, timeout=10)
+            self.assertEqual(denied.exception.code, 403)
+            denied.exception.close()
+            with mock.patch.object(dash, "provider_endpoint_catalog", return_value={"ok":True,"model":"vendor/model","endpoints":[]} ) as catalog:
+                request = urllib.request.Request(url, headers={"x-dashboard-token":dash.TOKEN})
+                with opener.open(request, timeout=10) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertTrue(json.loads(response.read())["ok"])
+            catalog.assert_called_once_with("vendor/model")
         finally:
             server.shutdown()
             server.server_close()
