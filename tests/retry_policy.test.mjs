@@ -201,3 +201,44 @@ test('a Retry-After on a successful answer never reaches the metrics', { timeout
   assert.equal(payload.last.retryAfterMs, null, 'a successful answer must not carry a retry hint');
   assert.equal(payload.rateLimit, null, 'a success is not a rate-limit observation');
 });
+
+test('a zero request budget leaves the existing attempt count unchanged', { timeout: 15000 }, async t => {
+  let calls = 0;
+  const { base, metrics } = await startProxy(t, {
+    requestBudgetMs: 0,
+    fetchImpl: async () => { calls += 1; return new Response('nope', { status: 500 }); },
+  });
+  const response = await send(base);
+  await response.text();
+  assert.equal(calls, 4, 'the per-stage limits alone still allow four attempts');
+  assert.equal((await metrics()).retryBudgetExceeded, 0);
+});
+
+test('an exhausted request budget stops before the next attempt', { timeout: 15000 }, async t => {
+  let calls = 0;
+  const { base } = await startProxy(t, {
+    requestBudgetMs: 40,
+    fetchImpl: async () => {
+      calls += 1;
+      await new Promise(resolve => setTimeout(resolve, 60));
+      return new Response('nope', { status: 500 });
+    },
+  });
+  const response = await send(base);
+  await response.text();
+  assert.equal(calls, 1, 'the second attempt must not start after the budget is spent');
+  assert.notEqual(response.status, 200);
+});
+
+test('a request budget never replaces an answer already delivered', { timeout: 15000 }, async t => {
+  let calls = 0;
+  const { base } = await startProxy(t, {
+    requestBudgetMs: 1,
+    fetchImpl: async () => { calls += 1; return Response.json(message(UPSTREAM_MODEL)); },
+  });
+  const response = await send(base);
+  const text = await response.text();
+  assert.equal(response.status, 200);
+  assert.match(text, /"ok"/);
+  assert.equal(calls, 1);
+});

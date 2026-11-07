@@ -1152,6 +1152,12 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
   // request must not exceed this; 0 disables the cap. Per-wait retryMaxWaitMs still applies.
   retryBudgetMs = Number.isFinite(Number(process.env.ROUTE_RETRY_BUDGET_MS))
     ? Math.min(600000, Math.max(0, Number(process.env.ROUTE_RETRY_BUDGET_MS))) : 60000,
+  // Whole-request budget: queue wait, every external attempt and every retry wait together.
+  // 0 (default) keeps today's per-stage limits only, so existing sessions are unchanged.
+  // When enabled, an exhausted budget stops the request before another attempt or wait
+  // starts; an answer already forwarded to the client is never replaced.
+  requestBudgetMs = Number.isFinite(Number(process.env.ROUTE_REQUEST_BUDGET_MS))
+    ? Math.min(1800000, Math.max(0, Number(process.env.ROUTE_REQUEST_BUDGET_MS))) : 0,
   metricsPath = process.env.ROUTE_METRICS_PATH,
   instanceId = process.env.ROUTE_INSTANCE_ID,
   instanceMetricsPath = process.env.ROUTE_INSTANCE_METRICS_PATH,
@@ -1248,6 +1254,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
     return Math.min(Math.max(Math.trunc(number), min), max);
   };
   requestTotalTimeoutMs = boundedLimit(requestTotalTimeoutMs, 0, 10 * 60 * 1000, 'request total timeout');
+  requestBudgetMs = boundedLimit(requestBudgetMs, 0, 30 * 60 * 1000, 'request budget');
   maxConcurrentRequests = boundedLimit(maxConcurrentRequests, 1, 64, 'request concurrency limit');
   maxInflightBytes = boundedLimit(maxInflightBytes, 1, 1024 * 1024 * 1024, 'in-flight byte limit');
   maxConnections = boundedLimit(maxConnections, 1, 1024, 'connection limit');
@@ -1794,6 +1801,10 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
       }
       // Everything from here to the response is a routed request; count it once.
       const startedAt = performance.now();
+      // Whole-request budget (0 = off). It bounds queue wait plus every attempt and retry
+      // wait together; exceeding it stops the request before new work starts, never by
+      // replacing an answer that already reached the client.
+      const budgetDeadline = requestBudgetMs > 0 ? startedAt + requestBudgetMs : null;
       let firstByteMs = null;
       const noteFirstByte = () => { if (firstByteMs === null) firstByteMs = performance.now() - startedAt; };
       metrics.requests += 1;
@@ -2444,6 +2455,13 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
           // reported with the last status and the circuit still opens.
           let budgetExhausted = false;
           if (attempt + 1 < attempts && retryBudgetMs > 0 && retryBudgetLeft <= 0) budgetExhausted = true;
+          // Whole-request budget: once the remaining time cannot cover the next wait and
+          // attempt, report the existing failure instead of starting more work.
+          if (!budgetExhausted && attempt + 1 < attempts && budgetDeadline !== null &&
+              performance.now() >= budgetDeadline) {
+            budgetExhausted = true;
+            logEvent({ event: 'request_budget_exhausted', provider: target.name, status: failureStatus ?? null });
+          }
           if (budgetExhausted) {
             metrics.retryBudgetExceeded += 1;
             logEvent({ event: 'retry_budget_exhausted', provider: target.name, status: failureStatus ?? null });
@@ -2452,7 +2470,10 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
           if (attempt + 1 < attempts) {
             const backoff = congested ? retryDelayMs * (2 ** attempt) * (1 + Math.random() * 0.25) : retryDelayMs;
             const waitMs = Math.min(Math.max(backoff, retryAfterMs), retryMaxWaitMs);
-            const allowed = retryBudgetMs > 0 ? Math.min(waitMs, retryBudgetLeft) : waitMs;
+            // The whole-request budget also caps this wait: waiting past the deadline would
+            // only delay a failure the next attempt check would refuse anyway.
+            const remainingMs = budgetDeadline === null ? Infinity : Math.max(0, budgetDeadline - performance.now());
+            const allowed = Math.min(retryBudgetMs > 0 ? Math.min(waitMs, retryBudgetLeft) : waitMs, remainingMs);
             if (allowed >= 0) retryBudgetLeft -= allowed;
             const finishWait = startPhase('retryWait');
             try {

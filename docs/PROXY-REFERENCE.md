@@ -44,6 +44,7 @@ Proxy behavior can be tuned with these environment variables (the defaults are e
 | `ROUTE_STREAM_PASSTHROUGH` | off | `1` forwards validated frames immediately (full); `2` only on verifiable paths (forceJson validation excluded); `0` explicit off. Default remains buffered |
 | `ROUTE_COOLDOWN_MS` | `30000` | Circuit cooldown (0–600000); a parsed `Retry-After` from a 429 takes precedence |
 | `ROUTE_RETRY_BUDGET_MS` | `60000` | Aggregate retry-wait budget per request (0–600000); `0` disables, exhaustion is observable via `retryBudgetExceeded` in `/api/metrics` |
+| `ROUTE_REQUEST_BUDGET_MS` | `0` | Opt-in whole-request budget (0–1800000) covering Local queue wait plus every attempt and retry wait. `0` keeps the existing per-stage limits only. When enabled, no new attempt or wait starts past the deadline; an answer already forwarded is never replaced. Exhaustion is also counted in `retryBudgetExceeded` |
 | `ROUTE_PREWARM` | on | `0` disables the one-time upstream origin pre-warm (HEAD) at startup |
 | `ROUTE_UPSTREAM_H2` | off | `1` switches the upstream client to per-origin `node:http2` sessions (multiplexing; h2 over https, h2c over plaintext) |
 | `ROUTE_STABILIZE_PROMPT_CACHE` | off | `1` peels the trailing `<total_tokens>…` footer from system text before the external request to keep the prefix cache (opt-in) |
