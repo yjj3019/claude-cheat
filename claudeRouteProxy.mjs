@@ -783,6 +783,30 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false)
   let diagnosticUsage = {};
   let measuredInput = null, measuredOutput = null;
   const thinking = block => ['thinking', 'redacted_thinking'].includes(block?.type);
+  // One pass over the frame's lines replaces three split(/\r?\n/) arrays per frame: the
+  // joined `data:` payload and the first `event:` name the previous code built twice.
+  // The rules are unchanged: every `data:` line is trimmed and joined with \n, and the
+  // first `event:` name is compared with the parsed event type.
+  const parseFrame = frame => {
+    let data = '', named, lines = null, sawData = false;
+    for (let start = 0; start <= frame.length;) {
+      let end = frame.indexOf('\n', start);
+      if (end === -1) end = frame.length;
+      let line = frame.slice(start, end);
+      if (line.endsWith('\r')) line = line.slice(0, -1);
+      if (line.startsWith('data:')) {
+        if (lines === null) lines = [];
+        lines.push(line.slice(5).trim());
+        sawData = true;
+      } else if (named === undefined && line.startsWith('event:')) {
+        named = line.slice(6).trim();
+      }
+      if (end === frame.length) break;
+      start = end + 1;
+    }
+    if (sawData) data = lines.join('\n');
+    return { data, named };
+  };
   return {
     get started() { return started; },
     get stopped() { return stopped; },
@@ -790,11 +814,10 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false)
     get reportedModel() { return reportedModel; },
     get usage() { return { input_tokens: measuredInput, output_tokens: measuredOutput }; },
     validate(frame) {
-      const data = frame.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trim()).join('\n');
+      const { data, named } = parseFrame(frame);
       if (!data) return frame + '\n\n';
       if (data === '[DONE]') { if (!stopped) throw new Error('Premature stream terminator'); return ''; }
       const event = JSON.parse(data);
-      const named = frame.split(/\r?\n/).find(line => line.startsWith('event:'))?.slice(6).trim();
       if (named !== undefined && named !== event.type) throw new Error('Unexpected stream event');
       if (!STREAM_EVENTS.has(event.type)) throw new Error('Unexpected stream event');
       if (stopped) { if (event.type === 'ping') return ''; throw new Error('Event after message stop'); }

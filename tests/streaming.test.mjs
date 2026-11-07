@@ -405,6 +405,55 @@ test('a transport failure after the first frame ends the stream instead of retry
   }
 });
 
+test('CRLF frames, split data lines and surrounding whitespace keep one meaning', async () => {
+  // Providers differ in line endings and may wrap one JSON payload over several data
+  // lines. The parser must join and trim them exactly as the single-line form, and the
+  // buffered reply must still be the same validated stream.
+  const crlf = list => list.map(piece => piece.replace(/\n/g, '\r\n')).join('');
+  const pieces = [
+    'event: message_start\ndata: ' + JSON.stringify({ type: 'message_start', message: { ...META, model: 'stream/model' } }) + '\n\n',
+    'event: content_block_start\ndata: ' + JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }) + '\n\n',
+    'event: content_block_delta\ndata: ' + JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'crlf ok' } }) + '\n\n',
+    'event: content_block_stop\ndata: ' + JSON.stringify({ type: 'content_block_stop', index: 0 }) + '\n\n',
+    'event: message_delta\ndata: ' + JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn' } }) + '\n\n',
+    'event: message_stop\ndata: ' + JSON.stringify({ type: 'message_stop' }) + '\n\n',
+  ];
+  const { server, base } = await start({ chunks: [crlf(pieces)] });
+  try {
+    const result = await request(base);
+    assert.equal(result.status, 200);
+    assert.match(result.body, /crlf ok/);
+    assert.match(result.body, /message_stop/);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test('a payload split over several data lines is joined before JSON parsing', async () => {
+  // SSE joins the data fields of one event with a newline, so a provider may wrap a
+  // long JSON payload after a whitespace-significant point such as a comma or brace.
+  const payload = JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'split ok' } });
+  const cut = payload.indexOf(',');
+  const pieces = [
+    'event: message_start\ndata: ' + JSON.stringify({ type: 'message_start', message: { ...META, model: 'stream/model' } }) + '\n\n',
+    'event: content_block_start\ndata: ' + JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }) + '\n\n',
+    `event: content_block_delta\ndata: ${payload.slice(0, cut + 1)}\ndata: ${payload.slice(cut + 1)}\n\n`,
+    'event: content_block_stop\ndata: ' + JSON.stringify({ type: 'content_block_stop', index: 0 }) + '\n\n',
+    'event: message_delta\ndata: ' + JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn' } }) + '\n\n',
+    'event: message_stop\ndata: ' + JSON.stringify({ type: 'message_stop' }) + '\n\n',
+  ];
+  const { server, base } = await start({ chunks: [pieces.join('')] });
+  try {
+    const result = await request(base);
+    assert.equal(result.status, 200);
+    assert.match(result.body, /split ok/);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
 test('passthrough closes the stream when a later frame is invalid', async () => {
   // Text arrives first (so the client has bytes), then the protocol breaks: the proxy
   // must not fall back, because that would duplicate output the client already saw.
