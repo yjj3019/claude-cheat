@@ -1140,6 +1140,19 @@ class PageTests(unittest.TestCase):
         # Detection is only offered for the supported backends, not arbitrary PATH commands.
         self.assertIn("getElementById('cfg-cli-CLI_KIND')", dash.SETTINGS_PAGE)
 
+    def test_overview_metric_tiles_are_two_columns_and_context_follows(self):
+        css=dash.PAGE_CSS
+        self.assertIn('.ov-tiles{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))',css)
+        self.assertNotIn('.overview-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr))',css)
+        self.assertIn('@media(max-width:420px){.overview-grid{grid-template-columns:repeat(2,minmax(0,1fr))',css)
+        self.assertIn('.overview-tile:nth-child(n+3){padding-top:10px;border-top:1px solid var(--line)}',css)
+        self.assertIn('.overview,.flow-card{height:560px;min-height:560px;overflow:hidden}',css)
+        page=dash.PAGE
+        self.assertIn("tile('관측 속도'",page)
+        self.assertIn("tile('외부 p95'",page)
+        self.assertIn('표시 세션',page)
+        self.assertIn('오늘 사용',page)
+
     def test_hidden_elements_and_empty_charts_do_not_mislead(self):
         # A .pill/.btn author display rule beats the UA [hidden] rule; zero metrics must not
         # render a fake "최대 1.00 %" scale label.
@@ -4744,6 +4757,16 @@ class SnapshotCacheTests(unittest.TestCase):
         self.assertIn('snapshot_etag', Path('routeDashboard.py').read_text(encoding='utf-8'))
 
 class AttentionQueueTests(unittest.TestCase):
+    def test_attention_queue_matches_dashboard_dark_cards_and_severity_tokens(self):
+        css = dash.PAGE_CSS
+        self.assertIn(".attention{margin-bottom:14px;border:1px solid var(--line);border-left:3px solid var(--warn);border-radius:10px;background:var(--panel)", css)
+        self.assertIn(".attention-item{display:grid;grid-template-columns:10px minmax(0,1fr) auto", css)
+        self.assertIn("background:var(--panel-2)", css)
+        self.assertIn(".attention-item.critical{border-color:var(--bad-line)}", css)
+        self.assertIn(".attention-item.critical .attention-dot{background:var(--bad)}", css)
+        self.assertNotIn("background:#fff", css[css.find(".attention{"):css.find(".attention-history summary")])
+        self.assertIn(".attention-actions .btn{min-height:44px}", css)
+
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         dash.ATTENTION_FILE = self.root / ".dashboard-attention.json"

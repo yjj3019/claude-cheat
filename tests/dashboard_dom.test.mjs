@@ -1329,6 +1329,21 @@ test('cancelled requests are excluded from the failure rate and each connection 
   assert.doesNotMatch(html, /CLI 보고 여부/);
 });
 
+test('session monitor states name the evidence instead of implying activity', () => {
+  // The session monitor card is inserted next to the live chart, so the DOM stub does not
+  // render it; assert the served script carries every evidence-based label instead.
+  const page = ASSETS.dashboard;
+  assert.match(page, /대기 중 \$\{count\(queued\)\}/);
+  assert.match(page, /모델 응답 대기 중/);
+  assert.match(page, /상태 확인 불가/);
+  assert.match(page, /진행 상태 미보고/);
+  assert.match(page, /연결 종료는 서버 계산 중단을 뜻하지 않습니다/);
+  const source = execFileSync(process.env.PYTHON || 'python', ['-X', 'utf8', '-c',
+    'import routeDashboard as d; print(d.PAGE)'], { cwd: new URL('..', import.meta.url), encoding: 'utf-8' });
+  assert.match(source, /제공자 속도 제한/);
+  assert.match(source, /프록시가 보고한 값만 사용합니다/);
+});
+
 test('connection summary says no events were recorded instead of printing zeros', () => {
   const data = fixture({active_session: {provider: 'local'},
     proxy_metrics: {startedAt: 's', requests: 1, ok: 1, failed: 0, aborted: 0, configuration: {provider: 'local'}}});
@@ -1587,16 +1602,19 @@ test('the notification button stays hidden without a Notification API', () => {
 test('attention queue renders only actionable items with direct actions', () => {
   const { context, sandbox } = loadDashboard();
   sandbox.render(fixture({
-    alerts: [{ level: 'critical', title: 'OpenRouter 잔액 부족', detail: '남은 금액 $1.00', code: 'low_balance' }],
+    alerts: [{ level: 'warn', title: '호스트 CPU 사용률 높음', detail: '호스트 CPU가 최근 표본에서 97.6%로 높게 지속됐습니다.', code: 'host_cpu_pressure' }],
     attention: {
-      counts: { open: 1, critical: 1, warn: 0, acknowledged: 0, snoozed: 0, history: 0 },
-      items: [{ id: '0123456789ab', level: 'critical', title: 'OpenRouter 잔액 부족',
-        detail: '남은 금액 $1.00', state: 'open', command: null, age_seconds: 12 }],
+      counts: { open: 1, critical: 0, warn: 1, acknowledged: 0, snoozed: 0, history: 0 },
+      items: [{ id: '0123456789ab', level: 'warn', title: '호스트 CPU 사용률 높음',
+        detail: '호스트 CPU가 최근 표본에서 97.6%로 높게 지속됐습니다.', project: 'enjoy-tesla', state: 'open', command: null, age_seconds: 9 * 3600 }],
       acknowledged: [], snoozed: [], history: [],
     },
   }));
   const html = context.nodes.get('alerts').innerHTML;
   assert.match(html, /지금 필요한 것/);
+  assert.match(html, /호스트 CPU 사용률 높음/);
+  assert.match(html, /97\.6%/);
+  assert.match(html, /9시간 전/);
   assert.match(html, /data-attention-action="ack"/);
   assert.match(html, /data-attention-action="resolve"/);
   assert.match(html, /1시간 미루기/);
