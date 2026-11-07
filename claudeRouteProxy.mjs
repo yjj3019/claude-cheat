@@ -2212,7 +2212,13 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
           if (attempt > 0) metrics.retries += 1;
           client.signal.throwIfAborted();
           const controller = new AbortController();
-          const cancel = () => controller.abort('client_close');
+          const cancel = () => {
+            controller.abort('client_close');
+            // Observation only: the client went away while an upstream attempt was open.
+            // This says nothing about whether the provider kept computing the answer.
+            logEvent({ event: 'client_cancelled_during_attempt', provider: target.name,
+              attempt: attempt + 1, received_headers: receivedHeaders });
+          };
           client.signal.addEventListener('abort', cancel, { once: true });
           // Ordinary mode: attemptTimeoutMs bounds silence (headers and gaps between chunks), so long but live
           // generations survive; attemptCeilingMs bounds the total. Local/compat modes keep the fixed total limit.

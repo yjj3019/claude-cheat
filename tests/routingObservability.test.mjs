@@ -247,6 +247,24 @@ test('cancellation during retry delay measures actual wait and never starts the 
   assert.equal(m.routingTimingMs.total.count, 1);
 });
 
+test('cancelling an open upstream attempt is recorded without claiming the server stopped', async t => {
+  const events = captureEvents(t);
+  const started = deferred();
+  const f = await fixture(t, async () => { started.resolve(); return new Promise(() => {}); });
+  const controller = new AbortController();
+  const pending = f.send(controller.signal).catch(error => error);
+  await started.promise;
+  controller.abort();
+  await pending;
+  await waitFor(async () => events.some(event => event.event === 'client_cancelled_during_attempt'));
+  const event = events.find(item => item.event === 'client_cancelled_during_attempt');
+  assert.equal(event.provider, 'local');
+  assert.equal(event.attempt, 1);
+  assert.equal(event.received_headers, false);
+  // The log must not assert anything about provider-side computation.
+  assert.equal(Object.hasOwn(event, 'provider_stopped'), false);
+});
+
 test('a committed stream failure records one attempt and cannot replay or fall back', async t => {
   let calls = 0;
   const payload = frame('message_start', { message: { ...message(), content: [] } }) +
