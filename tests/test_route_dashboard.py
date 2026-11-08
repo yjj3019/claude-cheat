@@ -19,6 +19,10 @@ SPEC = importlib.util.spec_from_file_location(
     "route_dashboard", Path(__file__).resolve().parents[1] / "routeDashboard.py")
 dash = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(dash)
+VERSION_SPEC = importlib.util.spec_from_file_location(
+    "route_version_test", Path(__file__).resolve().parents[1] / "routeVersion.py")
+route_version = importlib.util.module_from_spec(VERSION_SPEC)
+VERSION_SPEC.loader.exec_module(route_version)
 # Attention state is user data; never let tests write the real dashboard state file.
 _ATTENTION_TMP = tempfile.TemporaryDirectory()
 dash.ATTENTION_FILE = Path(_ATTENTION_TMP.name) / ".dashboard-attention.json"
@@ -4813,3 +4817,25 @@ class AttentionQueueTests(unittest.TestCase):
             dash.attention_action("not-an-id", "ack")
         with self.assertRaises(ValueError):
             dash.attention_action("000000000000", "snooze", minutes=0)
+
+class VersionCacheTests(unittest.TestCase):
+    def test_expired_or_moved_signature_rereads_instead_of_pinning(self):
+        # A cached answer used to be returned unconditionally, so a commit made after the
+        # dashboard started was never seen: the badge pinned that commit forever.
+        route_version._LOCAL.update({"at": 0.0, "signature": None, "data": {
+            "version": "1.0.6", "commit": "old", "commit_short": "old",
+            "label": "v1.0.6 (old)", "source": "git", "dirty": False}})
+        self.addCleanup(route_version._LOCAL.update,
+                        {"at": 0.0, "signature": None, "data": None})
+        first = route_version.local_info()
+        self.assertTrue(first.get("stale"), "an expired cache must trigger a re-read")
+        # The background read lands within a moment; a later poll must carry it.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            data = route_version.local_info()
+            if data.get("source") == "git" and not data.get("stale"):
+                break
+            time.sleep(0.1)
+        self.assertEqual(data.get("source"), "git")
+        self.assertFalse(data.get("stale"))
+        self.assertTrue(data.get("cached"))

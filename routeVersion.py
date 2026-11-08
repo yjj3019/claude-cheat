@@ -198,13 +198,19 @@ def local_info(refresh: bool = False, blocking: bool = False) -> dict:
 
     Without ``blocking`` this returns the last reading (or a placeholder) immediately and
     re-reads in the background, so a 1.1s git startup never lands in a render path.
+    A cached answer is reused only while it is younger than ``LOCAL_TTL_SECONDS`` and the
+    checkout signature (HEAD and index mtimes) is unchanged; either expiring triggers one
+    background re-read, so a commit made after the dashboard started is seen on a later
+    poll instead of being pinned for the process lifetime.
     """
     signature = _local_signature()
     with _LOCK:
         cached = _LOCAL["data"]
         age = time.monotonic() - _LOCAL["at"] if cached is not None else None
-        fresh = cached is not None and not refresh
-    if fresh:
+        signature_moved = signature is not None and _LOCAL["signature"] is not None and signature != _LOCAL["signature"]
+        reusable = (cached is not None and not refresh and not signature_moved
+                    and age is not None and age < LOCAL_TTL_SECONDS)
+    if reusable:
         return {**cached, "cached": True, "age_seconds": round(age or 0, 1)}
     if blocking:
         _refresh_local()
