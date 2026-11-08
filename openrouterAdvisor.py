@@ -34,6 +34,11 @@ import urllib.error
 ROOT = Path(__file__).resolve().parent
 LEGACY_MODEL = "deepseek/deepseek-v4.1-flash-1017"
 PRO_SESSION_GATE = "CLAUDE_PRO_CONSULT_ENABLED"
+# A console-less parent (the dashboard's detached takeover tree, or a service run) leaves
+# every console-APP child to allocate its own console window — that is the frequent
+# cmd-window flash. On Windows, opt every captured/background child out unless the caller
+# explicitly wants the child attached (run_cli, the user's foreground session).
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 # Captured before any caller can replace it: ownership checks must recognise a real child
 # even while a test or an embedder stubs `subprocess.Popen`.
 _REAL_POPEN = subprocess.Popen
@@ -630,7 +635,7 @@ def run_cli(command: list, env: dict, prompt: str | None = None) -> int:
 def run_owned(args: list, env: dict, cwd: str, prompt: str = "", timeout: int = 120) -> dict:
     process = subprocess.Popen(args, env=env, cwd=cwd, stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, encoding="utf-8")
+                               text=True, encoding="utf-8", creationflags=_NO_WINDOW)
     # Captured while the child is alive; the Popen handle keeps this pid ours until reaped.
     identity = localProcessTree.process_identity(process.pid)
     try:
@@ -845,7 +850,7 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
     try:
         proxy = subprocess.Popen(proxy_command, env=proxy_env,
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8",
-                                 stderr=None if debug else subprocess.DEVNULL)
+                                 stderr=None if debug else subprocess.DEVNULL, creationflags=_NO_WINDOW)
     except OSError:
         if isolated:
             raise startup_error("local_proxy_start_failed") from None
@@ -916,7 +921,8 @@ def diagnose_local() -> int:
         raise FileNotFoundError("Node.js required for Local diagnostics")
     env = clean_env()
     env.update(config)
-    return subprocess.call([node, str(ROOT / "claudeRouteProxy.mjs"), "--diagnose-local"], env=env)
+    return subprocess.call([node, str(ROOT / "claudeRouteProxy.mjs"), "--diagnose-local"], env=env,
+                           creationflags=_NO_WINDOW)
 
 
 def check_cli_backend(backend):
@@ -960,7 +966,8 @@ def check_connection(provider: str, config: dict | None = None) -> int:
         env.pop(name, None)
     env.update(config)
     try:
-        return subprocess.call([node, str(ROOT / "claudeRouteProxy.mjs"), "--check-connection"], env=env)
+        return subprocess.call([node, str(ROOT / "claudeRouteProxy.mjs"), "--check-connection"], env=env,
+                           creationflags=_NO_WINDOW)
     except OSError:
         print(json.dumps({**failed, "reason": "connection_check_failed"}), flush=True)
         return 1
@@ -968,7 +975,8 @@ def check_connection(provider: str, config: dict | None = None) -> int:
 
 def local_cli_command(claude: str, compat: bool = False) -> list:
     try:
-        version = subprocess.run([claude, "--version"], capture_output=True, text=True, timeout=10, check=True)
+        version = subprocess.run([claude, "--version"], capture_output=True, text=True, timeout=10, check=True,
+                          creationflags=_NO_WINDOW)
     except (OSError, subprocess.SubprocessError, ValueError):
         raise LocalStartupError("local_cli_version_check_failed") from None
     match = re.match(r"(\d+)\.(\d+)\.(\d+)", version.stdout.strip())
