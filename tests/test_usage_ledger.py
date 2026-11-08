@@ -89,7 +89,7 @@ class UsageLedgerTests(unittest.TestCase):
         v2 = self.event(2, provider="local", reported_model="actual-model", schema_version=2)
         self.assertEqual(self.ledger.ingest(self.session, [v2])["inserted"], 1)
         with contextlib.closing(sqlite3.connect(self.ledger.path)) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
             self.assertEqual(db.execute("SELECT reported_model,event_version FROM events ORDER BY event_seq").fetchall(),
                              [("guessed-model", 1), ("actual-model", 2)])
             self.assertEqual(db.execute("SELECT offset FROM cursors").fetchone()[0], 88)
@@ -295,6 +295,20 @@ class UsageLedgerTests(unittest.TestCase):
         result = self.ledger.collect()
         self.assertIn("unsafe_source", result["errors"])
         self.assertEqual(result["events_inserted"], 0)
+
+
+    def test_report_carries_prompt_cache_sums_for_v3_events(self):
+        read = self.event(1, provider="openrouter", reported_model="vendor/m",
+                          schema_version=3, cache_read_tokens=400, cache_creation_tokens=60)
+        self.ledger.ingest(self.session, [read])
+        rows = self.ledger.report("day", self.now)["rows"]
+        self.assertEqual(rows[0]["cache_read_tokens"], 400)
+        self.assertEqual(rows[0]["cache_creation_tokens"], 60)
+        # v1/v2 producers do not report cache fields: the sums must stay None, not zero.
+        plain = self.event(2, provider="openrouter", reported_model="vendor/m", schema_version=2)
+        self.ledger.ingest(self.session, [plain])
+        rows = self.ledger.report("day", self.now)["rows"]
+        self.assertEqual(rows[0]["cache_read_tokens"], 400)
 
 
 if __name__ == "__main__":

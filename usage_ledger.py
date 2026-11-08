@@ -11,7 +11,7 @@ import stat
 import time
 import uuid
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 MAX_BATCH = 512
 MAX_ROWS = 5000
 MAX_NUMBER = 2**53 - 1
@@ -27,6 +27,9 @@ STATUSES = frozenset(("ok", "failed", "aborted"))
 EVENT_KEYS = frozenset(("instance_id", "event_seq", "timestamp", "provider", "requested_model",
                         "reported_model", "usage_measured", "input_tokens", "output_tokens",
                         "status", "elapsed_ms"))
+# Schema v3 adds prompt-cache token fields; they stay optional so a v1/v2 producer
+# keeps ingesting unchanged, and NULL means "not reported by that producer".
+CACHE_KEYS = frozenset(("cache_read_tokens", "cache_creation_tokens"))
 
 
 class LedgerError(ValueError):
@@ -63,10 +66,13 @@ def _number(value, *, nullable=False):
 
 
 def _event(instance, value):
-    if not isinstance(value, dict) or (set(value) != EVENT_KEYS and set(value) != EVENT_KEYS | {"schema_version"}):
+    if not isinstance(value, dict) or (set(value) != EVENT_KEYS and
+                                      set(value) != EVENT_KEYS | {"schema_version"} and
+                                      set(value) != EVENT_KEYS | CACHE_KEYS and
+                                      set(value) != EVENT_KEYS | CACHE_KEYS | {"schema_version"}):
         raise LedgerError("invalid_event")
     version = value.get("schema_version", 1)
-    if type(version) is not int or version not in (1, 2) or ("schema_version" in value and version != 2):
+    if type(version) is not int or version not in (1, 2, SCHEMA_VERSION):
         raise LedgerError("invalid_event")
     if _instance(value["instance_id"]) != instance:
         raise LedgerError("instance_mismatch")
@@ -96,11 +102,16 @@ def _event(instance, value):
         raise LedgerError("invalid_number")
     if (not measured and (incoming is not None or outgoing is not None)) or (measured and incoming is None and outgoing is None):
         raise LedgerError("invalid_event")
+    cache_read = _number(value.get("cache_read_tokens"), nullable=True)
+    cache_write = _number(value.get("cache_creation_tokens"), nullable=True)
+    if any(v is not None and v > MAX_TOKENS for v in (cache_read, cache_write)):
+        raise LedgerError("invalid_number")
     elapsed = value["elapsed_ms"]
     if type(elapsed) not in (int, float) or not 0 <= elapsed <= MAX_NUMBER or not math.isfinite(elapsed):
         raise LedgerError("invalid_number")
     return (instance, seq, timestamp, value["provider"], _model(value["requested_model"]),
-            _model(value["reported_model"]), int(measured), incoming, outgoing, value["status"], elapsed, version)
+            _model(value["reported_model"]), int(measured), incoming, outgoing, value["status"], elapsed,
+            version, cache_read, cache_write)
 
 
 class UsageLedger:
@@ -153,6 +164,7 @@ class UsageLedger:
                       provider TEXT NOT NULL, requested_model TEXT, reported_model TEXT,
                       usage_measured INTEGER NOT NULL, input_tokens INTEGER, output_tokens INTEGER,
                       status TEXT NOT NULL, elapsed_ms REAL NOT NULL, event_version INTEGER NOT NULL DEFAULT 1,
+                      cache_read_tokens INTEGER, cache_creation_tokens INTEGER,
                       PRIMARY KEY (instance_id, event_seq));
                     CREATE INDEX events_timestamp ON events(timestamp);
                     CREATE TABLE cursors (instance_id TEXT PRIMARY KEY, device TEXT NOT NULL,
@@ -160,16 +172,19 @@ class UsageLedger:
                     CREATE TABLE collector_state (name TEXT PRIMARY KEY, value TEXT NOT NULL);
                     CREATE TABLE collector_issues (instance_id TEXT NOT NULL, code TEXT NOT NULL,
                       count INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(instance_id, code));
-                    PRAGMA user_version=2;
+                    PRAGMA user_version=3;
                     COMMIT;
                 """)
-            elif version == 1 and create:
+            elif version in (1, 2) and create:
                 db.execute("BEGIN IMMEDIATE")
-                if db.execute("PRAGMA user_version").fetchone()[0] == 1:
-                    db.execute("ALTER TABLE events ADD COLUMN event_version INTEGER NOT NULL DEFAULT 1")
-                    db.execute("PRAGMA user_version=2")
+                if db.execute("PRAGMA user_version").fetchone()[0] == version:
+                    if version == 1:
+                        db.execute("ALTER TABLE events ADD COLUMN event_version INTEGER NOT NULL DEFAULT 1")
+                    db.execute("ALTER TABLE events ADD COLUMN cache_read_tokens INTEGER")
+                    db.execute("ALTER TABLE events ADD COLUMN cache_creation_tokens INTEGER")
+                    db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                 db.commit()
-            elif version not in (1, SCHEMA_VERSION):
+            elif version not in (1, 2, SCHEMA_VERSION):
                 raise LedgerError("unsupported_schema")
             return db
         except (sqlite3.Error, OSError, LedgerError) as error:
@@ -202,13 +217,14 @@ class UsageLedger:
         inserted = 0
         for row in rows:
             existing = db.execute("SELECT instance_id,event_seq,timestamp,provider,requested_model,reported_model,"
-                                  "usage_measured,input_tokens,output_tokens,status,elapsed_ms,event_version "
+                                  "usage_measured,input_tokens,output_tokens,status,elapsed_ms,event_version,"
+                                  "cache_read_tokens,cache_creation_tokens "
                                   "FROM events WHERE instance_id=? AND event_seq=?", row[:2]).fetchone()
             if existing is not None:
                 if tuple(existing) != tuple(row):
                     raise LedgerError("event_conflict")
             else:
-                db.execute("INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", row)
+                db.execute("INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row)
                 inserted += 1
         return inserted
 
@@ -397,7 +413,7 @@ class UsageLedger:
                 response["coverage"] = "partial"
             start_epoch = time.mktime((start.year, start.month, start.day, 0, 0, 0, 0, 0, -1))
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            model = "CASE WHEN event_version = 2 THEN reported_model ELSE NULL END" if version == 2 else "NULL"
+            model = "CASE WHEN event_version >= 2 THEN reported_model ELSE NULL END" if version >= 2 else "NULL"
             response["model_provenance_unverified"] = db.execute(
                 "SELECT COUNT(*) FROM events WHERE " + ("event_version < 2" if version >= 2 else "1")
                 + " AND timestamp >= ? AND timestamp <= ?", (start_epoch, local.timestamp())).fetchone()[0]
@@ -412,6 +428,21 @@ class UsageLedger:
             keys = ("bucket", "provider", "requested_model", "reported_model", "instance_id", "requests",
                     "ok", "failed", "aborted", "input_samples", "input_tokens", "output_samples",
                     "output_tokens", "mean_elapsed_ms", "max_elapsed_ms")
+            # Prompt-cache sums ride along when the store carries the v3 columns; an older
+            # store (a test fixture or an un-migrated read) reports None instead of failing.
+            if version >= SCHEMA_VERSION:
+                cache_sql = f"""SELECT {bucket} AS bucket, provider, requested_model, {model} AS actual_model, instance_id,
+                    SUM(cache_read_tokens), SUM(cache_creation_tokens)
+                    FROM events WHERE timestamp >= ? AND timestamp <= ?
+                    GROUP BY bucket, provider, requested_model, actual_model, instance_id
+                    ORDER BY bucket DESC LIMIT ?"""
+                cache_rows = {}
+                for row in db.execute(cache_sql, (start_epoch, local.timestamp(), (MAX_ROWS + 1) * 10)):
+                    cache_rows[row[:5]] = (row[5], row[6])
+                for index, row in enumerate(result):
+                    read, write = cache_rows.get(tuple(row[:5]), (None, None))
+                    result[index] = row + (read, write)
+                keys += ("cache_read_tokens", "cache_creation_tokens")
             response["truncated"] = len(result) > MAX_ROWS
             response["rows"] = [dict(zip(keys, row)) for row in result[:MAX_ROWS]]
             response["storage_bytes"] = self.path.stat().st_size

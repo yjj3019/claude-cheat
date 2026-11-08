@@ -1927,12 +1927,18 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
           const inputTokens = ok && routeKind === 'external' ? validTokens(performanceSample?.inputTokens) : null;
           const outputTokens = ok && routeKind === 'external' ? validTokens(performanceSample?.outputTokens) : null;
           const measured = inputTokens !== null || outputTokens !== null;
+          // Prompt-cache accounting: these decide whether prefix-cache work pays off, so
+          // they ride along only when this response actually reported them (schema v3).
+          const cacheRead = ok && routeKind === 'external' ? validTokens(performanceSample?.cacheReadTokens) : null;
+          const cacheWrite = ok && routeKind === 'external' ? validTokens(performanceSample?.cacheCreationTokens) : null;
+          const measuredCache = cacheRead !== null || cacheWrite !== null;
           appendUsage({ timestamp: new Date().toISOString(), provider: usageProvider,
             requested_model: usageModel(usageRequestedModel),
             reported_model: ok ? usageModel(usageReportedModel) : null,
             usage_measured: Boolean(measured),
             input_tokens: inputTokens,
             output_tokens: outputTokens,
+            ...(measuredCache || measured ? { cache_read_tokens: cacheRead, cache_creation_tokens: cacheWrite } : {}),
             status: aborted ? 'aborted' : ok ? 'ok' : 'failed', elapsed_ms: elapsed });
         }
         scheduleMetricsFlush();
@@ -2338,16 +2344,20 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
               }
               // SSE usage is available only after the complete stream validates. CLI bridge
               // placeholders are never measurements unless the bridge confirms them.
-              let inputTokens = null, outputTokens = null;
+              let inputTokens = null, outputTokens = null, cacheRead = null, cacheWrite = null;
               if (target.name !== 'cli' || response.headers.get('x-cli-usage-measured') === 'true') {
                 const usage = validated.contentType === 'application/json' ? JSON.parse(validated.text).usage : validated.usage;
                 if (Number.isSafeInteger(usage?.input_tokens) && usage.input_tokens >= 0) inputTokens = usage.input_tokens;
                 if (Number.isSafeInteger(usage?.output_tokens) && usage.output_tokens >= 0) outputTokens = usage.output_tokens;
+                if (Number.isSafeInteger(usage?.cache_read_input_tokens) && usage.cache_read_input_tokens >= 0) cacheRead = usage.cache_read_input_tokens;
+                if (Number.isSafeInteger(usage?.cache_creation_input_tokens) && usage.cache_creation_input_tokens >= 0) cacheWrite = usage.cache_creation_input_tokens;
               }
               const result = forceJson && body.stream === true ? jsonMessageStream(validated.text, !compatProfile) : validated;
               result.reportedModel = validated.reportedModel;
               result.outputTokens = outputTokens;
               result.inputTokens = inputTokens;
+              result.cacheReadTokens = cacheRead;
+              result.cacheCreationTokens = cacheWrite;
               if (provider === 'cli') {
                 result.cliReportedModel = response.headers.get('x-cli-reported-model');
                 result.cliUsageMeasured = response.headers.get('x-cli-usage-measured') === 'true';
@@ -2371,7 +2381,10 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
             usageReportedModel = target.name === 'cli' ? response.cliReportedModel : response.reportedModel;
             logReplacement();
             performanceSample = { provider: target.name, inputTokens: response.inputTokens ?? null,
-              outputTokens: response.outputTokens ?? null, cliProcessMs: response.cliProcessMs ?? null };
+              outputTokens: response.outputTokens ?? null,
+              cacheReadTokens: response.cacheReadTokens ?? null,
+              cacheCreationTokens: response.cacheCreationTokens ?? null,
+              cliProcessMs: response.cliProcessMs ?? null };
             if (response.streamed) { res.end(); return; }
             res.writeHead(200, { 'content-type': response.contentType, 'cache-control': 'no-store' });
             res.end(response.text);
