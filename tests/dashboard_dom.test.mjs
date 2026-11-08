@@ -622,7 +622,10 @@ test('an alert that shares an insight code is not repeated', () => {
 
 test('the header shows the generated summary', () => {
   const nodes = render(fixture());
-  assert.match(nodes.get('stamp').textContent, /OpenRouter로 정상 처리 중/);
+  // Segmented rendering: each fact is a nowrap span, so the readable text keeps the
+  // same sentence while the DOM stays structured for clean wrapping.
+  assert.match(nodes.get('stamp').innerHTML, /OpenRouter로 정상 처리 중/);
+  assert.match(nodes.get('stamp').innerHTML, /class="seg"/);
   assert.match(nodes.get('stamp').title, /vendor\/model/);
 });
 
@@ -1327,6 +1330,18 @@ test('cancelled requests are excluded from the failure rate and each connection 
   assert.match(html, /토큰과 추정 비용/);
   assert.match(html, /CLI 응답의 토큰은/);
   assert.doesNotMatch(html, /CLI 보고 여부/);
+});
+
+test('topbar summary renders as segments instead of a dotted sentence', () => {
+  // Each fact is a nowrap segment with a calm separator, so a wrap lands between
+  // facts; the older single textContent collapsed several facts into one string.
+  fixture({ active_session: {provider: 'openrouter'},
+    proxy_metrics: {startedAt: 's', requests: 3, ok: 3, stale: false,
+      configuration: {provider: 'openrouter'}, routes: {external: 3, plan: 0}} });
+  const page = ASSETS.dashboard;
+  assert.match(page, /stamp\.innerHTML = segments/);
+  assert.match(page, /class="sep"/);
+  assert.match(page, /class="seg"/);
 });
 
 test('session monitor states name the evidence instead of implying activity', () => {

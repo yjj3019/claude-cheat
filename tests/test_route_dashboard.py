@@ -2946,7 +2946,7 @@ class SnapshotTests(unittest.TestCase):
                          ["account", "active_session", "aggregate_sessions", "alerts", "attention", "configured", "generated_at", "help",
                           "host_resources", "insights", "model", "pricing", "proactive", "provider", "providers",
                           "proxy_metrics", "proxy_modified_at", "proxy_stale", "refresh_ms",
-                          "routing", "selected_instance", "sessions", "summary", "usage", "version"])
+                          "routing", "selected_instance", "sessions", "summary", "summary_parts", "usage", "version"])
         self.assertEqual(data["model"], "vendor/model")
         # The version block is served without waiting for git: an unread checkout reports
         # its pending state instead of stalling the page.
