@@ -173,6 +173,32 @@ class TakeoverGuardTests(unittest.TestCase):
         routed.assert_not_called()
         marker.assert_not_called()
 
+    def test_takeover_exits_and_cleans_up_when_the_recorded_launcher_is_gone(self):
+        # The dashboard's auto-takeover serves a CLI it never launched; when that CLI's
+        # launcher pid disappears, the loop must end (the routed_session finally block
+        # clears the handoff) instead of keeping a dead session visible forever.
+        record = {"port": 48432, "nonce": "n", "mode": "ordinary", "launcher_pid": 999999}
+        sleeps = []
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) >= 2:
+                raise KeyboardInterrupt  # the client-watch break exits the loop first
+        patches = [mock.patch.object(advisor, "read_handoff", return_value=record),
+                   mock.patch.object(advisor, "port_open", return_value=True),
+                   mock.patch("shutil.which", return_value="exe"),
+                   mock.patch.object(advisor, "provider_config", return_value={}),
+                   mock.patch.object(advisor, "request_handover",
+                                     return_value={"drained": True, "waitedMs": 0, "forced": False}),
+                   mock.patch.object(advisor, "wait_for_port_release", return_value=True),
+                   mock.patch.object(advisor, "_process_start_time", side_effect=[123.0, None]),
+                   mock.patch.object(advisor, "routed_session", mock.MagicMock()),
+                   mock.patch.object(advisor.time, "sleep", fake_sleep)]
+        for patch in patches:
+            self.enterContext(patch)
+        log = self.enterContext(mock.patch.object(advisor, "log_route_marker"))
+        self.assertEqual(advisor.takeover("openrouter"), 0)
+        self.assertTrue(any("gone" in str(call.args) for call in log.call_args_list))
+
     def test_takeover_refuses_a_session_without_a_token(self):
         self.enterContext(mock.patch.object(advisor, "read_handoff",
                                             return_value={"port": 48432, "nonce": "", "mode": "ordinary"}))

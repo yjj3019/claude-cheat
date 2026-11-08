@@ -463,6 +463,48 @@ def project_context(cwd=None) -> dict:
             "repo": repo[:200] if repo else None, "branch": branch}
 
 
+def _process_start_time(pid):
+    """Creation time of a pid as epoch seconds, or None when it cannot be verified."""
+    try:
+        import ctypes
+
+        class PBI(ctypes.Structure):
+            _fields_ = [("ExitStatus", ctypes.c_void_p), ("PebBaseAddress", ctypes.c_void_p),
+                        ("AffinityMask", ctypes.c_void_p), ("BasePriority", ctypes.c_void_p),
+                        ("UniqueProcessId", ctypes.c_void_p),
+                        ("InheritedFromUniqueProcessId", ctypes.c_void_p)]
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return None
+        info = PBI()
+        returned = ctypes.c_ulong()
+        ok = ctypes.windll.ntdll.NtQueryInformationProcess(
+            handle, 0, ctypes.byref(info), ctypes.sizeof(info), ctypes.byref(returned))
+        ctypes.windll.kernel32.CloseHandle(handle)
+        if ok != 0 or not info.UniqueProcessId:
+            return None
+        # FILETIME of the process: creation time via GetProcessTimes is simpler.
+        creation = ctypes.c_ulonglong()
+        exit_time = ctypes.c_ulonglong()
+        kernel = ctypes.c_ulonglong()
+        user = ctypes.c_ulonglong()
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return None
+        try:
+            if not ctypes.windll.kernel32.GetProcessTimes(
+                    handle, ctypes.byref(creation), ctypes.byref(exit_time),
+                    ctypes.byref(kernel), ctypes.byref(user)):
+                return None
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+        times0 = creation
+        # creation is times[0] in 100ns units since 1601-01-01.
+        return (int(times0) - 116444736000000000) / 10_000_000
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
 def write_handoff(*, port, nonce, proxy_pid, provider, cli_pid, mode, dual=None, instance_id=None, instance_dir=None):
     """Record the live route so another terminal can take it over without changing the port.
 
@@ -474,6 +516,11 @@ def write_handoff(*, port, nonce, proxy_pid, provider, cli_pid, mode, dual=None,
         return  # nothing usable to record (also keeps mocked sessions out of the file)
     payload = {"port": port, "nonce": nonce, "proxy_pid": proxy_pid, "launcher_pid": cli_pid,
                "provider": provider, "mode": mode, "started": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    # The takeover path keeps serving after the original launcher exits; a start-time
+    # snapshot lets it distinguish "pid reused by another process" from "client gone".
+    started = _process_start_time(cli_pid)
+    if started is not None:
+        payload["launcher_started"] = started
     if dual:
         payload["dual"] = {"provider": dual["ROUTE_ALT_PROVIDER"], "alias": dual["ROUTE_ALT_ALIAS"],
                            "model": dual["ROUTE_ALT_MODEL"]}
@@ -1071,8 +1118,23 @@ def takeover(provider: str = "auto", debug: bool = False) -> int:
                           "waited_ms": report.get("waitedMs"),
                           "forced": bool(report.get("forced"))}), flush=True)
         try:
+            # The takeover keeps serving a CLI it did not launch, so it cannot use its own
+            # child-exit signals. Watch the recorded launcher instead: when that pid is gone
+            # (or reused by a different process), the session is over and this tree must
+            # clean up — otherwise the dashboard shows an ended session forever.
+            client_pid = record.get("launcher_pid")
+            client_started = _process_start_time(client_pid) if isinstance(client_pid, int) else None
             while True:
                 time.sleep(1)
+                if not isinstance(client_pid, int):
+                    continue
+                current = _process_start_time(client_pid)
+                if current is not None and client_started is None:
+                    client_started = current  # first observation of an already-running pid
+                gone = current is None or (client_started is not None and abs(current - client_started) > 0.5)
+                if gone:
+                    log_route_marker(f"takeover client pid={client_pid} gone; ending the takeover session")
+                    return 0
         except KeyboardInterrupt:
             return 0
 
