@@ -95,6 +95,20 @@ class RouteLogTests(unittest.TestCase):
         self.log = self.root / ".route.log"
         self.enterContext(mock.patch.object(dash, "ROUTE_LOG", self.log))
 
+    def test_recent_cli_backend_diagnostic_is_allowlisted(self):
+        now = datetime(2026, 10, 25, 3, 0, tzinfo=timezone.utc)
+        event = {"ts": now.isoformat(), "event": "cli_mode_rejected", "provider": "cli",
+                 "reason": "fallback", "detail": "invalid_request", "backend_code": "unsupported_request"}
+        recent = dash.routing_state([event], now=now)["recent"]
+        self.assertEqual(recent[0]["backend_code"], "unsupported_request")
+        for unsafe in ("synthetic-secret", "sk-ant-secret", [], None):
+            with self.subTest(unsafe=unsafe):
+                recent = dash.routing_state([{**event, "backend_code": unsafe}], now=now)["recent"]
+                self.assertNotIn("backend_code", recent[0])
+                self.assertNotIn("synthetic-secret", json.dumps(recent))
+        other = dash.routing_state([{**event, "provider": "local"}], now=now)["recent"]
+        self.assertNotIn("backend_code", other[0])
+
     def test_state_tracks_the_newest_decision_and_idles_out(self):
         now = datetime(2026, 10, 25, 3, 0, 0, tzinfo=timezone.utc)
         self.log.write_text(

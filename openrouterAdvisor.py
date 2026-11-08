@@ -794,6 +794,13 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
         # must route externally without -OpenRouterCompat. Narrowing this to compat mode in
         # e075542 made every request fall back to Plan; do not repeat that regression.
         env.update(CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="1", CLAUDE_CODE_DISABLE_ADVISOR_TOOL="1")
+    elif provider == "cli":
+        # Claude Code is still the frontend in a CLI-backed session. Its experimental
+        # beta headers can make ordinary Sonnet requests bypass the CLI for Plan before
+        # they reach the bridge. Ask the frontend for the stable protocol instead;
+        # never remove unknown betas or native tools from requests in the proxy.
+        # Do not override an explicit Advisor setting here.
+        env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
     # The user's own Git Bash location is needed by the Bash tool; it is not provider routing.
     if isolated and "CLAUDE_CODE_GIT_BASH_PATH" in os.environ:
         env["CLAUDE_CODE_GIT_BASH_PATH"] = os.environ["CLAUDE_CODE_GIT_BASH_PATH"]

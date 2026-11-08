@@ -312,7 +312,9 @@ routing:
 
 이번 실행 흐름과 문서 개선은 Cursor의 [CLI 설계 지침](https://github.com/cursor/plugins/blob/main/cli-for-agent/skills/cli-for-agents/SKILL.md)과 [문서 신뢰성 검토 지침](https://github.com/cursor/plugins/blob/main/agent-compatibility/agents/docs-reliability-review.md)을 참고했습니다. 명시적 옵션·실행 예제·조치 가능한 오류·문서와 동작의 일치를 적용 대상으로 삼았습니다. Claude-Cheat는 Cursor 플러그인이나 해당 저장소 전체의 이식판이 아니며, 해당 저장소 전체를 이식했다고 주장하지 않습니다.
 
-일반 OpenRouter·Local·CLI 실행은 원본 Claude Code의 beta·advisor 설정을 임의로 끄지 않습니다. 지원되는 요청만 외부 경로로 보내고 미지원 네이티브 기능은 Plan으로 보냅니다. 명시적인 호환·제한 모드는 별도 정책을 적용합니다.
+일반 CLI 백엔드 세션은 불필요한 Plan 우회를 줄이도록 Claude Code에 실험 beta 비활성화를 요청합니다. 명시적 Advisor 설정은 이 조치로 변경하지 않습니다. 실제 Claude Code 버전에서 해당 설정이 어떻게 적용되는지는 별도 확인이 필요합니다. 일반 OpenRouter 세션은 실험 beta와 Advisor 도구를 비활성화하며, 일반 Local 세션은 기존 설정을 유지합니다. 프록시는 미지원 네이티브 요청을 임의로 변환하지 않고 기존 Plan 경로로 보냅니다. 명시적인 호환·제한 모드는 별도 정책을 적용합니다.
+
+CLI 백엔드 오류에 `CLI diagnostic: ...`이 표시되면 `unsupported_request`는 브리지가 요청 형식을 지원하지 않은 것이고, `not_logged_in`은 CLI 로그인 확인이 필요하다는 뜻입니다. `cli_process_failed`는 CLI 프로세스 비정상 종료, `cli_turn_failed`는 Codex 실패 이벤트, `cli_empty_output`은 Codex 이벤트가 비어 있었다는 뜻입니다. `cli_failed`는 세부 단계가 확인되지 않은 경우이며, `invalid_response`·`invalid_tool_call`은 응답 검증 실패입니다. 기존 세션에는 이 상세 코드가 없을 수 있으므로 새 세션에서 확인하세요. 코드는 원인을 좁히는 정보이며 요청 내용이나 CLI 출력 원문은 포함하지 않습니다.
 
 Local 단독 일반 세션에서는 이 두 비활성화 스위치를 설정하지 않으며, SSH/MCP·도구 검색·플러그인·hooks·사용자/프로젝트 권한 설정을 유지합니다. 알려진 MCP 지연 로딩·CLI 제어 필드는 기존 호환성 검증을 거쳐 Local로 전달합니다. 원본 CLI의 `tool_addition` 선언은 대화 내용과 도구 결과를 유지하면서 Local 도구 목록으로 변환합니다. 충돌하는 도구 재정의·알 수 없는 형식은 원본 대화와 도구 정의를 유지한 Plan 경로로 보냅니다. CLI가 도구 이력에 넣는 `provider_specific_fields: null`만 값 없음으로 정리하며, 실제 객체 데이터나 서명은 이 규칙으로 제거하지 않습니다. 캐시 경계는 서버 형식에 맞게 바뀔 수 있습니다. 해당 요청은 JSON 응답을 검증한 뒤 필요한 경우 CLI용 SSE로 바꿉니다. 지원하지 않는 네이티브 기능과 Opus/Haiku/Fable 요청에는 기존 Plan 경로를 유지하며 Local 실패는 오류를 반환합니다. Local 추론 서명이 Plan 이력과 충돌하지 않도록 일반 모드의 외부 thinking 비활성화 정책도 유지합니다.
 

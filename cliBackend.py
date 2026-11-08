@@ -23,6 +23,15 @@ import localProcessTree
 import routeCli
 
 MAX_BYTES = 4 * 1024 * 1024
+# Fixed, non-sensitive bridge diagnostics. Never expose exception text or CLI output in headers.
+PUBLIC_ERROR_CODES = frozenset({
+    "invalid_request", "unsupported_request", "wrong_model", "not_logged_in", "cli_failed",
+    "cli_process_failed", "cli_turn_failed", "cli_empty_output",
+    "backend_version_unverified", "invalid_response", "invalid_tool_call", "invalid_tool_choice",
+    "invalid_usage", "incomplete_response", "native_tool_execution_detected", "spawn_failed",
+    "process_tracking_unavailable", "timeout", "cancelled", "request_too_large", "output_too_large",
+    "backend_busy",
+})
 HEADER_TIMEOUT_SECONDS = 10
 # Audit L7: a connection without a valid token used to hold one of the 16 slots for the
 # full header timeout, so a tokenless slowloris could pin every slot in 10s cycles. The
@@ -55,9 +64,10 @@ GROK_DENIED_TOOLS = ("run_terminal_command,kill_command_or_subagent,search_repla
 
 
 class BackendError(ValueError):
-    def __init__(self, code):
+    def __init__(self, code, *, diagnostic=None):
         super().__init__(code)
         self.code = code
+        self.diagnostic = diagnostic
 
 
 def _json(text):
@@ -217,8 +227,11 @@ def parse_output(kind, text):
         return value, model, usage
     if kind == "codex":
         events = [_json(line) for line in text.splitlines() if line.strip()]
-        if not events or any(not isinstance(e, dict) or e.get("type") in ("error", "turn.failed") for e in events):
-            raise BackendError("cli_failed")
+        if not events:
+            raise BackendError("cli_failed", diagnostic="cli_empty_output")
+        if any(not isinstance(e, dict) or e.get("type") in ("error", "turn.failed") for e in events):
+            # Only a fixed category leaves the bridge, never the event's message/body.
+            raise BackendError("cli_failed", diagnostic="cli_turn_failed")
         if any(e.get("type") in ("item.started", "item.updated", "item.completed")
                and isinstance(e.get("item"), dict)
                and e["item"].get("type") not in ("agent_message", "reasoning", "error") for e in events):
@@ -335,7 +348,10 @@ def _run(argv, prompt, env, cwd, timeout, cancelled, process_timing=None):
             raise BackendError("output_too_large")
         if process.returncode:
             error = bytes(buffers[1]).decode("utf-8", "replace")
-            raise BackendError("not_logged_in" if routeCli._AUTH_RE.search(error) else "cli_failed")
+            if routeCli._AUTH_RE.search(error):
+                raise BackendError("not_logged_in")
+            # Keep the exact exit code and stderr private; expose only the failure stage.
+            raise BackendError("cli_failed", diagnostic="cli_process_failed")
         if process_timing is not None and math.isfinite(process_ms) and 0 <= process_ms <= 180000:
             process_timing["process_ms"] = round(process_ms, 2)
         try:
@@ -509,6 +525,12 @@ def serve(values):
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(raw)))
+                error_code = value.get("error") if status >= 400 and isinstance(value, dict) else None
+                diagnostic = (metadata or {}).get("error_diagnostic") if error_code == "cli_failed" else None
+                if diagnostic in ("cli_process_failed", "cli_turn_failed", "cli_empty_output"):
+                    error_code = diagnostic
+                if isinstance(error_code, str) and error_code in PUBLIC_ERROR_CODES:
+                    self.send_header("X-CLI-Error-Code", error_code)
                 self.send_header("X-CLI-Usage-Measured", "true" if (metadata or {}).get("usage_measured") else "false")
                 model = (metadata or {}).get("reported_model")
                 if model:
@@ -581,7 +603,8 @@ def serve(values):
                     self.close_connection = True
                     return
                 code = error.code if isinstance(error, BackendError) else "invalid_request"
-                self.send(400, {"error": code})
+                diagnostic = error.diagnostic if isinstance(error, BackendError) else None
+                self.send(400, {"error": code}, {"error_diagnostic": diagnostic})
     class Server(ThreadingHTTPServer):
         daemon_threads = False
 

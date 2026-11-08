@@ -317,11 +317,22 @@ class LauncherArgumentsTests(unittest.TestCase):
                 for key in config:
                     self.assertNotIn(key, front)
                 self.assertNotIn("CLAUDE_CODE_DISABLE_ADVISOR_TOOL", front)
-                self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", front)
+                self.assertEqual(front.get("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"), "1")
                 self.assertNotIn("CLAUDE_CONFIG_DIR", front)
                 self.assertEqual(spawn.call_args.kwargs["env"]["LOCAL_LLM_API_KEY"], "synthetic-bridge-token")
                 self.assertEqual(spawn.call_args.kwargs["env"]["SONNET_PROVIDER"], "cli")
         proxy.terminate.assert_called_once()
+
+    def test_cli_preserves_an_explicit_advisor_choice(self):
+        # Requesting Advisor must not be silently rewritten or automatically enabled.
+        for choice in ("off", "opus"):
+            with self.subTest(choice=choice), mock.patch.object(route.shutil, "which", return_value="fixture"), \
+                 mock.patch.object(route.routeCli, "resolve_command", return_value=["fixture"]), \
+                 mock.patch.object(route, "prepare_blackbox_hook", return_value=None), \
+                 mock.patch.object(route, "routed_session", return_value=contextlib.nullcontext({})), \
+                 mock.patch.object(route, "run_cli", return_value=0) as run:
+                self.assertEqual(route.launch("cli", cli_args=["--advisor", choice]), 0)
+                self.assertEqual(run.call_args.args[0][-2:], ["--advisor", choice])
 
     def test_cli_saved_default_resolves_three_configured_services(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(route, "ROOT", Path(directory)), mock.patch.dict(os.environ, {}, clear=True):

@@ -435,6 +435,11 @@ const STOP_REASONS = new Set(['end_turn', 'max_tokens', 'stop_sequence', 'tool_u
 const CONTROL_STOPS = new Set(['refusal', 'model_context_window_exceeded']);
 const DIAGNOSTIC_BLOCK_TYPES = ['text', 'tool_use', 'thinking', 'redacted_thinking'];
 const DIAGNOSTIC_USAGE_FIELDS = ['input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'];
+// Accept only known, non-sensitive codes from the authenticated loopback CLI bridge.
+const CLI_ERROR_CODES = new Set(['invalid_request', 'unsupported_request', 'wrong_model', 'not_logged_in',
+  'cli_failed', 'cli_process_failed', 'cli_turn_failed', 'cli_empty_output', 'backend_version_unverified', 'invalid_response', 'invalid_tool_call', 'invalid_tool_choice',
+  'invalid_usage', 'incomplete_response', 'native_tool_execution_detected', 'spawn_failed',
+  'process_tracking_unavailable', 'timeout', 'cancelled', 'request_too_large', 'output_too_large', 'backend_busy']);
 // Keep diagnostics separate from throwable provider objects: an upstream cannot inject
 // arbitrary error properties into the log. Only bounded enums/counts leave this boundary.
 const emptyResponseDiagnostics = new WeakMap();
@@ -1704,7 +1709,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
     req.on('aborted', () => client.abort('client_close'));
     // A failed external attempt can still decide the client-facing result: if the route
     // downstream fails too, the provider's own status and wait are more useful than a 502.
-    let failureStatus = null, retryAfterHintMs = null;
+    let failureStatus = null, retryAfterHintMs = null, cliBackendError = null;
     inflight += 1;
     ownsTurn = true;
     // A short correlation id ties every diagnostic line of this turn together. It is an
@@ -1974,7 +1979,9 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
               timeout: [`${errorPrefix}_timeout`, `${label} request timed out.`],
               authentication_failed: [`${errorPrefix}_authentication_failed`, `${label} server authentication failed. Check the ${label} API key and access permissions; restart the ${label} session after changing credentials.`],
               payment_required: [`${errorPrefix}_payment_required`, `${label} server rejected the request for billing or credit reasons. Check the ${label} account balance and limits; restart the ${label} session after changing them.`],
-              invalid_request: [`${errorPrefix}_invalid_request`, `${label} server rejected the request.`],
+              invalid_request: [`${errorPrefix}_invalid_request`, selectedProvider === 'cli'
+                ? 'CLI bridge returned HTTP 400; see any diagnostic code for the reported stage.'
+                : `${label} server rejected the request.`],
               empty_response: [`${errorPrefix}_empty_response`, `${label} server returned an empty response.`],
               upstream_error: [`${errorPrefix}_upstream_error`, `${label} server request failed. Check the ${errorPrefix} routing log.`],
             };
@@ -1987,9 +1994,12 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
             const retryHint = recoveryInProgress ? '' : remaining > 0 ?
               ` Wait ${remaining} second${remaining === 1 ? '' : 's'} before a new request.` :
               ` Send a new request to check ${label} recovery.`;
-            message = `[${code}] ${description}${retryHint} Plan fallback disabled.`;
+            const cliDiagnostic = selectedProvider === 'cli' && cliBackendError && reason === 'fallback'
+              ? ` CLI diagnostic: ${cliBackendError}.` : '';
+            message = `[${code}] ${description}${cliDiagnostic}${retryHint} Plan fallback disabled.`;
           }
           logEvent({ event: `${errorPrefix}_mode_rejected`, provider: selectedProvider, reason, ...(detail ? { detail } : {}),
+            ...(selectedProvider === 'cli' && cliBackendError && reason === 'fallback' ? { backend_code: cliBackendError } : {}),
             ...(code ? { code } : {}), ...(retryAfterSeconds !== undefined ? { retry_after_seconds: retryAfterSeconds } : {}),
             ...(previousErrorCode ? { previous_error_code: previousErrorCode } : {}),
             ...(betas.length ? { beta_features: betaFeatures, unsupported_beta_count: betas.length } : {}) });
@@ -2264,6 +2274,10 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
               }
               status = response.status;
               if (target.name === 'cli' && status === 429) cliActivity.rejected += 1;
+              if (!response.ok && target.name === 'cli') {
+                const reported = response.headers.get('x-cli-error-code');
+                cliBackendError = CLI_ERROR_CODES.has(reported) ? reported : null;
+              }
               if (!response.ok) {
                 // Only a failed answer carries a wait for the client; a Retry-After on a
                 // successful response is not part of the result and must not taint metrics.

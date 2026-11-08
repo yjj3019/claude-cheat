@@ -5,6 +5,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import sys
 import tempfile
@@ -117,6 +118,15 @@ class BackendTest(unittest.TestCase):
         self.assertEqual((value["text"], model, usage["output_tokens"]), ("synthetic answer", "gpt-test", 3))
         self.error("incomplete_response", backend.parse_output, "codex", codex_output().rsplit("\n", 1)[0])
         self.error("cli_failed", backend.parse_output, "codex", codex_output() + '\n{"type":"turn.failed"}')
+        with self.assertRaises(backend.BackendError) as failed:
+            backend.parse_output("codex", '{"type":"turn.failed","error":{"message":"secret fixture"}}')
+        self.assertEqual(failed.exception.code, "cli_failed")
+        self.assertEqual(failed.exception.diagnostic, "cli_turn_failed")
+        self.assertNotIn("secret fixture", str(failed.exception))
+        with self.assertRaises(backend.BackendError) as empty:
+            backend.parse_output("codex", "")
+        self.assertEqual(empty.exception.code, "cli_failed")
+        self.assertEqual(empty.exception.diagnostic, "cli_empty_output")
         native = '{"type":"item.started","item":{"type":"command_execution","command":"forbidden"}}\n'
         self.error("native_tool_execution_detected", backend.parse_output, "codex", native + codex_output())
 
@@ -182,13 +192,49 @@ class BackendTest(unittest.TestCase):
                 result = response.status, dict(response.getheaders()), json.loads(response.read())
                 connection.close()
                 return result
-            self.assertEqual(post(request(), "invalid")[0], 403)
-            self.assertEqual(post([], "Bearer " + token)[2], {"error": "invalid_request"})
+            forbidden_status, forbidden_headers, _ = post(request(), "invalid")
+            self.assertEqual(forbidden_status, 403)
+            self.assertNotIn("X-CLI-Error-Code", forbidden_headers)
+            invalid_status, invalid_headers, invalid_body = post([], "Bearer " + token)
+            self.assertEqual(invalid_status, 400)
+            self.assertEqual(invalid_body, {"error": "invalid_request"})
+            self.assertEqual(invalid_headers.get("X-CLI-Error-Code"), "invalid_request")
             status, headers, body = post(request(), "Bearer " + token)
             self.assertEqual(status, 200)
             self.assertEqual(headers["X-CLI-Reported-Model"], "native-test")
             self.assertEqual(headers["X-CLI-Usage-Measured"], "true")
             self.assertEqual(body["model"], "cli/codex")
+
+    def test_bridge_proxy_and_dashboard_share_fixed_error_codes(self):
+        import routeDashboard as dash
+        proxy = (Path(__file__).resolve().parents[1] / "claudeRouteProxy.mjs").read_text(encoding="utf-8")
+        match = re.search(r"const CLI_ERROR_CODES = new Set\(\[(.*?)\]\);", proxy, re.S)
+        self.assertIsNotNone(match)
+        proxy_codes = set(re.findall(r"'([a-z_]+)'", match.group(1)))
+        self.assertEqual(proxy_codes, backend.PUBLIC_ERROR_CODES)
+        self.assertEqual(dash._CLI_PUBLIC_DIAGNOSTICS, backend.PUBLIC_ERROR_CODES)
+
+    def test_loopback_error_header_exposes_only_allowlisted_codes(self):
+        instance = self.construct(runner=lambda *_: codex_output())
+        with patch.object(backend, "Backend", return_value=instance), backend.serve({}) as (_, url, token):
+            parsed = urlsplit(url)
+            for code, diagnostic, expected in (("unsupported_request", None, "unsupported_request"),
+                                                ("not_logged_in", None, "not_logged_in"),
+                                                ("cli_failed", "cli_turn_failed", "cli_turn_failed"),
+                                                ("cli_failed", "cli_process_failed", "cli_process_failed"),
+                                                ("cli_failed", "synthetic-secret-must-not-leak", "cli_failed"),
+                                                ("synthetic-secret-must-not-leak", None, None)):
+                with self.subTest(code=code, diagnostic=diagnostic), patch.object(
+                        instance, "generate", side_effect=backend.BackendError(code, diagnostic=diagnostic)):
+                    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+                    try:
+                        conn.request("POST", parsed.path, json.dumps(request()), {"Authorization": "Bearer " + token})
+                        response = conn.getresponse()
+                        self.assertEqual(response.status, 400)
+                        self.assertEqual(response.getheader("X-CLI-Error-Code"), expected)
+                        response.read()
+                    finally:
+                        conn.close()
 
     def test_loopback_emits_only_bounded_process_duration_metadata(self):
         instance = self.construct(runner=lambda *_: codex_output())
@@ -533,6 +579,11 @@ class BackendTest(unittest.TestCase):
                              directory, .15, lambda: False, timing)
             self.assertEqual(timing, {})
             self.error("not_logged_in", run, "import sys; sys.stderr.write('authentication required'); sys.exit(1)")
+            with self.assertRaises(backend.BackendError) as process_error:
+                run("import sys; sys.stderr.write('private diagnostic'); sys.exit(3)")
+            self.assertEqual(process_error.exception.code, "cli_failed")
+            self.assertEqual(process_error.exception.diagnostic, "cli_process_failed")
+            self.assertNotIn("private diagnostic", str(process_error.exception))
             self.error("timeout", run, "import time; time.sleep(10)", .15)
             start = time.monotonic()
             self.error("cancelled", run, "import time; time.sleep(10)", 3, lambda: time.monotonic() - start > .15)

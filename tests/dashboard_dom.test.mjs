@@ -620,6 +620,18 @@ test('an alert that shares an insight code is not repeated', () => {
   assert.doesNotMatch(alerts, /실행기 재시작 필요/);
 });
 
+test('recent routing history shows the CLI backend diagnostic safely', () => {
+  const data=fixture();
+  data.routing.recent=[{ts:'2026-10-25T08:00:00+00:00',event:'cli_mode_rejected',provider:'cli',
+    reason:'fallback',detail:'invalid_request',backend_code:'unsupported_request'}];
+  const html=render(data).get('grid').innerHTML;
+  assert.match(html,/fallback \/ invalid_request \/ unsupported_request/);
+  data.routing.recent[0].backend_code='<img src=x onerror=alert(1)>';
+  const escaped=render(data).get('grid').innerHTML;
+  assert.doesNotMatch(escaped,/<img src=x onerror=alert\(1\)>/);
+  assert.match(escaped,/&lt;img/);
+});
+
 test('the header shows the generated summary', () => {
   const nodes = render(fixture());
   // Segmented rendering: each fact is a nowrap span, so the readable text keeps the

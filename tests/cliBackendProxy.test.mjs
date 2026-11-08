@@ -14,7 +14,7 @@ const message = (model, content = [{type:'text',text:'fixture answer'}]) => ({
   usage:{input_tokens:5,output_tokens:2},
 });
 
-async function fixture(t, handler, extra = {}) {
+async function fixture(t, handler, extra = {}, planHandler = () => Response.json(message(SONNET))) {
   const calls = [];
   const server = createProxy({provider:'cli',cliKind:'codex',cliRequestedModel:'requested-model',
     localUrl:BRIDGE,localModel:'cli/codex',localKey:BRIDGE_TOKEN,nonce:NONCE,retryDelayMs:0,
@@ -22,14 +22,14 @@ async function fixture(t, handler, extra = {}) {
       calls.push({url,headers:options.headers,body:JSON.parse(options.body)});
       if (url === BRIDGE) return handler(options);
       assert.equal(url,'https://api.anthropic.com/v1/messages');
-      return Response.json(message(SONNET));
+      return planHandler(options);
     }});
   await listenSafe(server);
   t.after(()=>{server.closeAllConnections();server.close();});
   const base=`http://127.0.0.1:${server.address().port}`;
-  const request = (body, signal)=>fetch(base+'/v1/messages',{method:'POST',signal,
+  const request = (body, signal, beta='oauth-2025-04-20,inline-tools-2026-09-15')=>fetch(base+'/v1/messages',{method:'POST',signal,
     headers:{'content-type':'application/json','x-local-route-token':NONCE,
-      authorization:'Bearer sk-ant-oat-synthetic','anthropic-beta':'oauth-2025-04-20,inline-tools-2026-09-15'},
+      authorization:'Bearer sk-ant-oat-synthetic','anthropic-beta':beta},
     body:JSON.stringify({model:SONNET,max_tokens:256,messages:[{role:'user',content:'fixture input'}],...body})});
   const metrics=async()=>await (await fetch(base+'/api/metrics',{headers:{'x-local-route-token':NONCE}})).json();
   return {calls,request,metrics};
@@ -64,6 +64,35 @@ for (const stream of [false,true]) {
   });
 }
 
+test('stable Sonnet request goes to CLI; an unknown beta remains native-only',async t=>{
+  const f=await fixture(t,()=>Response.json(message('cli/codex')));
+  let reply=await f.request({},undefined,'oauth-2025-04-20,interleaved-thinking-2025-05-14');
+  assert.equal(reply.status,200); await reply.text();
+  assert.equal(f.calls.length,1); assert.equal(f.calls[0].url,BRIDGE);
+  reply=await f.request({},undefined,'oauth-2025-04-20,future-native-2026-10-20');
+  assert.equal(reply.status,200); await reply.text();
+  assert.equal(f.calls.length,2);
+  assert.equal(f.calls[1].url,'https://api.anthropic.com/v1/messages');
+  assert.equal(f.calls[1].headers['anthropic-beta'],'oauth-2025-04-20,future-native-2026-10-20');
+  const m=await f.metrics();
+  assert.equal(m.routes.external,1); assert.equal(m.routes.plan,1);
+});
+
+test('stable CLI routing preserves host tool definitions and tool history',async t=>{
+  const tool={name:'Read',description:'Read a file',input_schema:{type:'object',properties:{path:{type:'string'}}}};
+  const messages=[{role:'user',content:'inspect'},
+    {role:'assistant',content:[{type:'tool_use',id:'toolu_fixture',name:'Read',input:{path:'fixture'}}]},
+    {role:'user',content:[{type:'tool_result',tool_use_id:'toolu_fixture',content:'fixture result'}]}];
+  const f=await fixture(t,()=>Response.json(message('cli/codex')));
+  const reply=await f.request({tools:[tool],messages},undefined,'oauth-2025-04-20,effort-2025-11-24');
+  assert.equal(reply.status,200); await reply.text();
+  assert.equal(f.calls.length,1); assert.equal(f.calls[0].url,BRIDGE);
+  assert.deepEqual(f.calls[0].body.tools,[tool]);
+  assert.deepEqual(f.calls[0].body.messages,messages);
+  const m=await f.metrics();
+  assert.equal(m.routes.external,1); assert.equal(m.routes.plan,0);
+});
+
 test('CLI provider exposes only backend-reported model and measured usage',async t=>{
   const f=await fixture(t,()=>Response.json(message('cli/codex'),{
     headers:{'x-cli-reported-model':'reported-model','x-cli-usage-measured':'true'}}));
@@ -88,6 +117,68 @@ test('CLI failures attempt once and never send the conversation to Plan',async t
   assert.equal(m.attempts,1);
   assert.equal(m.retries,0);
   assert.equal(m.routes.plan,0);
+});
+
+test('an Advisor native tool stays on the Plan path and is never sent to the CLI bridge',async t=>{
+  const f=await fixture(t,()=>{throw new Error('CLI must not receive an Advisor native tool');});
+  const body={tools:[{type:'advisor_20260301',name:'advisor',model:'claude-opus-5-5'}]};
+  const reply=await f.request(body,undefined,'oauth-2025-04-20,advisor-tool-2026-03-01');
+  assert.equal(reply.status,200); await reply.text();
+  assert.equal(f.calls.length,1);
+  assert.equal(f.calls[0].url,'https://api.anthropic.com/v1/messages');
+  assert.deepEqual(f.calls[0].body.tools,body.tools);
+  assert.equal((await f.metrics()).routes.plan,1);
+});
+
+test('an Advisor Plan rate limit is returned once without retrying or using the CLI',async t=>{
+  const f=await fixture(t,()=>{throw new Error('CLI must not receive an Advisor native tool');}, {},
+    ()=>Response.json({type:'error',error:{type:'rate_limit_error',message:'rate limited'}},
+      {status:429,headers:{'retry-after':'60'}}));
+  const reply=await f.request({tools:[{type:'advisor_20260301',name:'advisor',model:'claude-opus-5-5'}]},
+    undefined,'oauth-2025-04-20,advisor-tool-2026-03-01');
+  assert.equal(reply.status,429);
+  assert.equal(reply.headers.get('retry-after'),'60');
+  await reply.text();
+  assert.equal(f.calls.length,1);
+  assert.equal(f.calls[0].url,'https://api.anthropic.com/v1/messages');
+  const metrics=await f.metrics();
+  assert.equal(metrics.routes.plan,1);
+  assert.equal(metrics.routes.external,0);
+});
+
+test('CLI bridge diagnostic is allowlisted and does not change routing or retry behavior',async t=>{
+  const f=await fixture(t,()=>Response.json({error:'unsupported_request'},
+    {status:400,headers:{'x-cli-error-code':'unsupported_request'}}));
+  const reply=await f.request({},undefined,'oauth-2025-04-20');
+  const text=await reply.text();
+  assert.equal(reply.status,400);
+  assert.match(text,/cli_invalid_request/);
+  assert.match(text,/CLI diagnostic: unsupported_request/);
+  assert.equal(f.calls.length,1);
+  assert.equal((await f.metrics()).routes.plan,0);
+});
+
+test('CLI process and turn failure stages are forwarded as fixed diagnostic codes',async t=>{
+  for (const diagnostic of ['cli_process_failed','cli_turn_failed','cli_empty_output']) {
+    const f=await fixture(t,()=>Response.json({error:'cli_failed'},
+      {status:400,headers:{'x-cli-error-code':diagnostic}}));
+    const reply=await f.request({},undefined,'oauth-2025-04-20');
+    assert.equal(reply.status,400);
+    assert.match(await reply.text(),new RegExp(`CLI diagnostic: ${diagnostic}`));
+    assert.equal(f.calls.length,1);
+    assert.equal((await f.metrics()).routes.plan,0);
+  }
+});
+
+test('untrusted CLI diagnostic headers are not reflected',async t=>{
+  const secret='synthetic-secret-must-not-leak';
+  const f=await fixture(t,()=>Response.json({error:secret},
+    {status:400,headers:{'x-cli-error-code':secret}}));
+  const reply=await f.request({},undefined,'oauth-2025-04-20');
+  assert.equal(reply.status,400);
+  assert.doesNotMatch(await reply.text(),/synthetic-secret-must-not-leak/);
+  assert.equal(f.calls.length,1);
+  assert.equal((await f.metrics()).routes.plan,0);
 });
 
 test('native Plan models bypass the CLI backend',async t=>{
