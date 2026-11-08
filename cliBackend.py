@@ -41,10 +41,11 @@ PRE_AUTH_TIMEOUT_SECONDS = 3
 BODY_TIMEOUT_SECONDS = 10
 READ_POLL_SECONDS = .2
 MAX_CONNECTIONS = 16
-# Versions that passed the live round-trip (tool-free "Reply with exactly OK" via the
-# isolated adapter command) and the feature-flag survey below. A version not listed here
-# fails closed until it is re-verified against that same procedure.
-VERIFIED_VERSIONS = {"codex": {"0.165.0", "0.166.0"}, "claude": {"2.1.312", "2.1.319"},
+# Versions that passed the live verification protocol (2026-11-08 for 0.167.0): tool-free
+# turn, tool round-trip with tool_use → tool_result, structured output via --output-schema,
+# all 22 CODEX_DISABLED feature flags accepted, and a synthetic long-context turn inside the
+# 4 MiB bridge guard. A version not listed here fails closed until it is re-verified.
+VERIFIED_VERSIONS = {"codex": {"0.165.0", "0.166.0", "0.167.0"}, "claude": {"2.1.312", "2.1.319"},
                      "grok": {"1.0.77"}}
 SCHEMA = {"type": "object", "additionalProperties": False, "required": ["text", "tool_calls"],
           "properties": {"text": {"type": "string"}, "tool_calls": {"type": "array", "items": {
