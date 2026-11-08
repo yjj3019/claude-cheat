@@ -1144,6 +1144,16 @@ class PageTests(unittest.TestCase):
         # Detection is only offered for the supported backends, not arbitrary PATH commands.
         self.assertIn("getElementById('cfg-cli-CLI_KIND')", dash.SETTINGS_PAGE)
 
+    def test_dual_provider_toggle_contract_is_complete(self):
+        # Runtime backend switching exists through the dual alias; the settings page must
+        # expose it and the API must accept a same-call toggle with a validated value.
+        self.assertIn('save_dual_provider', open('routeDashboard.py', encoding='utf-8').read())
+        page = dash.SETTINGS_PAGE
+        self.assertIn('dual-provider', page)
+        self.assertIn('saveDualProvider', page)
+        self.assertIn('이중 공급자 별칭 사용', page)
+        self.assertIn("payload.get(\"dual_provider\")", open('routeDashboard.py', encoding='utf-8').read())
+
     def test_overview_metric_tiles_are_two_columns_and_context_follows(self):
         css=dash.PAGE_CSS
         self.assertIn('.ov-tiles{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))',css)
