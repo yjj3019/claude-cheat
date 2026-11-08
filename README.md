@@ -2,7 +2,7 @@
 
 **한국어** | [English](README.en.md) · [MIT License](LICENSE)
 
-**현재 버전: 1.0.5** — 대시보드 쓰기 주소(`#token=…`) 자동 오픈 · 키만으로 모델 목록 조회 · 저지연 TCP/HTTP/2/스트리밍 옵션. [릴리즈 이력](docs/HISTORY.ko.md)
+**현재 버전: 1.0.7** — 종료 세션 자동 정리 · 프롬프트 캐시 적중률 표시 · 실행 중 백엔드 전환(이중 공급자 별칭) · 전체 요청 시간 예산(`ROUTE_REQUEST_BUDGET_MS`) · SSE 파싱 최적화 · 설정 파일 읽기 캐시 · 콘솔 창 깜빡임 제거. [릴리즈 이력](docs/HISTORY.ko.md)
 
 Claude Code를 실행하면서 호환되는 Sonnet 요청을 **Local LLM, OpenRouter 또는 CLI 모델 백엔드**로 보내는 로컬 라우터입니다. 원본 Claude Sonnet을 프록시 없이 실행하는 선택지도 제공합니다.
 

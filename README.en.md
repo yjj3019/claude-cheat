@@ -6,7 +6,7 @@
 
 [MIT License](LICENSE) · [License selection review](LICENSE-REVIEW.md)
 
-**Current version: 1.0.5** — the dashboard auto-opens on its token-backed `#token=…` write_url, model lists load with a key alone, plus low-latency TCP/HTTP/2/streaming options. See the [release history (Korean)](docs/HISTORY.ko.md).
+**Current version: 1.0.7** — ended sessions are cleaned up automatically, the dashboard shows the prompt-cache hit rate, a running session can switch backends through the dual-provider alias, plus an opt-in whole-request budget (`ROUTE_REQUEST_BUDGET_MS`), a faster single-pass SSE parser, a settings read cache, and no more console-window flashes. See the [release history (Korean)](docs/HISTORY.ko.md).
 
 A local router that preserves the existing Claude Code Plan login and settings while sending compatible Sonnet requests to the configured OpenRouter model, local LLM, or verified CLI model backend. The repository includes the launcher, proxy, and synthetic regression tests. It does not contain API keys, OAuth credentials, personal settings, or private diagnostic scripts.
 
