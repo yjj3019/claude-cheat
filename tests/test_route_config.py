@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -201,6 +202,25 @@ class StoreTests(unittest.TestCase):
         # The cross-process save lock is a sibling dot-file, not a settings artifact.
         lock = "." + cfg.CONFIG_NAME + ".lock"
         return sorted(p.name for p in Path(self.tmp).iterdir() if p.name != lock)
+
+    def test_unchanged_ticks_reuse_the_parsed_file_and_a_save_is_seen_immediately(self):
+        # The dashboard snapshot loop re-reads every service every few seconds. The stat
+        # cache must be transparent (same values), skip re-reading while unchanged, and
+        # invalidate on save so a stored change is never served stale.
+        store = make_store(self.tmp, **{"openclaude.config.yaml": 'openrouter:\n  model: "vendor/a"\n'})
+        first = store.read_provider("openrouter")
+        before = store._cache
+        second = store.read_provider("openrouter")
+        self.assertEqual(first, second)
+        self.assertEqual(before, store._cache, "an unchanged tick must reuse the cached bytes")
+        store.write_provider("openrouter", {"OPENROUTER_MODEL": "vendor/b"})
+        self.assertIsNone(store._cache, "a save must invalidate the cache")
+        self.assertEqual(store.read_provider("openrouter")["OPENROUTER_MODEL"], "vendor/b")
+        # A file changed by something else is still detected through size+mtime.
+        path = Path(self.tmp) / cfg.CONFIG_NAME
+        time.sleep(0.02)
+        path.write_bytes(path.read_bytes() + b"\n")
+        self.assertEqual(store.read_provider("openrouter")["OPENROUTER_MODEL"], "vendor/b")
 
     def test_reset_credentials_sanitizes_primary_backup_and_legacy_without_touching_other_values(self):
         main = 'openrouter:\n  model: "vendor/a"\n  api_key: "SECRET_MAIN" # SECRET_COMMENT\nlocal:\n  model: "keep"\n  api_key: "OTHER_KEY"\nrouting:\n  default_provider: "openrouter"\n'

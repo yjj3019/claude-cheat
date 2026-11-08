@@ -452,6 +452,11 @@ class Store:
 
     def __init__(self, path=CONFIG_PATH):
         self.path = Path(path)
+        # The dashboard re-reads every service's settings on each snapshot tick (3s), which
+        # measured as the dominant cost (file opens plus a full YAML parse per provider).
+        # A stat-only cache invalidates on size+mtime change, so an edit is still seen
+        # immediately while an unchanged tick skips the read and parse entirely.
+        self._cache = None  # (size_ns, mtime_ns, text) or None
 
     def _legacy(self, provider):
         """The deprecated dotenv file for a service, or None when it never had one."""
@@ -562,6 +567,7 @@ class Store:
                         text = _history_append(text, entries, provider, before)
                     text = _history_append(text, entries, provider, after)
             self._atomic_write(text, raw, original is not None and raw.startswith(b"\xef\xbb\xbf"))
+            self._cache = None  # a save must be visible to the very next read
 
     def reset_provider(self, provider, scope):
         """Clear a service's managed values from settings, its backup and legacy file.
@@ -674,8 +680,20 @@ class Store:
 
     def _read_bytes(self):
         try:
-            return self.path.read_bytes()
+            stat = self.path.stat()
+            cached = self._cache
+            if cached is not None and cached[0] == (stat.st_size, stat.st_mtime_ns):
+                return cached[1]
+            raw = self.path.read_bytes()
+            # An atomic save replaces the file, so the stat taken before read_bytes could
+            # describe the previous version; only trust the cache when size+mtime match
+            # the bytes actually read.
+            after = self.path.stat()
+            if (after.st_size, after.st_mtime_ns) == (stat.st_size, stat.st_mtime_ns):
+                self._cache = ((stat.st_size, stat.st_mtime_ns), raw)
+            return raw
         except FileNotFoundError:
+            self._cache = None
             return None
 
     @staticmethod
