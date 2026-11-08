@@ -1157,6 +1157,16 @@ class PageTests(unittest.TestCase):
         self.assertIn('표시 세션',page)
         self.assertIn('오늘 사용',page)
 
+    def test_today_usage_card_shows_cache_hit_rate_without_faking_zero(self):
+        # The observed-rate row only appears when the provider actually reported cache
+        # tokens; an unpriced or CLI session must not invent a percentage.
+        page = dash.PAGE
+        self.assertIn('캐시 적중률', page)
+        self.assertIn('today.external[2]', page)
+        self.assertIn('today.external[0]', page)
+        # The rate is derived from read vs (fresh input + fresh write), never a constant.
+        self.assertIn('read * 100 / (read + fresh)', page)
+
     def test_hidden_elements_and_empty_charts_do_not_mislead(self):
         # A .pill/.btn author display rule beats the UA [hidden] rule; zero metrics must not
         # render a fake "최대 1.00 %" scale label.
