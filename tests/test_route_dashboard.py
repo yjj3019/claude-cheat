@@ -7,6 +7,7 @@ import io
 import http.client
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -1147,12 +1148,12 @@ class PageTests(unittest.TestCase):
     def test_dual_provider_toggle_contract_is_complete(self):
         # Runtime backend switching exists through the dual alias; the settings page must
         # expose it and the API must accept a same-call toggle with a validated value.
-        self.assertIn('save_dual_provider', open('routeDashboard.py', encoding='utf-8').read())
+        self.assertIn('save_dual_provider', Path('routeDashboard.py').read_text(encoding='utf-8'))
         page = dash.SETTINGS_PAGE
         self.assertIn('dual-provider', page)
         self.assertIn('saveDualProvider', page)
         self.assertIn('이중 공급자 별칭 사용', page)
-        self.assertIn("payload.get(\"dual_provider\")", open('routeDashboard.py', encoding='utf-8').read())
+        self.assertIn("payload.get(\"dual_provider\")", Path('routeDashboard.py').read_text(encoding='utf-8'))
 
     def test_overview_metric_tiles_are_two_columns_and_context_follows(self):
         css=dash.PAGE_CSS
@@ -1166,6 +1167,19 @@ class PageTests(unittest.TestCase):
         self.assertIn("tile('외부 p95'",page)
         self.assertIn('표시 세션',page)
         self.assertIn('오늘 사용',page)
+
+    def test_topbar_summary_wraps_instead_of_clipping(self):
+        # The stamp carries today's usage and the priority alert; clipping it hid the
+        # numbers behind an ellipsis, so the rule must wrap and the bar must grow.
+        css = dash.PAGE_CSS
+        base = next(rule for rule in css.split('}') if '.brand p{' in rule)
+        self.assertIn('white-space:normal', base)
+        self.assertIn('overflow-wrap:anywhere', base)
+        self.assertNotIn('text-overflow:ellipsis', base)
+        topbar = next(rule for rule in css.split('}') if '.topbar-in{display:flex' in rule)
+        self.assertIn('min-height:66px', topbar)
+        # min-height contains the substring "height"; match the exact property instead.
+        self.assertIsNone(re.search(r'(?<![a-z-])height:66px', topbar))
 
     def test_today_usage_card_shows_cache_hit_rate_without_faking_zero(self):
         # The observed-rate row only appears when the provider actually reported cache
