@@ -437,7 +437,8 @@ const DIAGNOSTIC_BLOCK_TYPES = ['text', 'tool_use', 'thinking', 'redacted_thinki
 const DIAGNOSTIC_USAGE_FIELDS = ['input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'];
 // Accept only known, non-sensitive codes from the authenticated loopback CLI bridge.
 const CLI_ERROR_CODES = new Set(['invalid_request', 'unsupported_request', 'wrong_model', 'not_logged_in',
-  'cli_failed', 'cli_process_failed', 'cli_turn_failed', 'cli_empty_output', 'backend_version_unverified', 'invalid_response', 'invalid_tool_call', 'invalid_tool_choice',
+  'cli_failed', 'cli_process_failed', 'cli_turn_failed', 'cli_empty_output', 'cli_reported_rate_limit',
+  'cli_reported_context_limit', 'backend_version_unverified', 'invalid_response', 'invalid_tool_call', 'invalid_tool_choice',
   'invalid_usage', 'incomplete_response', 'native_tool_execution_detected', 'spawn_failed',
   'process_tracking_unavailable', 'timeout', 'cancelled', 'request_too_large', 'output_too_large', 'backend_busy']);
 // Keep diagnostics separate from throwable provider objects: an upstream cannot inject
@@ -2451,6 +2452,13 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
             congested = target.name === 'local' &&
               ([429, 503, 529].includes(status) || controller.signal.reason === 'attempt_timeout');
             logEvent({ event: 'external_attempt_failed', provider: target.name, attempt: attempt + 1,
+              ...(target.name === 'cli' ? { request_diagnostic: {
+                request_bytes: Buffer.byteLength(externalPayload),
+                message_count: Math.min(Array.isArray(externalBody.messages) ? externalBody.messages.length : 0, 65535),
+                tool_count: Math.min(Array.isArray(externalBody.tools) ? externalBody.tools.length : 0, 65535),
+                effort: ['low', 'medium', 'high'].includes(externalBody.output_config?.effort)
+                  ? externalBody.output_config.effort : null,
+              } } : {}),
               ...(Number.isInteger(status) ? { status } : {}), ...(validation ? { validation } : {}),
               ...(['missing_body', 'empty_body', 'empty_content', 'content_without_usable_output',
                 'stream_without_usable_content'].includes(error?.validationDetail) ? { validation_detail: error.validationDetail } : {}),

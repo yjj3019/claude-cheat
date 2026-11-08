@@ -526,7 +526,7 @@ def _instance_summary(events):
 # can contain user-controlled or stale data, so never echo an arbitrary backend string.
 _CLI_PUBLIC_DIAGNOSTICS = frozenset({
     "invalid_request", "unsupported_request", "wrong_model", "not_logged_in", "cli_failed",
-    "cli_process_failed", "cli_turn_failed", "cli_empty_output",
+    "cli_process_failed", "cli_turn_failed", "cli_empty_output", "cli_reported_rate_limit", "cli_reported_context_limit",
     "backend_version_unverified", "invalid_response", "invalid_tool_call", "invalid_tool_choice",
     "invalid_usage", "incomplete_response", "native_tool_execution_detected", "spawn_failed",
     "process_tracking_unavailable", "timeout", "cancelled", "request_too_large", "output_too_large",

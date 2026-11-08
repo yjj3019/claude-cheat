@@ -113,6 +113,21 @@ class BackendTest(unittest.TestCase):
         self.error("invalid_tool_choice", backend.validate_reply, {"text": "", "tool_calls": value["tool_calls"] * 2},
                    {**request(), "tool_choice": {"type": "auto", "disable_parallel_tool_use": True}})
 
+    def test_codex_failure_diagnostics_only_classify_explicit_error_events(self):
+        events = [
+            ({"type": "turn.failed", "error": {"message": "HTTP 429: private fixture"}}, "cli_reported_rate_limit"),
+            ({"type": "turn.failed", "error": {"message": "Context window exceeded: private fixture"}}, "cli_reported_context_limit"),
+            ({"type": "error", "message": "unclassified private fixture"}, "cli_turn_failed"),
+            ({"type": "item.completed", "item": {"type": "agent_message", "text": "HTTP 429"}}, None),
+        ]
+        for event, expected in events:
+            with self.subTest(event_type=event["type"], expected=expected):
+                output = json.dumps(event).encode("utf-8")
+                self.assertEqual(backend._cli_failure_diagnostic(output), expected)
+        self.assertIsNone(backend._cli_failure_diagnostic(b"not json: HTTP 429 secret"))
+        self.assertNotIn("private fixture", repr(backend._cli_failure_diagnostic(
+            b'{"type":"turn.failed","error":{"message":"HTTP 429: private fixture"}}')))
+
     def test_codex_requires_terminal_success_and_rejects_native_execution(self):
         value, model, usage = backend.parse_output("codex", codex_output(model="gpt-test", usage={"input_tokens": 2, "output_tokens": 3}))
         self.assertEqual((value["text"], model, usage["output_tokens"]), ("synthetic answer", "gpt-test", 3))
@@ -222,6 +237,8 @@ class BackendTest(unittest.TestCase):
                                                 ("not_logged_in", None, "not_logged_in"),
                                                 ("cli_failed", "cli_turn_failed", "cli_turn_failed"),
                                                 ("cli_failed", "cli_process_failed", "cli_process_failed"),
+                                                ("cli_failed", "cli_reported_rate_limit", "cli_reported_rate_limit"),
+                                                ("cli_failed", "cli_reported_context_limit", "cli_reported_context_limit"),
                                                 ("cli_failed", "synthetic-secret-must-not-leak", "cli_failed"),
                                                 ("synthetic-secret-must-not-leak", None, None)):
                 with self.subTest(code=code, diagnostic=diagnostic), patch.object(
@@ -584,6 +601,11 @@ class BackendTest(unittest.TestCase):
             self.assertEqual(process_error.exception.code, "cli_failed")
             self.assertEqual(process_error.exception.diagnostic, "cli_process_failed")
             self.assertNotIn("private diagnostic", str(process_error.exception))
+            with self.assertRaises(backend.BackendError) as rate_error:
+                run("import json,sys; print(json.dumps({'type':'turn.failed','error':{'message':'HTTP 429 private fixture'}})); sys.exit(1)")
+            self.assertEqual(rate_error.exception.code, "cli_failed")
+            self.assertEqual(rate_error.exception.diagnostic, "cli_reported_rate_limit")
+            self.assertNotIn("private fixture", str(rate_error.exception))
             self.error("timeout", run, "import time; time.sleep(10)", .15)
             start = time.monotonic()
             self.error("cancelled", run, "import time; time.sleep(10)", 3, lambda: time.monotonic() - start > .15)

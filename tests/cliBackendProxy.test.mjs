@@ -159,7 +159,7 @@ test('CLI bridge diagnostic is allowlisted and does not change routing or retry 
 });
 
 test('CLI process and turn failure stages are forwarded as fixed diagnostic codes',async t=>{
-  for (const diagnostic of ['cli_process_failed','cli_turn_failed','cli_empty_output']) {
+  for (const diagnostic of ['cli_process_failed','cli_turn_failed','cli_empty_output','cli_reported_rate_limit','cli_reported_context_limit']) {
     const f=await fixture(t,()=>Response.json({error:'cli_failed'},
       {status:400,headers:{'x-cli-error-code':diagnostic}}));
     const reply=await f.request({},undefined,'oauth-2025-04-20');
@@ -168,6 +168,24 @@ test('CLI process and turn failure stages are forwarded as fixed diagnostic code
     assert.equal(f.calls.length,1);
     assert.equal((await f.metrics()).routes.plan,0);
   }
+});
+
+test('CLI failure logs bounded request shape without prompts or tool names',async t=>{
+  const logged=t.mock.method(console,'error',()=>{});
+  const f=await fixture(t,()=>Response.json({error:'cli_failed'},
+    {status:400,headers:{'x-cli-error-code':'cli_process_failed'}}));
+  const secret='sensitive-fixture-not-for-logs';
+  const body={messages:[{role:'user',content:secret}],
+    tools:[{name:'PrivateFixtureTool',input_schema:{type:'object'}}],output_config:{effort:'high'}};
+  const reply=await f.request(body,undefined,'oauth-2025-04-20');
+  assert.equal(reply.status,400); await reply.text();
+  const events=logged.mock.calls.map(call=>JSON.parse(call.arguments[0]));
+  const event=events.find(item=>item.event==='external_attempt_failed');
+  assert.ok(event.request_diagnostic.request_bytes>0);
+  assert.equal(event.request_diagnostic.message_count,1);
+  assert.equal(event.request_diagnostic.tool_count,1);
+  assert.equal(event.request_diagnostic.effort,'high');
+  assert.doesNotMatch(JSON.stringify(events),/sensitive-fixture-not-for-logs|PrivateFixtureTool/);
 });
 
 test('untrusted CLI diagnostic headers are not reflected',async t=>{

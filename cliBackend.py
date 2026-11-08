@@ -26,7 +26,7 @@ MAX_BYTES = 4 * 1024 * 1024
 # Fixed, non-sensitive bridge diagnostics. Never expose exception text or CLI output in headers.
 PUBLIC_ERROR_CODES = frozenset({
     "invalid_request", "unsupported_request", "wrong_model", "not_logged_in", "cli_failed",
-    "cli_process_failed", "cli_turn_failed", "cli_empty_output",
+    "cli_process_failed", "cli_turn_failed", "cli_empty_output", "cli_reported_rate_limit", "cli_reported_context_limit",
     "backend_version_unverified", "invalid_response", "invalid_tool_call", "invalid_tool_choice",
     "invalid_usage", "incomplete_response", "native_tool_execution_detected", "spawn_failed",
     "process_tracking_unavailable", "timeout", "cancelled", "request_too_large", "output_too_large",
@@ -210,6 +210,37 @@ def _reported(result):
     return model, usage
 
 
+def _cli_failure_diagnostic(output):
+    """Classify explicit CLI JSONL failures without exposing their text or context.
+
+    Only top-level error/turn.failed events are considered; model output and tool text
+    must never become diagnostic evidence. Unknown or malformed events return None.
+    """
+    try:
+        lines = output.decode("utf-8", "replace").splitlines()[-64:]
+        saw_failure = False
+        for line in lines:
+            if len(line) > 65536:
+                continue
+            try:
+                event = _json(line)
+            except BackendError:
+                continue
+            if not isinstance(event, dict) or event.get("type") not in ("error", "turn.failed"):
+                continue
+            error = event.get("error")
+            message = error.get("message") if isinstance(error, dict) else event.get("message")
+            if isinstance(message, str):
+                if re.search(r"\b(?:rate[ _-]?limit(?:ed)?|usage limit|too many requests|http 429)\b", message, re.I):
+                    return "cli_reported_rate_limit"
+                if re.search(r"\b(?:context (?:window|length)|maximum context)\b.{0,80}\b(?:exceed(?:ed|s)?|too (?:large|long))\b", message, re.I):
+                    return "cli_reported_context_limit"
+            saw_failure = True
+        return "cli_turn_failed" if saw_failure else None
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_output(kind, text):
     if not isinstance(text, str):
         raise BackendError("invalid_response")
@@ -231,7 +262,8 @@ def parse_output(kind, text):
             raise BackendError("cli_failed", diagnostic="cli_empty_output")
         if any(not isinstance(e, dict) or e.get("type") in ("error", "turn.failed") for e in events):
             # Only a fixed category leaves the bridge, never the event's message/body.
-            raise BackendError("cli_failed", diagnostic="cli_turn_failed")
+            diagnostic = _cli_failure_diagnostic(text.encode("utf-8")) or "cli_turn_failed"
+            raise BackendError("cli_failed", diagnostic=diagnostic)
         if any(e.get("type") in ("item.started", "item.updated", "item.completed")
                and isinstance(e.get("item"), dict)
                and e["item"].get("type") not in ("agent_message", "reasoning", "error") for e in events):
@@ -350,8 +382,10 @@ def _run(argv, prompt, env, cwd, timeout, cancelled, process_timing=None):
             error = bytes(buffers[1]).decode("utf-8", "replace")
             if routeCli._AUTH_RE.search(error):
                 raise BackendError("not_logged_in")
-            # Keep the exact exit code and stderr private; expose only the failure stage.
-            raise BackendError("cli_failed", diagnostic="cli_process_failed")
+            # Codex can emit a structured failure event on stdout before exiting nonzero.
+            # Classify only explicit JSONL failure events; never expose their contents.
+            diagnostic = _cli_failure_diagnostic(bytes(buffers[0])) or "cli_process_failed"
+            raise BackendError("cli_failed", diagnostic=diagnostic)
         if process_timing is not None and math.isfinite(process_ms) and 0 <= process_ms <= 180000:
             process_timing["process_ms"] = round(process_ms, 2)
         try:
@@ -527,7 +561,8 @@ def serve(values):
                 self.send_header("Content-Length", str(len(raw)))
                 error_code = value.get("error") if status >= 400 and isinstance(value, dict) else None
                 diagnostic = (metadata or {}).get("error_diagnostic") if error_code == "cli_failed" else None
-                if diagnostic in ("cli_process_failed", "cli_turn_failed", "cli_empty_output"):
+                if diagnostic in ("cli_process_failed", "cli_turn_failed", "cli_empty_output",
+                                  "cli_reported_rate_limit", "cli_reported_context_limit"):
                     error_code = diagnostic
                 if isinstance(error_code, str) and error_code in PUBLIC_ERROR_CODES:
                     self.send_header("X-CLI-Error-Code", error_code)
