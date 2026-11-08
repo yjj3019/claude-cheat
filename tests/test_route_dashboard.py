@@ -1145,6 +1145,29 @@ class PageTests(unittest.TestCase):
         # Detection is only offered for the supported backends, not arbitrary PATH commands.
         self.assertIn("getElementById('cfg-cli-CLI_KIND')", dash.SETTINGS_PAGE)
 
+    def test_dead_session_handoffs_are_swept_but_live_ones_kept(self):
+        # A hard-killed launcher leaves handoff.json behind; the refresh loop must drop
+        # the pointer once its launcher pid is provably gone and keep everything else.
+        sweep = dash._sweep_dead_handoffs
+        alive = dash._process_alive
+        import os as _os
+        instances = dash.ROOT / ".usage-stats" / "instances"
+        dead_dir = instances / "0dead00000000000000000000000000"
+        live_dir = instances / "0live000000000000000000000000000"
+        dead_dir.mkdir(parents=True, exist_ok=True)
+        live_dir.mkdir(parents=True, exist_ok=True)
+        (dead_dir / "handoff.json").write_text(json.dumps(
+            {"port": 59999, "launcher_pid": 2147483000, "nonce": "n", "provider": "openrouter"}), encoding="utf-8")
+        (live_dir / "handoff.json").write_text(json.dumps(
+            {"port": 59998, "launcher_pid": _os.getpid(), "nonce": "n", "provider": "openrouter"}), encoding="utf-8")
+        self.addCleanup(lambda: __import__("shutil").rmtree(dead_dir, ignore_errors=True))
+        self.addCleanup(lambda: __import__("shutil").rmtree(live_dir, ignore_errors=True))
+        self.assertTrue(alive(_os.getpid()))
+        sweep()
+        self.assertFalse((dead_dir / "handoff.json").exists(), "a dead launcher's pointer must be removed")
+        self.assertTrue((live_dir / "handoff.json").exists(), "a live launcher's pointer must be kept")
+        self.assertTrue(dead_dir.exists(), "usage data is retained; only the pointer goes")
+
     def test_dual_provider_toggle_contract_is_complete(self):
         # Runtime backend switching exists through the dual alias; the settings page must
         # expose it and the API must accept a same-call toggle with a validated value.

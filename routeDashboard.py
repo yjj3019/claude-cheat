@@ -3860,9 +3860,64 @@ def _sweep_orphan_instances():
             continue
 
 
+
+
+def _sweep_dead_handoffs():
+    """Remove handoff.json files whose launcher is verifiably gone (usage data is kept).
+
+    A launcher writes its handoff on start and clears it in a ``finally`` block, but a
+    hard kill (or the takeover keeper outliving its client) can leave one behind. A stale
+    handoff makes the session monitor show an ended session until the 30-day orphan sweep,
+    so this removes the pointer as soon as the recorded launcher pid is provably dead —
+    and only then: a pid that cannot be verified stays untouched rather than guessed.
+    """
+    base = ROOT / ".usage-stats" / "instances"
+    try:
+        handoffs = list(base.glob("*/handoff.json"))
+    except OSError:
+        return
+    removed = 0
+    for handoff in handoffs:
+        try:
+            record = json.loads(handoff.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        pid = record.get("launcher_pid") if isinstance(record, dict) else None
+        if type(pid) is not int or pid <= 0:
+            continue
+        if _process_alive(pid):
+            continue
+        try:
+            handoff.unlink()
+            removed += 1
+        except OSError:
+            continue
+    if removed:
+        _record_auto_update(f"removed {removed} dead-session handoff files")
+
+
+def _process_alive(pid):
+    """True only when the pid names a live process; unverifiable means alive (fail closed)."""
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True
+    import ctypes
+    handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+    if handle:
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    return False
+
+
 def _usage_refresh_loop():
     while True:
         _refresh_usage_stats()
+        _sweep_dead_handoffs()
         _sweep_orphan_instances()
         time.sleep(_USAGE_REFRESH_SECONDS)
 
