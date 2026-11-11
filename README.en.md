@@ -354,7 +354,7 @@ Compatibility launches retain explicitly set frontend agent/team/task/background
 
 Plan HTTP-date retry hints are converted to seconds. Capability-rejection errors and retry headers have regression coverage; credential redaction and the error-size cap remain. Empty-response logs add fixed `validation_detail` categories without recording response content.
 
-Remote Control is disabled by Claude Code for custom API base URLs. Detached `--bg` sessions still require a persistent proxy lifecycle design: management-command passthrough alone does not solve that. Full live Agent Teams/MCP/plugin parity is not established. See the [source review and verification status](docs/HARNESS-COMPATIBILITY-REVIEW.ko.md).
+Remote Control is disabled by Claude Code for custom API base URLs. Detached `--bg` sessions keep routing after the foreground process exits: the launcher hands the proxy to a dedicated keeper that holds it until the session is stopped, taken over, or its instance is cleared. Full live Agent Teams/MCP/plugin parity is not established. See the [source review and verification status](docs/HARNESS-COMPATIBILITY-REVIEW.ko.md).
 
 The final section of the [routing compatibility review](docs/HARNESS-COMPATIBILITY-REVIEW.ko.md) studies performance and feature preservation using observed routing data. Retry-budget, end-to-end deadline and streaming changes are proposals, not deployed behavior.
 

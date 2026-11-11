@@ -694,11 +694,11 @@ Claude Code·Node.js·Python·외부 서비스와 모델 자체는 배포 대상
 
 일반 모드는 사용자 Claude Code 환경을 유지합니다. Local/OpenRouter 호환 모드도 명시적으로 설정한 Agent Teams·subagent·작업 목록·백그라운드·IDE·플러그인 탐색·skill 동기화 선호를 보존하도록 보완했습니다. 설정하지 않은 기능을 자동 활성화하지 않으며 제공자 인증·라우팅 격리와 제한형 LocalMode 정책은 유지합니다. 계정 동기화 기능에는 원본의 로그인 조건이 그대로 적용됩니다.
 
-`attach`, `logs`, `respawn`, `stop`/`kill`, `rm`, `purge`, `gateway`, `setup-token`, `upgrade`는 모델 설정이나 연결 검사 없이 원본 Claude 관리 명령으로 전달합니다. 삭제·인증 등의 실제 동작과 확인 절차는 원본 명령의 책임입니다. 이 명령 전달 지원이 `--bg`로 시작한 라우팅 세션의 프록시 수명까지 보장한다는 뜻은 아닙니다.
+`attach`, `logs`, `respawn`, `stop`/`kill`, `rm`, `purge`, `gateway`, `setup-token`, `upgrade`는 모델 설정이나 연결 검사 없이 원본 Claude 관리 명령으로 전달합니다. 삭제·인증 등의 실제 동작과 확인 절차는 원본 명령의 책임입니다. `--bg`로 시작한 라우팅 세션은 이제 전면 프로세스가 끝나도 프록시가 살아 있게 됩니다(`keep_instance_alive`).
 
 Plan 경로의 HTTP-date `Retry-After`는 클라이언트가 읽을 수 있는 초 단위로 정규화합니다. 일반적인 기능 거부 오류 본문과 재시도 헤더 보존을 회귀 검사하며, 자격증명 마스킹과 오류 크기 제한은 유지합니다. `external_attempt_failed.validation_detail`은 빈 응답을 `missing_body`, `empty_body`, `empty_content`, `content_without_usable_output`, `stream_without_usable_content`로 구분합니다. 응답 본문·reasoning·도구 인자를 기록하지 않습니다.
 
-**남은 경계:** Remote Control은 사용자 지정 API base URL에서 비활성화되는 Claude Code 자체 제약이 있습니다. `--bg`는 전면 프로세스 종료 이후 프록시가 살아 있어야 하므로 현재 동기 실행 수명과 별도로 설계·검증해야 합니다. 실제 Agent Team·SSH/MCP·plugin 전체 조합을 통과했다고 주장하지 않습니다. [상세 근거와 검증 상태](docs/HARNESS-COMPATIBILITY-REVIEW.ko.md)
+**남은 경계:** Remote Control은 사용자 지정 API base URL에서 비활성화되는 Claude Code 자체 제약이 있습니다. `--bg`로 시작한 라우팅 세션은 전면 프로세스가 끝나도 전용 keeper 프로세스(`--keep-instance`)가 프록시를 붙들고 있어 계속 라우팅하며, 세션이 끝나거나 takeover·정리 대상이 되면 해제됩니다. 실제 Agent Team·SSH/MCP·plugin 전체 조합을 통과했다고 주장하지 않습니다. [상세 근거와 검증 상태](docs/HARNESS-COMPATIBILITY-REVIEW.ko.md)
 
 핵심 라우팅의 성능·기능 공동 개선 연구는 [호환성 분석 문서](docs/HARNESS-COMPATIBILITY-REVIEW.ko.md)의 마지막 절에 정리했습니다. 운영 관측과 제안을 구분하며, 재시도·전체 시간 예산·스트리밍 변경은 아직 적용하지 않았습니다.
 

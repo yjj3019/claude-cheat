@@ -1530,7 +1530,7 @@ class ConfigTests(unittest.TestCase):
         self.put_openrouter()
         self.put("local", LOCAL_LLM_URL="http://127.0.0.1:11434/v1/messages", LOCAL_LLM_MODEL="fixture")
         dash.save_default_provider("local")
-        with mock.patch.object(route, "ROOT", self.root), mock.patch.dict(os.environ, {}, clear=True):
+        with mock.patch.object(route, "ROOT", self.root), mock.patch.dict(os.environ, {"SYSTEMROOT": os.environ.get("SYSTEMROOT") or os.environ.get("SystemRoot") or "C:\\Windows"}, clear=True):
             self.assertEqual(route.configured_provider(), "local")
 
     def test_local_snapshots_skip_openrouter_and_do_not_reuse_its_priced_cache(self):
@@ -1595,7 +1595,7 @@ class ConfigTests(unittest.TestCase):
         ready = queue.Queue()
         threading.Thread(target=lambda: ready.put(proxy.stdout.readline()), daemon=True).start()
         port = json.loads(ready.get(timeout=10))["port"]
-        self.enterContext(mock.patch.dict(os.environ, {}, clear=True))
+        self.enterContext(mock.patch.dict(os.environ, {"SYSTEMROOT": os.environ.get("SYSTEMROOT") or os.environ.get("SystemRoot") or "C:\\Windows"}, clear=True))
         handoff = self.root / ".session-handoff.json"
         log = self.root / ".route.log"
         log.write_text(route_line(datetime.now(timezone.utc).isoformat(),

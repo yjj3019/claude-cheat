@@ -613,6 +613,56 @@ def verify_owned_proxy(port, nonce, timeout=5.0) -> bool:
     return False
 
 
+def read_instance_handoff(instance_dir):
+    """Read one instance handoff without raising."""
+    try:
+        data = json.loads((Path(instance_dir) / "handoff.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, AttributeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def spawn_instance_keeper(instance_dir, stdin):
+    """Detach a keeper that holds one routed proxy for a --bg (detached) session.
+
+    The keeper inherits ``stdin`` — a duplicated end of the proxy's parent pipe — so
+    the proxy keeps serving after this launcher exits. The proxy exits when that last
+    pipe end closes, which the keeper does when it decides the session is over
+    (see ``keep_instance_alive``) or is itself stopped.
+    """
+    flags = _NO_WINDOW | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    return subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--keep-instance", str(instance_dir)],
+                            stdin=stdin, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
+
+
+def keep_instance_alive(instance_dir, poll_seconds=2.0) -> int:
+    """Hold a routed proxy for a detached (--bg) session after its launcher exits.
+
+    A ``--bg`` native session returns to the shell while the detached CLI keeps
+    running, so the launcher must not terminate its proxy on exit. This keeper owns
+    a duplicated proxy pipe end (see ``spawn_instance_keeper``); it returns the
+    moment the instance handoff for that proxy is gone (takeover completed, the
+    session was stopped, or an orphan sweep cleared the instance) or the proxy
+    stops answering its own token. Exiting closes the last pipe end and the proxy
+    exits with it. Returns 0.
+    """
+    while True:
+        record = read_instance_handoff(instance_dir)
+        if record is None:
+            log_route_marker("keeper instance handoff gone; releasing the routed proxy")
+            return 0
+        if not port_open(record.get("port")):
+            log_route_marker(f"keeper proxy port closed; releasing the routed proxy")
+            return 0
+        try:
+            if not verify_owned_proxy(record.get("port"), record.get("nonce"), timeout=poll_seconds):
+                log_route_marker("keeper proxy no longer answers its token; releasing the routed proxy")
+                return 0
+        except (OSError, ValueError):
+            return 0
+        time.sleep(poll_seconds)
+
+
 def handover_timeout_seconds() -> float:
     """Client wait must cover the proxy's drain cap, or the launcher fails first."""
     try:
@@ -620,6 +670,8 @@ def handover_timeout_seconds() -> float:
     except ValueError:
         milliseconds = 120000
     return max(milliseconds, 1000) / 1000 + 5
+
+
 
 
 def request_handover(port, nonce, timeout=None):
@@ -707,9 +759,10 @@ def run_owned(args: list, env: dict, cwd: str, prompt: str = "", timeout: int = 
 
 @contextlib.contextmanager
 def routed_session(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False,
-                   openrouter_compat: bool = False, debug: bool = False, port=None, nonce=None):
+                   openrouter_compat: bool = False, debug: bool = False, port=None, nonce=None,
+                   background: bool = False):
     options = dict(local_only=local_only, local_compat=local_compat, openrouter_compat=openrouter_compat,
-                   debug=debug, port=port, nonce=nonce)
+                   debug=debug, port=port, nonce=nonce, background=background)
     if provider != "cli":
         with _routed_session(provider, **options) as env:
             yield env
@@ -747,7 +800,8 @@ def _verify_port_owned(port, nonce, proxy) -> bool:
 @contextlib.contextmanager
 def _routed_session(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False,
                   openrouter_compat: bool = False, debug: bool = False,
-                  port: int | None = None, nonce: str | None = None, _config=None, _backend=None):
+                  port: int | None = None, nonce: str | None = None, _config=None, _backend=None,
+                  background: bool = False):
     """Own one loopback proxy; ordinary sessions alone use the subscription login."""
     if (local_only and provider != "local") or (local_compat and not local_only):
         raise ValueError("Local CLI mode requires the local provider")
@@ -873,7 +927,7 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
     proxy_env.update(config, LOCAL_ROUTE_TOKEN=nonce, LOCAL_ROUTE_ONLY="1" if local_only else "0")
     if dual:
         proxy_env.update(dual)
-    instance_id, instance_dir = str(uuid.uuid4()), None
+    instance_id, instance_dir, keeper = str(uuid.uuid4()), None, None
     try:
         instance_dir = instance_directory(ROOT, instance_id)
         proxy_env.update(ROUTE_INSTANCE_ID=instance_id,
@@ -951,20 +1005,35 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
         write_handoff(port=port, nonce=nonce, proxy_pid=proxy.pid, provider=provider,
                       cli_pid=os.getpid(), dual=dual, mode=mode,
                       instance_id=instance_id if instance_dir else None, instance_dir=instance_dir)
+        # A --bg native session detaches after the CLI spawns its detached child, so the
+        # launcher must not terminate its proxy when the foreground returns. The keeper
+        # inherits a duplicated proxy pipe end; once it returns the last end closes and
+        # the proxy exits with it (keep_instance_alive). Without an instance directory
+        # (rare) the session keeps the launcher-bound lifetime.
+        keeper = None
+        if background and instance_dir is not None:
+            try:
+                keeper = spawn_instance_keeper(instance_dir, proxy.stdin)
+            except (OSError, ValueError):
+                log_route_marker("keeper spawn failed; the session keeps the launcher-bound lifetime")
+                keeper = None
         yield env
     finally:
         log_route_marker(f"launcher exit pid={os.getpid()}")
-        clear_handoff(proxy_pid=proxy.pid)
-        if instance_dir is not None:
-            clear_instance_handoff(instance_dir, proxy.pid)
-        proxy.terminate()
-        try:
-            proxy.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proxy.kill()
-            proxy.wait(timeout=5)
-        proxy.stdout.close()
-        proxy.stdin.close()
+        if background and keeper is not None:
+            log_route_marker(f"launcher handed the proxy to keeper pid={keeper.pid}; the --bg session keeps routing")
+        else:
+            clear_handoff(proxy_pid=proxy.pid)
+            if instance_dir is not None:
+                clear_instance_handoff(instance_dir, proxy.pid)
+            proxy.terminate()
+            try:
+                proxy.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proxy.kill()
+                proxy.wait(timeout=5)
+            proxy.stdout.close()
+            proxy.stdin.close()
 
 
 def diagnose_local() -> int:
@@ -1290,9 +1359,12 @@ def _resolved_cli(command: list) -> list:
 
 
 def launch(provider: str = "auto", local_only: bool = False, local_compat: bool = False, openrouter_compat: bool = False, debug: bool = False,
-           print_prompt: str | None = None, print_json: bool = True, cli_args: list[str] | None = None) -> int:
+           print_prompt: str | None = None, print_json: bool = True, cli_args: list[str] | None = None,
+           background: bool = False) -> int:
     native_args = validate_claude_args(cli_args or [], local_only=local_only,
                                        compat=local_compat or openrouter_compat, print_prompt=print_prompt)
+    if any(value.split("=", 1)[0] == "--bg" for value in native_args):
+        background = True
     if native_args and native_args[0] in _CLAUDE_MANAGEMENT:
         claude = shutil.which("claude")
         if not claude:
@@ -1360,8 +1432,8 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
         if openrouter_compat:
             prompt_index = command.index("--append-system-prompt") + 1
             command[prompt_index] = command[prompt_index].replace("Local session", "OpenRouter session")
-        session = routed_session(provider, openrouter_compat=True, debug=debug) if openrouter_compat else (
-            routed_session(provider, local_only=True, local_compat=True, debug=debug) if local_compat else routed_session(provider, local_only=True, debug=debug))
+        session = routed_session(provider, openrouter_compat=True, background=background, debug=debug) if openrouter_compat else (
+            routed_session(provider, local_only=True, local_compat=True, background=background, debug=debug) if local_compat else routed_session(provider, local_only=True, background=background, debug=debug))
         with session as env:
             # CLI settings.env outranks process env: pin the same isolated route at that boundary.
             settings_index = command.index("--settings") + 1
@@ -1390,7 +1462,7 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
     print(f"Sonnet replacement: {provider}. Opus/Haiku/Fable keep Claude Plan OAuth.")
     print("Provider failures return an error without Plan fallback; native-only requests may still use Plan.")
     print("Native-only features stay on Plan. Replacement replies are buffered until validated.")
-    with routed_session(provider, debug=debug) as env:
+    with routed_session(provider, background=background, debug=debug) as env:
         command = [claude, "--model", "sonnet"]
         recording = prepare_blackbox_hook(env, native_args)
         session_settings = {}
@@ -1580,6 +1652,8 @@ Exit codes: 0 = success, 2 = usage/service choice required, others = failure.
         parser.add_argument("--version", action="store_true",
                             help="Print the running version and update state, then exit")
         parser.add_argument("--cli-args-b64", default=None, help=argparse.SUPPRESS)
+        parser.add_argument("--keep-instance", default=None, help=argparse.SUPPRESS,
+                           metavar="INSTANCE_DIR")
         options = parser.parse_args(arguments)
         if options.version:
             # The explicit command may wait: a person asked for the answer.
@@ -1590,6 +1664,12 @@ Exit codes: 0 = success, 2 = usage/service choice required, others = failure.
             if native_args:
                 parser.error("Use either -- suffix or encoded CLI arguments, not both")
             native_args = decode_claude_args(options.cli_args_b64)
+        if options.keep_instance is not None:
+            if options.takeover or options.local_mode or options.local_compat or options.openrouter_compat \
+                    or options.check_local or options.diagnose_local or options.print_prompt is not None \
+                    or options.print_text or options.provider != "auto" or options.cli_args_b64 is not None:
+                parser.error("--keep-instance is an internal helper and cannot be combined with other options")
+            return keep_instance_alive(Path(options.keep_instance))
         if options.takeover and (options.local_mode or options.local_compat or options.openrouter_compat
                                  or options.check_local or options.diagnose_local or options.print_prompt is not None
                                  or options.print_text):

@@ -16,7 +16,7 @@ class ProviderChoiceTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(mock.patch.object(route, "ROOT", self.root))
-        self.enterContext(mock.patch.dict(os.environ, {}, clear=True))
+        self.enterContext(mock.patch.dict(os.environ, {"SYSTEMROOT": os.environ.get("SYSTEMROOT") or os.environ.get("SystemRoot") or "C:\\Windows"}, clear=True))
 
     def write_openrouter(self, model="vendor/model-a", key="sk-or-synthetic-key"):
         (self.root / ".env.openrouter").write_text(

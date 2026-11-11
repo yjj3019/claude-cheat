@@ -22,7 +22,7 @@ class OpenRouterConfigTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(mock.patch.object(route, "ROOT", self.root))
         self.enterContext(mock.patch.object(route.Path, "home", return_value=self.root))
-        self.enterContext(mock.patch.dict(os.environ, {}, clear=True))
+        self.enterContext(mock.patch.dict(os.environ, {"SYSTEMROOT": os.environ.get("SYSTEMROOT") or os.environ.get("SystemRoot") or "C:\\Windows"}, clear=True))
 
     def write(self, model="fixture/model-a", key="sk-or-synthetic-key"):
         (self.root / ".env.openrouter").write_text(
@@ -352,7 +352,7 @@ class OpenRouterConfigTests(unittest.TestCase):
              mock.patch.object(route, "routed_session", return_value=contextlib.nullcontext(pinned)) as session, \
              mock.patch.object(route.subprocess, "call", return_value=0) as child, contextlib.redirect_stdout(output):
             self.assertEqual(route.launch("openrouter", openrouter_compat=True), 0)
-        session.assert_called_once_with("openrouter", openrouter_compat=True, debug=False)
+        session.assert_called_once_with("openrouter", openrouter_compat=True, background=False, debug=False)
         command = child.call_args.args[0]
         self.assertNotIn("--safe-mode", command)
         self.assertNotIn("--disallowedTools", command)

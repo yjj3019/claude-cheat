@@ -31,7 +31,7 @@ class RequirementR1Tests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(mock.patch.object(route, "ROOT", self.root))
         self.enterContext(mock.patch.object(route.Path, "home", return_value=self.root))
-        self.enterContext(mock.patch.dict(os.environ, {}, clear=True))
+        self.enterContext(mock.patch.dict(os.environ, {"SYSTEMROOT": os.environ.get("SYSTEMROOT") or os.environ.get("SystemRoot") or "C:\\Windows"}, clear=True))
 
     def start(self, provider="openrouter", dual=None, **flags):
         proxy = mock.Mock()

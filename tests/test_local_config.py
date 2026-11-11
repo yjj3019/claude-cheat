@@ -28,7 +28,7 @@ class LocalTestCase(unittest.TestCase):
         self.root = Path(self.temp)
         self.enterContext(mock.patch.object(route, "ROOT", self.root))
         self.enterContext(mock.patch.object(route, "check_connection", return_value=0))
-        self.enterContext(mock.patch.dict(os.environ, {}, clear=True))
+        self.enterContext(mock.patch.dict(os.environ, {"SYSTEMROOT": os.environ.get("SYSTEMROOT") or os.environ.get("SystemRoot") or "C:\\Windows"}, clear=True))
         self.enterContext(mock.patch.object(route, "read_key", side_effect=AssertionError("OpenRouter key access")))
         self.enterContext(mock.patch.object(route, "run_owned", side_effect=AssertionError("Claude invocation")))
         self.guard = self.enterContext(mock.patch.object(route.localProcessTree, "ensure_windows_local_tree"))
@@ -244,7 +244,7 @@ class LocalCliModeTests(LocalTestCase):
                   "ANTHROPIC_SMALL_FAST_MODEL": "claude-haiku-5-5", "CLAUDE_CODE_SUBAGENT_MODEL": "claude-sonnet-5-5"}
         with contextlib.redirect_stdout(output), mock.patch.object(route.shutil, "which", return_value="synthetic-cli"), mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.304")), mock.patch.object(route, "routed_session", return_value=contextlib.nullcontext(pinned)) as session, mock.patch.object(route.subprocess, "call", return_value=0) as child:
             self.assertEqual(route.launch("local", local_only=True, local_compat=True), 0)
-        session.assert_called_once_with("local", local_only=True, local_compat=True, debug=False)
+        session.assert_called_once_with("local", local_only=True, local_compat=True, background=False, debug=False)
         self.assertIn("compatibility mode", output.getvalue())
         self.assertIn("No Plan fallback", output.getvalue())
         command = child.call_args.args[0]
@@ -411,7 +411,7 @@ class LocalCliModeTests(LocalTestCase):
     def test_local_output_budget_is_applied_before_cli_context_calculation(self):
         for requested, expected in ((None, "8192"), ("", "8192"), ("2048", "8192"),
                                     ("8192", "8192"), ("16384", "16384"), ("32_768", "32768"), ("3.2e4", "32000")):
-            with self.subTest(requested=requested), mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.304 (Claude Code)")):
+            with self.subTest(requested=requested), mock.patch.dict(os.environ, {"SYSTEMROOT": os.environ.get("SYSTEMROOT") or os.environ.get("SystemRoot") or "C:\\Windows"}, clear=True), mock.patch.object(route.subprocess, "run", return_value=mock.Mock(stdout="2.1.304 (Claude Code)")):
                 if requested is not None:
                     os.environ["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = requested
                 command = route.local_cli_command("synthetic-cli")
@@ -542,7 +542,7 @@ class LocalCliModeTests(LocalTestCase):
         env = {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "2048"}
         with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(route.shutil, "which", return_value="synthetic-cli"), mock.patch.object(route, "routed_session", return_value=contextlib.nullcontext(env)) as session, mock.patch.object(route.subprocess, "call", return_value=0) as child:
             self.assertEqual(route.launch("local"), 0)
-        session.assert_called_once_with("local", debug=False)
+        session.assert_called_once_with("local", background=False, debug=False)
         command = child.call_args.args[0]
         self.assertEqual(command[:3], ["synthetic-cli", "--model", "sonnet"])
         self.assertEqual(json.loads(command[4]), {"env": {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "2048"}})

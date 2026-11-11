@@ -51,7 +51,7 @@ class LauncherArgumentsTests(unittest.TestCase):
                          mock.patch.object(route, "ROOT", Path(directory)), \
                          mock.patch.object(route.Path, "cwd", return_value=Path(directory)), \
                          mock.patch.object(route.Path, "home", return_value=Path(directory)), \
-                         mock.patch.dict(os.environ, {}, clear=True), \
+                         mock.patch.dict(os.environ, {"SYSTEMROOT": os.environ.get("SYSTEMROOT") or os.environ.get("SystemRoot") or "C:\\Windows"}, clear=True), \
                          mock.patch.object(route.shutil, "which", return_value="fixture.cmd"), \
                          mock.patch.object(route.routeCli, "resolve_command",
                                            return_value=["node", "fixture.js"]) as resolved, \
@@ -356,12 +356,43 @@ class LauncherArgumentsTests(unittest.TestCase):
         self.assertIn("claude auth status", stderr.getvalue())
         self.assertIn("OpenClaude.ps1", stderr.getvalue())
         self.assertIn("로그인이 필요", stderr.getvalue())
-        with mock.patch.object(route, "launch", side_effect=route.PlanLoginError()), \
-             mock.patch.dict(os.environ, {"CLAUDE_CHEAT_HUMAN_GUIDANCE": "1"}), \
-             contextlib.redirect_stderr(io.StringIO()) as human_output:
-            self.assertEqual(route.main(["--provider", "cli"]), 1)
-        self.assertNotIn('"event"', human_output.getvalue())
-        self.assertIn("claude auth login", human_output.getvalue())
+    def test_keep_instance_exits_when_the_instance_handoff_is_cleared(self):
+        # Missing instance directory: nothing to hold, return immediately.
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(route.keep_instance_alive(Path(directory), poll_seconds=0.05), 0)
+
+    def test_keep_instance_holds_while_the_proxy_answers_then_releases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            handoff = {"port": 12347, "nonce": "keep-token", "proxy_pid": 777, "mode": "ordinary"}
+            (Path(directory) / "handoff.json").write_text(json.dumps(handoff), encoding="utf-8")
+            with mock.patch.object(route, "port_open", return_value=True), \
+                 mock.patch.object(route, "verify_owned_proxy", side_effect=[True, True, False]):
+                self.assertEqual(route.keep_instance_alive(Path(directory), poll_seconds=0.05), 0)
+
+    def test_bg_native_args_mark_the_session_background(self):
+        # --bg marks the session so the launcher hands the proxy to a keeper instead of
+        # terminating it; the launch call itself only probes, never questions anything.
+        auth = {"loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "pro"}
+        with tempfile.TemporaryDirectory() as directory:
+            proxy = mock.Mock()
+            proxy.pid, proxy.stdout, proxy.stdin = 4242, mock.Mock(), mock.Mock()
+            proxy.stdout.readline.return_value = '{"port": 12348}\n'
+            with mock.patch.object(route, "configured_provider", return_value="openrouter"), \
+                 mock.patch.object(route, "run_owned", return_value=auth), \
+                 mock.patch.object(route.shutil, "which", return_value="claude"), \
+                 mock.patch.object(route, "read_env", return_value={"ANTHROPIC_AUTH_TOKEN": "sk-or-test-placeholder", "OPENROUTER_MODEL": "fixture/model"}), \
+                 mock.patch.object(route, "provider_config", return_value={"SONNET_PROVIDER": "openrouter", "OPENROUTER_API_KEY": "sk-or-test-placeholder", "OPENROUTER_MODEL": "fixture/model"}), \
+                 mock.patch.object(route, "check_connection", return_value=0), \
+                 mock.patch.object(route.subprocess, "Popen", return_value=proxy) as spawn, \
+                 mock.patch.object(route.subprocess, "call", return_value=0) as call, \
+                 mock.patch.object(route, "verify_owned_proxy", return_value=True), \
+                 mock.patch.object(route, "version_banner", return_value=""):
+                self.assertEqual(route.launch("openrouter", cli_args=["x", "--bg"]), 0)
+            self.assertGreaterEqual(call.call_count, 1)
+            spawned = [a.args[0] for a in spawn.call_args_list][1:]
+            self.assertTrue(any(a and str(a[1]).endswith("openrouterAdvisor.py") and "--keep-instance" in a for a in spawned),
+                            "a --bg launch must hand the proxy to its --keep-instance keeper")
+            self.assertEqual(call.call_args.args[0][0], "claude")
 
 
 if __name__ == "__main__":

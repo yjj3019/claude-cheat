@@ -33,7 +33,7 @@ class DualProviderTestCase(unittest.TestCase):
         self.temp = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(self.temp)
         self.enterContext(mock.patch.object(route, "ROOT", self.root))
-        self.enterContext(mock.patch.dict(os.environ, {}, clear=True))
+        self.enterContext(mock.patch.dict(os.environ, {"SYSTEMROOT": os.environ.get("SYSTEMROOT") or os.environ.get("SystemRoot") or "C:\\Windows"}, clear=True))
         self.enterContext(mock.patch.object(route, "check_connection", return_value=0))
         self.enterContext(mock.patch.object(route.localProcessTree, "ensure_windows_local_tree"))
         self.proxy = mock.Mock()
