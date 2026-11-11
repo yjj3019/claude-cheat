@@ -645,7 +645,20 @@ def keep_instance_alive(instance_dir, poll_seconds=2.0) -> int:
     session was stopped, or an orphan sweep cleared the instance) or the proxy
     stops answering its own token. Exiting closes the last pipe end and the proxy
     exits with it. Returns 0.
+
+    The keeper re-owns the instance handoff with its own pid on arrival: the
+    original launcher has already exited by then, and the dashboard's dead-handoff
+    sweep must see a live owner or it would delete the pointer and release this
+    detached session.
     """
+    record = read_instance_handoff(instance_dir)
+    if record is not None and isinstance(record.get("port"), int) and isinstance(record.get("proxy_pid"), int):
+        try:
+            write_handoff(port=record["port"], nonce=record.get("nonce"), proxy_pid=record["proxy_pid"],
+                          provider=record.get("provider"), cli_pid=os.getpid(), mode=record.get("mode"),
+                          dual=record.get("dual"), instance_id=record.get("instance_id"), instance_dir=instance_dir)
+        except (OSError, ValueError):
+            log_route_marker("keeper handoff re-own failed; the session keeps the launcher-bound lifetime")
     while True:
         record = read_instance_handoff(instance_dir)
         if record is None:

@@ -369,6 +369,21 @@ class LauncherArgumentsTests(unittest.TestCase):
                  mock.patch.object(route, "verify_owned_proxy", side_effect=[True, True, False]):
                 self.assertEqual(route.keep_instance_alive(Path(directory), poll_seconds=0.05), 0)
 
+    def test_keep_instance_reowns_the_handoff_so_the_dashboard_sweep_keeps_the_session(self):
+        # A --bg launcher has already exited when the keeper takes over; without the
+        # re-own write the dashboard dead-handoff sweep deletes the pointer and the
+        # detached session would be released. The keeper must own it with its own pid.
+        with tempfile.TemporaryDirectory() as directory:
+            handoff = {"port": 12349, "nonce": "reown-token", "proxy_pid": 778, "provider": "openrouter",
+                       "mode": "ordinary", "instance_id": "reown-instance"}
+            (Path(directory) / "handoff.json").write_text(json.dumps(handoff), encoding="utf-8")
+            with mock.patch.object(route, "port_open", return_value=False):
+                self.assertEqual(route.keep_instance_alive(Path(directory), poll_seconds=0.05), 0)
+            saved = json.loads((Path(directory) / "handoff.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved["launcher_pid"], os.getpid(), "keeper must re-own the handoff with its own pid")
+            self.assertEqual(saved["proxy_pid"], 778)
+            self.assertEqual(saved["nonce"], "reown-token")
+
     def test_bg_native_args_mark_the_session_background(self):
         # --bg marks the session so the launcher hands the proxy to a keeper instead of
         # terminating it; the launch call itself only probes, never questions anything.

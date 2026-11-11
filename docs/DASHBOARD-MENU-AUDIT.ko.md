@@ -39,7 +39,7 @@
 2. `TEST_TEXT`에 CLI 백엔드의 실제 응답 코드가 대부분 없었다. 특히 Grok에서 가장 흔한 `backend_version_unverified`가 원문 코드로 노출됐다 → `backend_*`·`cli_*`·취소·프로토콜·도구·용량 계열 21개 코드를 한국어 문구로 추가.
 3. CLI 종류 선택지에 `grok`이 감지되면 선택 가능하게 보였지만 `VERIFIED_VERSIONS["grok"] = set()`이라 실제 실행은 항상 거부된다(카드 안내문은 이미 "사용할 수 없습니다"라고 표시). 선택지 자체에 "grok (미검증 · 실행 불가)"를 붙여 안내문과 일치시켰다.
 
-남은 사항: CLI 설정 초기화 버튼은 없다. 백엔드 `/api/config-reset`이 `cli`를 `invalid_reset`으로 거부하므로 UI 미노출이 계약과 일치한다(문서화만 필요). 같은 이름의 `loadConfig()`가 공유 번들에 두 번 정의되어 앞의 정의(토큰 없음)가 뒤 정의에 의해 덮인다 — 동작 영향은 없지만 후속 정리 후보.
+남은 사항: CLI 설정 초기화 버튼은 없다. 백엔드 `/api/config-reset`이 `cli`를 `invalid_reset`으로 거부하므로 UI 미노출이 계약과 일치한다(문서화만 필요). 같은 이름의 `loadConfig()`가 공유 번들에 두 번 정의되어 앞의 정의(토큰 없음)가 뒤 정의에 의해 덮이는 문제는 2026-11-11 확인 시점에 이미 사라져 `loadConfig()` 정의가 단일하며(`routeDashboard.py`의 `loadConfig()` · `loadConfigHistory()` 구분), 해결됨으로 종결했다.
 
 ## 3. 사용량
 

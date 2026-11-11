@@ -33,7 +33,7 @@ CLI 백엔드 진단과 Codex 0.167.0 검증이 추가되었습니다.
 
 문서에 남아 있던 분리 실행(`--bg`) 프록시 수명 경계를 해결했습니다.
 
-- **`--bg` 프록시 keeper** — `--bg` 네이티브 인자를 받으면 실행기가 프록시의 파이프 끝을 이어받는 전용 keeper(`--keep-instance`)를 분리 실행하고, 전면 프로세스가 끝나도 세션이 계속 라우팅합니다. keeper는 인스턴스 핸드오프가 사라지거나(takeover·정지·정리) 프록시가 자기 토큰으로 응답을 멈추면 종료되고, 마지막 파이프 끝이 닫히며 프록시도 함께 마칩니다. 인스턴스 디렉터리가 없으면 기존 실행기 수명 방식을 유지합니다.
+- **`--bg` 프록시 keeper** — `--bg` 네이티브 인자를 받으면 실행기가 프록시의 파이프 끝을 이어받는 전용 keeper(`--keep-instance`)를 분리 실행하고, 전면 프로세스가 끝나도 세션이 계속 라우팅합니다. keeper는 인스턴스 핸드오프가 사라지거나(takeover·정지·정리) 프록시가 자기 토큰으로 응답을 멈추면 종료되고, 마지막 파이프 끝이 닫히며 프록시도 함께 마칩니다. 인스턴스 디렉터리가 없으면 기존 실행기 수명 방식을 유지합니다. keeper는 도착 즉시 인스턴스 핸드오프의 소유주(`launcher_pid`)를 자기 pid로 이어받아, 실행기가 이미 떠난 뒤에도 대시보드의 죽은 세션 스윕이 분리 세션을 해제하지 않도록 합니다(회귀 테스트 고정).
 - **버전 캐시 회귀 수정** — 2507200 커밋이 "checkout 변경 시 캐시 무효" 규칙을 넣으며 `test_local_info_is_cached_until_explicit_refresh`의 계약(명시적 refresh 전에는 git을 다시 실행하지 않음)을 깨뜨려 전체 Python 스위트가 1건 실패하던 회귀를 되돌렸습니다(재사용 규칙을 "TTL + 명시적 refresh만"으로 복원).
 - **Windows 환경 클리어 회귀 수정** — 테스트가 `os.environ`을 완전히 비울 때 `SYSTEMROOT`가 사라지며 CPython의 SSL 계층이 루프백 HTTP까지 `SSLError`로 실패해 `LocalMetadataTests` 16건이 환경·머신에 따라 깨지던 원인을 제거했습니다(환경 클리어 시 `SYSTEMROOT` 보존).
 - **검증** — `tests/test_launcher_arguments.py`에 keeper 단위 테스트 3건(핸드오프 소멸·응답 정지·`--bg` 표식) 추가. `tests.test_route_version` 31건 통과, `tests.test_handover_contract`·`tests.test_windows_runtime` 전체 통과.

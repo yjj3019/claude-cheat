@@ -188,7 +188,7 @@ Plan의 날짜형 Retry-After를 초로 변환하고 일반적인 기능 거부 
 
 회귀 검증: 대상 Node 테스트 318개, 전체 Node 테스트 598개 통과. Python 런처 테스트 11개 통과, 설정 테스트 118개 실행 중 1개 건너뜀, 실패 없음. 실제 설치된 Claude Code 2.1.312의 격리된 합성 백엔드에서 하위 에이전트 2개 및 4개가 직접 연결과 프록시 연결 모두 병렬 실행·완료됨을 확인했습니다. 4개 시험에서 프록시는 최대 2개씩 처리했고 Local 6건·Plan 0건으로 고유한 자식 결과 4개와 부모 완료를 확인했습니다. 재현 명령은 `node tests/native_subagents_smoke.mjs 2` 및 `node tests/native_subagents_smoke.mjs 4`입니다. 이는 실제 공유 Local 모델의 추론·도구 수행 능력이나 Agent Teams 전체 과정 검증을 대신하지 않습니다.
 
-남은 주요 경계는 사용자 지정 API URL에서의 Remote Control 제한, 실제 인증 환경의 Agent Teams·SSH/MCP·Skills·Plugins 통합 검증입니다. `--bg` 분리 실행은 2026-11-11부터 전면 프로세스 종료 후에도 프록시를 유지합니다(`--keep-instance` keeper). 전체 기능 동등성은 아직 입증되지 않았습니다.
+남은 주요 경계는 사용자 지정 API URL에서의 Remote Control 제한, 실제 인증 환경의 Agent Teams·SSH/MCP·Skills·Plugins 통합 검증입니다. `--bg` 분리 실행은 2026-11-11부터 전면 프로세스 종료 후에도 프록시를 유지합니다(`--keep-instance` keeper, 핸드오프 소유권도 keeper가 이어받아 대시보드 스윕이 분리 세션을 해제하지 않음). 전체 기능 동등성은 아직 입증되지 않았습니다.
 
 
 ## 핵심 라우팅 성능·기능 공동 개선 연구 (2026-10-29)
