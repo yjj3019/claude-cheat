@@ -40,6 +40,28 @@ CLI 백엔드 진단과 Codex 0.167.0 검증이 추가되었습니다.
 
 남는 경계 — 사용자 지정 API URL에서 비활성화되는 Remote Control 제한과 실제 인증 환경의 Agent Teams·SSH/MCP·Plugins 통합 검증은 그대로입니다(Claude Code 자체 제약·실사용 환경 필요).
 
+### 1.0.7 추가 (2026-11-12) — Local LLM 저장 전 모델 목록 검색
+
+설정 페이지의 Local LLM 모델 `목록` 버튼이 **저장된 설정 없이도** 동작하도록 했습니다.
+
+- **저장 전 검색** — 입력한 API Endpoint(`/v1/messages`)와 API 키를 **둘 다** 입력하면(키가 필요 없는 서버면 아무 값) 저장 전 값으로 서버의 `/v1/models` 목록을 불러와 선택할 수 있습니다. 기존 `/api/models`(저장 설정 기준)는 그대로이며, 검색 전용 `POST /api/models-search`가 추가됐습니다.
+- **입력 순서 재배치** — Local LLM 필드 순서를 `Messages URL → 서버 키 → 모델 ID(목록)`으로 바꿔 "엔드포인트 → 키 → 모델 검색" 흐름에 맞게 조정했습니다.
+- **URL 자동 완성** — Messages URL에 `http://127.0.0.1:11434`(호스트:포트)나 `…/v1`까지만 입력하면 저장·검색 경계에서 `…/v1/messages`로 자동 보정됩니다(`normalize_local_url`). 다른 경로(`/v1/chat/completions` 등)·잘못된 입력은 그대로 두어 기존 엄격한 검증이 판단하며, 저장 형식은 런처·프록시가 이미 기대하는 `…/v1/messages`로 유지됩니다.
+- **LAN http 예외** — 검색 프로브에 입력한 **내부 HTTP 예외** 주소까지 전달해, 루프백이 아닌 LAN http 서버(예: `http://172.21.135.113:4000/v1/messages`)도 저장 전 목록 검색이 가능합니다(저장과 동일한 "예외 주소 = URL" 규칙). 예외가 비어 있으면 검색 프로브가 같은 주소를 자동으로 적용하고(검색 전용 편의, 저장 시에는 UI가 필드를 자동 채워 명시 기록),Messages URL이 규칙 위반이면 피커에 구체적 사유를 안내합니다.
+- **크레덴셜 경계 유지** — `/api/test`의 "주소·키는 저장 값만" 원칙을 깨지 않도록, 검색 프로브는 전송된 주소와 키만 사용하고 저장된 키로 절대 대체하지 않습니다(주소+저장 키 조합은 키 유출 경로이기 때문). 검색 요청은 토큰 인증 + 분당 6회 제한, 모델 ID 자리표시자로 저장과 동일한 URL·키 규칙을 그대로 검증합니다. `/v1/models`는 전송된 주소의 같은 출처에서만 유도됩니다.
+- **검증** — `ModelsSearchEndpointTests`(토큰 필수·필드 누락/비허용 URL·전송 값만 사용·출처 규칙·LAN http 예외·base 엔드포인트 자동 완성) + `NormalizeLocalUrlTests` 2건 + 저장 시 정규화 1건 추가.
+
+### 1.0.7 추가 (2026-11-12) — Agent Teams·추론(thinking) 활성화: 10회 시뮬레이션과 로컬 동시성·검증 가시성
+
+Agent Teams와 thinking의 실질 제약을 10라운드 시뮬레이션으로 도출하고, 연구 리포트([AGENT-TEAMS-THINKING-RESEARCH.ko.md](AGENT-TEAMS-THINKING-RESEARCH.ko.md))의 권장 우선순위 1~4를 구현했습니다.
+
+- **10회 시뮬레이션** — `tests/simulate_agent_teams_thinking.mjs`가 Agent Teams(버스트 4–12턴 × 10라운드, 팀 툴 세트·`cache_control`)와 thinking(6시나리오 × 10라운드)을 합성 업스트림으로 돌립니다. 결과: 기본 한계(동시 2+대기 8)에서 burst>10일 때만 `local_busy`(4/80턴), thinking은 일반 로컬이 요청 강제 비활성·서버 thinking 블록 반환 시 503, compat 왕복(서명 없는 블록 반환·히스토리 제거로 pinning 불성립)·Plan 의존(403)까지 확인. 예상 밖 실패 0건.
+- **로컬 동시성 env(A2)** — `ROUTE_LOCAL_CONCURRENCY`(1–64)·`ROUTE_LOCAL_QUEUE_LIMIT`(0–256)·`ROUTE_LOCAL_QUEUE_WAIT_MS`(0–600000, 기존 60s 상한 완화)·`ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS`(30s–15min, compat/local-only 세션)를 프록시가 읽고 런처가 올바른 값만 전달(잘못된 값은 무시+경고). 팀 규모나 느린 GPU에 맞게 버스트 `local_busy`를 완화합니다.
+- **thinking 검증과 가시성(T2)** — 품질 검증(`modelQualityProbe`)에 `--thinking` 옵트인 3번째 합성 호출을 추가해 서버가 thinking 블록을 `present`/`absent`/`invalid`/`error`로 판정합니다. 대시보드 **도구 왕복 검사** 결과와 evidence에 `thinking`이 쌓이고, 진단 `capabilities.thinking`이 미검증 `unknown`에서 판정값으로 채워집니다. Local 설정 카드에는 Agent Teams·thinking → `-LocalCompat` 권장 힌트가 표시됩니다.
+- **Agent Teams 행(A3)** — 진단 `capabilities.agent_teams`이 지원 제공자에서 `supported`로 보고됩니다(팀 툴은 표준 API shape 통과 — 시뮬레이션으로 검증). live 팀 검증 절차(인터랙티브 세션, 메일박스·태스크 파일 확인)는 연구 리포트 §4에 정리했습니다.
+- **모드 선택 가이드(A1+T1)** — README "모드 선택 가이드: Agent Teams와 추론(thinking)"이 목적별 권장 세션(팀·thinking → `-LocalCompat`, 구독 thinking 턴 → 일반 세션의 Plan 폴백)과 로컬 동시성 조정 표를 정리합니다.
+- **검증** — `localAdmission.test.mjs` +3(env 오버라이드·병렬 승인·타임아웃 클램프), `test_model_quality_probe.py` +6, `test_route_dashboard.py` +4. Node·Python 전체 스위트 통과. live P1 probe(`python modelQualityProbe.py --provider local --run --thinking`)는 저장된 실제 로컬 키가 필요합니다.
+
 ### 이전 버전
 
 1.0.5·1.0.6의 항목은 Git 커밋(`52a5da1`, `14037f4`)과 [PROXY-REFERENCE](PROXY-REFERENCE.md)의 환경 변수 표에서 확인하세요. 과거 문서를 현재 기능의 보증으로 읽지 마세요.

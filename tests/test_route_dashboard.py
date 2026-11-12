@@ -12,6 +12,8 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -750,7 +752,8 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(report["capabilities"], {"scope": "configured_model", "source": "not_checked",
                          "tools": "unknown", "vision": "unknown", "thinking": "unknown",
                          "streaming": "unknown", "context_limit": "unknown",
-                         "tool_roundtrip_evidence": {"status": "not_checked", "scope": "backend_only"}})
+                         "agent_teams": "supported",
+                         "tool_roundtrip_evidence": {"status": "not_checked", "scope": "backend_only", "thinking": None}})
         self.assertEqual(report["configuration"]["next_provider"], "local")
         self.assertEqual(report["configuration"]["configured_model"], "fixture-local")
         self.assertFalse(report["session"]["active"])
@@ -763,6 +766,24 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertNotIn("private-api-key-fixture", public)
         self.assertNotIn("127.0.0.1:11434", public)
         self.assertNotIn(str(self.root), public)
+
+    def test_capabilities_report_probed_thinking_and_agent_teams(self):
+        identity = dash._tool_config_identity("local", {
+            "LOCAL_LLM_URL": "http://127.0.0.1:11434/v1/messages",
+            "LOCAL_LLM_MODEL": "fixture-local", "LOCAL_LLM_API_KEY": "private-api-key-fixture"})
+        entry = {"status": "passed", "model_match": True, "thinking": "present", "identity": identity,
+                 "monotonic": time.monotonic(), "timestamp": datetime.now(timezone.utc).isoformat()}
+        with mock.patch.dict(dash._TOOL_EVIDENCE, {"local": entry}):
+            report = dash.diagnostics_report()
+        self.assertEqual(report["capabilities"]["thinking"], "present")
+        self.assertEqual(report["capabilities"]["agent_teams"], "supported")
+        self.assertEqual(report["capabilities"]["tool_roundtrip_evidence"]["thinking"], "present")
+        entry["thinking"] = "absent"
+        with mock.patch.dict(dash._TOOL_EVIDENCE, {"local": entry}):
+            self.assertEqual(dash.diagnostics_report()["capabilities"]["thinking"], "absent")
+        entry["thinking"] = "error"
+        with mock.patch.dict(dash._TOOL_EVIDENCE, {"local": entry}):
+            self.assertEqual(dash.diagnostics_report()["capabilities"]["thinking"], "unknown")
 
     def test_authenticated_loaded_model_and_unchecked_upstream_are_separate(self):
         self.live_proxy()
@@ -1753,6 +1774,15 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), committed["file"])
         self.assertEqual(backup.read_bytes(), committed["backup"])
 
+    def test_save_normalizes_a_base_local_url_to_the_messages_path(self):
+        # The settings page accepts a bare host:port or …/v1; the storage boundary stores the
+        # canonical …/v1/messages that launcher and proxy consume.
+        self.put("local", LOCAL_LLM_URL="http://127.0.0.1:11434", LOCAL_LLM_MODEL="llama")
+        dash.save_config("local", {"LOCAL_LLM_URL": "http://127.0.0.1:11434/v1", "LOCAL_LLM_MODEL": "llama"})
+        stored = dash._store("local").read_provider("local")
+        self.assertEqual(stored["LOCAL_LLM_URL"], "http://127.0.0.1:11434/v1/messages")
+        dash._validate_local(stored)
+
     def test_snapshot_masks_secrets_and_reports_which_are_set(self):
         self.put_openrouter("vendor/model")
         snapshot = dash.config_snapshot()
@@ -2579,6 +2609,169 @@ class ModelCatalogTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+
+class NormalizeLocalUrlTests(unittest.TestCase):
+    def test_base_and_v1_forms_become_the_messages_path(self):
+        self.assertEqual(dash.normalize_local_url("http://127.0.0.1:11434"), "http://127.0.0.1:11434/v1/messages")
+        self.assertEqual(dash.normalize_local_url("http://127.0.0.1:11434/"), "http://127.0.0.1:11434/v1/messages")
+        self.assertEqual(dash.normalize_local_url("http://127.0.0.1:11434/v1"), "http://127.0.0.1:11434/v1/messages")
+        self.assertEqual(dash.normalize_local_url("http://127.0.0.1:11434/v1/"), "http://127.0.0.1:11434/v1/messages")
+        self.assertEqual(dash.normalize_local_url("https://gpu.example.com:8443/v1"), "https://gpu.example.com:8443/v1/messages")
+        self.assertEqual(dash.normalize_local_url("http://127.0.0.1:11434/v1/messages"), "http://127.0.0.1:11434/v1/messages")
+
+    def test_other_paths_and_invalid_input_are_left_for_validation(self):
+        self.assertEqual(dash.normalize_local_url("http://127.0.0.1:11434/v1/chat/completions"),
+                         "http://127.0.0.1:11434/v1/chat/completions")
+        self.assertEqual(dash.normalize_local_url("not a url"), "not a url")
+        self.assertEqual(dash.normalize_local_url(""), "")
+        self.assertEqual(dash.normalize_local_url(None), "")
+
+
+class ModelsSearchEndpointTests(unittest.TestCase):
+    """POST /api/models-search searches an unsaved Local LLM server's model list.
+
+    The settings page lets the operator type an API Endpoint and API key and search *before*
+    saving. This is the one posted-address exception, and it must never mix in stored
+    credentials: the probe carries its own key and the lookup only ever derives /v1/models
+    from that posted address (the save-time origin rule stays).
+    """
+
+    def _post(self, port, payload, token=True):
+        import threading
+        body = json.dumps(payload).encode("utf-8")
+        headers = {"content-type": "application/json"}
+        if token:
+            headers["x-dashboard-token"] = dash.TOKEN
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/models-search", data=body, method="POST",
+            headers=headers)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        return request, opener
+
+    def test_models_search_requires_the_write_token(self):
+        import threading
+        server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            request, opener = self._post(port, {"provider": "local", "url": "http://127.0.0.1:11434/v1/messages", "key": "posted-key"}, token=False)
+            with self.assertRaises(urllib.error.HTTPError) as denied:
+                opener.open(request, timeout=10)
+            self.assertEqual(denied.exception.code, 403)
+            denied.exception.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_models_search_rejects_missing_fields_and_foreign_providers(self):
+        import threading
+        server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            cases = (
+                ({"provider": "local", "key": "posted-key"}, "invalid_local_url"),
+                ({"provider": "local", "url": "http://127.0.0.1:11434/v1/messages"}, "invalid_local_key"),
+                ({"provider": "local", "url": "http://127.0.0.1:11434/other", "key": "posted-key"}, "invalid_local_url"),
+                ({"provider": "openrouter", "url": "http://127.0.0.1:11434/v1/messages", "key": "posted-key"}, "unknown_provider"),
+            )
+            for payload, error in cases:
+                with mock.patch.object(dash, "_rate_ok", return_value=True):
+                    request, opener = self._post(port, payload)
+                    with self.assertRaises(urllib.error.HTTPError) as denied:
+                        opener.open(request, timeout=10)
+                    self.assertEqual(denied.exception.code, 400)
+                    self.assertEqual(json.loads(denied.exception.read())["error"], error)
+                    denied.exception.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_models_search_posts_only_its_own_endpoint_and_key(self):
+        import threading
+        server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with mock.patch.object(dash, "_rate_ok", return_value=True), \
+                 mock.patch.object(dash, "model_catalog", return_value={"provider": "local", "ok": True,
+                     "models": [{"id": "local-model", "name": "local-model"}]}) as catalog:
+                request, opener = self._post(port, {"provider": "local",
+                                                   "url": "http://127.0.0.1:11435/v1/messages",
+                                                   "key": "posted-key", "allow_remote": True,
+                                                   "http_url": "http://127.0.0.1:11435/v1/messages"})
+                with opener.open(request, timeout=10) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertTrue(json.loads(response.read())["ok"])
+            values = catalog.call_args.kwargs["values"]
+            self.assertEqual(values["LOCAL_LLM_URL"], "http://127.0.0.1:11435/v1/messages")
+            self.assertEqual(values["LOCAL_LLM_API_KEY"], "posted-key")
+            self.assertEqual(values["LOCAL_LLM_ALLOW_REMOTE"], "true")
+            self.assertEqual(values["LOCAL_LLM_MODEL"], "model-search-probe")
+            self.assertEqual(values["LOCAL_LLM_HTTP_URL"], "http://127.0.0.1:11435/v1/messages")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_models_search_normalizes_a_base_endpoint_before_probing(self):
+        import threading
+        server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with mock.patch.object(dash, "_rate_ok", return_value=True), \
+                 mock.patch.object(dash, "model_catalog", return_value={"provider": "local", "ok": True,
+                      "models": [{"id": "local-model", "name": "local-model"}]}) as catalog:
+                request, opener = self._post(port, {"provider": "local",
+                                                    "url": "http://127.0.0.1:11435/v1",
+                                                    "key": "posted-key"})
+                with opener.open(request, timeout=10) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertTrue(json.loads(response.read())["ok"])
+            values = catalog.call_args.kwargs["values"]
+            self.assertEqual(values["LOCAL_LLM_URL"], "http://127.0.0.1:11435/v1/messages")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_local_search_values_never_falls_back_to_stored_values(self):
+        values = dash._local_search_values("http://127.0.0.1:11434/v1/messages", "posted-key", False)
+        self.assertEqual(values["LOCAL_LLM_URL"], "http://127.0.0.1:11434/v1/messages")
+        self.assertEqual(values["LOCAL_LLM_API_KEY"], "posted-key")
+        self.assertEqual(values["LOCAL_LLM_ALLOW_REMOTE"], "false")
+        dash._validate_local(values)  # same rules as a real save, minus a real model id
+        with self.assertRaises(ValueError):
+            dash._local_search_values("", "posted-key", False)
+        with self.assertRaises(ValueError):
+            dash._local_search_values("http://127.0.0.1:11434/v1/messages", "", False)
+
+    def test_local_search_covers_a_lan_http_endpoint_via_the_internal_exception(self):
+        # The settings flow is endpoint -> key -> search: a LAN http endpoint (e.g. a home
+        # Ollama/LM Studio box) must be searchable with endpoint+key alone. The probe applies
+        # the internal-HTTP exception itself, since the operator typed both the URL and the
+        # key; saving still records the exception explicitly (the settings UI pre-fills it).
+        lan_url = "http://172.21.135.113:4000/v1/messages"
+        auto = dash._local_search_values(lan_url, "posted-key", False)
+        self.assertEqual(auto["LOCAL_LLM_HTTP_URL"], lan_url)
+        dash._validate_local(auto)
+        # An explicit matching exception is honoured as-is.
+        with_exception = dash._local_search_values(lan_url, "posted-key", False, lan_url)
+        self.assertEqual(with_exception["LOCAL_LLM_HTTP_URL"], lan_url)
+        dash._validate_local(with_exception)
+        # A different exception URL is no exception at all (save-time rule: it must equal the URL).
+        with self.assertRaises(ValueError):
+            dash._validate_local(dash._local_search_values(lan_url, "posted-key", False,
+                                                          "http://172.21.135.113:4000/other"))
+        # Loopback endpoints need no exception, and https endpoints are left untouched.
+        dash._validate_local(dash._local_search_values("http://127.0.0.1:11434/v1/messages", "posted-key", False))
+        self.assertEqual(dash._local_search_values("https://gpu.example.com/v1/messages", "posted-key", True)["LOCAL_LLM_HTTP_URL"], "")
+        # Base forms are completed to the messages path before the exception logic applies.
+        base = dash._local_search_values("http://172.21.135.113:4000", "posted-key", False)
+        self.assertEqual(base["LOCAL_LLM_URL"], "http://172.21.135.113:4000/v1/messages")
+        self.assertEqual(base["LOCAL_LLM_HTTP_URL"], "http://172.21.135.113:4000/v1/messages")
+        dash._validate_local(base)
+        dash._validate_local(dash._local_search_values("http://172.21.135.113:4000/v1/", "posted-key", False))
 
 
 class UsageStatsTests(unittest.TestCase):
@@ -3853,6 +4046,46 @@ class ToolRoundtripApiTests(unittest.TestCase):
         self.assertNotIn("private-secret", json.dumps(result))
         self.assertTrue(dash._TOOL_PROBE_LOCK.acquire(blocking=False))
         dash._TOOL_PROBE_LOCK.release()
+
+    def test_passed_probe_reports_thinking_capability_in_result_and_evidence(self):
+        import modelQualityProbe
+        values = {"LOCAL_LLM_MODEL": "model-a"}
+        with mock.patch.object(dash, "read_settings", return_value=values), \
+                mock.patch.object(modelQualityProbe, "configured_call", return_value=(object(), "model-a")), \
+                mock.patch.object(modelQualityProbe, "evaluate", return_value={"ok": True, "reason": "passed"}), \
+                mock.patch.object(modelQualityProbe, "evaluate_thinking",
+                                  return_value={"thinking_status": "present", "thinking_blocks": 1,
+                                                "signed": True, "elapsed_ms": 1200}) as thinking:
+            result = dash.run_tool_roundtrip("local")
+        thinking.assert_called_once()
+        self.assertEqual(result["thinking"], "present")
+        self.assertEqual(result["thinking_elapsed_ms"], 1200)
+        self.assertEqual(dash._tool_probe_evidence("local", values)["thinking"], "present")
+
+    def test_failed_probe_skips_the_thinking_probe(self):
+        import modelQualityProbe
+        values = {"LOCAL_LLM_MODEL": "model-a"}
+        with mock.patch.object(dash, "read_settings", return_value=values), \
+                mock.patch.object(modelQualityProbe, "configured_call", return_value=(object(), "model-a")), \
+                mock.patch.object(modelQualityProbe, "evaluate",
+                                  return_value={"ok": False, "reason": "continuation_failed"}), \
+                mock.patch.object(modelQualityProbe, "evaluate_thinking") as thinking:
+            result = dash.run_tool_roundtrip("local")
+        thinking.assert_not_called()
+        self.assertNotIn("thinking", result)
+
+    def test_thinking_probe_error_never_fails_the_roundtrip(self):
+        import modelQualityProbe
+        values = {"LOCAL_LLM_MODEL": "model-a"}
+        with mock.patch.object(dash, "read_settings", return_value=values), \
+                mock.patch.object(modelQualityProbe, "configured_call", return_value=(object(), "model-a")), \
+                mock.patch.object(modelQualityProbe, "evaluate", return_value={"ok": True, "reason": "passed"}), \
+                mock.patch.object(modelQualityProbe, "evaluate_thinking", side_effect=RuntimeError("private-detail")):
+            result = dash.run_tool_roundtrip("local")
+        self.assertTrue(result["ok"])
+        self.assertNotIn("thinking", result)
+        self.assertNotIn("private-detail", json.dumps(result))
+        self.assertEqual(dash._TOOL_EVIDENCE["local"]["status"], "passed")
 
     def test_endpoint_requires_auth_and_only_accepts_saved_settings(self):
         import threading

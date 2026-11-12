@@ -1,0 +1,466 @@
+{
+  "rounds": 10,
+  "agent_teams": [
+    {
+      "mode": "ordinary-local",
+      "teammates": 2,
+      "turns": 2,
+      "burst": 4,
+      "delayMs": 90,
+      "totalRequests": 4,
+      "ok": 4,
+      "localBusy": 0,
+      "maxUpstreamActive": 2,
+      "maxQueueWaitMs": 132,
+      "unexpected": [],
+      "issue": "ordinary-local: 4 concurrent turns absorbed, max queue wait 132ms (no rejection yet)",
+      "ms": 250
+    },
+    {
+      "mode": "local-compat",
+      "teammates": 3,
+      "turns": 2,
+      "burst": 6,
+      "delayMs": 127,
+      "totalRequests": 6,
+      "ok": 6,
+      "localBusy": 0,
+      "maxUpstreamActive": 2,
+      "maxQueueWaitMs": 291,
+      "unexpected": [],
+      "issue": "local-compat: 6 concurrent turns absorbed, max queue wait 291ms (no rejection yet)",
+      "ms": 419
+    },
+    {
+      "mode": "ordinary-local",
+      "teammates": 4,
+      "turns": 2,
+      "burst": 8,
+      "delayMs": 164,
+      "totalRequests": 8,
+      "ok": 8,
+      "localBusy": 0,
+      "maxUpstreamActive": 2,
+      "maxQueueWaitMs": 519,
+      "unexpected": [],
+      "issue": "ordinary-local: 8 concurrent turns absorbed, max queue wait 519ms (no rejection yet)",
+      "ms": 684
+    },
+    {
+      "mode": "local-compat",
+      "teammates": 5,
+      "turns": 2,
+      "burst": 10,
+      "delayMs": 201,
+      "totalRequests": 10,
+      "ok": 10,
+      "localBusy": 0,
+      "maxUpstreamActive": 2,
+      "maxQueueWaitMs": 868,
+      "unexpected": [],
+      "issue": "local-compat: 10 concurrent turns absorbed, max queue wait 868ms (no rejection yet)",
+      "ms": 1071
+    },
+    {
+      "mode": "ordinary-local",
+      "teammates": 6,
+      "turns": 2,
+      "burst": 12,
+      "delayMs": 108,
+      "totalRequests": 12,
+      "ok": 10,
+      "localBusy": 2,
+      "maxUpstreamActive": 2,
+      "maxQueueWaitMs": 500,
+      "unexpected": [],
+      "issue": "ordinary-local: 2/12 teammate turns REJECTED local_busy (admission cap 2 + queue 8); max queue wait 500ms",
+      "ms": 611
+    },
+    {
+      "mode": "local-compat",
+      "teammates": 2,
+      "turns": 2,
+      "burst": 4,
+      "delayMs": 145,
+      "totalRequests": 4,
+      "ok": 4,
+      "localBusy": 0,
+      "maxUpstreamActive": 2,
+      "maxQueueWaitMs": 169,
+      "unexpected": [],
+      "issue": "local-compat: 4 concurrent turns absorbed, max queue wait 169ms (no rejection yet)",
+      "ms": 316
+    },
+    {
+      "mode": "ordinary-local",
+      "teammates": 3,
+      "turns": 2,
+      "burst": 6,
+      "delayMs": 182,
+      "totalRequests": 6,
+      "ok": 6,
+      "localBusy": 0,
+      "maxUpstreamActive": 2,
+      "maxQueueWaitMs": 381,
+      "unexpected": [],
+      "issue": "ordinary-local: 6 concurrent turns absorbed, max queue wait 381ms (no rejection yet)",
+      "ms": 564
+    },
+    {
+      "mode": "local-compat",
+      "teammates": 4,
+      "turns": 2,
+      "burst": 8,
+      "delayMs": 219,
+      "totalRequests": 8,
+      "ok": 8,
+      "localBusy": 0,
+      "maxUpstreamActive": 2,
+      "maxQueueWaitMs": 698,
+      "unexpected": [],
+      "issue": "local-compat: 8 concurrent turns absorbed, max queue wait 698ms (no rejection yet)",
+      "ms": 918
+    },
+    {
+      "mode": "ordinary-local",
+      "teammates": 5,
+      "turns": 2,
+      "burst": 10,
+      "delayMs": 126,
+      "totalRequests": 10,
+      "ok": 10,
+      "localBusy": 0,
+      "maxUpstreamActive": 2,
+      "maxQueueWaitMs": 569,
+      "unexpected": [],
+      "issue": "ordinary-local: 10 concurrent turns absorbed, max queue wait 569ms (no rejection yet)",
+      "ms": 696
+    },
+    {
+      "mode": "local-compat",
+      "teammates": 6,
+      "turns": 2,
+      "burst": 12,
+      "delayMs": 163,
+      "totalRequests": 12,
+      "ok": 10,
+      "localBusy": 2,
+      "maxUpstreamActive": 2,
+      "maxQueueWaitMs": 687,
+      "unexpected": [],
+      "issue": "local-compat: 2/12 teammate turns REJECTED local_busy (admission cap 2 + queue 8); max queue wait 687ms",
+      "ms": 852
+    }
+  ],
+  "thinking": {
+    "rounds": [
+      {
+        "findings": [
+          {
+            "severity": "known-limitation",
+            "text": "S1 ordinary-local: client requested thinking=enabled, upstream received thinking={\"type\":\"disabled\"} (model never reasons in ordinary mode; silent capability loss)"
+          },
+          {
+            "severity": "known-limitation",
+            "text": "S2 ordinary-local: local server returning thinking blocks -> HTTP 503 code=[local_upstream_error] Local server request failed. Check the local routing log. Send a new request to check Local recovery. Plan fallback disabled. (turn fails; requires --local-compat)"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S3 local-compat: thinking forwarded={\"type\":\"adaptive\"}, unsigned thinking block returned to client OK"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S4 local-compat: echoed thinking block stripped before upstream (no pinning loop)"
+          },
+          {
+            "severity": "known-limitation",
+            "text": "S5 ordinary-openrouter: thinking.display -> Plan fallback -> HTTP 403 without saved subscription OAuth (upstream calls=0)"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S6 ordinary-local: signed thinking history stripped before local upstream (session stays routable after a Plan turn)"
+          }
+        ],
+        "problems": []
+      },
+      {
+        "findings": [
+          {
+            "severity": "known-limitation",
+            "text": "S1 ordinary-local: client requested thinking=enabled, upstream received thinking={\"type\":\"disabled\"} (model never reasons in ordinary mode; silent capability loss)"
+          },
+          {
+            "severity": "known-limitation",
+            "text": "S2 ordinary-local: local server returning thinking blocks -> HTTP 503 code=[local_upstream_error] Local server request failed. Check the local routing log. Send a new request to check Local recovery. Plan fallback disabled. (turn fails; requires --local-compat)"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S3 local-compat: thinking forwarded={\"type\":\"adaptive\"}, unsigned thinking block returned to client OK"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S4 local-compat: echoed thinking block stripped before upstream (no pinning loop)"
+          },
+          {
+            "severity": "known-limitation",
+            "text": "S5 ordinary-openrouter: thinking.display -> Plan fallback -> HTTP 403 without saved subscription OAuth (upstream calls=0)"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S6 ordinary-local: signed thinking history stripped before local upstream (session stays routable after a Plan turn)"
+          }
+        ],
+        "problems": []
+      },
+      {
+        "findings": [
+          {
+            "severity": "known-limitation",
+            "text": "S1 ordinary-local: client requested thinking=enabled, upstream received thinking={\"type\":\"disabled\"} (model never reasons in ordinary mode; silent capability loss)"
+          },
+          {
+            "severity": "known-limitation",
+            "text": "S2 ordinary-local: local server returning thinking blocks -> HTTP 503 code=[local_upstream_error] Local server request failed. Check the local routing log. Send a new request to check Local recovery. Plan fallback disabled. (turn fails; requires --local-compat)"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S3 local-compat: thinking forwarded={\"type\":\"adaptive\"}, unsigned thinking block returned to client OK"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S4 local-compat: echoed thinking block stripped before upstream (no pinning loop)"
+          },
+          {
+            "severity": "known-limitation",
+            "text": "S5 ordinary-openrouter: thinking.display -> Plan fallback -> HTTP 403 without saved subscription OAuth (upstream calls=0)"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S6 ordinary-local: signed thinking history stripped before local upstream (session stays routable after a Plan turn)"
+          }
+        ],
+        "problems": []
+      },
+      {
+        "findings": [
+          {
+            "severity": "known-limitation",
+            "text": "S1 ordinary-local: client requested thinking=enabled, upstream received thinking={\"type\":\"disabled\"} (model never reasons in ordinary mode; silent capability loss)"
+          },
+          {
+            "severity": "known-limitation",
+            "text": "S2 ordinary-local: local server returning thinking blocks -> HTTP 503 code=[local_upstream_error] Local server request failed. Check the local routing log. Send a new request to check Local recovery. Plan fallback disabled. (turn fails; requires --local-compat)"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S3 local-compat: thinking forwarded={\"type\":\"adaptive\"}, unsigned thinking block returned to client OK"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S4 local-compat: echoed thinking block stripped before upstream (no pinning loop)"
+          },
+          {
+            "severity": "known-limitation",
+            "text": "S5 ordinary-openrouter: thinking.display -> Plan fallback -> HTTP 403 without saved subscription OAuth (upstream calls=0)"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S6 ordinary-local: signed thinking history stripped before local upstream (session stays routable after a Plan turn)"
+          }
+        ],
+        "problems": []
+      },
+      {
+        "findings": [
+          {
+            "severity": "known-limitation",
+            "text": "S1 ordinary-local: client requested thinking=enabled, upstream received thinking={\"type\":\"disabled\"} (model never reasons in ordinary mode; silent capability loss)"
+          },
+          {
+            "severity": "known-limitation",
+            "text": "S2 ordinary-local: local server returning thinking blocks -> HTTP 503 code=[local_upstream_error] Local server request failed. Check the local routing log. Send a new request to check Local recovery. Plan fallback disabled. (turn fails; requires --local-compat)"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S3 local-compat: thinking forwarded={\"type\":\"adaptive\"}, unsigned thinking block returned to client OK"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S4 local-compat: echoed thinking block stripped before upstream (no pinning loop)"
+          },
+          {
+            "severity": "known-limitation",
+            "text": "S5 ordinary-openrouter: thinking.display -> Plan fallback -> HTTP 403 without saved subscription OAuth (upstream calls=0)"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S6 ordinary-local: signed thinking history stripped before local upstream (session stays routable after a Plan turn)"
+          }
+        ],
+        "problems": []
+      },
+      {
+        "findings": [
+          {
+            "severity": "known-limitation",
+            "text": "S1 ordinary-local: client requested thinking=enabled, upstream received thinking={\"type\":\"disabled\"} (model never reasons in ordinary mode; silent capability loss)"
+          },
+          {
+            "severity": "known-limitation",
+            "text": "S2 ordinary-local: local server returning thinking blocks -> HTTP 503 code=[local_upstream_error] Local server request failed. Check the local routing log. Send a new request to check Local recovery. Plan fallback disabled. (turn fails; requires --local-compat)"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S3 local-compat: thinking forwarded={\"type\":\"adaptive\"}, unsigned thinking block returned to client OK"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S4 local-compat: echoed thinking block stripped before upstream (no pinning loop)"
+          },
+          {
+            "severity": "known-limitation",
+            "text": "S5 ordinary-openrouter: thinking.display -> Plan fallback -> HTTP 403 without saved subscription OAuth (upstream calls=0)"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S6 ordinary-local: signed thinking history stripped before local upstream (session stays routable after a Plan turn)"
+          }
+        ],
+        "problems": []
+      },
+      {
+        "findings": [
+          {
+            "severity": "known-limitation",
+            "text": "S1 ordinary-local: client requested thinking=enabled, upstream received thinking={\"type\":\"disabled\"} (model never reasons in ordinary mode; silent capability loss)"
+          },
+          {
+            "severity": "known-limitation",
+            "text": "S2 ordinary-local: local server returning thinking blocks -> HTTP 503 code=[local_upstream_error] Local server request failed. Check the local routing log. Send a new request to check Local recovery. Plan fallback disabled. (turn fails; requires --local-compat)"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S3 local-compat: thinking forwarded={\"type\":\"adaptive\"}, unsigned thinking block returned to client OK"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S4 local-compat: echoed thinking block stripped before upstream (no pinning loop)"
+          },
+          {
+            "severity": "known-limitation",
+            "text": "S5 ordinary-openrouter: thinking.display -> Plan fallback -> HTTP 403 without saved subscription OAuth (upstream calls=0)"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S6 ordinary-local: signed thinking history stripped before local upstream (session stays routable after a Plan turn)"
+          }
+        ],
+        "problems": []
+      },
+      {
+        "findings": [
+          {
+            "severity": "known-limitation",
+            "text": "S1 ordinary-local: client requested thinking=enabled, upstream received thinking={\"type\":\"disabled\"} (model never reasons in ordinary mode; silent capability loss)"
+          },
+          {
+            "severity": "known-limitation",
+            "text": "S2 ordinary-local: local server returning thinking blocks -> HTTP 503 code=[local_upstream_error] Local server request failed. Check the local routing log. Send a new request to check Local recovery. Plan fallback disabled. (turn fails; requires --local-compat)"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S3 local-compat: thinking forwarded={\"type\":\"adaptive\"}, unsigned thinking block returned to client OK"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S4 local-compat: echoed thinking block stripped before upstream (no pinning loop)"
+          },
+          {
+            "severity": "known-limitation",
+            "text": "S5 ordinary-openrouter: thinking.display -> Plan fallback -> HTTP 403 without saved subscription OAuth (upstream calls=0)"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S6 ordinary-local: signed thinking history stripped before local upstream (session stays routable after a Plan turn)"
+          }
+        ],
+        "problems": []
+      },
+      {
+        "findings": [
+          {
+            "severity": "known-limitation",
+            "text": "S1 ordinary-local: client requested thinking=enabled, upstream received thinking={\"type\":\"disabled\"} (model never reasons in ordinary mode; silent capability loss)"
+          },
+          {
+            "severity": "known-limitation",
+            "text": "S2 ordinary-local: local server returning thinking blocks -> HTTP 503 code=[local_upstream_error] Local server request failed. Check the local routing log. Send a new request to check Local recovery. Plan fallback disabled. (turn fails; requires --local-compat)"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S3 local-compat: thinking forwarded={\"type\":\"adaptive\"}, unsigned thinking block returned to client OK"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S4 local-compat: echoed thinking block stripped before upstream (no pinning loop)"
+          },
+          {
+            "severity": "known-limitation",
+            "text": "S5 ordinary-openrouter: thinking.display -> Plan fallback -> HTTP 403 without saved subscription OAuth (upstream calls=0)"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S6 ordinary-local: signed thinking history stripped before local upstream (session stays routable after a Plan turn)"
+          }
+        ],
+        "problems": []
+      },
+      {
+        "findings": [
+          {
+            "severity": "known-limitation",
+            "text": "S1 ordinary-local: client requested thinking=enabled, upstream received thinking={\"type\":\"disabled\"} (model never reasons in ordinary mode; silent capability loss)"
+          },
+          {
+            "severity": "known-limitation",
+            "text": "S2 ordinary-local: local server returning thinking blocks -> HTTP 503 code=[local_upstream_error] Local server request failed. Check the local routing log. Send a new request to check Local recovery. Plan fallback disabled. (turn fails; requires --local-compat)"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S3 local-compat: thinking forwarded={\"type\":\"adaptive\"}, unsigned thinking block returned to client OK"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S4 local-compat: echoed thinking block stripped before upstream (no pinning loop)"
+          },
+          {
+            "severity": "known-limitation",
+            "text": "S5 ordinary-openrouter: thinking.display -> Plan fallback -> HTTP 403 without saved subscription OAuth (upstream calls=0)"
+          },
+          {
+            "severity": "verified-working",
+            "text": "S6 ordinary-local: signed thinking history stripped before local upstream (session stays routable after a Plan turn)"
+          }
+        ],
+        "problems": []
+      }
+    ],
+    "problems": []
+  },
+  "unexpected": [],
+  "summary": {
+    "agent_teams": {
+      "rounds": 10,
+      "requests": 80,
+      "ok": 76,
+      "localBusy": 4,
+      "maxQueueWaitMs": 868,
+      "headline": "4/80 teammate turns were REJECTED local_busy across 10 burst rounds (admission cap 2 + queue 8); max queue wait 868ms"
+    },
+    "thinking": {
+      "scenariosPerRound": 6,
+      "problems": []
+    },
+    "unexpected": []
+  }
+}

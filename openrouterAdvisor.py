@@ -956,6 +956,18 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
         # Opt-in frame passthrough (OpenClaude.ps1 -Stream); the proxy reads it at startup.
         if provider == "openrouter" and os.environ.get("ROUTE_STREAM_PASSTHROUGH"):
             proxy_env["ROUTE_STREAM_PASSTHROUGH"] = os.environ["ROUTE_STREAM_PASSTHROUGH"]
+        # Opt-in Local admission tuning (Agent Teams / slow local servers). Only well-formed
+        # values are forwarded so a typo cannot fail the proxy at startup; otherwise the
+        # proxy applies its own default.
+        for name, minimum in (("ROUTE_LOCAL_CONCURRENCY", 1), ("ROUTE_LOCAL_QUEUE_LIMIT", 0),
+                              ("ROUTE_LOCAL_QUEUE_WAIT_MS", 0), ("ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS", 1)):
+            value = os.environ.get(name)
+            if value is None:
+                continue
+            if not value.isdigit() or int(value) < minimum:
+                print(json.dumps({"event": "local_admission_env_ignored", "name": name}), file=sys.stderr, flush=True)
+                continue
+            proxy_env[name] = value
     proxy_env.pop("LOCAL_ROUTE_COMPAT", None)
     proxy_env.pop("OPENROUTER_ROUTE_COMPAT", None)
     if local_compat:

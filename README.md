@@ -528,6 +528,38 @@ Local 응답은 JSON으로 받아 설정한 모델을 검증한 뒤 CLI용 SSE�
 
 응답 모델이 설정과 일치하고, `LOCAL_DIAGNOSTIC_OK`라는 정확한 문구로 답하며 `end_turn`으로 종료해야 성공입니다. 성공 시 `local_diagnostic`, `inference_checked`, `model_confirmed`, `reply_confirmed`가 모두 `true`입니다. 실패하면 고정 오류 분류만 출력하고 종료 코드 1을 반환합니다. 이 결과는 최소 Messages 추론 검증이며 일반 CLI의 전체 기능 호환성을 보증하지 않습니다. 모델 목록만 조회하는 `-CheckLocal`과는 함께 사용할 수 없습니다.
 
+### 모드 선택 가이드: Agent Teams와 추론(thinking)
+
+| 목적 | 권장 세션 | 설명 |
+|---|---|---|
+| 로컬 모델 + Agent Teams | `-Provider Local -LocalCompat` | 팀 툴(`Agent`, `SendMessage`, `TaskCreate/Get/List/Update`)은 표준 API shape으로 프록시가 그대로 통과시킵니다. teammate는 독립 세션이며 로컬 동시성은 아래 환경변수로 조정 |
+| 로컬 모델 + 추론(thinking) 패널 | `-Provider Local -LocalCompat` | 일반 로컬 세션은 thinking 요청을 **강제 비활성화**하며, 서버가 thinking 블록을 반환하면 그 턴이 실패합니다. compat 모드에서는 thinking이 그대로 전달되고 반환된 thinking 블록이 표시됩니다 |
+| 가끔 쓰는 thinking 턴 (구독 보유) | 일반 세션 (옵션 없음) | 네이티브 기능이 필요한 요청은 Plan fallback으로 자동 전환(서명된 thinking, 구독 사용). Local·OpenRouter 자체 장애는 Plan으로 전환하지 않습니다 |
+| OpenRouter + Agent Teams | 일반 OpenRouter 또는 `-OpenRouterCompat` | 일반은 Plan 폴백이 뒷받침되고, compat는 OpenRouter로만 고정됩니다 |
+
+- compat 모드에서 thinking 히스토리는 외부 요청에서 자동으로 제거되므로 thinking 턴 이후에도 세션이 Plan으로 "고정"되지 않습니다(시뮬레이션으로 검증, 아래).
+- 대시보드의 **도구 왕복 검사**는 최대 3회 합성 호출로 서버가 thinking 블록을 **내느냐**를 직접 검사합니다("추론(thinking) 블록: 발견됨/발생 없음…"). 발생하지 않으면 추론 모델의 추론은 일반 텍스트로 출력됩니다(보기는 되나 thinking 패널이 아님).
+- Agent Teams는 **인터랙티브 세션**에서만 teammate를 만들 수 있으며(`-p` headless 불가), Windows는 in-process teammate만 가능합니다(split panes는 tmux·iTerm2 필요). 실험 기능이라 `/resume`·`/rewind` 미복원 등 한계가 있습니다.
+
+#### 로컬 동시성 조정 (Agent Teams)
+
+프록시는 로컬 턴을 기본 **동시 2 + 대기열 8(최대 60초 대기)** 으로 제한하고 초과분에는 `local_busy` 503을 반환합니다. 런처를 실행하기 전 다음 환경변수로 조정할 수 있으며, 미설정·잘못된 값은 기본값이 적용됩니다.
+
+| 환경변수 | 기본값 | 범위 | 의미 |
+|---|---|---|---|
+| `ROUTE_LOCAL_CONCURRENCY` | `2` | 1–64 | 로컬 서버에 병렬로 실행할 턴 수 |
+| `ROUTE_LOCAL_QUEUE_LIMIT` | `8` | 0–256 | 포화 시 대기할 최대 턴 수 |
+| `ROUTE_LOCAL_QUEUE_WAIT_MS` | `60000` | 0–600000 | 대기열 턴의 최대 대기 시간(ms) |
+| `ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS` | `120000` | 30000–900000 | local-only·compat 세션의 전체 요청 제한(일반 모드는 무응답 30초 윈도우 유지) |
+
+```powershell
+$env:ROUTE_LOCAL_CONCURRENCY = "4"
+$env:ROUTE_LOCAL_QUEUE_WAIT_MS = "300000"
+.\OpenClaude.ps1 -Provider Local -LocalCompat
+```
+
+4~5명의 teammate가 동시에 멈추는 버스트(10턴)도 기본 한계 내에서 전부 흡수되고, 12턴(6명)부터 초과분이 `local_busy`로 거절됩니다 — `tests/simulate_agent_teams_thinking.mjs`의 10라운드 시뮬레이션 결과입니다. teammate 수 × 동시 턴을 `concurrency + queue` 이상으로 유지하세요. 느린 GPU(턴당 수 초)에서는 대기 한도(`ROUTE_LOCAL_QUEUE_WAIT_MS`)도 함께 올려야 큐 대기 60초 초과가 `local_busy`가 되지 않습니다.
+
 ## 5. 상세 문서
 
 상세 내용은 README가 길어지는 것을 막기 위해 분리해 두었습니다. 필요할 때만 열어 보세요.

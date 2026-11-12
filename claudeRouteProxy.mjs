@@ -1153,7 +1153,15 @@ export function parseRetryAfter(value, nowMs = Date.now()) {
 export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM_H2 === '1' ? http2UpstreamFetch : fetch, provider = 'openrouter', openrouterModel, openrouterUpstreamProvider = '', localUrl,
   localModel, localKey, localAllowRemote = false, localHttpUrl, cliKind = null, cliRequestedModel = null, localOnly = false, localCompat = false, openrouterCompat = false, fallbackModel = 'claude-sonnet-5-5', retryDelayMs = 1000,
   cooldownMs = Number.isFinite(Number(process.env.ROUTE_COOLDOWN_MS))
-    ? Math.min(600000, Math.max(0, Number(process.env.ROUTE_COOLDOWN_MS))) : 30000, attemptTimeoutMs = localOnly || openrouterCompat ? 120000 : 30000, planHeaderMs = 120000, planIdleMs = 300000, attemptCeilingMs = 300000, now = Date.now,
+    ? Math.min(600000, Math.max(0, Number(process.env.ROUTE_COOLDOWN_MS))) : 30000,
+  // Local/compat sessions keep a fixed total per-attempt limit; slow local reasoning models
+  // can need more. ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS raises it (clamped to 30s..15min). Ordinary
+  // mode keeps its 30s silence window by design.
+  attemptTimeoutMs = localOnly || openrouterCompat
+    ? (Number.isFinite(Number(process.env.ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS))
+      ? Math.min(900000, Math.max(30000, Number(process.env.ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS))) : 120000)
+    : 30000,
+  planHeaderMs = 120000, planIdleMs = 300000, attemptCeilingMs = 300000, now = Date.now,
   // P1 step budget: the aggregate retry wait (backoff plus honored Retry-After hints) across one
   // request must not exceed this; 0 disables the cap. Per-wait retryMaxWaitMs still applies.
   retryBudgetMs = Number.isFinite(Number(process.env.ROUTE_RETRY_BUDGET_MS))
@@ -1190,7 +1198,14 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
   // wait at most this long and the full hint reaches the client as Retry-After instead.
   retryMaxWaitMs = Number.isFinite(Number(process.env.ROUTE_RETRY_MAX_WAIT_MS))
     ? Number(process.env.ROUTE_RETRY_MAX_WAIT_MS) : 10000,
-  localConcurrency = 2, localQueueLimit = 8,
+  // Local admission: how many local upstream turns run in parallel, how many may wait, and how
+  // long a queued turn may wait. Agent Teams sends several teammates at once, so these are
+  // env-tunable. Like the pre-existing ROUTE_LOCAL_QUEUE_WAIT_MS, a set-but-invalid value
+  // fails startup loudly instead of silently changing admission behavior.
+  localConcurrency = process.env.ROUTE_LOCAL_CONCURRENCY === undefined
+    ? 2 : Number(process.env.ROUTE_LOCAL_CONCURRENCY),
+  localQueueLimit = process.env.ROUTE_LOCAL_QUEUE_LIMIT === undefined
+    ? 8 : Number(process.env.ROUTE_LOCAL_QUEUE_LIMIT),
   localQueueWaitMs = process.env.ROUTE_LOCAL_QUEUE_WAIT_MS === undefined
     ? 60000 : Number(process.env.ROUTE_LOCAL_QUEUE_WAIT_MS),
   // Opt-in: peel the CLI's trailing token-count footer from system text before the external
@@ -1266,7 +1281,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
   maxConnections = boundedLimit(maxConnections, 1, 1024, 'connection limit');
   if (!Number.isSafeInteger(localConcurrency) || localConcurrency < 1 || localConcurrency > 64 ||
       !Number.isSafeInteger(localQueueLimit) || localQueueLimit < 0 || localQueueLimit > 256 ||
-      !Number.isFinite(localQueueWaitMs) || localQueueWaitMs < 0 || localQueueWaitMs > 60000)
+      !Number.isFinite(localQueueWaitMs) || localQueueWaitMs < 0 || localQueueWaitMs > 600000)
     throw new Error('Invalid Local admission limits');
   // This bounds this proxy's contribution, not other users of the shared server.
   const localQueue = [];

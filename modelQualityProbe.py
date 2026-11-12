@@ -60,6 +60,43 @@ def evaluate(call, model, deadline=None):
             "elapsed_ms": round((time.monotonic() - started) * 1000)}
 
 
+def evaluate_thinking(call, model, deadline=None):
+    """Run one extra synthetic call that requests extended thinking.
+
+    The backend either emits Anthropic-style thinking blocks (it can serve
+    --local-compat sessions with reasoning visible), returns plain text only
+    (thinking stays disabled for this model), or rejects the thinking parameter
+    (reported as 'error' without failing the primary tool round-trip).
+    """
+    started = time.monotonic()
+    body = {"model": model, "max_tokens": 1024, "stream": False,
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "messages": [{"role": "user", "content": "Think briefly, then reply with only: probe"}]}
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("probe_deadline")
+    try:
+        message, _ = call(body)
+    except Exception:
+        # Provider errors can contain credentials or raw model output; keep the reason coarse.
+        return {"thinking_status": "error", "thinking_blocks": 0, "signed": None,
+                "elapsed_ms": round((time.monotonic() - started) * 1000)}
+    blocks = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(blocks, list):
+        return {"thinking_status": "error", "thinking_blocks": 0, "signed": None,
+                "elapsed_ms": round((time.monotonic() - started) * 1000)}
+    thinking_blocks = [block for block in blocks if isinstance(block, dict) and block.get("type") == "thinking"]
+    if thinking_blocks:
+        valid = all(isinstance(block.get("thinking"), str) and block["thinking"].strip()
+                    for block in thinking_blocks)
+        status = "present" if valid else "invalid"
+        signed = all(isinstance(block.get("signature"), str) and block["signature"]
+                     for block in thinking_blocks)
+    else:
+        status, signed = "absent", False
+    return {"thinking_status": status, "thinking_blocks": len(thinking_blocks), "signed": signed,
+            "elapsed_ms": round((time.monotonic() - started) * 1000)}
+
+
 def configured_call(provider, dashboard=None, deadline=None, values=None):
     if provider == "cli":
         import cliBackend
@@ -106,6 +143,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--provider", required=True, choices=("local", "openrouter", "cli"))
     parser.add_argument("--run", action="store_true", help="perform up to two real inference calls")
+    parser.add_argument("--thinking", action="store_true",
+                        help="after a passed round-trip, spend one more call probing thinking blocks")
     args = parser.parse_args(argv)
     if not args.run:
         parser.error("--run is required; real model inference consumes usage")
@@ -113,6 +152,12 @@ def main(argv=None):
         deadline = time.monotonic() + 180
         call, model = configured_call(args.provider, deadline=deadline)
         result = evaluate(call, model, deadline=deadline)
+        if args.thinking and isinstance(result, dict) and result.get("reason") == "passed":
+            try:
+                result["thinking"] = evaluate_thinking(call, model, deadline=deadline)
+            except (OSError, ValueError, KeyError, TypeError, urllib.error.URLError, TimeoutError):
+                result["thinking"] = {"thinking_status": "error", "thinking_blocks": 0, "signed": None,
+                                      "elapsed_ms": 0}
     except (OSError, ValueError, KeyError, TypeError, urllib.error.URLError):
         result = {"ok": False, "reason": "configuration_or_request_failed"}
     except Exception:

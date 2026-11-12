@@ -56,7 +56,7 @@
 ## 공통 점검
 
 - 네 페이지 모두 같은 내비게이션(4개)과 현재 페이지 `aria-current="page"`를 사용한다.
-- 페이지 HTML·CSS·JS는 인증 없이 제공되고, 데이터 API(`/api/config`, `/api/models`, `/api/cli`, `/api/usage-stats`, `/api/blackbox`, `/api/default-provider`, `/api/test`, `/api/config-reset`)는 `x-dashboard-token`을 요구한다. `/api/status`·`/api/diagnostics`·`/api/snapshot`은 읽기 전용 공개다.
+- 페이지 HTML·CSS·JS는 인증 없이 제공되고, 데이터 API(`/api/config`, `/api/models`, `/api/models-search`, `/api/cli`, `/api/usage-stats`, `/api/blackbox`, `/api/default-provider`, `/api/test`, `/api/config-reset`)는 `x-dashboard-token`을 요구한다. `/api/status`·`/api/diagnostics`·`/api/snapshot`은 읽기 전용 공개다. `POST /api/models-search`는 저장 전 Local LLM 검색 전용으로, 전송된 주소와 키만 사용하며 저장 값은 섞지 않는다.
 - 헤더가 없거나 토큰이 틀리면 403 `token_required`, POST 반복은 429 `rate_limited`, 입력 오류는 400 `invalid_*`로 응답함을 실제 요청으로 확인했다.
 - 렌더 결과에 중복 DOM id가 없다(대시보드의 `chart-details`는 CLI 토큰 카드와 타임라인 카드 중 하나만 렌더되어 상호배타).
 - 사소한 미비: 파비콘·본문 건너뛰기 링크 없음(접근성 개선 후보, 기능 영향 없음).

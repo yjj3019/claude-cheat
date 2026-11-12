@@ -71,7 +71,7 @@ test('Local queue wait defaults to 60 seconds and honors a bounded environment o
   process.env.ROUTE_LOCAL_QUEUE_WAIT_MS = '15000';
   const custom = await fixture(t, async (_url, options) => response(options), { localQueueWaitMs: undefined });
   assert.equal((await custom.metrics()).localAdmission.queueWaitMs, 15000);
-  for (const invalid of ['invalid', '-1', '60001', 'Infinity']) {
+  for (const invalid of ['invalid', '-1', '600001', 'Infinity']) {
     process.env.ROUTE_LOCAL_QUEUE_WAIT_MS = invalid;
     assert.throws(() => createProxy({ nonce: 'admission-test', provider: 'local', localUrl: LOCAL,
       localModel: MODEL }), /Invalid Local admission limits/);
@@ -165,6 +165,67 @@ test('Local congestion retries back off while successful replies release capacit
   assert.equal(stamps.length, 4);
   for (let i = 1; i < stamps.length; i++) assert.ok(stamps[i] - stamps[i - 1] >= 30 * (2 ** (i - 1)) - 5);
   assert.equal((await metrics()).localAdmission.active, 0);
+});
+
+test('Local admission concurrency and queue limit honor bounded environment overrides', async t => {
+  const names = ['ROUTE_LOCAL_CONCURRENCY', 'ROUTE_LOCAL_QUEUE_LIMIT'];
+  const previous = Object.fromEntries(names.map(name => [name, process.env[name]]));
+  t.after(() => { for (const name of names) {
+    if (previous[name] === undefined) delete process.env[name]; else process.env[name] = previous[name]; } });
+  for (const name of names) delete process.env[name];
+  const defaults = await fixture(t, async (_url, options) => response(options),
+    { localConcurrency: undefined, localQueueLimit: undefined });
+  assert.equal((await defaults.metrics()).localAdmission.concurrency, 2);
+  assert.equal((await defaults.metrics()).localAdmission.queueLimit, 8);
+  process.env.ROUTE_LOCAL_CONCURRENCY = '4';
+  process.env.ROUTE_LOCAL_QUEUE_LIMIT = '16';
+  const tuned = await fixture(t, async (_url, options) => response(options),
+    { localConcurrency: undefined, localQueueLimit: undefined });
+  const admission = (await tuned.metrics()).localAdmission;
+  assert.equal(admission.concurrency, 4);
+  assert.equal(admission.queueLimit, 16);
+  for (const [name, invalid] of [['ROUTE_LOCAL_CONCURRENCY', '0'], ['ROUTE_LOCAL_CONCURRENCY', '65'],
+    ['ROUTE_LOCAL_CONCURRENCY', 'invalid'], ['ROUTE_LOCAL_QUEUE_LIMIT', '-1'],
+    ['ROUTE_LOCAL_QUEUE_LIMIT', '257'], ['ROUTE_LOCAL_QUEUE_LIMIT', 'Infinity']]) {
+    process.env[name] = invalid;
+    assert.throws(() => createProxy({ nonce: 'admission-test', provider: 'local', localUrl: LOCAL, localModel: MODEL }),
+      /Invalid Local admission limits/);
+    delete process.env[name];
+  }
+});
+
+test('ROUTE_LOCAL_CONCURRENCY admits that many parallel Local turns without queuing', async t => {
+  const previous = process.env.ROUTE_LOCAL_CONCURRENCY;
+  t.after(() => { if (previous === undefined) delete process.env.ROUTE_LOCAL_CONCURRENCY;
+    else process.env.ROUTE_LOCAL_CONCURRENCY = previous; });
+  process.env.ROUTE_LOCAL_CONCURRENCY = '4';
+  const gate = deferred(); let active = 0, peak = 0;
+  const { send } = await fixture(t, async (url, options) => {
+    active++; peak = Math.max(peak, active);
+    await gate.promise;
+    active--;
+    return response(options);
+  }, { localConcurrency: undefined, localQueueLimit: undefined });
+  const pending = Array.from({ length: 4 }, () => send());
+  try { await waitFor(() => peak === 4); } finally { gate.resolve(); }
+  for (const answer of await Promise.all(pending)) { assert.equal(answer.status, 200); await answer.text(); }
+  assert.equal(peak, 4);
+});
+
+test('ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS is accepted and clamped for local-only sessions', async t => {
+  const name = 'ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS';
+  const previous = process.env[name];
+  t.after(() => { if (previous === undefined) delete process.env[name]; else process.env[name] = previous; });
+  // Below/above the clamp and a non-numeric value all start the proxy: the value is clamped
+  // into 30s..15min (non-numeric falls back to the 120s default) instead of crashing startup.
+  for (const value of ['1000', '30000', '900000', '3600000', 'not-a-number']) {
+    process.env[name] = value;
+    assert.doesNotThrow(() => createProxy({ nonce: 'admission-test', provider: 'local', localOnly: true,
+      localUrl: LOCAL, localModel: MODEL }));
+  }
+  delete process.env[name];
+  assert.doesNotThrow(() => createProxy({ nonce: 'admission-test', provider: 'local', localOnly: true,
+    localUrl: LOCAL, localModel: MODEL }));
 });
 
 test('Aborting an active Local turn releases capacity to the queued turn', async t => {

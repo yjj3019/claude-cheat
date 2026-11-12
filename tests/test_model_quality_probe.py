@@ -152,6 +152,82 @@ class ModelQualityProbeTest(unittest.TestCase):
         self.assertEqual(model, "cli/codex")
         self.assertIs(metadata["model_matches_requested"], False)
 
+    def test_thinking_probe_reports_block_presence_and_signature(self):
+        requests = []
+        def call(body):
+            requests.append(body)
+            self.assertEqual(body["thinking"], {"type": "enabled", "budget_tokens": 1024})
+            return {"stop_reason": "end_turn",
+                    "content": [{"type": "thinking", "thinking": "brief reasoning", "signature": "opaque"},
+                                {"type": "text", "text": "probe"}]}, {}
+        result = probe.evaluate_thinking(call, "private/model")
+        self.assertEqual(result["thinking_status"], "present")
+        self.assertEqual(result["thinking_blocks"], 1)
+        self.assertTrue(result["signed"])
+        self.assertNotIn("private/model", json.dumps(result))
+
+    def test_thinking_probe_reports_plain_text_as_absent(self):
+        result = probe.evaluate_thinking(
+            lambda body: ({"stop_reason": "end_turn", "content": [{"type": "text", "text": "probe"}]}, {}), "model")
+        self.assertEqual(result["thinking_status"], "absent")
+        self.assertEqual(result["thinking_blocks"], 0)
+        self.assertFalse(result["signed"])
+
+    def test_thinking_probe_reports_malformed_blocks_and_backend_errors(self):
+        malformed = {"stop_reason": "end_turn",
+                     "content": [{"type": "thinking", "thinking": "   "}, {"type": "text", "text": "x"}]}
+        self.assertEqual(probe.evaluate_thinking(lambda body: (malformed, {}), "model")["thinking_status"], "invalid")
+        def broken(body):
+            raise ValueError("provider rejected the thinking parameter")
+        result = probe.evaluate_thinking(broken, "model")
+        self.assertEqual(result["thinking_status"], "error")
+        self.assertIsNone(result["signed"])
+        self.assertNotIn("rejected", json.dumps(result))
+
+    def test_thinking_deadline_raises_before_the_call(self):
+        calls = []
+        def call(body):
+            calls.append(body)
+            return {"stop_reason": "end_turn", "content": []}, {}
+        with patch.object(probe.time, "monotonic", side_effect=[181, 181]):
+            with self.assertRaises(TimeoutError):
+                probe.evaluate_thinking(call, "model", deadline=180)
+        self.assertEqual(calls, [])
+
+    def test_thinking_flag_adds_a_third_call_only_after_a_passed_roundtrip(self):
+        calls = []
+        def call(body):
+            calls.append(body)
+            if len(calls) == 1:
+                return tool_call(), {}
+            if len(calls) == 2:
+                value = body["messages"][2]["content"][0]["content"]
+                return {"stop_reason": "end_turn", "content": [{"type": "text", "text": value}]}, {}
+            self.assertIn("thinking", body)
+            return {"stop_reason": "end_turn",
+                    "content": [{"type": "thinking", "thinking": "t"}, {"type": "text", "text": "probe"}]}, {}
+        out = io.StringIO()
+        with patch.object(probe, "configured_call", return_value=(call, "model")), contextlib.redirect_stdout(out):
+            self.assertEqual(probe.main(["--provider", "local", "--run", "--thinking"]), 0)
+        payload = json.loads(out.getvalue())
+        self.assertEqual(payload["thinking"]["thinking_status"], "present")
+        self.assertEqual(len(calls), 3)
+
+    def test_thinking_flag_is_skipped_when_the_roundtrip_fails(self):
+        calls = []
+        def call(body):
+            calls.append(body)
+            if len(calls) == 1:
+                return tool_call(), {}
+            return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "not the value"}]}, {}
+        out = io.StringIO()
+        with patch.object(probe, "configured_call", return_value=(call, "model")), contextlib.redirect_stdout(out):
+            self.assertEqual(probe.main(["--provider", "local", "--run", "--thinking"]), 1)
+        payload = json.loads(out.getvalue())
+        self.assertEqual(payload["reason"], "continuation_failed")
+        self.assertNotIn("thinking", payload)
+        self.assertEqual(len(calls), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
