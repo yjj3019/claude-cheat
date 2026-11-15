@@ -41,12 +41,26 @@ $legacyNames = [ordered]@{
 }
 
 function Resolve-Directory([string]$path) {
-    return [System.IO.Path]::GetFullPath($path).TrimEnd('\', '/')
+    $full = [System.IO.Path]::GetFullPath($path)
+    $trimmed = $full.TrimEnd('\', '/')
+    if (($trimmed.Length -eq 2) -and ($trimmed[1] -eq ':')) {
+        # A drive root keeps its separator: "C:" alone is drive-relative, "C:\" is the root.
+        return $full.Substring(0, $trimmed.Length + 1)
+    }
+    return $trimmed
 }
 
 # Batch files are read by cmd.exe with the OEM code page, not UTF-8. The checkout path is
 # embedded in the file, so write and compare using the same encoding.
 function Get-BatchEncoding() {
+    # PowerShell 7 (Core) needs the legacy code pages registered first; on 5.1 it is a
+    # harmless no-op or absent, so the failure is swallowed either way.
+    try {
+        [System.Text.Encoding]::RegisterProvider([System.Text.CodePagesEncodingProvider]::Instance)
+    }
+    catch {
+        # CodePagesEncodingProvider is already present (5.1) or not needed.
+    }
     return [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
 }
 
@@ -95,6 +109,16 @@ function Test-LegacyForwarder([string]$path) {
     return ($null -ne $first) -and ($first -like "$marker*")
 }
 
+# Ownership is decided by the installer marker line, not by byte equality: the embedded
+# checkout path changes when the checkout moves, and the marker is what proves this
+# installer wrote the file. Files without the marker stay fail-closed foreign.
+function Test-ManagedForwarder([string]$path) {
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+    try { $first = Get-Content -LiteralPath $path -TotalCount 3 -ErrorAction Stop }
+    catch { return $false }
+    return ($null -ne $first) -and @($first | Where-Object { $_ -like "*$marker*" }).Count -gt 0
+}
+
 function Remove-LegacyForwarders() {
     foreach ($name in $legacyNames.Keys) {
         $path = Join-Path $destination $name
@@ -108,7 +132,7 @@ if ($Remove) {
     foreach ($name in $commands.Keys) {
         $path = Join-Path $destination $name
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
-        if (-not (Test-Forwarder $path $commands[$name][0] $commands[$name][1])) {
+        if (-not (Test-ManagedForwarder $path)) {
             Write-Warning "kept $name (not created by this installer)"
             continue
         }
@@ -116,6 +140,14 @@ if ($Remove) {
         Write-Host "removed $path"
     }
     Remove-LegacyForwarders
+    # Undo the user-PATH entry Add-UserPathEntry added for this install directory: only
+    # that exact entry, compared entry by entry (never a regex over the whole PATH).
+    $pathEntries = @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' | Where-Object { $_ })
+    $kept = @($pathEntries | Where-Object { $_.TrimEnd('\', '/') -ne $destination })
+    if ($kept.Count -ne $pathEntries.Count) {
+        [Environment]::SetEnvironmentVariable('Path', ($kept -join ';'), 'User')
+        Write-Host "removed user PATH entry: $destination"
+    }
     return
 }
 
@@ -131,7 +163,7 @@ foreach ($name in $commands.Keys) {
         continue
     }
     $path = Join-Path $destination $name
-    if ((Test-Path -LiteralPath $path) -and -not (Test-Forwarder $path $targetScript $label)) {
+    if ((Test-Path -LiteralPath $path) -and -not (Test-ManagedForwarder $path)) {
         Write-Warning "kept $name (a file not created by this installer already exists)"
         continue
     }

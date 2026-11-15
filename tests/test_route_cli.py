@@ -93,9 +93,16 @@ class FakeCase(unittest.TestCase):
         kw.setdefault("timeout", 10)
         return rc.run_safely([NODE, str(FAKE), *args], cwd=self.work, env=rc.child_env("codex"), **kw)
 
-    def skip_probe(self):
-        """Node starts slowly on some machines: only tests of the probe itself spawn it."""
-        patcher = mock.patch.object(rc, "probe_version", return_value={"ok": True, "version": "9.9.9", "reason": None})
+    PROBED = {"codex": "0.167.0", "grok": "1.0.77", "claude": "2.1.312"}
+
+    def skip_probe(self, kind="codex"):
+        """Node starts slowly on some machines: only tests of the probe itself spawn it.
+
+        The stubbed version is a VERIFIED_VERSIONS member so the verified 'ready' outcome
+        stays reachable; the real probe path covers unverified versions separately.
+        """
+        patcher = mock.patch.object(rc, "probe_version",
+                                   return_value={"ok": True, "version": self.PROBED[kind], "reason": None})
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -145,6 +152,12 @@ class ResolveCommand(unittest.TestCase):
     def test_js_shim_in_special_directory(self):
         self.assertEqual([os.path.normcase(os.path.realpath(p)) for p in rc.resolve_command(str(CMD))],
                          [os.path.normcase(os.path.realpath(NODE)), os.path.normcase(os.path.realpath(FAKE))])
+
+    def test_legacy_tilde_dp0_shim_resolves_like_the_v6_form(self):
+        d = self.shim(r"sub\t.js")
+        legacy = (d / "codex.cmd").read_text(encoding="utf-8").replace('"%dp0%\\', '"%~dp0%\\')
+        (d / "codex.cmd").write_text(legacy, encoding="utf-8")
+        self.assertEqual(os.path.realpath(rc.resolve_command(str(d / "codex.cmd"))[1]), os.path.realpath(d / "sub" / "t.js"))
 
     def test_shim_dir_node_preferred(self):
         d = self.shim(r"sub\t.js")
@@ -329,6 +342,14 @@ class RunSafely(FakeCase):
         self.assertEqual((slow["ok"], slow["reason"]), (False, "timeout"))
         self.assertEqual(rc.probe_version(["no-such-binary-xyz"], {})["reason"], "version_failed")
 
+    def test_probe_version_requires_an_exact_line_ending_version(self):
+        self.assertEqual(rc.probe_version([NODE, "-e", "console.log('codex 0.167.0')", "--"],
+                                          rc.child_env("codex"))["version"], "0.167.0")
+        for suffix in ("0.167.0-dev", "codex 0.167.0-dev", "0.167.0+build"):
+            with self.subTest(line=suffix):
+                result = rc.probe_version([NODE, "-e", f"console.log('{suffix}')", "--"], rc.child_env("codex"))
+                self.assertEqual((result["ok"], result["reason"]), (False, "version_failed"), suffix)
+
 
 class ConnectionTest(FakeCase):
     def capped(self, seconds=15):
@@ -349,9 +370,11 @@ class ConnectionTest(FakeCase):
 
     def test_reasons_through_shim(self):
         self.capped()
-        result = self.codex("ok")  # the whole path, including the real probe through the shim
+        # The whole path, including the real probe through the shim: the fake reports 9.9.9,
+        # which no session accepts, so a perfect round trip must not claim "ready" anymore.
+        result = self.codex("ok")
         self.assertEqual((result["ok"], result["reason"], result["version"], result["exit_code"]),
-                         (True, "ready", "9.9.9", 0))
+                         (False, "unsupported_version", "9.9.9", 0))
         self.assertEqual(self.codex("version_fail")["reason"], "version_failed")
         self.skip_probe()
         for mode, ok, reason in (("ok", True, "ready"), ("nonzero", False, "nonzero_exit"),
@@ -396,6 +419,14 @@ class ConnectionTest(FakeCase):
                 mock.patch.object(rc, "probe_version", return_value={"ok": True, "version": "1.0.0", "reason": None}):
             self.assertEqual(rc.connection_test("grok")["reason"], "spawn_failed")
 
+    def test_unverified_version_reports_unsupported_version(self):
+        self.patch_binary("claude")
+        ok_run = dict(TREE_RESULT, stdout=b'{"result": "OK"}')
+        with mock.patch.object(rc, "probe_version", return_value={"ok": True, "version": "0.999.0", "reason": None}), \
+                mock.patch.object(rc, "run_safely", return_value=ok_run):
+            result = rc.connection_test("claude")
+        self.assertEqual((result["ok"], result["reason"], result["version"]), (False, "unsupported_version", "0.999.0"))
+
     def test_invalid_kind_and_model_run_nothing(self):
         with mock.patch.object(rc, "find_binary", side_effect=AssertionError("ran")):
             self.assertEqual(rc.connection_test("gemini")["reason"], "invalid_kind")
@@ -437,10 +468,10 @@ class ConnectionTest(FakeCase):
         self.assertEqual(self.codex("ok")["reason"], "ready")  # lock released
 
     def test_commands_and_fixed_prompt(self):
-        self.skip_probe()
         prompt = "Reply with exactly OK"
         seen = {}
         for kind in ("codex", "grok", "claude"):
+            self.skip_probe(kind)
             self.patch_binary(kind) if kind != "codex" else None
             set_mode("argv_dump")
             side_file("argv.json").unlink(missing_ok=True)
@@ -464,13 +495,14 @@ class ConnectionTest(FakeCase):
         self.assertIn("--safe-mode", claude["argv"])
 
     def test_grok_ansi_and_claude_json(self):
-        self.skip_probe()
+        self.skip_probe("grok")
         self.patch_binary("grok")
         set_mode("ok")
         self.assertEqual(rc.connection_test("grok")["reason"], "ready")
         set_mode("wrong_reply")
         self.assertEqual(rc.connection_test("grok")["reason"], "unexpected_reply")
         self.patch_binary("claude")
+        self.skip_probe("claude")
         set_mode("ok")
         self.assertEqual(rc.connection_test("claude")["reason"], "ready")
         set_mode("claude_error")

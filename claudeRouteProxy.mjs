@@ -1150,17 +1150,28 @@ export function parseRetryAfter(value, nowMs = Date.now()) {
   return Math.min(Math.max(at - reference, 0), RETRY_AFTER_MAX_MS);
 }
 
+// Local admission env knobs shared by the createProxy defaults and the CLI decode: ASCII
+// digits only, inside the documented bounds for that knob. A set-but-invalid value fails
+// startup loudly (the launcher filters these first, so reaching this error means a direct
+// proxy run with a malformed value).
+const localAdmissionEnv = (name, fallback, min, max) => {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  if (!/^[0-9]+$/.test(raw)) throw new Error('Invalid Local admission limits');
+  const value = Number(raw);
+  if (value < min || value > max) throw new Error('Invalid Local admission limits');
+  return value;
+};
+
 export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM_H2 === '1' ? http2UpstreamFetch : fetch, provider = 'openrouter', openrouterModel, openrouterUpstreamProvider = '', localUrl,
   localModel, localKey, localAllowRemote = false, localHttpUrl, cliKind = null, cliRequestedModel = null, localOnly = false, localCompat = false, openrouterCompat = false, fallbackModel = 'claude-sonnet-5-5', retryDelayMs = 1000,
   cooldownMs = Number.isFinite(Number(process.env.ROUTE_COOLDOWN_MS))
     ? Math.min(600000, Math.max(0, Number(process.env.ROUTE_COOLDOWN_MS))) : 30000,
   // Local/compat sessions keep a fixed total per-attempt limit; slow local reasoning models
-  // can need more. ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS raises it (clamped to 30s..15min). Ordinary
+  // can need more. ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS raises it (bounded to 30s..15min). Ordinary
   // mode keeps its 30s silence window by design.
   attemptTimeoutMs = localOnly || openrouterCompat
-    ? (Number.isFinite(Number(process.env.ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS))
-      ? Math.min(900000, Math.max(30000, Number(process.env.ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS))) : 120000)
-    : 30000,
+    ? localAdmissionEnv('ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS', 120000, 30000, 900000) : 30000,
   planHeaderMs = 120000, planIdleMs = 300000, attemptCeilingMs = 300000, now = Date.now,
   // P1 step budget: the aggregate retry wait (backoff plus honored Retry-After hints) across one
   // request must not exceed this; 0 disables the cap. Per-wait retryMaxWaitMs still applies.
@@ -1177,7 +1188,6 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
   instanceMetricsPath = process.env.ROUTE_INSTANCE_METRICS_PATH,
   usageEventsPath = process.env.ROUTE_USAGE_EVENTS_PATH,
   streamPassthrough = process.env.ROUTE_STREAM_PASSTHROUGH,
-  handoverTimeoutMs = Number(process.env.ROUTE_HANDOVER_TIMEOUT_MS) || 120000,
   // Idle, not total: a client may send for minutes as long as it keeps sending. 0 disables it.
   requestIdleTimeoutMs = Number.isFinite(Number(process.env.ROUTE_REQUEST_IDLE_TIMEOUT_MS))
     ? Number(process.env.ROUTE_REQUEST_IDLE_TIMEOUT_MS) : 30000,
@@ -1198,16 +1208,18 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
   // wait at most this long and the full hint reaches the client as Retry-After instead.
   retryMaxWaitMs = Number.isFinite(Number(process.env.ROUTE_RETRY_MAX_WAIT_MS))
     ? Number(process.env.ROUTE_RETRY_MAX_WAIT_MS) : 10000,
+  // Handover drain cap: the client must not outlive the proxy's drain, so any positive value
+  // above 10 minutes is clamped and a missing/broken/zero/negative value keeps 120s.
+  handoverTimeoutMs = process.env.ROUTE_HANDOVER_TIMEOUT_MS === undefined ? 120000
+    : (() => { const value = Number(process.env.ROUTE_HANDOVER_TIMEOUT_MS);
+      return Number.isFinite(value) && value > 0 ? Math.min(600000, value) : 120000; })(),
   // Local admission: how many local upstream turns run in parallel, how many may wait, and how
   // long a queued turn may wait. Agent Teams sends several teammates at once, so these are
   // env-tunable. Like the pre-existing ROUTE_LOCAL_QUEUE_WAIT_MS, a set-but-invalid value
   // fails startup loudly instead of silently changing admission behavior.
-  localConcurrency = process.env.ROUTE_LOCAL_CONCURRENCY === undefined
-    ? 2 : Number(process.env.ROUTE_LOCAL_CONCURRENCY),
-  localQueueLimit = process.env.ROUTE_LOCAL_QUEUE_LIMIT === undefined
-    ? 8 : Number(process.env.ROUTE_LOCAL_QUEUE_LIMIT),
-  localQueueWaitMs = process.env.ROUTE_LOCAL_QUEUE_WAIT_MS === undefined
-    ? 60000 : Number(process.env.ROUTE_LOCAL_QUEUE_WAIT_MS),
+  localConcurrency = localAdmissionEnv('ROUTE_LOCAL_CONCURRENCY', 2, 1, 64),
+  localQueueLimit = localAdmissionEnv('ROUTE_LOCAL_QUEUE_LIMIT', 8, 0, 256),
+  localQueueWaitMs = localAdmissionEnv('ROUTE_LOCAL_QUEUE_WAIT_MS', 60000, 0, 600000),
   // Opt-in: peel the CLI's trailing token-count footer from system text before the external
   // request so the provider's prefix cache survives between turns. Documented in the README.
   stabilizePromptCache = process.env.ROUTE_STABILIZE_PROMPT_CACHE === '1',
@@ -2635,7 +2647,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     provider: process.env.SONNET_PROVIDER || 'openrouter', localUrl: process.env.LOCAL_LLM_URL,
     localModel: process.env.LOCAL_LLM_MODEL, localKey: process.env.LOCAL_LLM_API_KEY,
     cliKind: process.env.CLI_KIND, cliRequestedModel: process.env.CLI_MODEL,
-    attemptTimeoutMs: process.env.SONNET_PROVIDER === 'cli' ? (Number(process.env.CLI_TIMEOUT_S) || 60) * 1000 : undefined,
+    attemptTimeoutMs: process.env.SONNET_PROVIDER === 'cli' ? (Number(process.env.CLI_TIMEOUT_S) || 60) * 1000
+      : process.env.ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS === undefined ? undefined
+        : localAdmissionEnv('ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS', 120000, 30000, 900000),
     localOnly: process.env.LOCAL_ROUTE_ONLY === '1', localCompat: process.env.LOCAL_ROUTE_COMPAT === '1', openrouterCompat: process.env.OPENROUTER_ROUTE_COMPAT === '1', localHttpUrl: process.env.LOCAL_LLM_HTTP_URL, localAllowRemote: process.env.LOCAL_LLM_ALLOW_REMOTE === 'true',
     metricsPath: process.env.ROUTE_METRICS_PATH,
     instanceId: process.env.ROUTE_INSTANCE_ID,
@@ -2645,6 +2659,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     maxInflightBytes: process.env.ROUTE_MAX_INFLIGHT_BYTES || undefined,
     requestTotalTimeoutMs: process.env.ROUTE_REQUEST_TOTAL_TIMEOUT_MS || undefined,
     maxConnections: process.env.ROUTE_MAX_CONNECTIONS || undefined,
+    localConcurrency: process.env.ROUTE_LOCAL_CONCURRENCY === undefined ? undefined
+      : localAdmissionEnv('ROUTE_LOCAL_CONCURRENCY', 2, 1, 64),
+    localQueueLimit: process.env.ROUTE_LOCAL_QUEUE_LIMIT === undefined ? undefined
+      : localAdmissionEnv('ROUTE_LOCAL_QUEUE_LIMIT', 8, 0, 256),
+    localQueueWaitMs: process.env.ROUTE_LOCAL_QUEUE_WAIT_MS === undefined ? undefined
+      : localAdmissionEnv('ROUTE_LOCAL_QUEUE_WAIT_MS', 60000, 0, 600000),
     altProvider: process.env.ROUTE_ALT_PROVIDER || null, altModel: process.env.ROUTE_ALT_MODEL, altUrl: process.env.ROUTE_ALT_URL,
     altKey: process.env.ROUTE_ALT_KEY, altAllowRemote: process.env.ROUTE_ALT_ALLOW_REMOTE === 'true', altHttpUrl: process.env.ROUTE_ALT_HTTP_URL,
     altReasoning: process.env.ROUTE_ALT_REASONING || '',
@@ -2652,7 +2672,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   for (const name of ['OPENROUTER_API_KEY', 'OPENROUTER_MODEL', 'OPENROUTER_UPSTREAM_PROVIDER', 'OPENROUTER_REASONING', 'LOCAL_ROUTE_TOKEN', 'LOCAL_ROUTE_ONLY', 'LOCAL_ROUTE_COMPAT', 'OPENROUTER_ROUTE_COMPAT', 'SONNET_PROVIDER', 'LOCAL_LLM_URL',
     'LOCAL_LLM_MODEL', 'LOCAL_LLM_API_KEY', 'LOCAL_LLM_ALLOW_REMOTE', 'LOCAL_LLM_HTTP_URL', 'LOCAL_LLM_MODELS_URL', 'ROUTE_METRICS_PATH', 'ROUTE_INSTANCE_ID', 'ROUTE_INSTANCE_METRICS_PATH', 'ROUTE_USAGE_EVENTS_PATH', 'ROUTE_ALT_PROVIDER', 'ROUTE_ALT_MODEL', 'ROUTE_ALT_URL',
     'ROUTE_ALT_KEY', 'ROUTE_ALT_ALLOW_REMOTE', 'ROUTE_ALT_HTTP_URL', 'ROUTE_ALT_ALIAS', 'ROUTE_ALT_UPSTREAM_PROVIDER', 'ROUTE_ALT_REASONING', 'CLI_KIND', 'CLI_MODEL', 'CLI_TIMEOUT_S',
-    'ROUTE_MAX_CONCURRENT_REQUESTS', 'ROUTE_MAX_INFLIGHT_BYTES', 'ROUTE_REQUEST_TOTAL_TIMEOUT_MS', 'ROUTE_MAX_CONNECTIONS']) delete process.env[name];
+    'ROUTE_MAX_CONCURRENT_REQUESTS', 'ROUTE_MAX_INFLIGHT_BYTES', 'ROUTE_REQUEST_TOTAL_TIMEOUT_MS', 'ROUTE_MAX_CONNECTIONS',
+    'ROUTE_LOCAL_CONCURRENCY', 'ROUTE_LOCAL_QUEUE_LIMIT', 'ROUTE_LOCAL_QUEUE_WAIT_MS', 'ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS', 'ROUTE_HANDOVER_TIMEOUT_MS']) delete process.env[name];
   if (process.argv.slice(2).includes('--check-connection')) {
     try {
       const result = await checkConnection(config);

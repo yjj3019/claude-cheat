@@ -58,6 +58,12 @@ class ModelQualityProbeTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["reason"], "continuation_failed")
 
+    def test_backend_timeout_is_reported_as_probe_timeout(self):
+        out = io.StringIO()
+        with patch.object(probe, "configured_call", side_effect=TimeoutError("probe_deadline")), contextlib.redirect_stdout(out):
+            self.assertEqual(probe.main(["--provider", "local", "--run"]), 1)
+        self.assertEqual(json.loads(out.getvalue())["reason"], "probe_timeout")
+
     def test_backend_exception_never_prints_sensitive_details(self):
         out = io.StringIO()
         with patch.object(probe, "configured_call", side_effect=RuntimeError("private-token")), contextlib.redirect_stdout(out):

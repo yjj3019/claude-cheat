@@ -206,7 +206,7 @@ HELP_SECTION = {
         ["POST /api/config", "서비스 설정 저장·삭제(clear)"],
         ["POST /api/test", "연결 검사 (metadata·inference·tool_roundtrip)"],
         ["POST /api/config-reset", "OpenRouter·Local 인증 정보 삭제·초기화"],
-    ["POST /api/attention", "대시보드 주의 항목 확인·미루기·해결"],
+        ["POST /api/attention", "대시보드 주의 항목 확인·미루기·해결"],
         ["GET /api/metrics (프록시)", "프록시 카운터. 같은 세션 토큰 필요, 127.0.0.1 전용"],
     ],
     "states": [["external", "외부 모델 사용 중 (Local·OpenRouter·CLI)"], ["plan", "Plan 우회 중"],
@@ -929,7 +929,10 @@ def _save_usage_states(states, now=None):
     payload = {"version": USAGE_CACHE_VERSION, "claims_evicted": evicted,
                "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "files": files}
     try:
-        temporary = USAGE_CACHE_FILE.with_suffix(USAGE_CACHE_FILE.suffix + ".tmp")
+        # Unique temp sibling (pid + random suffix), so two writing processes can never
+        # collide on a fixed ".tmp" name before os.replace.
+        temporary = USAGE_CACHE_FILE.with_name(
+            f".{USAGE_CACHE_FILE.name}.{os.getpid()}.{secrets.token_hex(3)}.tmp")
         temporary.write_text(json.dumps(payload), encoding="utf-8")
         os.replace(temporary, USAGE_CACHE_FILE)
         _USAGE_CACHE_META["saved_at"] = time.monotonic()
@@ -1058,9 +1061,14 @@ def _session_cost(tokens, pricing, cache_write_1h=0):
         return None
     write_1h = _cache_write_1h_tokens(tokens, cache_write_1h)
     rate_1h, _source = _cache_write_1h_rate(pricing)
-    return (tokens[0] * pricing["prompt"] + tokens[1] * pricing["completion"] +
-            tokens[2] * pricing["cache_read"] +
-            (tokens[3] - write_1h) * pricing["cache_write"] + write_1h * rate_1h)
+    # A rate axis absent from the card is None in the record (never faked as $0);
+    # estimation treats it as 0.0 so a partial card still prices the axes it reports.
+    def rate(name):
+        value = pricing.get(name)
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
+    return (tokens[0] * rate("prompt") + tokens[1] * rate("completion") +
+            tokens[2] * rate("cache_read") +
+            (tokens[3] - write_1h) * rate("cache_write") + write_1h * rate_1h)
 
 
 def _cost_status(state, pricing):
@@ -1620,21 +1628,27 @@ def model_pricing(key, model, cache=None, now=None):
             if not pricing:
                 result["error"] = "model_not_found"
             else:
-                def rate(name):
-                    try:
-                        return float(pricing.get(name) or 0)
-                    except (TypeError, ValueError):
-                        return 0.0
-                result = {"ok": True, "error": None, "prompt": rate("prompt"),
-                          "completion": rate("completion"),
-                          "cache_read": rate("input_cache_read"),
-                          "cache_write": rate("input_cache_write"),
-                          # Optional TTL tier; absent means the standard write rate is used.
-                          "cache_write_1h": _optional_rate(
-                              pricing, ("input_cache_write_1h", "cache_write_1h")),
-                          "normalized_model": normalize_model_id(model),
-                          "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-                result["pricing_version"] = _pricing_version(result)
+                def rate(*names):
+                    # Every per-token field is optional: an absent or unparsable
+                    # rate stays None instead of being faked as $0.
+                    return _optional_rate(pricing, names)
+                prompt, completion = rate("prompt"), rate("completion")
+                cache_read, cache_write = rate("input_cache_read"), rate("input_cache_write")
+                if (prompt is None and completion is None
+                        and cache_read is None and cache_write is None):
+                    # No usable rate on any token axis: unknown model, never $0.
+                    result["error"] = "model_not_found"
+                else:
+                    result = {"ok": True, "error": None, "prompt": prompt,
+                              "completion": completion,
+                              "cache_read": cache_read,
+                              "cache_write": cache_write,
+                              # Optional TTL tier; absent means the standard write rate is used.
+                              "cache_write_1h": _optional_rate(
+                                  pricing, ("input_cache_write_1h", "cache_write_1h")),
+                              "normalized_model": normalize_model_id(model),
+                              "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+                    result["pricing_version"] = _pricing_version(result)
         except urllib.error.HTTPError as error:
             result["error"] = f"http_{error.code}"
             error.close()
@@ -2079,7 +2093,19 @@ def live_sessions(limit=MAX_LIVE_SESSIONS):
     """Every live routed session, newest handoff first; a dead or unrelated port is skipped."""
     base = ROOT / ".usage-stats" / "instances"
     try:
-        paths = sorted(base.glob("*/handoff.json"), key=lambda item: item.stat().st_mtime, reverse=True)[:limit]
+        # Only genuine instance directories count; symlink/junction subdirectories are
+        # never descended (Path.glob("*/handoff.json") would follow them into foreign trees).
+        candidates = []
+        with os.scandir(base) as scan:
+            for entry in scan:
+                if (entry.is_symlink() or not entry.is_dir(follow_symlinks=False)
+                        or getattr(Path(entry.path), "is_junction", lambda: False)()):
+                    continue
+                handoff = Path(entry.path) / "handoff.json"
+                if handoff.is_symlink() or not handoff.is_file():
+                    continue
+                candidates.append(handoff)
+        paths = sorted(candidates, key=lambda item: item.stat().st_mtime, reverse=True)[:limit]
     except OSError:
         return []
     rows = []
@@ -3015,11 +3041,6 @@ def _http_json(url, headers, body=None, timeout=12):
     import urllib.error
     import urllib.request
 
-    class NoRedirect(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, req, fp, code, msg, headers, newurl):
-            # Only the configured endpoint is authorized to receive provider credentials.
-            return None
-
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
     data = json.dumps(body).encode("utf-8") if body is not None else None
     request = urllib.request.Request(url, data=data, headers=headers,
@@ -3953,7 +3974,9 @@ def _sweep_orphan_instances():
     base = ROOT / ".usage-stats" / "instances"
     cutoff = time.time() - 30 * 86400
     try:
-        directories = [entry for entry in base.glob("*") if entry.is_dir()]
+        directories = [entry for entry in base.glob("*")
+                       if not entry.is_symlink() and entry.is_dir(follow_symlinks=False)
+                       and not getattr(entry, "is_junction", lambda: False)()]
     except OSError:
         return
     for directory in directories:
@@ -3961,7 +3984,7 @@ def _sweep_orphan_instances():
             if directory.stat().st_mtime >= cutoff:
                 continue
             handoff = directory / "handoff.json"
-            record = json.loads(handoff.read_text(encoding="utf-8")) if handoff.is_file() else None
+            record = json.loads(handoff.read_text(encoding="utf-8")) if not handoff.is_symlink() and handoff.is_file() else None
             port = record.get("port") if isinstance(record, dict) else None
             if isinstance(port, int) and _port_open(port):
                 continue
@@ -3982,8 +4005,18 @@ def _sweep_dead_handoffs():
     and only then: a pid that cannot be verified stays untouched rather than guessed.
     """
     base = ROOT / ".usage-stats" / "instances"
+    handoffs = []
     try:
-        handoffs = list(base.glob("*/handoff.json"))
+        # Scan without descending through symlink/junction subdirectories, so a
+        # junction named like an instance can never lead the sweep into a foreign tree.
+        with os.scandir(base) as scan:
+            for entry in scan:
+                if (entry.is_symlink() or not entry.is_dir(follow_symlinks=False)
+                        or getattr(Path(entry.path), "is_junction", lambda: False)()):
+                    continue
+                candidate = Path(entry.path) / "handoff.json"
+                if not candidate.is_symlink() and candidate.is_file():
+                    handoffs.append(candidate)
     except OSError:
         return
     removed = 0
@@ -4927,7 +4960,7 @@ function renderUsage(payload) {
   const val=(key)=>aggregate[key]===null||aggregate[key]===undefined?'미보고':usageNumber(aggregate[key]);
   const requestLimits=`요청 동시 ${val('admission_active')}/${val('admission_max')} · 본문 메모리 ${val('admission_inflight_bytes')}/${val('admission_max_bytes')} B`;
   const rejectTotals=`거부 누적: 동시 429 ${val('admission_rejected_concurrency')} · 본문 예산 503 ${val('admission_rejected_bytes')} · Local 대기 ${val('local_rejected')} · CLI 429 ${val('cli_rejected')}`;
-  const aggregateStatus=aggregate.partial?'수집 범위 일부 미확인 · 주기당 ${MAX_USAGE_INSTANCES}개, 후보 최대 ${MAX_USAGE_CANDIDATES}개를 순환 조회합니다. 후보 상한 초과는 포함되지 않습니다.':`인증 세션 ${usageNumber(aggregate.observed_instances)}개`;
+  const aggregateStatus=aggregate.partial?`수집 범위 일부 미확인 · 주기당 ${MAX_USAGE_INSTANCES}개, 후보 최대 ${MAX_USAGE_CANDIDATES}개를 순환 조회합니다. 후보 상한 초과는 포함되지 않습니다.`:`인증 세션 ${usageNumber(aggregate.observed_instances)}개`;
   const telemetryCard=card('호스트 · 실행기 자원',`${usageNumber(aggregate.active_instances)}개 인증 실행기${aggregate.partial?' · 일부 인스턴스 미확인':''}`,
     `<div class="metrics-strip"><div class="m"><span class="k">호스트 CPU</span><span class="v">${typeof host.cpu_percent==='number'?num(host.cpu_percent)+'%':'미보고'}</span></div>`+
     `<div class="m"><span class="k">호스트 메모리</span><span class="v">${typeof host.memory_percent==='number'?num(host.memory_percent)+'%':'미보고'}</span></div>`+
@@ -6291,7 +6324,7 @@ def _auto_reload_loop(initial):
     (``_stop_previous``) to stop this process and bind the same port, so the listening
     socket is never closed by a serving thread.
     """
-    if os.environ.get("ROUTE_DASHBOARD_AUTO_RELOAD", "1").strip().lower() in {"0", "false", "no"}:
+    if os.environ.get("ROUTE_DASHBOARD_AUTO_RELOAD", "1").strip().lower() in {"0", "off", "false", "no", "disabled"}:
         return
     while True:
         time.sleep(3)

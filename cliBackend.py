@@ -350,7 +350,10 @@ def _run(argv, prompt, env, cwd, timeout, cancelled, process_timing=None):
             pass  # A CLI that rejects authentication may exit before reading its prompt.
     try:
         job = localProcessTree.create_job_for(process.pid)
-        if os.name == "nt" and job is None:
+        if os.name == "nt" and job is None and process.poll() is None:
+            # A child that already died inside the Popen -> job-attach window must fall
+            # through to the drain-and-diagnose path below (staged failure diagnostic /
+            # not_logged_in); only a live child that cannot be tracked fails here.
             raise BackendError("process_tracking_unavailable")
         for pipe, index in ((process.stdout, 0), (process.stderr, 1)):
             thread = threading.Thread(target=drain, args=(pipe, index), daemon=True)

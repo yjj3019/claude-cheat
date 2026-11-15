@@ -581,6 +581,25 @@ class BackendTest(unittest.TestCase):
                     thread.join(5)
             self.assertEqual(errors, [])
 
+    def test_child_that_exits_before_the_job_attach_reports_the_real_failure(self):
+        """A child dead inside the Popen -> job-attach window must not be masked as
+        process_tracking_unavailable: the drain-and-diagnose path (not_logged_in) must run."""
+        with tempfile.TemporaryDirectory() as directory:
+            process = {}
+            real_popen = backend.subprocess.Popen
+            def spawn(*args, **kwargs):
+                process["child"] = real_popen(*args, **kwargs)
+                return process["child"]
+            def attach(pid):
+                process["child"].wait(timeout=15)  # the fake CLI exits inside the attach window
+                return None
+            with patch.object(backend.subprocess, "Popen", side_effect=spawn), \
+                    patch.object(backend.localProcessTree, "create_job_for", side_effect=attach):
+                self.error("not_logged_in", backend._run,
+                           [sys.executable, "-c",
+                            "import sys; sys.stderr.write('authentication required'); sys.exit(1)"],
+                           "", os.environ.copy(), directory, 15, lambda: False)
+
     def test_runner_memory_io_and_bounded_failures(self):
         with tempfile.TemporaryDirectory() as directory:
             def run(script, timeout=15, cancelled=lambda: False):

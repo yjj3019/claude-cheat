@@ -660,7 +660,8 @@ class PricingTests(unittest.TestCase):
             self.assertTrue(first["ok"])
             self.assertAlmostEqual(first["prompt"], 0.000001)
             self.assertAlmostEqual(first["cache_read"], 0.0000001)
-            self.assertEqual(first["cache_write"], 0.0)
+            # Absent token axes stay None in the record: never faked as $0.
+            self.assertIsNone(first["cache_write"])
             again = dash.model_pricing("sk-or-synthetic", "vendor/model", cache=cache, now=11.0)
             self.assertEqual(again, first)
             factory.assert_called_once()
@@ -2772,6 +2773,56 @@ class ModelsSearchEndpointTests(unittest.TestCase):
         self.assertEqual(base["LOCAL_LLM_HTTP_URL"], "http://172.21.135.113:4000/v1/messages")
         dash._validate_local(base)
         dash._validate_local(dash._local_search_values("http://172.21.135.113:4000/v1/", "posted-key", False))
+
+    def test_models_search_rate_limits_through_the_real_counter(self):
+        """The 7th POST in the same minute window is 429 via the real _rate_ok counter."""
+        import threading
+        old_counts = dict(dash._MODEL_RATE.get("counts", {}))
+        old_window = dash._MODEL_RATE.get("window")
+        old_monotonic = dash.time.monotonic
+        try:
+            dash.time.monotonic = lambda: 1000.0  # one fixed minute window: deterministic
+            dash._MODEL_RATE["counts"] = {}
+            dash._MODEL_RATE["window"] = -1
+            server = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
+            port = server.server_address[1]
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                with mock.patch.object(dash, "model_catalog", return_value={"provider": "local", "ok": True,
+                     "models": [{"id": "local-model", "name": "local-model"}]}):
+                    for index in range(6):
+                        request, opener = self._post(port, {"provider": "local",
+                                                            "url": "http://127.0.0.1:11434/v1/messages",
+                                                            "key": "posted-key"})
+                        with opener.open(request, timeout=10) as response:
+                            self.assertEqual(response.status, 200, f"request {index + 1}")
+                    request, opener = self._post(port, {"provider": "local",
+                                                        "url": "http://127.0.0.1:11434/v1/messages",
+                                                        "key": "posted-key"})
+                    with self.assertRaises(urllib.error.HTTPError) as denied:
+                        opener.open(request, timeout=10)
+                    self.assertEqual(denied.exception.code, 429)
+                    self.assertEqual(json.loads(denied.exception.read())["error"], "rate_limited")
+                    denied.exception.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+        finally:
+            dash.time.monotonic = old_monotonic
+            dash._MODEL_RATE["counts"] = old_counts
+            dash._MODEL_RATE["window"] = old_window
+
+
+class UsagePageHintTests(unittest.TestCase):
+    """Static rendering details of the usage page that the API tests cannot observe."""
+
+    def test_usage_partial_branch_is_a_template_literal_with_real_limits(self):
+        """The partial branch must interpolate ${MAX_USAGE_INSTANCES}/${MAX_USAGE_CANDIDATES}."""
+        hint = ("aggregate.partial?`수집 범위 일부 미확인 · 주기당 ${MAX_USAGE_INSTANCES}개, "
+                "후보 최대 ${MAX_USAGE_CANDIDATES}개를 순환 조회합니다. 후보 상한 초과는 포함되지 않습니다.`")
+        self.assertIn(hint, dash.JS_USAGE)
+        # The single-quoted sibling at the same spot would print the literal "${...}".
+        self.assertNotIn("aggregate.partial?'수집 범위 일부 미확인", dash.JS_USAGE)
 
 
 class UsageStatsTests(unittest.TestCase):

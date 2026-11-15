@@ -80,7 +80,7 @@ class KillOwnedTreeTests(unittest.TestCase):
         self.identity = (4321, 1111)
 
     def kill(self, current, protected=(), failure=None, process=None):
-        taskkill = mock.Mock(side_effect=failure)
+        taskkill = mock.Mock(side_effect=failure, return_value=0)
         with mock.patch.object(localProcessTree, "process_identity", return_value=current), \
              mock.patch.object(localProcessTree, "own_tree_pids", return_value=set(protected)), \
              mock.patch.object(localProcessTree, "_taskkill_tree", taskkill):
@@ -128,9 +128,11 @@ class KillOwnedTreeTests(unittest.TestCase):
         process.kill.assert_not_called()
 
     def test_taskkill_failure_or_timeout_still_kills_the_owned_root(self):
-        for failure in (subprocess.TimeoutExpired("taskkill", 5), OSError("synthetic"),
-                        subprocess.CalledProcessError(1, "taskkill")):
-            with self.subTest(failure=type(failure).__name__):
+        for kind, failure in (("timeout", subprocess.TimeoutExpired("taskkill", 5)),
+                              ("oserror", OSError("synthetic")),
+                              ("called-process-error", subprocess.CalledProcessError(1, "taskkill")),
+                              ("nonzero-exit", lambda *a, **k: 2)):
+            with self.subTest(failure=kind):
                 self.process = mock.Mock(pid=4321)
                 outcome, taskkill = self.kill((4321, 1111), failure=failure)
                 self.assertEqual(outcome, "root")
@@ -139,11 +141,12 @@ class KillOwnedTreeTests(unittest.TestCase):
 
     def test_taskkill_wait_is_bounded(self):
         with mock.patch.object(localProcessTree.subprocess, "run") as run:
-            localProcessTree._taskkill_tree(4321)
+            returncode = localProcessTree._taskkill_tree(4321)
         args, kwargs = run.call_args
         self.assertEqual(args[0], ["taskkill", "/PID", "4321", "/T", "/F"])
         self.assertEqual(kwargs["timeout"], 5.0)
         self.assertFalse(kwargs["check"])
+        self.assertEqual(returncode, run.return_value.returncode)
 
     def test_an_untraceable_process_object_is_refused(self):
         for pid in ("4321", None):

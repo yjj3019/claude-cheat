@@ -13,13 +13,15 @@ import time
 from pathlib import Path
 
 import localProcessTree
+import cliBackend
 
 KINDS = ("codex", "grok", "claude")
 PROMPT = "Reply with exactly OK"
 NODE_FALLBACK = r"C:\Program Files\nodejs\node.exe"
 _MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}")
 _VERSION_RE = re.compile(r"\d+\.\d+\.\d+")
-_SHIM_RE = re.compile(r'"%dp0%\\([^"]+)"\s*%\*')
+# npm cmd-shim v6 uses "%dp0%\...", legacy shims use "%~dp0%\..."; both are honored.
+_SHIM_RE = re.compile(r'"%(?:~)?dp0%\\([^"]+)"\s*%\*')
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _FLAG_RE = re.compile(r"unknown (option|argument|flag)|unexpected argument|unrecognized (option|argument)"
                       r"|invalid (option|argument)", re.I)
@@ -244,8 +246,21 @@ def run_safely(argv, *, stdin_text=None, cwd, env, timeout, max_bytes=1048576):
             _rmtree(tmp)
 
 
+def _exact_version(stdout):
+    """The first trimmed line whose final token is exactly 'x.y.z'.
+
+    An anchored fullmatch, never an unanchored search: '0.167.0-dev' and '0.167.0+build'
+    are prefixes of their line's final token and must not pass as the verified version.
+    """
+    for line in stdout.decode("utf-8", "replace").splitlines():
+        tokens = line.split()
+        if tokens and _VERSION_RE.fullmatch(tokens[-1]):
+            return tokens[-1]
+    return None
+
+
 def probe_version(argv_prefix, env, timeout=10):
-    """Run `<prefix> --version` in an empty temp cwd and extract the first x.y.z."""
+    """Run `<prefix> --version` in an empty temp cwd and extract the first exact x.y.z."""
     cwd = tempfile.mkdtemp(prefix="routecli-cwd-")
     try:
         result = run_safely([*argv_prefix, "--version"], cwd=cwd, env=env, timeout=timeout)
@@ -255,10 +270,10 @@ def probe_version(argv_prefix, env, timeout=10):
         _rmtree(cwd)
     if result["timed_out"]:
         return {"ok": False, "version": None, "reason": "timeout"}
-    match = _VERSION_RE.search(result["stdout"].decode("utf-8", "replace"))
-    if result["exit_code"] != 0 or not match:
+    version = _exact_version(result["stdout"])
+    if result["exit_code"] != 0 or not version:
         return {"ok": False, "version": None, "reason": "version_failed"}
-    return {"ok": True, "version": match.group(), "reason": None}
+    return {"ok": True, "version": version, "reason": None}
 
 
 def detect_all(pinned=None):
@@ -344,7 +359,12 @@ def _classify(result, reply_of):
 
 
 def connection_test(kind, *, binary=None, model=None, timeout_s=60):
-    """One bounded, serialized `reply OK` round trip through a CLI; reasons only, never CLI output."""
+    """One bounded, serialized `reply OK` round trip through a CLI; reasons only, never CLI output.
+
+    "ready" additionally requires the probed backend version to be listed in
+    cliBackend.VERIFIED_VERSIONS; an unverified exact version reports "unsupported_version"
+    instead, so the dashboard never claims "ready" for a backend every session will reject.
+    """
     result = {"ok": False, "reason": None, "kind": kind, "version": None, "exit_code": None, "elapsed_ms": 0}
     if kind not in KINDS:
         return {**result, "reason": "invalid_kind"}
@@ -376,6 +396,8 @@ def connection_test(kind, *, binary=None, model=None, timeout_s=60):
         argv, stdin_text, reply_of = _command(kind, tmp, model)
         run = run_safely([*prefix, *argv], stdin_text=stdin_text, cwd=tmp, env=env, timeout=timeout_s)
         reason = _classify(run, reply_of)
+        if reason == "ready" and probe["version"] not in cliBackend.VERIFIED_VERSIONS.get(kind, set()):
+            reason = "unsupported_version"
         return {**result, "ok": reason == "ready", "reason": reason, "exit_code": run["exit_code"],
                 "elapsed_ms": run["elapsed_ms"]}
     except CliError as error:

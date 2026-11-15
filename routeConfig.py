@@ -369,7 +369,7 @@ def update_text(text, section, updates):
     lines = _split_lines(text)
     if lines and lines[-1] == "":
         lines.pop()
-    header = [i for i, line in enumerate(lines) if re.fullmatch(re.escape(section) + r":\s*(#.*)?", line.rstrip())]
+    header = [i for i, line in enumerate(lines) if re.fullmatch(re.escape(section) + r":\s*(#.*)?", line.lstrip("\ufeff").rstrip())]
     if len(header) > 1:
         raise ConfigError("duplicate_section", header[1] + 1)
     pending = {key: value for key, value in updates.items() if value is not None}
@@ -537,8 +537,11 @@ class Store:
                 text = self._seed()
             else:
                 doc = parse(original)
-                if doc.errors:
-                    raise doc.errors[0]
+                error = doc.first_error(provider)
+                if error:
+                    # A provider whose section is unreadable must not be persisted over,
+                    # or the save would look accepted while the next read refuses it.
+                    raise error
                 text = original
                 # A service whose section does not exist yet is still being served from its
                 # deprecated .env file. Creating the section without those legacy values would

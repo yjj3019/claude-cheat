@@ -158,6 +158,10 @@ def main(argv=None):
             except (OSError, ValueError, KeyError, TypeError, urllib.error.URLError, TimeoutError):
                 result["thinking"] = {"thinking_status": "error", "thinking_blocks": 0, "signed": None,
                                       "elapsed_ms": 0}
+    except TimeoutError:
+        # Same label as routeDashboard.run_tool_roundtrip: a deadline has to surface as
+        # probe_timeout, not as a configuration failure.
+        result = {"ok": False, "reason": "probe_timeout"}
     except (OSError, ValueError, KeyError, TypeError, urllib.error.URLError):
         result = {"ok": False, "reason": "configuration_or_request_failed"}
     except Exception:

@@ -171,6 +171,19 @@ class UpdateTextTests(unittest.TestCase):
         out = cfg.update_text('openrouter:\r\n  model: "m"\r\n', "openrouter", {"model": "n"})
         self.assertEqual(out, 'openrouter:\r\n  model: "n"\r\n')
 
+    def test_section_headers_may_carry_a_leading_bom(self):
+        # parse() strips a leading BOM, so update_text must match the header
+        # BOM-insensitively: without that, an update would append a second section and
+        # the next read would refuse the duplicated file.
+        text = '\ufeffopenrouter:\n  model: "m"\nlocal:\n  model: "l"\n'
+        out = cfg.update_text(text, "openrouter", {"model": "n"})
+        self.assertEqual(out.count("openrouter:"), 1)
+        doc = cfg.parse(out)
+        self.assertEqual(doc.errors, [])
+        self.assertFalse(doc.sections["openrouter"]["errors"])
+        self.assertEqual(doc.sections["openrouter"]["values"]["model"], "n")
+        self.assertEqual(doc.sections["local"]["values"]["model"], "l")
+
     def test_values_round_trip_through_the_writer(self):
         tricky = ['plain', 'with "quotes"', "back\\slash", "# looks like a comment", "key: value", "- dash",
                   "  padded  ", "true", "false", "", "한글 🚀", "a'b", "http://h:1/p?x=1#f", "&anchor", "*alias",
@@ -373,6 +386,16 @@ class StoreTests(unittest.TestCase):
         store = make_store(self.tmp, **{"openclaude.config.yaml": 'openrouter:\n  modle: "x"\nlocal:\n  model: "m"\n'})
         store.write_provider("local", {"LOCAL_LLM_MODEL": "n"})
         self.assertEqual(store.read_provider("local"), {"LOCAL_LLM_MODEL": "n"})
+
+    def test_a_save_cannot_repair_the_section_read_provider_would_refuse(self):
+        # The save gate checks the provider's own section, not just document-level errors:
+        # persisting over a broken section would make the save look accepted while the
+        # next read rejects the file.
+        store = make_store(self.tmp, **{"openclaude.config.yaml": 'openrouter:\n  modle: "x"\nlocal:\n  model: "m"\n'})
+        with self.assertRaises(cfg.ConfigError) as caught:
+            store.write_provider("openrouter", {"OPENROUTER_MODEL": "vendor/new"})
+        self.assertEqual(caught.exception.code, "unknown_key")
+        self.assertEqual(store.read_provider("local"), {"LOCAL_LLM_MODEL": "m"})
 
     def test_undecodable_settings_file_is_never_rewritten(self):
         store = make_store(self.tmp, **{"openclaude.config.yaml": b'openrouter:\n  model: "\xff"\n'})

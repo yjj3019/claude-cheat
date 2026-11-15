@@ -810,6 +810,41 @@ def _verify_port_owned(port, nonce, proxy) -> bool:
     return verify_owned_proxy(port, nonce)
 
 
+# Local admission tuning forwarded to the proxy: (name, lower bound, upper bound). The
+# bounds mirror the proxy's own startup validation (claudeRouteProxy.mjs), so the launcher
+# never forwards a value the proxy would reject.
+_LOCAL_ADMISSION_LIMITS = (
+    ("ROUTE_LOCAL_CONCURRENCY", 1, 64),
+    ("ROUTE_LOCAL_QUEUE_LIMIT", 0, 256),
+    ("ROUTE_LOCAL_QUEUE_WAIT_MS", 0, 600000),
+    ("ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS", 30000, 900000),
+)
+
+
+def _local_admission_env(environ=None):
+    """Validated Local admission tuning for the proxy environment.
+
+    Only ASCII-digit values inside the documented bounds are forwarded so a typo
+    cannot fail the proxy at startup (the proxy itself rejects out-of-range values);
+    a set-but-invalid value is skipped so the proxy applies its own default.
+    """
+    environ = os.environ if environ is None else environ
+    forwarded = {}
+    for name, minimum, maximum in _LOCAL_ADMISSION_LIMITS:
+        value = environ.get(name)
+        if value is None:
+            continue
+        try:
+            number = int(value)
+        except ValueError:
+            number = -1  # non-numeric or over-long: cannot be in range
+        if not value.isascii() or number < minimum or number > maximum:
+            print(json.dumps({"event": "local_admission_env_ignored", "name": name}), file=sys.stderr, flush=True)
+            continue
+        forwarded[name] = value
+    return forwarded
+
+
 @contextlib.contextmanager
 def _routed_session(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False,
                   openrouter_compat: bool = False, debug: bool = False,
@@ -935,6 +970,11 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
         env.update(dual_cli_env(dual))
     connection_result = check_cli_backend(_backend) if _backend is not None else check_connection(provider, config=config)
     if connection_result != 0:
+        if _backend is not None:
+            # A failing CLI backend cannot be continued into: the session would start only to
+            # die on its first turn. Abort before the CLI is spawned so the failure surfaces
+            # as the startup diagnostic instead of a mid-session crash.
+            raise LocalStartupError("local_cli_backend_unavailable")
         print(json.dumps({"event": "provider_connection_unavailable", "provider": provider,
                           "action": "continue", "plan_fallback": False}), flush=True)
     proxy_env.update(config, LOCAL_ROUTE_TOKEN=nonce, LOCAL_ROUTE_ONLY="1" if local_only else "0")
@@ -957,17 +997,10 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
         if provider == "openrouter" and os.environ.get("ROUTE_STREAM_PASSTHROUGH"):
             proxy_env["ROUTE_STREAM_PASSTHROUGH"] = os.environ["ROUTE_STREAM_PASSTHROUGH"]
         # Opt-in Local admission tuning (Agent Teams / slow local servers). Only well-formed
-        # values are forwarded so a typo cannot fail the proxy at startup; otherwise the
-        # proxy applies its own default.
-        for name, minimum in (("ROUTE_LOCAL_CONCURRENCY", 1), ("ROUTE_LOCAL_QUEUE_LIMIT", 0),
-                              ("ROUTE_LOCAL_QUEUE_WAIT_MS", 0), ("ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS", 1)):
-            value = os.environ.get(name)
-            if value is None:
-                continue
-            if not value.isdigit() or int(value) < minimum:
-                print(json.dumps({"event": "local_admission_env_ignored", "name": name}), file=sys.stderr, flush=True)
-                continue
-            proxy_env[name] = value
+        # ASCII-digit values inside the documented bounds are forwarded so a typo cannot
+        # fail the proxy at startup (the proxy itself rejects out-of-range values); a
+        # set-but-invalid value is skipped and the proxy applies its own default.
+        proxy_env.update(_local_admission_env())
     proxy_env.pop("LOCAL_ROUTE_COMPAT", None)
     proxy_env.pop("OPENROUTER_ROUTE_COMPAT", None)
     if local_compat:

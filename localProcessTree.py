@@ -108,12 +108,15 @@ def own_tree_pids():
 
 
 def _taskkill_tree(pid, timeout=TASKKILL_TIMEOUT_SECONDS):
-    """Kill a pid and its descendants; bounded so a stuck taskkill cannot block shutdown."""
+    """Kill a pid and its descendants; bounded so a stuck taskkill cannot block shutdown.
+
+    Returns the taskkill exit code; 0 means the tree was terminated.
+    """
     # taskkill is a console app: without this flag a console-less parent (the
     # dashboard's detached trees) makes Windows allocate a new console window per kill.
-    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], stdout=subprocess.DEVNULL,
-                   stderr=subprocess.DEVNULL, check=False, timeout=timeout,
-                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0)
+    return subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, check=False, timeout=timeout,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0).returncode
 
 
 def kill_owned_tree(process, identity, *, timeout=TASKKILL_TIMEOUT_SECONDS):
@@ -121,9 +124,9 @@ def kill_owned_tree(process, identity, *, timeout=TASKKILL_TIMEOUT_SECONDS):
 
     identity is the (pid, creation time) pair captured while the child was known alive.
     A verified mismatch, or a pid inside our own tree, refuses every kill ("refused").
-    An unverifiable identity, a failed or timed-out taskkill, and a taskkill refusal
-    all fall back to terminating the owned root handle only ("root"); a verified tree
-    kill reports "tree". The root kill always runs after a kill decision.
+    An unverifiable identity, a failed, timed-out or nonzero-exit taskkill, and a taskkill
+    refusal all fall back to terminating the owned root handle only ("root"); a verified
+    tree kill reports "tree". The root kill always runs after a kill decision.
     """
     pid = getattr(process, "pid", None)
     if not isinstance(pid, int) or pid in own_tree_pids():
@@ -136,8 +139,8 @@ def kill_owned_tree(process, identity, *, timeout=TASKKILL_TIMEOUT_SECONDS):
     try:
         if verified and os.name == "nt":
             try:
-                _taskkill_tree(pid, timeout)
-                outcome = "tree"
+                if _taskkill_tree(pid, timeout) == 0:
+                    outcome = "tree"
             except (OSError, subprocess.SubprocessError):
                 outcome = "root"
     finally:

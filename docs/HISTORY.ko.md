@@ -7,7 +7,19 @@
 과거 검사 결과나 정책을 현재 기능의 보증으로 해석하지 마세요. 합성 테스트와 실제 서비스 검증은 구분해야 합니다.
 
 
+
 ## 버전별 주요 변경
+
+### 1.0.7 추가 (2026-11-15) — 전면 감사 개선: admission env 검증 통일·대시보드/구성/설치자·CLI 진단
+
+전체 소스 감사([SOURCE-AUDIT.ko.md](SOURCE-AUDIT.ko.md))와 비판적 검토([CRITICAL-REVIEW.ko.md](CRITICAL-REVIEW.ko.md))에서 도출된 문제점의 수정 라운드입니다.
+
+- **로컬 admission env 검증 통일(MAJOR M1)** — `ROUTE_LOCAL_CONCURRENCY`(1–64)·`ROUTE_LOCAL_QUEUE_LIMIT`(0–256)·`ROUTE_LOCAL_QUEUE_WAIT_MS`(0–600000)·`ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS`(30s–15min)를 런처가 상한까지 검증해 올바른 값만 프록시에 전달하고(유니코드 숫자 `²`·`６５` 포함 set-but-invalid → `local_admission_env_ignored`로 무시 → 프록시 기본값), 프록시를 직접 실행할 때 잘못된 값이 설정돼 있으면 `Invalid Local admission limits`로 시작이 실패합니다(기존 "잘못된 값은 기본값" 문구를 README에서 정정). `ROUTE_HANDOVER_TIMEOUT_MS`는 0·음수·비수치일 때 120초 유지, 600초 초과분만 600초로 제한합니다. 다섯 env는 프록시 decode에서 소비 후 제거 목록에 추가되어 하위 프로세스로 새지 않습니다.
+- **CLI 백엔드 사전 점검 실패는 지연이 아니라 중단** — CLI 백엔드 세션이 사전 점검에 실패하면 `provider_connection_unavailable`(continue) 대신 `local_cli_backend_unavailable`로 시작이 멈춥니다. 첫 턴에서 죽는 세션 대신 시작 진단으로 표면화됩니다.
+- **대시보드** — 사용량 화면의 부분 집계/세션 비용이 사용할 수 없는 단가를 $0으로 위장하지 않고 `None`으로 표기하며, 일부 단가만 있는 레코드가 크래시하지 않습니다. 만료 세션 스윕·설정 저장이 심링크/정션을 따라가지 않습니다(`is_dir` 대신 `is_symlink` 거부, `os.scandir(follow_symlinks=False)`). 설정 저장이 고정 `.tmp` 이름을 버리고 고유 임시 파일+`os.replace`를 사용하며, 저장된 부분이 `read_provider`가 거부할 형식이면 저장이 실패합니다(첫 오류 보고). `/api/models-search` 요금 제한이 실측 카운터 경로로 전환되어 7번째 요청이 429를 반환합니다. 대시보드 PS1의 `-Port`(1–65535)·`-Refresh`(1–86400) 검증, auto-reload 끔 값 목록이 버전 캐시와 정렬됩니다.
+- **구성** — `update_text`가 BOM 없는 파일뿐 아니라 BOM 있는 섹션 헤더와도 대칭으로 일치합니다. 설치자의 배치 파일 인코딩 감지가 PowerShell 5.1뿐 아니라 7에서도 동작하고(CodePages 인코딩 공급자 등록), 드라이브 루트를 `C:`로 줄이지 않으며, 포워더 소유권 판정이 바이트 비교가 아니라 생성 마커 줄로 바뀌어 checkout 이동 후에도 갱신·제거가 가능하고 `-Remove`는 설치자가 추가한 정확한 PATH 항목만 제거합니다.
+- **CLI 진단** — 레거시 `%~dp0%` shim(SHIM 정규식) 인식, 버전 해석을 앞뒤 고정(fullmatch)으로 엄격화(꼬리 토큰의 `0.167.0-dev` 등은 `version_failed`), 미검증 버전 연결 검사가 `unsupported_version`로 보고됩니다. 즉시 종료한 CLI 자식이 작업 연결 전에 `process_tracking_unavailable`로 가려지면 실제 사유(`not_logged_in` 등)를 진단하고, 종료 코드가 주어지면 `tree`/`root` 라벨이 taskkill 결과를 따릅니다. 품질 프로브의 `TimeoutError`가 `probe_timeout`으로 구분됩니다.
+- **검증** — `tests/test_local_admission_env.py` 신규(경계·유니코드·과장 숫자 8건), `localAdmission.test.mjs` 확장(유니코드·시작 실패 목록, 시도 시간 초과 경계), 대시보드·구성·설치자·CLI 수정에 각 테스트 추가. Python·Node 전체 스위트 재실행 통과.
 
 ### 1.0.7 (2026-11-08, 커밋 2d06db9)
 

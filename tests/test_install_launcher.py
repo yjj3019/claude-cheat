@@ -157,15 +157,82 @@ class InstallLauncherTests(unittest.TestCase):
         self.assertEqual(removed.returncode, 0, removed.stderr[-400:])
         self.assertTrue(foreign.exists(), "a user file must survive -Remove")
 
-    def test_modified_generated_forwarder_is_preserved(self):
+    def test_installer_owned_forwarder_from_a_moved_checkout_is_refreshed(self):
+        # Ownership is decided by the installer marker line, not byte equality: after a
+        # checkout move the embedded path changes, but the marker still proves the
+        # installer wrote the file, so re-installing refreshes it instead of keeping stale
+        # forwarders that point at the old checkout.
         self.assertEqual(self.run_installer().returncode, 0)
+        moved = Path(tempfile.mkdtemp()) / "moved-checkout"
         path = self.target / "OpenClaude.cmd"
-        modified = decode_batch(path) + "rem user change\r\n"
-        path.write_bytes(modified.encode("mbcs"))
+        moved_body = decode_batch(path).replace(str(ROOT), str(moved))
+        path.write_bytes(moved_body.encode("mbcs"))
+        self.assertIn(str(moved), decode_batch(path))
         self.assertEqual(self.run_installer().returncode, 0)
-        self.assertEqual(decode_batch(path), modified)
+        body = decode_batch(path)
+        self.assertIn(str(ROOT), body)
+        self.assertNotIn(str(moved), body)
+
+    def test_remove_deletes_installer_owned_forwarders_after_a_checkout_move(self):
+        # The marker line, not the embedded checkout path, proves installer ownership:
+        # -Remove must delete the forwarders even when the embedded path no longer matches.
+        self.assertEqual(self.run_installer().returncode, 0)
+        moved = Path(tempfile.mkdtemp()) / "moved-checkout"
+        path = self.target / "installLauncher.cmd"
+        moved_body = decode_batch(path).replace(str(ROOT), str(moved))
+        path.write_bytes(moved_body.encode("mbcs"))
         self.assertEqual(self.run_installer("-Remove").returncode, 0)
-        self.assertEqual(decode_batch(path), modified)
+        self.assertFalse(path.exists())
+        foreign = self.target / "OpenClaude.cmd"
+        self.assertFalse(foreign.exists())
+
+    def test_remove_strips_only_the_exact_user_path_entry_the_installer_added(self):
+        if os.name != "nt":
+            self.skipTest("user PATH is Windows-only")
+        probe = [POWERSHELL, "-NoProfile", "-Command",
+                 "[Environment]::GetEnvironmentVariable('Path','User')"]
+        read_path = lambda: subprocess.run(probe, capture_output=True, text=True, timeout=60,
+                                           encoding="utf-8", errors="replace").stdout
+        bare = read_path()
+        entries = [entry for entry in bare.split(";") if entry]
+        if str(self.target) in entries or str(self.target).replace("/", "\\") in entries:
+            self.skipTest("target already on user PATH")
+        try:
+            # Add the exact entry the installer's Add-UserPathEntry writes, then -Remove.
+            add = [POWERSHELL, "-NoProfile", "-Command",
+                   "[Environment]::SetEnvironmentVariable('Path', ([Environment]::GetEnvironmentVariable('Path','User').TrimEnd(';') + ';' + '" + str(self.target) + "'), 'User')"]
+            added = subprocess.run(add, capture_output=True, text=True, timeout=60,
+                                   encoding="utf-8", errors="replace")
+            self.assertEqual(added.returncode, 0, added.stderr)
+            self.assertEqual(self.run_installer().returncode, 0)
+            removed = self.run_installer("-Remove")
+            self.assertEqual(removed.returncode, 0, removed.stderr[-600:])
+            after = [entry for entry in read_path().split(";") if entry]
+            self.assertNotIn(str(self.target), after)
+            self.assertEqual(after, entries, "only the installer's own entry may be removed")
+        finally:
+            restore = [POWERSHELL, "-NoProfile", "-Command",
+                       "[Environment]::SetEnvironmentVariable('Path', '" + bare + "', 'User')"]
+            subprocess.run(restore, capture_output=True, timeout=60)
+
+    def test_resolve_directory_keeps_a_drive_root_separator(self):
+        # "C:\\" must stay "C:\\": TrimEnd would degrade it to the drive-relative "C:".
+        harness = self.target / "probe-resolve.ps1"
+        self.target.mkdir(parents=True, exist_ok=True)
+        harness.write_text(
+            "$src = Get-Content -Raw '" + str(ROOT / "installLauncher.ps1") + "'\n"
+            "$m = [regex]::Match($src, '(?ms)^function Resolve-Directory.*?\\r?\\n\\}')\n"
+            "if (-not $m.Success) { throw 'Resolve-Directory function not found' }\n"
+            "Invoke-Expression $m.Value\n"
+            "[Console]::WriteLine('root<' + (Resolve-Directory 'C:\\') + '>')\n"
+            "[Console]::WriteLine('sub<' + (Resolve-Directory 'C:\\tmp\\') + '>')\n",
+            encoding="utf-8")
+        result = subprocess.run([POWERSHELL, "-NoProfile", "-File", str(harness)],
+                               capture_output=True, text=True, timeout=60,
+                               encoding="utf-8", errors="replace")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("<C:\\>", result.stdout)
+        self.assertIn("<C:\\tmp>", result.stdout)
 
     def test_install_is_idempotent(self):
         self.assertEqual(self.run_installer().returncode, 0)
