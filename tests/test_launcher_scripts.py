@@ -105,8 +105,8 @@ class LauncherEnvironmentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "OpenClaude.ps1").write_bytes(LAUNCHER.read_bytes())
-            (root / "OpenClaudeDashboard.ps1").write_text(
-                "param([switch]$Open)\nif ($env:ROUTE_STREAM_PASSTHROUGH -ne 'original') { throw 'environment changed' }\n$global:LASTEXITCODE = 0\n", encoding="utf-8")
+            (root / "launcherStartup.py").write_text(
+                "import os,sys\nassert sys.argv[1:] == ['--setup']\nassert os.environ['ROUTE_STREAM_PASSTHROUGH'] == 'original'\n", encoding="utf-8")
             result = self.run_script("$env:ROUTE_STREAM_PASSTHROUGH = 'original'; "
                                      f"& '{root / 'OpenClaude.ps1'}' -Setup -Stream")
             self.assertEqual(result.returncode, 0, result.stderr[-400:])

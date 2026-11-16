@@ -1656,6 +1656,16 @@ test('HTTP exceptions require a matching pin and never bypass HTTPS opt-in', () 
   }
 });
 
+test('proxy starts with real transport for an approved internal HTTP or remote HTTPS endpoint', () => {
+  for (const config of [
+    { localUrl: 'http://192.0.2.10:4000/v1/messages', localHttpUrl: 'http://192.0.2.10:4000/v1/messages' },
+    { localUrl: 'https://llm.example.invalid/v1/messages', localAllowRemote: true },
+  ]) {
+    const server = createProxy({ nonce: NONCE, provider: 'local', localModel: 'fixture', ...config });
+    server.close();
+  }
+});
+
 test('remote opt-in still rejects other plaintext HTTP servers', () => {
   assert.throws(() => createProxy({ nonce: NONCE, provider: 'local',
     localUrl: 'http://llm.example.invalid/v1/messages', localModel: 'configured-model', localAllowRemote: true }));

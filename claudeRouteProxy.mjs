@@ -6,6 +6,7 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { appendFile, appendFileSync, readFileSync, rename, renameSync, statSync, unlink, unlinkSync, writeFile, writeFileSync } from 'node:fs';
 import { monitorEventLoopDelay, PerformanceObserver } from 'node:perf_hooks';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { acquireShared, endpointKey, sharedStatus } from './localAdmission.mjs';
 
 // Monitoring: event-loop delay samples separate the proxy's own work from upstream latency.
 // The histogram's timer is unref'ed, so it never keeps the process alive.
@@ -517,6 +518,9 @@ function http2UpstreamFetch(input, options = {}) {
     const evict = () => { if (H2_SESSIONS.get(url.origin) === session) H2_SESSIONS.delete(url.origin); };
     session.on('error', evict);
     session.on('close', evict);
+    session.setTimeout(30000, () => { if (!session._routeStreams) session.destroy(); });
+    session._routeStreams = 0;
+    session.unref();
     H2_SESSIONS.set(url.origin, session);
   }
   return new Promise((resolve, reject) => {
@@ -528,9 +532,21 @@ function http2UpstreamFetch(input, options = {}) {
       if (!H2_FORBIDDEN.has(lower) && !lower.startsWith(':') && value !== undefined) headers[lower] = String(value);
     }
     const request = session.request(headers);
-    const abort = () => request.destroy();
+    session._routeStreams++; session.ref();
+    // Active requests already have their own deadlines; only reap idle sessions.
+    session.setTimeout(0);
+    const abort = () => request.destroy(new Error('This operation was aborted'));
     options.signal?.addEventListener('abort', abort, { once: true });
     let settled = false;
+    request.once('close', () => {
+      options.signal?.removeEventListener('abort', abort);
+      session._routeStreams--;
+      if (!session._routeStreams) {
+        if (!session.destroyed) session.setTimeout(30000);
+        session.unref();
+      }
+      if (!settled) { settled = true; reject(new Error('Upstream stream closed before headers')); }
+    });
     request.on('response', responseHeaders => {
       const status = Number(responseHeaders[':status']);
       if (status >= 300 && status < 400) { settled = true; request.destroy(); reject(new Error('URL redirect not supported')); return; }
@@ -1220,6 +1236,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
   localConcurrency = localAdmissionEnv('ROUTE_LOCAL_CONCURRENCY', 2, 1, 64),
   localQueueLimit = localAdmissionEnv('ROUTE_LOCAL_QUEUE_LIMIT', 8, 0, 256),
   localQueueWaitMs = localAdmissionEnv('ROUTE_LOCAL_QUEUE_WAIT_MS', 60000, 0, 600000),
+  sharedAdmission = false,
   // Opt-in: peel the CLI's trailing token-count footer from system text before the external
   // request so the provider's prefix cache survives between turns. Documented in the README.
   stabilizePromptCache = process.env.ROUTE_STABILIZE_PROMPT_CACHE === '1',
@@ -1298,6 +1315,17 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
   // This bounds this proxy's contribution, not other users of the shared server.
   const localQueue = [];
   let localActive = 0, localQueueRejected = 0;
+  const sharedState = { scope: 'host_endpoint', enabled: sharedAdmission && (provider === 'local' || altProvider === 'local'), active: 0, queued: 0,
+    concurrency: localConcurrency, queueLimit: localQueueLimit };
+  const sharedUrl = provider === 'local' ? externalUrl : altProvider === 'local' ? altExternalUrl : null;
+  const sharedTimer = sharedAdmission && sharedUrl ? setInterval(async () => {
+    try {
+      const state = await sharedStatus({url:sharedUrl, concurrency:localConcurrency, queueLimit:localQueueLimit});
+      Object.assign(sharedState, state, {endpoint:endpointKey(sharedUrl), stale:false, observedAt:new Date().toISOString()});
+      scheduleMetricsFlush();
+    } catch { sharedState.stale = true; }
+  }, 2000) : null;
+  sharedTimer?.unref();
   const localPermit = () => {
     localActive++;
     let released = false;
@@ -1405,6 +1433,8 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
     [name, { responses: 0, inputSamples: 0, inputTokens: 0, outputSamples: 0, outputTokens: 0 }]));
   // Only completed request aggregates, never content or individual request records.
   const monitoringHistory = new Map();
+  const recentRequests = [];
+  let sharedWaiting = 0;
   const currentMinute = () => Math.floor(now() / 60000);
   const pruneHistory = minute => {
     for (const key of monitoringHistory.keys()) {
@@ -1504,8 +1534,10 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
     modelPerformance: Object.fromEntries(Object.entries(modelPerformance).map(([name, value]) => [name, { ...value }])),
     tokenFlow: Object.fromEntries(Object.entries(tokenFlow).map(([name, value]) => [name, { ...value }])),
     monitoringHistory: historySnapshot(),
-    localAdmission: { active: localActive, queued: localQueue.length, rejected: localQueueRejected,
-      concurrency: localConcurrency, queueLimit: localQueueLimit, queueWaitMs: localQueueWaitMs },
+    localAdmission: { active: localActive, queued: localQueue.length + sharedWaiting, rejected: localQueueRejected,
+      scope: 'session', concurrency: localConcurrency, queueLimit: localQueueLimit, queueWaitMs: localQueueWaitMs },
+    sharedAdmission: { ...sharedState },
+    recentRequests: recentRequests.slice(),
     last: metrics.last,
     rateLimit: lastRateLimit ? { ...lastRateLimit } : null,
   });
@@ -1857,11 +1889,13 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
       let routeKind = null, routeReason = null, fallbackFailure = null, recorded = false, performanceSample = null;
       let usageProvider = 'unknown', usageRequestedModel = null, usageReportedModel = null;
       const openPhases = new Set();
+      const phaseMs = {};
       const startPhase = phase => {
         const start = performance.now();
         const finish = (end = performance.now()) => {
           if (!openPhases.delete(finish)) return;
           recordTiming(phase, end - start);
+          phaseMs[phase] = Number(((phaseMs[phase] || 0) + end - start).toFixed(2));
         };
         openPhases.add(finish);
         return finish;
@@ -1953,6 +1987,13 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
           // Exposed so a rate-limit answer stays visible to the dashboard (and to the circuit
           // work that will consume it); null means no usable Retry-After was seen.
           retryAfterMs: retryAfterHintMs, fallbackFailure };
+        if (aborted || responseFailed || res.statusCode >= 400 || elapsed >= 5000) {
+          const observation = { ...metrics.last, instanceId: routeInstanceId || null,
+            phasesMs: { ...phaseMs, total: elapsed } };
+          recentRequests.push(observation);
+          if (recentRequests.length > 20) recentRequests.shift();
+          logEvent({ event: 'request_completed', ...observation });
+        }
         // Count logical messages only; token counting is a different API operation.
         if (!req.url.startsWith('/v1/messages/count_tokens')) {
           const ok = !aborted && !responseFailed && res.statusCode < 400;
@@ -2178,7 +2219,29 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
       let releaseLocal = () => {};
       if (target.name === 'local') {
         const finishQueue = startPhase('queueWait');
-        try { releaseLocal = await acquireLocal(client.signal); }
+        try {
+          if (!sharedAdmission) releaseLocal = await acquireLocal(client.signal);
+          else {
+            sharedWaiting++;
+            try {
+              const releaseShared = await acquireShared({ url: target.url, concurrency: localConcurrency,
+                queueLimit: localQueueLimit, waitMs: localQueueWaitMs, signal: client.signal,
+                onState: state => { Object.assign(sharedState, state, { endpoint: endpointKey(target.url), observedAt: new Date().toISOString() }); scheduleMetricsFlush(); },
+                onLost: () => client.abort('shared_admission_lost') });
+              if (!releaseShared) { localQueueRejected++; releaseLocal = null; }
+              else {
+                const releaseSession = localPermit();
+                releaseLocal = () => { releaseShared(); releaseSession(); };
+              }
+            } catch (error) {
+              client.signal.throwIfAborted();
+              const code = error.code === 'shared_limit_mismatch' ? error.code : 'admission_unavailable';
+              fallbackFailure = code;
+              logEvent({ event: 'shared_admission_failed', code });
+              return reject(503, code);
+            } finally { sharedWaiting--; }
+          }
+        }
         finally { finishQueue(); }
       }
       if (!releaseLocal) {
@@ -2299,6 +2362,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
               if (!controller.signal.aborted) {
                 receivedHeaders = true;
                 recordTiming('externalHeaders', performance.now() - attemptStarted);
+                phaseMs.externalHeaders = Number((performance.now() - attemptStarted).toFixed(2));
               }
               status = response.status;
               if (target.name === 'cli' && status === 429) cliActivity.rejected += 1;
@@ -2347,6 +2411,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
                   if (!receivedBody && !controller.signal.aborted) {
                     receivedBody = true;
                     recordTiming('externalFirstBody', performance.now() - attemptStarted);
+                    phaseMs.externalFirstBody = Number((performance.now() - attemptStarted).toFixed(2));
                   }
                   noteFirstByte(); if (!noPlan) arm();
                 }, target.openrouter,
@@ -2605,6 +2670,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
   // replacement bind the same port. Node drops sockets beyond maxConnections before they
   // reach the request handler, so an over-cap connection is torn down rather than queued.
   server.maxConnections = maxConnections;
+  server.once('close', () => { if (sharedTimer) clearInterval(sharedTimer); });
   server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS;
   // A stalled header never reaches the request handler, so it is bounded by the server's
   // own header timeout; Node checks it on a coarse interval, which must shrink with the cap.
@@ -2623,7 +2689,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
   // stalled client cannot pin a worker beyond the handover cap.
   server.requestTimeout = Math.max(15000, (requestTotalTimeoutMs || 60000) + 5000);
   if (fetchImpl === fetch || fetchImpl === http2UpstreamFetch) {
-    prewarmOrigin(new URL(provider !== 'openrouter' && localUrl ? localEndpoint(localUrl, false, '') : 'https://openrouter.ai/api/v1/messages', 'http://prewarm').origin, fetchImpl);
+    prewarmOrigin(new URL(externalUrl).origin, fetchImpl);
     prewarmOrigin('https://api.anthropic.com', fetchImpl);
   }
   if (metricsPath || instanceMetricsPath) server.once('close', () => {
@@ -2640,6 +2706,17 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  // Startup failures expose only a fixed code, never a stack or configuration value.
+  const startupFailure = error => {
+    const message = String(error?.message || '');
+    const code = error?.code === 'EADDRINUSE' ? 'port_in_use' : error?.code === 'EACCES' ? 'bind_denied'
+      : /Local.*URL|Local.*credential|Local.*model|Local.*setting|Local admission|Proxy credentials|OpenRouter model/i.test(message)
+        ? 'configuration_invalid' : 'proxy_boot_failed';
+    process.stderr.write(JSON.stringify({ event: 'proxy_start_failed', code, stage: code.startsWith('port_') || code === 'bind_denied' ? 'bind' : 'configuration' }) + '\n');
+    process.exitCode = 1;
+    setImmediate(() => process.exit(1));
+  };
+  process.once('uncaughtException', startupFailure);
   const config = { key: process.env.OPENROUTER_API_KEY, openrouterModel: process.env.OPENROUTER_MODEL,
     openrouterUpstreamProvider: process.env.SONNET_PROVIDER === 'local' && process.env.ROUTE_ALT_PROVIDER === 'openrouter'
       ? process.env.ROUTE_ALT_UPSTREAM_PROVIDER : process.env.OPENROUTER_UPSTREAM_PROVIDER,
@@ -2694,7 +2771,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       process.exitCode = 1;
     }
   } else {
-    const server = createProxy(config);
+    const server = createProxy({ ...config, sharedAdmission: true });
     if (process.argv.slice(2).includes('--parent-pipe')) {
       const parentClosed = () => {
         emitDiagnostic(JSON.stringify({ event: config.openrouterCompat ? 'openrouter_parent_disconnected' : config.localOnly ? 'local_parent_disconnected' : 'parent_disconnected', provider: config.provider }));
@@ -2708,6 +2785,6 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     const portArg = process.argv.indexOf('--port');
     const requestedPort = portArg > 0 ? Number(process.argv[portArg + 1]) : 0;
     server.listen(Number.isInteger(requestedPort) ? requestedPort : 0, '127.0.0.1',
-      () => process.stdout.write(JSON.stringify({ port: server.address().port }) + '\n'));
+      () => { process.removeListener('uncaughtException', startupFailure); process.stdout.write(JSON.stringify({ port: server.address().port }) + '\n'); });
   }
 }

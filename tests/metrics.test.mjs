@@ -92,6 +92,18 @@ test('metrics endpoint requires the session token', async () => {
   }
 });
 
+test('failed requests retain bounded correlated timings without prompt or credential content', async () => {
+  const {server, base, metrics} = await start({failAlways:true});
+  try {
+    for (let i=0; i<23; i++) await send(base, {content:'private-prompt-canary'});
+    const data=await (await fetch(metrics,{headers:{'x-local-route-token':NONCE}})).json();
+    assert.equal(data.recentRequests.length,20);
+    assert.equal(new Set(data.recentRequests.map(row=>row.traceId)).size,20);
+    assert.ok(data.recentRequests.every(row=>row.outcome==='failed' && row.phasesMs.total>=0));
+    assert.doesNotMatch(JSON.stringify(data.recentRequests),/private-prompt-canary|sk-or-metrics|sk-ant-oat/);
+  } finally {server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
+});
+
 test('external timeouts distinguish deadline, ceiling and observed response stage', async () => {
   for (const stage of ['headers', 'body', 'stream', 'ceiling']) {
     const { server, base, metrics } = await start({

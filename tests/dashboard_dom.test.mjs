@@ -169,14 +169,14 @@ test('usage preserves same-period results when refresh fails but clears an old p
 
 test('usage polling is bounded and pauses while the page is hidden', async () => {
   const context=buildContext(), handlers={}, timers=[];
-  context.document.addEventListener=(event,handler)=>{handlers[event]=handler;};
+  context.document.addEventListener=(event,handler)=>{const previous=handlers[event];handlers[event]=()=>{previous?.();handler();};};
   context.setTimeout=(fn,delay)=>{timers.push({fn,delay});return timers.length;};
   const sandbox={...context,globalThis:null}; sandbox.globalThis=sandbox;
   let calls=0;
-  sandbox.fetch=async()=>{calls++;return {ok:true,json:async()=>({status:'ready',report:{rows:[]},sessions:[]})};};
+  sandbox.fetch=async url=>{if(url !== '/api/browser')calls++;return {ok:true,json:async()=>({status:'ready',report:{rows:[]},sessions:[]})};};
   vm.createContext(sandbox);vm.runInContext(ASSETS.usage,sandbox,{filename:'usage.js'});
   await sandbox.pollUsage();
-  assert.equal(timers.at(-1).delay,30000);
+  assert.ok(timers.some(timer => timer.delay === 30000));
   context.document.hidden=true;handlers.visibilitychange();const before=calls;
   await sandbox.pollUsage();assert.equal(calls,before);
   context.document.hidden=false;handlers.visibilitychange();
@@ -280,7 +280,7 @@ test('separate blackbox page uses existing authenticated recording actions', asy
   await sandbox.blackboxAction('start');
   await sandbox.blackboxAction('mark');
   await sandbox.blackboxAction('stop');
-  const writes = calls.filter(call => call.options.method === 'POST');
+  const writes = calls.filter(call => call.url === '/api/blackbox' && call.options.method === 'POST');
   assert.deepEqual(writes.map(call => JSON.parse(call.options.body).action), ['start','mark','stop']);
   assert.equal(JSON.parse(writes[0].options.body).mode, 'detailed');
   assert.ok(writes.every(call => call.url === '/api/blackbox' && call.options.headers['x-dashboard-token']));

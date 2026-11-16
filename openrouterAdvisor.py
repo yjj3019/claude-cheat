@@ -1013,15 +1013,40 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
     # proxy cannot drift into gigabytes of resident memory.
     proxy_command = [node, "--max-old-space-size=512", str(ROOT / "claudeRouteProxy.mjs"),
                      "--parent-pipe"] + (["--port", str(port)] if port else [])
+    import startupDiagnostics
+    def startup_status(stage, code, exit_code=None):
+        data = startupDiagnostics.record(ROOT, instance_id, provider, stage, code, exit_code)
+        if code not in {"starting", "ready"}:
+            print(json.dumps({"event": "proxy_startup", **data}), file=sys.stderr, flush=True)
+    startup_status("spawn", "starting")
     try:
         proxy = subprocess.Popen(proxy_command, env=proxy_env,
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding="utf-8",
-                                 stderr=None if debug else subprocess.DEVNULL, creationflags=_NO_WINDOW)
+                                 stderr=subprocess.PIPE, creationflags=_NO_WINDOW)
     except OSError:
+        startup_status("spawn", "spawn_failed")
         if isolated:
             raise startup_error("local_proxy_start_failed") from None
         raise
     ready = queue.Queue()
+    startup_failure = {}
+    stderr_done = threading.Event()
+    def drain_stderr():
+        try:
+            for line in getattr(proxy, "stderr", ()) or ():
+                if debug:
+                    print(line.rstrip(), file=sys.stderr)
+                try:
+                    data = json.loads(line)
+                    if isinstance(data, dict) and data.get("event") == "proxy_start_failed" and data.get("code") in startupDiagnostics.CODES:
+                        startup_failure.update(code=data["code"], stage=data.get("stage") if data.get("stage") in {"bind", "configuration"} else "configuration")
+                except (ValueError, TypeError):
+                    pass
+        except (OSError, UnicodeError, TypeError):
+            pass
+        finally:
+            stderr_done.set()
+    threading.Thread(target=drain_stderr, daemon=True).start()
     def read_ready():
         try:
             ready.put(proxy.stdout.readline())
@@ -1031,21 +1056,27 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
     try:
         try:
             port = json.loads(ready.get(timeout=15))["port"]
-        except (queue.Empty, ValueError, KeyError, TypeError):
+        except (queue.Empty, ValueError, KeyError, TypeError) as error:
+            stderr_done.wait(0.2)
+            startup_status(startup_failure.get("stage", "readiness"),
+                           startup_failure.get("code", "ready_timeout" if isinstance(error, queue.Empty) else "invalid_ready"), proxy.poll())
             if isolated:
                 raise startup_error("local_proxy_start_failed") from None
             raise RuntimeError("Local routing proxy did not start") from None
         if not isinstance(port, int) or not 1 <= port <= 65535:
+            startup_status("readiness", "invalid_ready", proxy.poll())
             if isolated:
                 raise startup_error("local_proxy_start_failed")
             raise RuntimeError("Invalid local routing port")
         if not _verify_port_owned(port, nonce, proxy):
+            startup_status("ownership", "ownership_failed", proxy.poll())
             # Never hand the CLI an unverified listener: a squatter on this loopback port
             # would receive the session's login and prompts (audit L5).
             log_route_marker(f"launcher abort unverified port={port}")
             if isolated:
                 raise startup_error("local_proxy_start_failed")
             raise RuntimeError("Local routing port is held by another process; refusing to start the session")
+        startup_status("ownership", "ready")
         headers = env.get("ANTHROPIC_CUSTOM_HEADERS", "").strip()
         env.update({"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
                     "ANTHROPIC_CUSTOM_HEADERS": (headers + "\n" if headers else "") + f"X-Local-Route-Token: {nonce}"})
@@ -1092,6 +1123,9 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
                 proxy.wait(timeout=5)
             proxy.stdout.close()
             proxy.stdin.close()
+            stderr_done.wait(0.5)
+            if getattr(proxy, "stderr", None):
+                proxy.stderr.close()
 
 
 def diagnose_local() -> int:
@@ -1600,12 +1634,12 @@ def _self_test_isolated() -> None:
             assert start.call_args.kwargs["env"]["OPENROUTER_MODEL"] == "fixture/model"
             assert "OPENROUTER_MODEL" not in env
             assert "sk-or-test-placeholder" not in repr(start.call_args.args)
-            assert start.call_args.kwargs["stderr"] == subprocess.DEVNULL
+            assert start.call_args.kwargs["stderr"] == subprocess.PIPE
         proxy.terminate.assert_called_once()
     assert dict(os.environ) == original_env
     with patch(__name__ + ".run_owned", return_value=auth), patch("shutil.which", return_value="executable"), patch(__name__ + ".read_env", return_value={"ANTHROPIC_AUTH_TOKEN": "sk-or-test-placeholder", "OPENROUTER_MODEL": "fixture/model"}), patch(__name__ + ".provider_config", return_value={"SONNET_PROVIDER": "openrouter", "OPENROUTER_API_KEY": "sk-or-test-placeholder", "OPENROUTER_MODEL": "fixture/model"}), patch(__name__ + ".check_connection", return_value=0), patch("subprocess.Popen", return_value=proxy) as start:
         with routed_session(debug=True):
-            assert start.call_args.kwargs["stderr"] is None
+            assert start.call_args.kwargs["stderr"] == subprocess.PIPE
     proxy = Mock()
     proxy.stdout.readline.return_value = '{"port": 12345}\n'
     with patch.dict(os.environ, {"LOCAL_LLM_URL": "http://127.0.0.1:11434/v1/messages", "LOCAL_LLM_MODELS_URL": "http://127.0.0.1:11434/v1/models", "LOCAL_LLM_MODEL": "fixture-local", "LOCAL_LLM_API_KEY": "test-local-key"}), patch(__name__ + ".run_owned", return_value=auth), patch("shutil.which", return_value="executable"), patch(__name__ + ".read_key", side_effect=AssertionError("Local must not read OpenRouter key")), patch(__name__ + ".check_connection", return_value=0), patch("subprocess.Popen", return_value=proxy) as start:

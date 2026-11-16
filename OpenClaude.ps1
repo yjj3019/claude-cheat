@@ -52,7 +52,7 @@ if ($Version) {
 $ErrorActionPreference = 'Stop'
 # -Setup only opens the dashboard settings page; it never writes .env files or starts a session.
 if ($Setup) {
-    & (Join-Path $PSScriptRoot 'OpenClaudeDashboard.ps1') -Open
+    & python (Join-Path $PSScriptRoot 'launcherStartup.py') --setup
     exit $LASTEXITCODE
 }
 # Startup checks apply only to an interactive routing session.

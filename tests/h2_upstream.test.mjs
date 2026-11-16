@@ -24,7 +24,7 @@ async function startH2Upstream(t) {
       content: [{ type: 'text', text: 'pong' }], stop_reason: 'end_turn' }));
   });
   await listenSafe(server);
-  t.after(() => new Promise(resolve => { server.closeAllSessions?.(); server.close(() => resolve()); }));
+  t.after(() => new Promise(resolve => { for (const session of sessions) session.destroy(); server.close(() => resolve()); }));
   return { server, streams, sessions };
 }
 
@@ -61,4 +61,29 @@ test('ROUTE_UPSTREAM_H2 surfaces a redirect as a failure instead of following it
   const proxy = await startProxy(t, redirectServer.server);
   const response = await proxy.ask('x');
   assert.ok(response.status >= 400, `redirect must fail closed (got ${response.status})`);
+});
+
+test('idle HTTP/2 cleanup does not interrupt a pending upstream response', async t => {
+  const connect = http2.connect;
+  t.mock.method(http2, 'connect', (...args) => {
+    const session = connect(...args);
+    const setTimeout = session.setTimeout.bind(session);
+    session.setTimeout = (ms, ...rest) => setTimeout(ms === 30000 ? 50 : ms, ...rest);
+    return session;
+  });
+  const upstream = await startH2Upstream(t);
+  upstream.server.removeAllListeners('stream');
+  upstream.server.on('stream', stream => {
+    stream.on('error', () => {});
+    setTimeout(() => {
+      if (stream.destroyed) return;
+      stream.respond({':status':200, 'content-type':'application/json'});
+      stream.end(JSON.stringify({type:'message', model:DEEPSEEK,
+        content:[{type:'text',text:'slow pong'}], stop_reason:'end_turn'}));
+    }, 150);
+  });
+  const proxy = await startProxy(t, upstream.server);
+  const response = await proxy.ask('slow response');
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).content[0].text, 'slow pong');
 });

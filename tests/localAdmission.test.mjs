@@ -94,7 +94,7 @@ test('Local queue bounds concurrency, rejects overflow without Plan and preserve
   assert.equal(planCalls, 0); assert.equal(localCalls, 1);
   gate.resolve(); await (await first).text(); await (await second).text();
   const m = await metrics();
-  assert.deepEqual(m.localAdmission, { active: 0, queued: 0, rejected: 1, concurrency: 1, queueLimit: 1, queueWaitMs: 1000 });
+  assert.deepEqual(m.localAdmission, { active: 0, queued: 0, rejected: 1, scope: 'session', concurrency: 1, queueLimit: 1, queueWaitMs: 1000 });
   assert.equal(m.circuitOpens, 0); assert.equal(localCalls, 2);
 });
 

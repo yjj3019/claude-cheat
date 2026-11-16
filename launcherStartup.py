@@ -11,6 +11,10 @@ import contextlib
 import stat
 from pathlib import Path
 from urllib.parse import quote
+from urllib.request import Request, ProxyHandler, build_opener
+
+# The write token must only reach the authenticated loopback dashboard.
+urlopen = build_opener(ProxyHandler({})).open
 
 ROOT = Path(__file__).resolve().parent
 _bootstrap_lock = None
@@ -176,17 +180,54 @@ def _update_locked(session_check=None):
     return True
 
 
-def dashboard():
+def dashboard(setup=False):
     """Reuse a verified dashboard or start one without stopping any existing process."""
     port = dash.DEFAULT_PORT
     # Open the token-backed write_url so the settings page can save; a plain
     # http://127.0.0.1:<port>/ visit is read-only by design (token_required).
     def open_write_url():
-        webbrowser.open(f"http://127.0.0.1:{port}/#token={quote(getattr(dash, 'TOKEN', ''), safe='')}")
+        page = 'settings' if setup else ''
+        webbrowser.open(f"http://127.0.0.1:{port}/{page}#token={quote(getattr(dash, 'TOKEN', ''), safe='')}")
+    def browser_present():
+        headers = {"x-dashboard-token": dash.TOKEN}
+        headers["content-type"] = "application/json"
+        def post(payload, timeout=2):
+            request = Request(f"http://127.0.0.1:{port}/api/browser", headers=headers,
+                              data=json.dumps(payload).encode())
+            with urlopen(request, timeout=timeout) as response:
+                data = json.load(response)
+                return data if isinstance(data, dict) else {}
+        request_id = None
+        try:
+            deadline = time.monotonic() + dash.BROWSER_COMMAND_TIMEOUT_SECONDS
+            result = post({"action": "open", "setup": setup})
+            request_id = result.get("request_id")
+            if result.get("present") is not True or not isinstance(request_id, str):
+                return False
+            while time.monotonic() < deadline:
+                result = post({"action": "result", "request_id": request_id},
+                              timeout=max(.01, min(.5, deadline - time.monotonic())))
+                if result.get("acknowledged") is True:
+                    return True
+                if result.get("pending") is not True:
+                    return False
+                time.sleep(min(.1, max(0, deadline - time.monotonic())))
+        except (OSError, ValueError, TypeError):
+            pass
+        # Atomically retire the command before opening a replacement tab. A tab
+        # that wakes later must not execute it; an acknowledgement racing this
+        # cancellation still counts as successful reuse.
+        if request_id:
+            try:
+                return post({"action": "cancel", "request_id": request_id}, timeout=.5).get("acknowledged") is True
+            except (OSError, ValueError, TypeError):
+                pass
+        return False
     if dash._port_open(port):
         record = dash._read_pid_record()
         if record and record.get("port") == port and dash._verify_pid_record(record) == "verified":
-            open_write_url()
+            if not browser_present():
+                open_write_url()
             return True
         print("OpenClaude: dashboard port is occupied by an unverified process.", file=sys.stderr)
         return False
@@ -203,7 +244,8 @@ def dashboard():
         record = dash._read_pid_record()
         if record and record.get("port") == port and dash._port_open(port):
             if record.get("pid") == process.pid or dash._verify_pid_record(record) == "verified":
-                open_write_url()
+                if not browser_present():
+                    open_write_url()
                 return True
         if process.poll() is not None and not dash._port_open(port):
             break
@@ -221,4 +263,6 @@ if __name__ == "__main__":
             sys.exit(20)
     if sys.argv[1:] == ["--dashboard"]:
         sys.exit(0 if dashboard() else 1)
+    if sys.argv[1:] == ["--setup"]:
+        sys.exit(0 if dashboard(setup=True) else 1)
     sys.exit(2)

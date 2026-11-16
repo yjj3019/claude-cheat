@@ -3,6 +3,8 @@ import contextlib
 import os
 import shutil
 import subprocess
+import json
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +18,7 @@ class StartupTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(mock.patch.object(startup, "ROOT", self.root))
         self.enterContext(mock.patch.object(startup.dash, "SESSION_HANDOFF_FILE", self.root / "handoff.json"))
+        self.enterContext(mock.patch.object(startup, "urlopen", side_effect=OSError("isolated test")))
 
     def git(self, args, timeout=None):
         if args[:2] == ["status", "--porcelain"]:
@@ -144,6 +147,61 @@ class StartupTests(unittest.TestCase):
              mock.patch.object(startup.dash, "_read_pid_record", return_value=None), \
              mock.patch.object(startup.webbrowser, "open") as browser:
             self.assertFalse(startup.dashboard())
+            browser.assert_not_called()
+
+    def test_existing_browser_is_reused_for_launch_and_setup(self):
+        record = {"pid": 1, "port": startup.dash.DEFAULT_PORT}
+        def response(request, **kwargs):
+            action=json.loads(request.data)['action']
+            return io.BytesIO(json.dumps({'present':True,'request_id':'a'*24} if action=='open'
+                                        else {'acknowledged':True,'pending':False}).encode())
+        with mock.patch.object(startup.dash, "_port_open", return_value=True), \
+             mock.patch.object(startup.dash, "_read_pid_record", return_value=record), \
+             mock.patch.object(startup.dash, "_verify_pid_record", return_value="verified"), \
+             mock.patch.object(startup, "urlopen", side_effect=response) as request, \
+             mock.patch.object(startup.webbrowser, "open") as browser:
+            self.assertTrue(startup.dashboard())
+            self.assertTrue(startup.dashboard(setup=True))
+            browser.assert_not_called()
+            opens=[json.loads(call.args[0].data) for call in request.call_args_list
+                   if json.loads(call.args[0].data)['action']=='open']
+            self.assertEqual([item['setup'] for item in opens],[False,True])
+
+    def test_unresponsive_browser_is_cancelled_before_opening_replacement(self):
+        clock=[0.0]; actions=[]
+        def response(request, **kwargs):
+            action=json.loads(request.data)['action']; actions.append(action)
+            data=({'present':True,'request_id':'b'*24} if action=='open' else
+                  {'acknowledged':False,'pending':action=='result'})
+            return io.BytesIO(json.dumps(data).encode())
+        def opened(url):
+            self.assertEqual(actions[-1],'cancel')
+            self.assertIn('/settings#token=',url)
+        record={'pid':1,'port':startup.dash.DEFAULT_PORT}
+        with mock.patch.object(startup.dash,'_port_open',return_value=True), \
+             mock.patch.object(startup.dash,'_read_pid_record',return_value=record), \
+             mock.patch.object(startup.dash,'_verify_pid_record',return_value='verified'), \
+             mock.patch.object(startup,'urlopen',side_effect=response), \
+             mock.patch.object(startup.time,'monotonic',side_effect=lambda:clock[0]), \
+             mock.patch.object(startup.time,'sleep',side_effect=lambda seconds:clock.__setitem__(0,clock[0]+seconds)), \
+             mock.patch.object(startup.webbrowser,'open',side_effect=opened) as browser:
+            self.assertTrue(startup.dashboard(setup=True))
+            browser.assert_called_once()
+        self.assertLessEqual(clock[0],startup.dash.BROWSER_COMMAND_TIMEOUT_SECONDS+.01)
+
+    def test_acknowledgement_during_cancellation_does_not_open_duplicate(self):
+        def response(request, **kwargs):
+            action=json.loads(request.data)['action']
+            if action=='result': raise TimeoutError('stalled result')
+            return io.BytesIO(json.dumps({'present':True,'request_id':'c'*24} if action=='open'
+                                        else {'acknowledged':True,'pending':False}).encode())
+        record={'pid':1,'port':startup.dash.DEFAULT_PORT}
+        with mock.patch.object(startup.dash,'_port_open',return_value=True), \
+             mock.patch.object(startup.dash,'_read_pid_record',return_value=record), \
+             mock.patch.object(startup.dash,'_verify_pid_record',return_value='verified'), \
+             mock.patch.object(startup,'urlopen',side_effect=response), \
+             mock.patch.object(startup.webbrowser,'open') as browser:
+            self.assertTrue(startup.dashboard(setup=True))
             browser.assert_not_called()
 
     @unittest.skipUnless(shutil.which("git"), "git required")

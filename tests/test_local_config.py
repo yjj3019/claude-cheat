@@ -466,7 +466,11 @@ class LocalCliModeTests(LocalTestCase):
                     with self.assertRaises(SystemExit) as exit_result:
                         runpy.run_path(str(SPEC.origin), run_name="__main__")
                 self.assertEqual(exit_result.exception.code, 1)
-                diagnostic = json.loads(err.getvalue())
+                diagnostics = [json.loads(line) for line in err.getvalue().splitlines()]
+                diagnostic = diagnostics[-1]
+                if label.startswith("proxy"):
+                    self.assertEqual(diagnostics[0]["event"], "proxy_startup")
+                    self.assertIn(diagnostics[0]["code"], {"spawn_failed", "invalid_ready"})
                 self.assertEqual(diagnostic["event"], "openrouter_start_failed")
                 self.assertEqual(diagnostic["kind"], "LocalStartupError")
                 self.assertEqual(diagnostic["code"], expected)

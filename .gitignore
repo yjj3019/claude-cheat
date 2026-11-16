@@ -6,6 +6,8 @@ __pycache__/
 *.pyc
 node_modules/
 *.log
+.*-test-output.txt
+.browser-real-output.txt
 .dashboard.pid
 .dashboard.token
 .analysis/

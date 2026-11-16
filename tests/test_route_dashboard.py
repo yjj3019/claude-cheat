@@ -1476,6 +1476,23 @@ class PortTests(unittest.TestCase):
 
 
 class ServerTests(unittest.TestCase):
+    def test_browser_commands_target_one_tab_and_acknowledge(self):
+        with mock.patch.object(dash, "_BROWSER_TABS", {}):
+            self.assertFalse(dash.browser_command({"action":"open"})["present"])
+            for tab in ("tab-first-123", "tab-second-456"):
+                dash.browser_command({"action":"heartbeat", "tab":tab, "visible":True})
+            result = dash.browser_command({"action":"open", "setup":True})
+            self.assertTrue(result["present"])
+            first = dash.browser_command({"action":"heartbeat", "tab":"tab-first-123"})
+            second = dash.browser_command({"action":"heartbeat", "tab":"tab-second-456"})
+            self.assertIsNone(first["command"])
+            self.assertEqual(second["command"]["page"], "settings")
+            self.assertIsNone(dash.browser_command({"action":"heartbeat", "tab":"tab-second-456", "ack":result["request_id"]})["command"])
+            for value in dash._BROWSER_TABS.values():
+                value["at"] -= 121
+            self.assertFalse(dash.browser_command({"action":"open"})["present"])
+
+
     def test_dashboard_server_binds_exclusively(self):
         self.assertFalse(dash.DashboardServer.allow_reuse_address)
         first = dash.DashboardServer(("127.0.0.1", 0), dash.Handler)
@@ -3201,10 +3218,10 @@ class SnapshotTests(unittest.TestCase):
              mock.patch.object(dash, "read_settings", return_value={"OPENROUTER_MODEL": "vendor/model", "ROUTE_DEFAULT_PROVIDER": "openrouter"}):
             data = dash.snapshot()
         self.assertEqual(sorted(data),
-                         ["account", "active_session", "aggregate_sessions", "alerts", "attention", "configured", "generated_at", "help",
-                          "host_resources", "insights", "model", "pricing", "proactive", "provider", "providers",
+                         ["account", "active_session", "aggregate_sessions", "alerts", "attention", "configuration_pending", "configured", "generated_at", "help",
+                          "host_resources", "insights", "model", "next_model", "pricing", "proactive", "provider", "providers",
                           "proxy_metrics", "proxy_modified_at", "proxy_stale", "refresh_ms",
-                          "routing", "selected_instance", "sessions", "summary", "summary_parts", "usage", "version"])
+                          "routing", "selected_instance", "sessions", "startup_history", "summary", "summary_parts", "usage", "version"])
         self.assertEqual(data["model"], "vendor/model")
         # The version block is served without waiting for git: an unread checkout reports
         # its pending state instead of stalling the page.
@@ -3217,6 +3234,18 @@ class SnapshotTests(unittest.TestCase):
             dash.main(["--host", "0.0.0.0"])
         with self.assertRaises(SystemExit):
             dash.main(["--host", "example.invalid"])
+
+    def test_live_model_and_pricing_do_not_switch_when_next_settings_change(self):
+        with mock.patch.object(dash, "_display_session", return_value=({"provider":"local"}, {"configuration":{"model":"running-model"}}, [])), \
+             mock.patch.object(dash, "_display_service", return_value=("local", {}, "next-model")), \
+             mock.patch.object(dash, "parse_route_log", return_value=[]), \
+             mock.patch.object(dash, "_service_finances", return_value=({},None)) as finances, \
+             mock.patch.object(dash, "proactive_alerts", return_value=[]):
+            data = dash.snapshot()
+        self.assertEqual(data["model"], "running-model")
+        self.assertEqual(data["next_model"], "next-model")
+        self.assertTrue(data["configuration_pending"])
+        self.assertEqual(finances.call_args.args[2], "running-model")
 
     def test_cached_snapshot_serves_without_rebuilding(self):
         built = {"generated_at": "2026-10-25T03:00:00+00:00", "routing": {}, "usage": {}, "account": {},
@@ -5174,23 +5203,50 @@ class AttentionQueueTests(unittest.TestCase):
             dash.attention_action("000000000000", "snooze", minutes=0)
 
 class VersionCacheTests(unittest.TestCase):
-    def test_expired_or_moved_signature_rereads_instead_of_pinning(self):
-        # A cached answer used to be returned unconditionally, so a commit made after the
-        # dashboard started was never seen: the badge pinned that commit forever.
-        route_version._LOCAL.update({"at": 0.0, "signature": None, "data": {
+    def test_expired_version_cache_refreshes_in_background(self):
+        # Exercise the real cache and worker, with controlled Git completion rather
+        # than requiring two real subprocesses (6s timeout each) to finish within 5s.
+        import threading
+        from types import SimpleNamespace
+        spec = importlib.util.spec_from_file_location("version_cache_fixture", route_version.__file__)
+        version = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(version)
+        version._LOCAL.update({"at": -version.LOCAL_TTL_SECONDS - 1, "signature": None, "data": {
             "version": "1.0.6", "commit": "old", "commit_short": "old",
             "label": "v1.0.6 (old)", "source": "git", "dirty": False}})
-        self.addCleanup(route_version._LOCAL.update,
-                        {"at": 0.0, "signature": None, "data": None})
-        first = route_version.local_info()
-        self.assertTrue(first.get("stale"), "an expired cache must trigger a re-read")
-        # The background read lands within a moment; a later poll must carry it.
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            data = route_version.local_info()
-            if data.get("source") == "git" and not data.get("stale"):
-                break
-            time.sleep(0.1)
-        self.assertEqual(data.get("source"), "git")
-        self.assertFalse(data.get("stale"))
-        self.assertTrue(data.get("cached"))
+        started, release = threading.Event(), threading.Event()
+        workers = []
+        commit = 'a' * 40
+        def worker(*args, **kwargs):
+            thread = threading.Thread(*args, **kwargs)
+            workers.append(thread)
+            return thread
+        def git(args):
+            if args[0] == 'status':
+                started.set()
+                if not release.wait(2):
+                    raise TimeoutError('the caller did not release the background read')
+                return 0, '# branch.oid ' + commit + '\n# branch.head main', ''
+            return 0, '2026-11-16T00:00:00+00:00', ''
+        with mock.patch.object(version, 'threading', SimpleNamespace(Thread=worker)), \
+             mock.patch.object(version, '_git', side_effect=git) as read:
+            try:
+                first = version.local_info()
+                self.assertTrue(started.wait(2))
+                self.assertTrue(first.get('stale'))
+                self.assertEqual(first['commit'], 'old')
+                release.set()
+                for thread in workers:
+                    thread.join(2)
+                    self.assertFalse(thread.is_alive())
+                data = version.local_info()
+                self.assertEqual(data['source'], 'git')
+                self.assertEqual(data['commit'], commit)
+                self.assertFalse(data.get('stale'))
+                self.assertTrue(data['cached'])
+                self.assertEqual(read.call_count, 2)
+                self.assertEqual(len(workers), 1, 'the fresh cache must avoid another worker')
+            finally:
+                release.set()
+                for thread in workers:
+                    thread.join(2)

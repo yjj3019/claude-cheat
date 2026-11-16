@@ -38,6 +38,8 @@ import unicodedata
 import urllib.error
 import urllib.request
 import webbrowser
+import concurrent.futures
+import startupDiagnostics
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -1967,13 +1969,24 @@ def _session_from_record(record):
             or any(ord(char) < 33 or ord(char) == 127 for char in nonce)):
         return None, None
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.5)
+    deadline_timer = None
     try:
         connection.request("GET", "/api/metrics", headers={"x-local-route-token": nonce})
+        sock = connection.sock
+        def expire():
+            try:
+                if sock:
+                    sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        deadline_timer = threading.Timer(0.75, expire)
+        deadline_timer.daemon = True
+        deadline_timer.start()
         response = connection.getresponse()
         if response.status != 200:
             return None, None
-        body = response.read(BYTES_CAP + 1)
-        if len(body) > BYTES_CAP:
+        body = response.read(256 * 1024 + 1)
+        if len(body) > 256 * 1024:
             return None, None
         metrics = json.loads(body)
         if not isinstance(metrics, dict) or not isinstance(metrics.get("startedAt"), str):
@@ -1981,6 +1994,8 @@ def _session_from_record(record):
     except (OSError, ValueError, http.client.HTTPException):
         return None, None
     finally:
+        if deadline_timer:
+            deadline_timer.cancel()
         connection.close()
     started = record.get("started")
     instance = record.get("instance_id")
@@ -2026,6 +2041,7 @@ def _session_summary(saved):
     process = metrics.get("process") if isinstance(metrics.get("process"), dict) else {}
     lag = process.get("eventLoopLagMs") if isinstance(process.get("eventLoopLagMs"), dict) else {}
     admission = metrics.get("requestAdmission") if isinstance(metrics.get("requestAdmission"), dict) else {}
+    local_admission = metrics.get("localAdmission") if isinstance(metrics.get("localAdmission"), dict) else {}
     last = metrics.get("last") if isinstance(metrics.get("last"), dict) else {}
     rate_limit = metrics.get("rateLimit") if isinstance(metrics.get("rateLimit"), dict) else {}
 
@@ -2072,7 +2088,14 @@ def _session_summary(saved):
             "aborted": number(metrics.get("aborted")),
             "inflight": number(metrics.get("inflightRequests")),
             "admission_active": number(admission.get("active")),
-            "admission_queued": number(admission.get("queued")),
+            "admission_queued": number(local_admission.get("queued")) if "queued" in local_admission else number(admission.get("queued")),
+            "local_queued": number(local_admission.get("queued")),
+            "local_active": number(local_admission.get("active")),
+            "local_concurrency": number(local_admission.get("concurrency")),
+            "shared_admission": metrics.get("sharedAdmission"),
+            "stale": metrics.get("stale", False),
+            "collected_at": metrics.get("collected_at"),
+            "age_seconds": metrics.get("age_seconds", 0),
             "routes": routes,
             "rate_per_min": rate,
             "latency_p95_ms": number(latency.get("p95")),
@@ -2087,6 +2110,71 @@ def _session_summary(saved):
                              "circuit_opens": circuit_opens, "rate_limit_at": rate_limit_at,
                              "retry_after_ms": retry_after_ms},
             "selected": False}
+
+
+_SESSION_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="session-metrics")
+_SESSION_COLLECT_LOCK = threading.Lock()
+_SESSION_PENDING = {}
+_SESSION_LAST = {}
+
+def _collect_sessions(records, budget=1.0):
+    """Bound the whole refresh and keep one outstanding probe per identity."""
+    deadline = time.monotonic() + max(0, budget)
+    if not _SESSION_COLLECT_LOCK.acquire(timeout=max(0, deadline - time.monotonic())):
+        return []
+    try:
+        probes = {}
+        for record in records:
+            if (not isinstance(record, dict) or
+                    not all(isinstance(record.get(field), str) for field in ("instance_id", "nonce")) or
+                    type(record.get("port")) is not int or
+                    (record.get("proxy_pid") is not None and type(record.get("proxy_pid")) is not int)):
+                continue
+            key = (record.get("instance_id"), record.get("port"), record.get("nonce"), record.get("proxy_pid"))
+            if key not in _SESSION_PENDING:
+                _SESSION_PENDING[key] = _SESSION_POOL.submit(_session_from_record, record)
+            probes[key] = _SESSION_PENDING[key]
+        cached = {key: _SESSION_LAST[key] for key in probes if key in _SESSION_LAST}
+        for key in list(_SESSION_LAST):
+            if key not in probes:
+                del _SESSION_LAST[key]
+        for key, future in list(_SESSION_PENDING.items()):
+            if key not in probes and (future.done() or future.cancel()):
+                del _SESSION_PENDING[key]
+    finally:
+        _SESSION_COLLECT_LOCK.release()
+    # Every caller waits on the same captured futures, without serializing other tabs.
+    concurrent.futures.wait(probes.values(), timeout=max(0, deadline - time.monotonic()))
+    acquired = _SESSION_COLLECT_LOCK.acquire(timeout=max(0, deadline - time.monotonic()))
+    try:
+        now = time.monotonic()
+        rows = []
+        for key, future in probes.items():
+            session = None
+            if future.done():
+                try:
+                    session, metrics = future.result()
+                except Exception:
+                    session, metrics = None, None
+                if session and session.get("instance_id") and metrics:
+                    metrics = {**metrics, "collected_at": datetime.now(timezone.utc).isoformat()}
+                    cached[key] = (session, metrics, now)
+                else:
+                    session = None
+                # Another caller may already have consumed this probe and started a
+                # newer one. Never delete or overwrite that newer generation.
+                if acquired and _SESSION_PENDING.get(key) is future:
+                    del _SESSION_PENDING[key]
+                    if session:
+                        _SESSION_LAST[key] = cached[key]
+            saved = _SESSION_LAST.get(key, cached.get(key)) if acquired else cached.get(key)
+            if saved and now - saved[2] <= 60:
+                old_session, old_metrics, at = saved
+                rows.append({"session": old_session, "metrics": {**old_metrics, "stale": session is None, "age_seconds": round(now - at, 2)}})
+        return rows
+    finally:
+        if acquired:
+            _SESSION_COLLECT_LOCK.release()
 
 
 def live_sessions(limit=MAX_LIVE_SESSIONS):
@@ -2108,7 +2196,7 @@ def live_sessions(limit=MAX_LIVE_SESSIONS):
         paths = sorted(candidates, key=lambda item: item.stat().st_mtime, reverse=True)[:limit]
     except OSError:
         return []
-    rows = []
+    records = []
     seen = set()
     for handoff in paths:
         try:
@@ -2116,7 +2204,7 @@ def live_sessions(limit=MAX_LIVE_SESSIONS):
         except (OSError, ValueError):
             continue
         port = record.get("port") if isinstance(record, dict) else None
-        if type(port) is not int or port in seen or not _port_open(port):
+        if type(port) is not int or not 1 <= port <= 65535 or port in seen:
             continue
         started = record.get("started") if isinstance(record, dict) else None
         if isinstance(started, str):
@@ -2129,11 +2217,8 @@ def live_sessions(limit=MAX_LIVE_SESSIONS):
             except ValueError:
                 pass
         seen.add(port)
-        session, metrics = _session_from_record(record)
-        if session is None or not session.get("instance_id"):
-            continue
-        rows.append({"session": session, "metrics": metrics})
-    return rows
+        records.append(record)
+    return _collect_sessions(records)
 
 
 def _attach_inferred_projects(summaries, sessions):
@@ -3498,9 +3583,10 @@ def snapshot():
     session, live_metrics, live_session_rows = _display_session()
     routing = _current_routing(parse_route_log(), session, live_metrics, now=now)
     provider, config, model = _display_service(routing, session)
-    account, pricing = _service_finances(provider, config, model)
-    if provider == "cli":
+    next_model = model
+    if session:
         model = ((live_metrics or {}).get("configuration") or {}).get("model")
+    account, pricing = _service_finances(provider, config, model)
     signature = (provider, model, (pricing or {}).get("pricing_version"), routing_signature(routing))
     # Tokens are counted from session records for every connection, not only OpenRouter:
     # a CLI display provider must not hide an earlier Local/OpenRouter session's usage.
@@ -3539,6 +3625,9 @@ def snapshot():
         "proxy_modified_at": (stamp.isoformat(timespec="seconds") if (stamp := code_modified_at()) else None),
         "help": {"reasons": REASON_HELP, **HELP_SECTION},
         "model": model,
+        "next_model": next_model,
+        "configuration_pending": bool(session and model != next_model),
+        "startup_history": startupDiagnostics.recent(ROOT),
         # Never blocks: the first render shows a pending state, then the background
         # checkout read and remote comparison fill it in on later polls.
         "version": {**routeVersion.version_report(include_update=False), "update": {"state": "disabled"}},
@@ -4369,6 +4458,7 @@ def _page(kind="dashboard"):
                '<button class="btn btn-sm" onclick="loadConfig(true)">다시 불러오기</button>' if kind == "settings" else '')
     body = DASHBOARD_BODY if dashboard else SETTINGS_BODY if kind == "settings" else USAGE_BODY if kind == "usage" else BLACKBOX_BODY
     script = JS_SHARED + (JS_DASHBOARD if dashboard else JS_SETTINGS if kind == "settings" else JS_USAGE if kind == "usage" else JS_BLACKBOX)
+    script += (ROOT / "browserPresence.js").read_text(encoding="utf-8")
     return ('<!doctype html>\n<html lang="ko"><head><meta charset="utf-8">'
             '<title>' + title + '</title>\n'
             '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
@@ -5621,6 +5711,8 @@ renderSettings = function(force) {
 };
 ''';
 
+JS_DASHBOARD += (ROOT / "monitoringPanel.js").read_text(encoding="utf-8")
+
 PAGE = _page("dashboard")
 SETTINGS_PAGE = _page("settings")
 BLACKBOX_PAGE = _page("blackbox")
@@ -5629,6 +5721,62 @@ USAGE_PAGE = _page("usage")
 
 
 
+
+_BROWSER_TABS = {}
+_BROWSER_ACKS = {}
+_BROWSER_PRESENCE_LOCK = threading.Lock()
+BROWSER_COMMAND_TIMEOUT_SECONDS = 3.0
+
+def browser_command(payload):
+    now = time.monotonic()
+    with _BROWSER_PRESENCE_LOCK:
+        for request_id, at in list(_BROWSER_ACKS.items()):
+            if now - at > 30:
+                del _BROWSER_ACKS[request_id]
+        for key, value in list(_BROWSER_TABS.items()):
+            if now - value["at"] > 120:
+                del _BROWSER_TABS[key]
+            elif value.get("command") and now >= value.get("command_deadline", 0):
+                value["command"] = None
+        if payload.get("action") in ("result", "cancel"):
+            request_id = payload.get("request_id")
+            if not isinstance(request_id, str) or not re.fullmatch(r"[a-f0-9]{24}", request_id):
+                return {"error": "invalid_browser_request"}
+            if request_id in _BROWSER_ACKS:
+                return {"acknowledged": True, "pending": False}
+            for state in _BROWSER_TABS.values():
+                if state.get("command") and state["command"]["id"] == request_id:
+                    if payload["action"] == "cancel":
+                        state["command"] = None
+                        break
+                    return {"acknowledged": False, "pending": True}
+            return {"acknowledged": False, "pending": False}
+        if payload.get("action") == "open":
+            tabs = list(_BROWSER_TABS.values())
+            if not tabs:
+                return {"present": False}
+            chosen = max(tabs, key=lambda item: (payload.get("setup") is True and item.get("page") == "/settings", item.get("focused", False), item["visible"], item["at"]))
+            chosen["command"] = {"id": secrets.token_hex(12), "page": "settings" if payload.get("setup") else "refresh"}
+            chosen["command_deadline"] = now + BROWSER_COMMAND_TIMEOUT_SECONDS
+            return {"present": True, "request_id": chosen["command"]["id"]}
+        tab = payload.get("tab")
+        if payload.get("action") == "close" and isinstance(tab, str):
+            _BROWSER_TABS.pop(tab, None)
+            return {"closed": True}
+        if payload.get("action") != "heartbeat" or not isinstance(tab, str) or not re.fullmatch(r"[A-Za-z0-9-]{8,80}", tab):
+            return {"error": "invalid_browser_request"}
+        if tab not in _BROWSER_TABS and len(_BROWSER_TABS) >= 64:
+            return {"error": "too_many_tabs"}
+        state = _BROWSER_TABS.setdefault(tab, {"command": None})
+        state.update(at=now, visible=payload.get("visible") is True, focused=payload.get("focused") is True,
+                     page=payload.get("page") if payload.get("page") in {"/", "/settings", "/usage", "/blackbox"} else None)
+        if state["command"] and state["command"]["id"] == payload.get("ack"):
+            _BROWSER_ACKS[state["command"]["id"]] = now
+            while len(_BROWSER_ACKS) > 128:
+                del _BROWSER_ACKS[next(iter(_BROWSER_ACKS))]
+            state["command"] = None
+        ack = payload.get("ack")
+        return {"command": state["command"], "acknowledged": isinstance(ack, str) and ack in _BROWSER_ACKS}
 
 class Handler(BaseHTTPRequestHandler):
     # A local client that opens a socket and trickles headers must not hold a thread forever.
@@ -5834,11 +5982,11 @@ class Handler(BaseHTTPRequestHandler):
         if not _host_allowed(self.headers.get("host")):
             return self._send(403, "application/json; charset=utf-8", json.dumps({"error": "host_rejected"}))
         path = self.path.split("?")[0]
-        if path not in ("/api/config", "/api/config-history-restore", "/api/test", "/api/default-provider", "/api/config-reset", "/api/blackbox", "/api/select-session", "/api/attention", "/api/models-search"):
+        if path not in ("/api/browser", "/api/config", "/api/config-history-restore", "/api/test", "/api/default-provider", "/api/config-reset", "/api/blackbox", "/api/select-session", "/api/attention", "/api/models-search"):
             return self._send(404, "application/json; charset=utf-8", json.dumps({"error": "not_found"}))
         if not self._authorized():
             return self._send(403, "application/json; charset=utf-8", json.dumps({"error": "token_required"}))
-        if not _rate_ok(self.client_address[0]):
+        if path != "/api/browser" and not _rate_ok(self.client_address[0]):
             return self._send(429, "application/json; charset=utf-8",
                               json.dumps({"error": "rate_limited", "limit_per_minute": RATE_LIMIT_PER_MINUTE}))
         origin = self.headers.get("origin")
@@ -5863,6 +6011,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, "application/json; charset=utf-8", json.dumps({"error": "invalid_json"}))
         if not isinstance(payload, dict):
             return self._send(400, "application/json; charset=utf-8", json.dumps({"error": "invalid_payload"}))
+        if path == "/api/browser":
+            result = browser_command(payload)
+            return self._send(400 if "error" in result else 200, "application/json; charset=utf-8", json.dumps(result))
         if path == "/api/attention":
             action = payload.get("action")
             minutes = payload.get("minutes")
@@ -6245,7 +6396,7 @@ def _stop_previous(port, path=None, timeout=5.0):
 AUTO_UPDATE_LOG = ROOT / ".auto-update.log"
 AUTO_UPDATE_INTERVAL_SECONDS = 60.0
 AUTO_UPDATE_POLL_SECONDS = 5.0
-DASHBOARD_SOURCE_FILES = (Path(__file__).resolve(), ROOT / "routeConfig.py", ROOT / "localProcessTree.py",
+DASHBOARD_SOURCE_FILES = (Path(__file__).resolve(), ROOT / "browserPresence.js", ROOT / "monitoringPanel.js", ROOT / "startupDiagnostics.py", ROOT / "routeConfig.py", ROOT / "localProcessTree.py",
                           ROOT / "routeVersion.py", ROOT / "VERSION")
 _AUTO_TAKEOVER_LAST = 0.0
 _AUTO_TAKEOVER_LOCK = threading.Lock()
@@ -6337,9 +6488,16 @@ def _auto_reload_loop(initial):
                     _record_auto_update("dashboard source changed; restarting the dashboard")
                     os.environ["ROUTE_DASHBOARD_REEXEC"] = f"{os.getpid()}:{(_read_pid_record(PID_FILE) or {}).get('started', '')}"
                     flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                    args = list(sys.argv[1:])
+                    if "--open" in args:
+                        index = args.index("--open")
+                        del args[index]
+                        if index < len(args) and not args[index].startswith("-"):
+                            del args[index]
+                    args = [arg for arg in args if arg != "--no-takeover" and not arg.startswith("--open=")]
                     with AUTO_UPDATE_LOG.open("a", encoding="utf-8") as log:
                         subprocess.Popen(
-                            [sys.executable, str(Path(__file__).resolve()), *[arg for arg in sys.argv[1:] if arg != "--no-takeover"]],
+                            [sys.executable, str(Path(__file__).resolve()), *args],
                             cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                             creationflags=flags, close_fds=True, env={**os.environ, "DASHBOARD_TOKEN": TOKEN})
                     os._exit(0)
