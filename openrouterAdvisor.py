@@ -1136,8 +1136,8 @@ def diagnose_local() -> int:
         raise FileNotFoundError("Node.js required for Local diagnostics")
     env = clean_env()
     env.update(config)
-    return subprocess.call([node, str(ROOT / "claudeRouteProxy.mjs"), "--diagnose-local"], env=env,
-                           creationflags=_NO_WINDOW)
+    # This is a foreground diagnostic: inherit the console so its JSON result is visible.
+    return subprocess.call([node, str(ROOT / "claudeRouteProxy.mjs"), "--diagnose-local"], env=env)
 
 
 def check_cli_backend(backend):

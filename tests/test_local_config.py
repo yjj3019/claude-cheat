@@ -151,6 +151,7 @@ class LocalDiagnosticTests(LocalTestCase):
             self.assertEqual(route.diagnose_local(), 0)
         which.assert_called_once_with("node")
         self.assertEqual(child.call_args.args[0], ["synthetic-node", str(self.root / "claudeRouteProxy.mjs"), "--diagnose-local"])
+        self.assertNotIn("creationflags", child.call_args.kwargs)
         env = child.call_args.kwargs["env"]
         self.assertEqual(env["SONNET_PROVIDER"], "local")
         self.assertEqual(env["LOCAL_LLM_API_KEY"], "synthetic-local-key")
