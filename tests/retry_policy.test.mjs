@@ -216,24 +216,31 @@ test('a zero request budget leaves the existing attempt count unchanged', { time
 
 test('an exhausted request budget stops before the next attempt', { timeout: 15000 }, async t => {
   let calls = 0;
-  const { base } = await startProxy(t, {
-    requestBudgetMs: 40,
-    fetchImpl: async () => {
-      calls += 1;
-      await new Promise(resolve => setTimeout(resolve, 60));
-      return new Response('nope', { status: 500 });
+  let cancelled = false;
+  const { base, metrics } = await startProxy(t, {
+    requestBudgetMs: 60,
+    fetchImpl: async (_url,{signal}) => {
+      calls++;
+      return new Promise((_resolve,reject) => signal.addEventListener('abort',() => {
+        cancelled = true;
+        reject(new Error('upstream cancelled'));
+      },{once:true}));
     },
   });
   const response = await send(base);
-  await response.text();
-  assert.equal(calls, 1, 'the second attempt must not start after the budget is spent');
-  assert.notEqual(response.status, 200);
+  assert.equal(response.status,504);
+  assert.match(await response.text(),/request_budget_exhausted/);
+  assert.equal(calls,1);
+  assert.equal(cancelled,true);
+  const snapshot = await metrics();
+  assert.equal(snapshot.failed,1);
+  assert.equal(snapshot.circuitOpens,0);
 });
 
 test('a request budget never replaces an answer already delivered', { timeout: 15000 }, async t => {
   let calls = 0;
   const { base } = await startProxy(t, {
-    requestBudgetMs: 1,
+    requestBudgetMs: 200,
     fetchImpl: async () => { calls += 1; return Response.json(message(UPSTREAM_MODEL)); },
   });
   const response = await send(base);
@@ -242,3 +249,63 @@ test('a request budget never replaces an answer already delivered', { timeout: 1
   assert.match(text, /"ok"/);
   assert.equal(calls, 1);
 });
+
+test('Local queue wait and inference share one deadline', async t => {
+  let release, calls = 0;
+  const gate = new Promise(resolve => { release = resolve; });
+  const {base,metrics} = await startProxy(t,{
+    provider:'local', localUrl:'http://127.0.0.1:11434/v1/messages', localModel:UPSTREAM_MODEL,
+    localConcurrency:1, requestBudgetMs:700,
+    fetchImpl:async () => {
+      if (++calls === 1) await gate;
+      else await new Promise(resolve => setTimeout(resolve,500));
+      return Response.json(message(UPSTREAM_MODEL));
+    },
+  });
+  const first = send(base);
+  await waitFor(() => calls === 1,'first Local call');
+  const queued = send(base);
+  try {
+    await waitFor(async () => (await metrics()).localAdmission.queued === 1,'second request queued');
+    await new Promise(resolve => setTimeout(resolve,350));
+  } finally { release(); }
+  assert.equal((await first).status,200);
+  const expired = await queued;
+  assert.equal(expired.status,504);
+  assert.match(await expired.text(),/request_budget_exhausted/);
+  assert.equal(calls,2);
+  const final = await metrics();
+  assert.equal(final.localAdmission.active,0);
+  assert.equal(final.localAdmission.queued,0);
+  assert.equal(final.circuitOpens,0);
+});
+
+for (const model of [MODEL,'claude-opus-5-5']) {
+  test(`request deadline ends a committed stream in-band for ${model}`, async t => {
+    let calls = 0;
+    const {base,metrics} = await startProxy(t,{
+      requestBudgetMs:200,streamPassthrough:true,
+      fetchImpl:async () => {
+        calls++;
+        const frames = [
+          {type:'message_start',message:{...message(UPSTREAM_MODEL),content:[]}},
+          {type:'content_block_start',index:0,content_block:{type:'text',text:'hello'}},
+          {type:'content_block_delta',index:0,delta:{type:'text_delta',text:'world'}},
+        ];
+        return new Response(new ReadableStream({start(controller) {
+          controller.enqueue(new TextEncoder().encode(frames.map(frame =>
+            'event: '+frame.type+'\ndata: '+JSON.stringify(frame)+'\n\n').join('')));
+        }}),{headers:{'content-type':'text/event-stream'}});
+      },
+    });
+    const response = await fetch(base,{method:'POST',headers:HEADERS,
+      body:JSON.stringify({...JSON.parse(requestBody()),model,stream:true})});
+    const text = await response.text();
+    assert.equal(response.status,200);
+    assert.match(text,/world/);
+    assert.match(text,/event: error/);
+    assert.match(text,/request_budget_exhausted/);
+    assert.equal(calls,1);
+    assert.equal((await metrics()).failed,1);
+  });
+}

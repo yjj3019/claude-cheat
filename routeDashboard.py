@@ -517,7 +517,7 @@ def _instance_summary(events):
         if event.get("event") == "route_selected":
             row["requests"] += 1
             row["provider"] = event.get("provider") if event.get("provider") in ROUTING_PROVIDERS else "plan"
-        elif event.get("event") == "external_attempt_failed":
+        elif event.get("event") in ("external_attempt_failed", "stream_broken"):
             row["failures"] += 1
         if event.get("ts"):
             row["last_ts"] = event["ts"]
@@ -614,7 +614,7 @@ def routing_state(events, now=None, idle_after=300, instance=None):
                     plan_reasons[label] = plan_reasons.get(label, 0) + 1
                 if isinstance(served, str) and served and len(served) <= 200:
                     models[f"{key}:{served}"] = models.get(f"{key}:{served}", 0) + 1
-            elif name == "external_attempt_failed":
+            elif name in ("external_attempt_failed", "stream_broken"):
                 status = event.get("status")
                 label = str(status) if isinstance(status, int) else (event.get("category") or "unknown")
                 if event.get("validation"):
@@ -3842,6 +3842,8 @@ def _usage_live_sessions(root=ROOT, limit=MAX_USAGE_INSTANCES):
                 admission = metrics.get("localAdmission") if provider == "local" else metrics.get("cliActivity") if provider == "cli" else None
                 recording = metrics.get("usageRecording") if isinstance(metrics.get("usageRecording"), dict) else {}
                 process = metrics.get("process") if isinstance(metrics.get("process"), dict) else {}
+                routes = metrics.get("routes") if isinstance(metrics.get("routes"), dict) else {}
+                efficiency = metrics.get("efficiency") if isinstance(metrics.get("efficiency"), dict) else {}
                 enabled = recording.get("enabled") if type(recording.get("enabled")) is bool else None
                 return ({"instance_id": entry.name, "provider": provider, "status": "active",
                          "recording": {"enabled": enabled, "dropped": count(recording.get("dropped")),
@@ -3850,6 +3852,11 @@ def _usage_live_sessions(root=ROOT, limit=MAX_USAGE_INSTANCES):
                          "requested_model": _diagnostic_model(config.get("requestedModel") if provider == "cli" else config.get("model"), [nonce])[0],
                          "reported_model": _diagnostic_model(config.get("model"), [nonce])[0] if provider == "cli" else None,
                          "requests": count(metrics.get("requests")), "failed": count(metrics.get("failed")),
+                         **_plan_comparison(metrics),
+                         **{key: (None if key in ("eligible_after_plan", "local_returns") and
+                                  "instance_followups" not in efficiency else count(efficiency.get(key)))
+                            for key in EFFICIENCY_FIELDS},
+                         "route_external": count(routes.get("external")), "route_plan": count(routes.get("plan")),
                          "inflight": count(metrics.get("inflightRequests")), "rss_bytes": count(process.get("rssBytes")),
                           "admission_active": count((metrics.get("requestAdmission") or {}).get("active") if isinstance(metrics.get("requestAdmission"), dict) else None),
                           "admission_max": count((metrics.get("requestAdmission") or {}).get("max") if isinstance(metrics.get("requestAdmission"), dict) else None),
@@ -3978,12 +3985,49 @@ def _sample_host_resources(now=None):
     return dict(_HOST_METRICS)
 
 
-def _aggregate_live_metrics(sessions):
+def _plan_comparison(metrics):
+    build = metrics.get("proxyBuild")
+    build = build if isinstance(build, dict) else {}
+    version, digest = build.get("version"), build.get("hash")
+    blockers = metrics.get("planBlockers")
+    allowed = {"unknown_beta", "native_advisor_declared", "unconverted_request", "mid_history_tool_change",
+               "unresolved_tool_reference", "incomplete_tool_history", "cache_conflict", "plan_model", "token_count",
+               "unsupported_beta", "unsupported_context_management", "unsupported_message_shape", "unsupported_output_config",
+               "unsupported_request_field", "unsupported_thinking_config", "unsupported_tool_choice", "unsupported_tool_definition",
+               "unsupported_content", "unsupported_content_field", "unsupported_content_block", "unsupported_tool_caller"}
+    counts = None
+    if isinstance(blockers, dict) and all(type(n) is int and 0 <= n <= 2**53-1 for n in blockers.values()):
+        counts = {}
+        for key, value in blockers.items():
+            label = key if key in allowed else "other"
+            counts[label] = counts.get(label, 0) + value
+        if sum(counts.values()) > 2**53-1:
+            counts = None
+    details = metrics.get("planBlockerDetails")
+    labels = {"declaration_conflict", "cache_boundary", "new_deferred_tool", "new_schema", "multiple_changes", "previous_use"}
+    if isinstance(details, dict) and all(type(n) is int and n >= 0 for n in details.values()) and sum(details.values()) <= 2**53-1:
+        buckets = {}
+        for key, n in details.items():
+            label = key if key in labels else "other"
+            buckets[label] = buckets.get(label, 0) + n
+        details = buckets
+    else:
+        details = None
+    return {"proxy_version": version if isinstance(version, str) and re.fullmatch(r"[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}", version) else None,
+            "proxy_hash": digest if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{12}", digest) else None,
+            "plan_blockers": counts, "plan_blocker_details": details}
+
+
+EFFICIENCY_FIELDS = ("logical_messages", "upstream_calls", "repeat_calls", "measured_calls",
+                     "observed_input", "observed_output", "cache_read", "cache_write", "repeat_tokens", "first_call_success", "eligible_after_plan", "first_local_returns", "local_returns", "instance_followups")
+
+
+def _aggregate_live_metrics(sessions, sessions_partial=None):
     """Aggregate authenticated live instances; never present incomplete sums as totals."""
     active = [row for row in sessions if row.get("status") == "active"]
-    metric_keys = ("requests", "failed", "inflight", "rss_bytes",
+    metric_keys = ("requests", "failed", "inflight", "rss_bytes", "route_external", "route_plan",
                    "admission_active", "admission_max", "admission_inflight_bytes", "admission_max_bytes",
-                   "admission_rejected_concurrency", "admission_rejected_bytes", "local_rejected", "cli_rejected")
+                   "admission_rejected_concurrency", "admission_rejected_bytes", "local_rejected", "cli_rejected", *EFFICIENCY_FIELDS)
 
     def checked_values(rows, key):
         return [row[key] for row in rows if type(row.get(key)) is int and 0 <= row[key] <= 2**53 - 1]
@@ -3994,7 +4038,7 @@ def _aggregate_live_metrics(sessions):
         total = sum(values)
         return total if total <= 2**53 - 1 else None
 
-    partial = bool(_USAGE_STATS.get("sessions_partial")) or any(row.get("status") != "active" for row in sessions)
+    partial = bool(_USAGE_STATS.get("sessions_partial") if sessions_partial is None else sessions_partial) or any(row.get("status") != "active" for row in sessions)
     totals = {key: safe_sum(checked_values(active, key), len(active)) if not partial else None
               for key in metric_keys}
     coverage = {key: len(checked_values(active, key)) for key in metric_keys}
@@ -4028,7 +4072,7 @@ def _refresh_usage_stats(now=None):
     try:
         sessions, partial = _usage_live_sessions(ROOT)
         _USAGE_STATS.update(sessions=sessions, sessions_partial=partial,
-                            aggregate_sessions=_aggregate_live_metrics(sessions),
+                            aggregate_sessions=_aggregate_live_metrics(sessions, sessions_partial=partial),
                             sessions_error=None)
     except Exception:
         _USAGE_STATS["sessions_partial"] = True
@@ -4990,6 +5034,7 @@ const MAX_USAGE_INSTANCES=1024, MAX_USAGE_CANDIDATES=4096;
 let usageSequence = 0;
 let lastUsagePeriod = null;
 let lastUsageFetched = null;
+let usageInstance = '';
 const usageProviders = {plan:'Claude Plan',local:'Local LLM',openrouter:'OpenRouter',cli:'CLI',unknown:'제공자 미확인'};
 function usageNumber(value) { return Number.isSafeInteger(value) && value >= 0 ? num(value) : '미보고'; }
 function usageDuration(value) { return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? `${num(Math.round(value))} ms` : '미보고'; }
@@ -5032,21 +5077,42 @@ function renderUsage(payload) {
   const status=document.getElementById('usage-status'), grid=document.getElementById('usage-grid');
   if (!payload) {status.textContent='모니터링 정보를 불러오지 못했습니다.';grid.innerHTML='';return;}
   const reportBuilding = payload.status === 'building';
-  const report=payload.report || {}, rows=Array.isArray(report.rows)?report.rows:[], sessions=Array.isArray(payload.sessions)?payload.sessions:[];
+  const report=payload.report || {}, allRows=Array.isArray(report.rows)?report.rows:[], sessions=Array.isArray(payload.sessions)?payload.sessions:[];
+  const ids=[...new Set(allRows.map(row=>row.instance_id).filter(id=>typeof id==='string' && /^[a-f0-9]{32}$/i.test(id)))].sort();
+  if (usageInstance && !ids.includes(usageInstance)) usageInstance='';
+  const rows=usageInstance ? allRows.filter(row=>row.instance_id===usageInstance) : allRows;
   const recordingWarning = sessions.some(s => s.status !== 'active' || !s.recording || s.recording.enabled !== true || [s.recording.dropped,s.recording.errors,s.recording.pending].some(value => !Number.isSafeInteger(value) || value !== 0));
   const partial=recordingWarning || payload.error || payload.sessions_error || payload.sessions_partial || payload.collection?.pending || (payload.collection?.errors||[]).length || report.coverage==='partial' || report.truncated;
   status.textContent=reportBuilding?'사용량 ledger 수집 대기 중입니다. host 자원과 인증된 proxy 상태는 별도 수집분으로 표시합니다.':partial?'일부 수집이 지연되거나 누락됐습니다. 표시된 수치는 확인된 범위만 포함합니다.':
     (report.collection_started ? '첫 관측: '+report.collection_started+' · 수집된 범위만 표시' : '아직 수집된 요청이 없습니다.');
   if (Number.isSafeInteger(report.model_provenance_unverified) && report.model_provenance_unverified > 0) status.textContent += ` 이전 수집 형식 ${usageNumber(report.model_provenance_unverified)}건의 실제 모델 출처 미확인: 보고 모델 미보고로 표시.`;
   const recordingText = s => { const r=s.recording; if (s.status !== 'active' || !r || r.enabled === null) return '기록 상태 미보고'; if (!r.enabled) return '기록 꺼짐'; return `누락 ${usageNumber(r.dropped)} · 오류 ${usageNumber(r.errors)} · 대기 ${usageNumber(r.pending)}`; };
-  const sessionRows=sessions.map(s=>`<tr><td class="mono">${esc((s.instance_id||'').slice(0,8))}</td><td>${esc(usageProviders[s.provider]||'제공자 미확인')}</td><td>${s.status==='active'?'인증 확인':'상태 미확인'}<br><small>${recordingText(s)}</small></td><td class="num">${usageNumber(s.inflight)}</td><td class="num">${usageNumber(s.queued)}</td><td class="num">${usageNumber(s.requests)}</td><td class="num">${usageNumber(s.failed)}</td><td class="num">${usageDuration(s.p95_ms)}</td></tr>`).join('');
+  const blockerText=counts=>counts==null?'미보고':Object.entries(counts).sort((a,b)=>b[1]-a[1]).map(([k,n])=>(k==='other'?'기타':esc(k))+' '+usageNumber(n)).join(' · ')||'0건';
+  const buildName=s=>[s.proxy_version||'버전 미보고',s.proxy_hash||'빌드 미보고'].join(' / ');
+  const builds=new Map();
+  for(const s of sessions){
+    const key=buildName(s);
+    if(!builds.has(key))builds.set(key,{sessions:0,reported:0,counts:{},detailReported:0,details:{}});
+    const group=builds.get(key);
+    group.sessions++;
+    if(s.status!=='active'||s.plan_blockers==null)continue;
+    group.reported++;
+    if(s.plan_blocker_details!=null){
+      group.detailReported++;
+      for(const [reason,n] of Object.entries(s.plan_blocker_details))group.details[reason]=(group.details[reason]||0)+n;
+    }
+    for(const [reason,n] of Object.entries(s.plan_blockers))group.counts[reason]=(group.counts[reason]||0)+n;
+  }
+  const buildRows=Array.from(builds,([name,g])=>`<tr><td>${esc(name)}</td><td>${g.reported} / ${g.sessions}</td><td>${blockerText(g.reported?g.counts:null)}</td><td>${blockerText(g.detailReported?g.details:null)} (${g.detailReported}/${g.sessions})</td></tr>`).join('');
+  const buildCard=card('버전별 Plan 전환 사유','실행기 시작 후 누적 · 현재 수집된 세션 중 보고분 합계',buildRows?`<table><tr><th>버전 / 빌드</th><th>보고 / 관측</th><th>사유별 건수</th><th>도구 변경 상세 (보고/관측)</th></tr>${buildRows}</table>`:'관측 세션 없음');
+  const sessionRows=sessions.map(s=>`<tr><td class="mono">${esc((s.instance_id||'').slice(0,8))}<br><small>${esc(buildName(s))}<br>${blockerText(s.plan_blockers)}<br>도구 변경 상세: ${blockerText(s.plan_blocker_details)}</small></td><td>${esc(usageProviders[s.provider]||'제공자 미확인')}</td><td>${s.status==='active'?'인증 확인':'상태 미확인'}<br><small>${recordingText(s)}</small></td><td class="num">${usageNumber(s.inflight)}</td><td class="num">${usageNumber(s.queued)}</td><td class="num">${usageNumber(s.requests)}<br><small>추론 요청 / 전송 / 재전송: ${usageNumber(s.logical_messages)} / ${usageNumber(s.upstream_calls)} / ${usageNumber(s.repeat_calls)}<br>재전송 관측 토큰: ${usageNumber(s.repeat_tokens)}<br>캐시 읽기 / 쓰기: ${usageNumber(s.cache_read)} / ${usageNumber(s.cache_write)}<br>대화별 Plan 후 Local 첫 시도 성공 / 최종 복귀 / 적격: ${usageNumber(s.first_local_returns)} / ${usageNumber(s.local_returns)} / ${usageNumber(s.eligible_after_plan)}<br>대화 미식별 실행기 후속: ${usageNumber(s.instance_followups)}</small></td><td class="num">${usageNumber(s.route_external)} / ${usageNumber(s.route_plan)}</td><td class="num">${usageNumber(s.failed)}</td><td class="num">${usageDuration(s.p95_ms)}</td></tr>`).join('');
   const host=payload.host_resources||{}, aggregate=payload.aggregate_sessions||{};
   const hostAge=host.sampled_at?Math.max(0,Math.round((Date.now()-Date.parse(host.sampled_at))/1000)):null;
   const hostErrors=[host.cpu_error?'CPU 미측정':null,host.memory_error?'메모리 미측정':null].filter(Boolean).join(' · ');
   const hostStatus=hostErrors?`${hostErrors} · OS API 미지원 또는 표본 실패`:host.error==='cpu_warming_up'?'CPU 첫 표본입니다. 다음 수집부터 사용률이 계산됩니다.':hostAge!==null?`host 표본 ${hostAge}초 전 · ${host.source||'출처 미보고'}`:'host 자원 표본 대기 중';
    const providerTotals=Object.entries(aggregate.by_provider||{}).filter(([,v])=>v&&Object.values(v).some(n=>Number.isSafeInteger(n))).map(([p,v])=>`${usageProviders[p]||p}: ${usageNumber(v.rss_bytes)} B RSS`).join(' · ')||'제공자별 RSS 미보고';
   const coverage=aggregate.metric_coverage||{};
-  const coverageText=Object.entries(coverage).map(([k,v])=>`${({requests:'요청',failed:'실패',inflight:'진행',rss_bytes:'RSS',admission_active:'슬롯',admission_max:'동시 한도',admission_inflight_bytes:'본문 메모리',admission_max_bytes:'본문 예산',admission_rejected_concurrency:'동시 거부',admission_rejected_bytes:'본문 거부',local_rejected:'Local 대기 거부',cli_rejected:'CLI 429'})[k]||k} ${usageNumber(v?.reported)}/${usageNumber(v?.active)}`).join(' · ');
+  const coverageText=Object.entries(coverage).map(([k,v])=>`${({requests:'요청',failed:'실패',inflight:'진행',rss_bytes:'RSS',route_external:'외부 경로',route_plan:'Plan 경로',admission_active:'슬롯',admission_max:'동시 한도',admission_inflight_bytes:'본문 메모리',admission_max_bytes:'본문 예산',admission_rejected_concurrency:'동시 거부',admission_rejected_bytes:'본문 거부',local_rejected:'Local 대기 거부',cli_rejected:'CLI 429'})[k]||k} ${usageNumber(v?.reported)}/${usageNumber(v?.active)}`).join(' · ');
   const val=(key)=>aggregate[key]===null||aggregate[key]===undefined?'미보고':usageNumber(aggregate[key]);
   const requestLimits=`요청 동시 ${val('admission_active')}/${val('admission_max')} · 본문 메모리 ${val('admission_inflight_bytes')}/${val('admission_max_bytes')} B`;
   const rejectTotals=`거부 누적: 동시 429 ${val('admission_rejected_concurrency')} · 본문 예산 503 ${val('admission_rejected_bytes')} · Local 대기 ${val('local_rejected')} · CLI 429 ${val('cli_rejected')}`;
@@ -5057,11 +5123,13 @@ function renderUsage(payload) {
     `<div class="m"><span class="k">호스트 사용 / 가용</span><span class="v">${usageNumber(host.memory_used_bytes)} / ${usageNumber(host.memory_available_bytes)} B</span></div>`+
     `<div class="m"><span class="k">활성 실행기 합계 RSS</span><span class="v">${usageNumber(aggregate.rss_bytes)} B</span></div>`+
     `<div class="m"><span class="k">활성 실행기 요청 · 진행</span><span class="v">${usageNumber(aggregate.requests)} · ${usageNumber(aggregate.inflight)}</span></div></div>`+
-    `<p class="hint">${esc(requestLimits)} · ${esc(rejectTotals)}</p><p class="hint">${esc(hostStatus)} · ${esc(aggregateStatus)} · 표본 ${esc(coverageText||'미보고')} · ${esc(providerTotals)}. 합계는 인증된 활성 세션의 필드가 모두 보고될 때만 표시합니다. 최대 ${MAX_USAGE_INSTANCES}개 인스턴스를 조회하며 초과 세션은 순환 수집합니다. OS host 메모리와 proxy RSS는 별도 지표입니다. GPU 메모리는 측정하지 않습니다.</p>`);
+    `<p class="hint">추론 요청 / 전송 / 재전송: ${val('logical_messages')} / ${val('upstream_calls')} / ${val('repeat_calls')} · 첫 전송 성공: ${val('first_call_success')} · 사용량 보고 전송: ${val('measured_calls')} · 관측 입력 / 출력: ${val('observed_input')} / ${val('observed_output')} · 캐시 읽기 / 쓰기: ${val('cache_read')} / ${val('cache_write')} · 대화별 Plan 후 Local 첫 시도 성공 / 최종 복귀 / 적격: ${val('first_local_returns')} / ${val('local_returns')} / ${val('eligible_after_plan')} · 대화 미식별 실행기 후속: ${val('instance_followups')} · 재전송 관측 토큰: ${val('repeat_tokens')} · 경로 선택 합계 외부 / Plan: ${val('route_external')} / ${val('route_plan')} · ${esc(requestLimits)} · ${esc(rejectTotals)}</p><p class="hint">${esc(hostStatus)} · ${esc(aggregateStatus)} · 표본 ${esc(coverageText||'미보고')} · ${esc(providerTotals)}. 합계는 인증된 활성 세션의 필드가 모두 보고될 때만 표시합니다. 최대 ${MAX_USAGE_INSTANCES}개 인스턴스를 조회하며 초과 세션은 순환 수집합니다. OS host 메모리와 proxy RSS는 별도 지표입니다. GPU 메모리는 측정하지 않습니다.</p>`);
   const details=rows.map(row=>`<tr><td>${esc(row.bucket||'—')}</td><td>${esc(usageProviders[row.provider]||'제공자 미확인')}</td><td class="mono">${esc(row.requested_model||'미보고')}</td><td class="mono">${esc(row.reported_model||'미보고')}</td><td class="mono">${esc((row.instance_id||'').slice(0,8))}</td><td class="num">${usageNumber(row.requests)}</td><td class="num">${usageNumber(row.failed)}</td><td class="num">${usageNumber(row.input_tokens)} <small>(${usageNumber(row.input_samples)}/${usageNumber(row.requests)})</small></td><td class="num">${usageNumber(row.output_tokens)} <small>(${usageNumber(row.output_samples)}/${usageNumber(row.requests)})</small></td><td class="num">${usageDuration(row.mean_elapsed_ms)}</td></tr>`).join('');
-  grid.innerHTML=telemetryCard + card('기간별 토큰 추이','보고된 사용량만 집계',usageChart(rows,report.period || document.getElementById('usage-period').value || 'day')) +
-    card('실행기별 현재 상태','수집 시점 기준 · 요청과 실패는 실행기 시작 후 누적 · 직접 Sonnet은 미관측', sessionRows ? `<div class="table-scroll"><table><thead><tr><th>실행기</th><th>서비스</th><th>상태</th><th>진행</th><th>대기</th><th>요청</th><th>실패</th><th>p95</th></tr></thead><tbody>${sessionRows}</tbody></table></div>` : '<p class="empty">인증된 실행기 기록이 없습니다. 기존 실행기와 직접 Sonnet은 표시되지 않을 수 있습니다.</p>') +
+  const selector=`<label for="usage-instance">사용량 범위</label> <select id="usage-instance" class="input"><option value="">전체 수집 실행기</option>${ids.map(id=>`<option value="${esc(id)}"${id===usageInstance?' selected':''}>${esc(id.slice(0,8))}</option>`).join('')}</select><p class="hint">선택은 기간별 토큰 추이와 아래 상세 표에 적용됩니다. 전체는 수집된 범위이며 미보고 토큰을 포함하지 않습니다.</p>`;
+  grid.innerHTML=telemetryCard + buildCard + card('실행기 선택','기간별 사용량 범위',selector) + card('기간별 토큰 추이','보고된 사용량만 집계',usageChart(rows,report.period || document.getElementById('usage-period').value || 'day')) +
+    card('실행기별 현재 상태','수집 시점 기준 · 경로는 실행기 시작 후 선택 건수 · 직접 Sonnet은 미관측', sessionRows ? `<div class="table-scroll"><table><thead><tr><th>실행기</th><th>서비스</th><th>상태</th><th>진행</th><th>대기</th><th>요청</th><th>외부 / Plan</th><th>실패</th><th>p95</th></tr></thead><tbody>${sessionRows}</tbody></table></div>` : '<p class="empty">인증된 실행기 기록이 없습니다. 기존 실행기와 직접 Sonnet은 표시되지 않을 수 있습니다.</p>') +
     card('기간 · 모델 · 실행기별','괄호는 토큰을 보고한 응답 수 / 전체 요청 수', details ? `<div class="table-scroll"><table><thead><tr><th>기간</th><th>서비스</th><th>요청 모델</th><th>보고 모델</th><th>실행기</th><th>요청</th><th>실패</th><th>입력 토큰</th><th>출력 토큰</th><th>평균 시간</th></tr></thead><tbody>${details}</tbody></table></div>` : '<p class="empty">조회 기간에 수집된 사용량이 없습니다.</p>');
+  document.getElementById('usage-instance')?.addEventListener('change', event=>{usageInstance=event.target.value;renderUsage(payload);});
 }
 async function loadUsage() {
   const period=document.getElementById('usage-period').value || 'day';

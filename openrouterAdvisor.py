@@ -599,7 +599,7 @@ def verify_owned_proxy(port, nonce, timeout=5.0) -> bool:
     deadline = time.monotonic() + timeout
     request = urllib.request.Request(f"http://127.0.0.1:{port}/api/hello", method="HEAD",
                                      headers={"x-local-route-token": nonce})
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoLocalRedirect())
     while time.monotonic() < deadline:
         try:
             with opener.open(request, timeout=1) as response:
@@ -687,6 +687,16 @@ def handover_timeout_seconds() -> float:
 
 
 
+def _handover_report(response):
+    raw = response.read(65537)
+    if len(raw) > 65536:
+        raise ValueError("oversized handover response")
+    report = json.loads(raw)
+    if not isinstance(report, dict):
+        raise ValueError("invalid handover response")
+    return report
+
+
 def request_handover(port, nonce, timeout=None):
     """Ask the running proxy to drain and exit so this launcher can rebind its port.
 
@@ -697,19 +707,22 @@ def request_handover(port, nonce, timeout=None):
         timeout = handover_timeout_seconds()
     request = urllib.request.Request(f"http://127.0.0.1:{port}/api/handover", data=b"",
                                      method="POST", headers={"x-local-route-token": nonce})
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoLocalRedirect())
     try:
         with opener.open(request, timeout=timeout) as response:
-            return json.loads(response.read() or b"{}")
+            try:
+                return _handover_report(response)
+            except (ValueError, RecursionError) as exc:
+                raise RuntimeError("Invalid handover response") from exc
     except urllib.error.HTTPError as error:
         try:
-            report = json.loads(error.read() or b"{}")
-        except ValueError:
+            report = _handover_report(error)
+        except (ValueError, RecursionError):
             report = {}
         finally:
             # An unclosed HTTPError keeps the socket until GC; close it explicitly.
             error.close()
-        if error.code == 409 and report.get("reverted"):
+        if error.code == 409 and report.get("reverted") is True:
             raise RuntimeError(
                 "The proxy kept serving an active turn and reverted the handover; "
                 "retry after it finishes") from None
@@ -886,9 +899,9 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
                    ANTHROPIC_SMALL_FAST_MODEL="claude-haiku-5-5", CLAUDE_CODE_SUBAGENT_MODEL="claude-sonnet-5-5")
     # Dual provider is an ordinary-session convenience: local-only and compatibility modes
     # rewrite requests and disable Plan fallback, so they never get a second provider.
-    # Ordinary OpenRouter sessions (and a dual session whose alternate is OpenRouter) keep the
-    # provider's stable protocol: Claude Code's experimental betas otherwise divert every
-    # request to Plan even though the user configured the external model with no extra option.
+    # OpenRouter keeps the stable protocol required by R1. Ordinary Local keeps
+    # experimental betas so Claude Code can use deferred MCP ToolSearch; native
+    # features that cannot be represented still route to Plan.
     dual = None if isolated or compat else dual_provider_setup(provider)
     if openrouter_compat or provider == "openrouter" or (
             dual is not None and dual.get("ROUTE_ALT_PROVIDER") == "openrouter"):
@@ -896,6 +909,10 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
         # must route externally without -OpenRouterCompat. Narrowing this to compat mode in
         # e075542 made every request fall back to Plan; do not repeat that regression.
         env.update(CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS="1", CLAUDE_CODE_DISABLE_ADVISOR_TOOL="1")
+    elif provider == "local" and not isolated:
+        # Retain the pre-existing Advisor policy while enabling ToolSearch. Honor
+        # an explicit user beta setting instead of overriding it.
+        env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"] = os.environ.get("CLAUDE_CODE_DISABLE_ADVISOR_TOOL", "1")
     elif provider == "cli":
         # Claude Code is still the frontend in a CLI-backed session. Its experimental
         # beta headers can make ordinary Sonnet requests bypass the CLI for Plan before
@@ -1555,6 +1572,9 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
     print("Provider failures return an error without Plan fallback; native-only requests may still use Plan.")
     print("Native-only features stay on Plan. Replacement replies are buffered until validated.")
     with routed_session(provider, background=background, debug=debug) as env:
+        if (provider == "local" and "CLAUDE_CODE_DISABLE_ADVISOR_TOOL" not in os.environ
+                and any(arg.split("=", 1)[0] == "--advisor" for arg in native_args)):
+            env.pop("CLAUDE_CODE_DISABLE_ADVISOR_TOOL", None)
         command = [claude, "--model", "sonnet"]
         recording = prepare_blackbox_hook(env, native_args)
         session_settings = {}
