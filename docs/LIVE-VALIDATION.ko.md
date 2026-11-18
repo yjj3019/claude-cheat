@@ -576,3 +576,22 @@ Public regression coverage in `tests/localLlmIntegration.test.mjs` now checks th
 
 Interactive verification used Claude Code 2.1.304 in Windows ConPTY with real TTY stdin/stdout/stderr, isolated temporary settings, synthetic files, and the existing Python Local launch path with default permissions. No print mode, `dontAsk`, permission bypass, or automatic approval was enabled. A single approved Edit ran only after approval; a subsequent denied Edit left the file unchanged. Ctrl+C during inference cancelled the request while preserving the CLI and proxy, and a new request in the same conversation succeeded. Normal `/exit` and a separate session's double Ctrl+C at idle both returned zero, terminated the CLI and proxy, and closed the proxy listener. Both sessions had zero Plan routes. Only the temporary proxy key was accepted during onboarding. Bracketed paste and a CSI-u Enter event were used for terminal input. Raw temporary history, settings, and workspaces were removed. Visual rendering in Windows Terminal, force-closing the terminal window, and OS shutdown were not tested; actual LLM computation cancellation remains unverified.
 
+# Local ToolSearch·토큰 계산·Auto 검토 추가 점검 (2026-11-17)
+
+실제 Claude Code 2.1.325, 일반 Local 프록시와 설정된 Local 서버를 사용했다. 프록시 인수인계 파일은 시험에서 쓰지 않았고 임시 작업 디렉터리와 합성 stdio MCP 도구를 사용했다. 외부 도구 코드는 복사하지 않았다.
+
+- 실험 beta 비활성화 변수를 시험 프로세스에서만 해제하고 ToolSearch를 켰을 때, 다른 MCP 설정을 제외한 합성 MCP 하나의 시험에서 ToolSearch → MCP 도구 호출 → 결과 확인이 성공했다. 세 요청 모두 Local이었다. 이후 사용자 MCP 설정도 읽은 시험에서는 도구 호출과 결과는 성공했으나 세 요청 모두 `unsupported_beta`로 Plan에 갔다. 두 시험은 print 모드이며 자동 복귀와 모든 MCP 기능을 증명하지 않는다. 따라서 beta 설정을 기본 해제하는 변경은 적용하지 않았다.
+- Local 모델 목록은 `max_input_tokens` 262144를 보고했다. 합성 사용자 메시지의 `count_tokens` 응답은 8이었고, 약 500회 반복한 설명을 가진 합성 도구 정의를 추가해도 8이었다. 같은 설명을 사용자 메시지에 넣으면 1009였다. 이 서버의 해당 응답만으로 도구 정의가 포함된 전체 입력을 정확히 계산한다고 가정하면 안 된다. 이 값이 출력까지 포함한 총 문맥 한도인지도 검증하지 않았다.
+- 2026-11-17 같은 설정의 추가 합성 진단에서는 도구 정의뿐 아니라 시스템 지시 추가에도 계수가 반응하지 않았고, 실제 추론 응답의 입력 사용량과도 일치하지 않았다. 별도의 한도 초과 응답은 실제 입력 토큰 수가 아닌 입력 문자 수를 반환했다. 따라서 이 서버 응답으로 남은 출력 토큰을 정확히 산출할 수 없으며, 자동 예산 축소의 근거로 사용하지 않는다. 새 진단은 서버 위치를 고정하지 않고 현재 설정된 서버에 적용된다.
+- Auto 시험에서 임시 파일 쓰기 요청과 결과를 확인했다. 별도 classifier 시작 기록은 발견되지 않았고 `CLAUDE_CODE_AUTO_MODE_MODEL` 지정은 서버 구성 모델 때문에 무시됐다는 로그가 관측됐다. 따라서 사용자가 본 Auto 검토 실패를 재현하거나 원인을 확정한 시험은 아니다. 기존 수동 승인 경계를 변경하지 않았다.
+
+추가 대화형 Windows 터미널 시험에서는 Claude Code 2.1.325의 Auto 모드로 격리된 임시 폴더에 합성 파일을 생성했고, 수동 승인 화면은 나타나지 않았으며 파일이 존재했다. 디버그 로그에 `classifier_request_started`는 없었다. 이 한 번의 동작으로 모든 명령에서 classifier가 정상 작동한다고 결론 내릴 수 없고, 원래 보고된 원격 SSH 명령의 승인 실패도 재현되지 않았다.
+
+추가 점검에서 실제 사용자 MCP 설정과 합성 MCP 도구를 함께 사용해 ToolSearch → 합성 도구 호출 → 결과 확인에 성공했고, 세 요청이 모두 Local로 기록됐다. 시험은 Claude Code print 모드에서 기존 Advisor 비활성화는 유지하고 beta 비활성화만 해제했다. 이전에 실패한 요청의 마지막 시스템 메시지에는 기존 도구를 참조하는 추가 블록이 있어, 이전 assistant 턴이 없고 하나로 식별되는 마지막 참조만 변환하고 중복·미등록·과거 참조는 Plan에 남기도록 했다. 이 제한을 추가한 뒤 실제 사용자 MCP 설정과 합성 MCP 도구 왕복을 다시 실행해 ToolSearch·도구 호출·결과 및 Local 경로 3건을 확인했다. Advisor가 활성화된 요청은 서버 전용 도구 정의로 인해 여전히 Plan에 남았다. 이 시험은 모든 MCP 도구, 자동 복귀 또는 대화형 세션의 완전한 호환성을 증명하지 않는다.
+
+별도의 대화형 Claude Code 2.1.326 Auto 시험은 사용자 설정을 포함하고 무해한 SSH 연결 확인을 요청했다. classifier 시작이 관측된 시기에 Local의 64토큰 요청은 빈 응답을 반복했지만, 최종적으로 해당 명령은 수동 승인 없이 실행됐고 SSH 공개키 인증 실패로 종료됐다. 원래의 Auto 검토 불가 문구는 재현되지 않았으며 짧은 요청과 classifier의 일대일 상관관계는 미확정이다. 기존 권한 규칙과 classifier 설정은 변경하지 않았다.
+
+2026-11-17 추가로 공식 도구 결과 형식에서 `content`가 선택 사항임을 확인했다. 내용이 없는 합성 도구 결과를 현재 설정된 Local 서버에 직접 보내 HTTP 200과 콘텐츠 블록을 받았다. 프록시가 이 결과를 미지원으로 분류하던 문제를 수정하고 합성 프록시 회귀 시험에서 원문 보존과 Local 경로를 확인했다. 이는 전체 MCP 서버·전송·콘텐츠 유형의 호환성 시험이 아니다. Auto 진단용 옵트인 요청 메타데이터는 회귀 시험으로만 확인했으며 기존 실패의 원인을 확정하지 않는다.
+
+이후 대화 중간의 도구 정의를 최상위 도구로 옮기면 이전 assistant 턴에서 그 도구가 이미 존재했던 것처럼 의미가 바뀔 수 있음을 확인했다. 이전 assistant 턴이 있는 정의 추가는 원본을 유지해 네이티브 경로로 보내며, 그 정의 추가가 이력에 계속 남아 있으면 다음 턴도 네이티브 경로에 머무른다. 해당 블록이 없는 별도의 호환 요청은 Local로 라우팅되는 합성 회귀 시험을 추가했다. 이는 해당 블록을 포함한 이력의 자동 복귀가 아니다. 현재 서버에 합성 짧은 메시지 및 약 8,600 입력 토큰 메시지를 보내 출력 예산 64와 512를 각각 시험한 네 요청에서는 모두 빈 콘텐츠 없이 종료됐다. 이 시험은 실제 classifier 요청을 재현하거나 이전 Auto 실패의 원인을 확정하지 않는다.
+

@@ -312,7 +312,7 @@ routing:
 
 이번 실행 흐름과 문서 개선은 Cursor의 [CLI 설계 지침](https://github.com/cursor/plugins/blob/main/cli-for-agent/skills/cli-for-agents/SKILL.md)과 [문서 신뢰성 검토 지침](https://github.com/cursor/plugins/blob/main/agent-compatibility/agents/docs-reliability-review.md)을 참고했습니다. 명시적 옵션·실행 예제·조치 가능한 오류·문서와 동작의 일치를 적용 대상으로 삼았습니다. Claude-Cheat는 Cursor 플러그인이나 해당 저장소 전체의 이식판이 아니며, 해당 저장소 전체를 이식했다고 주장하지 않습니다.
 
-일반 CLI 백엔드 세션은 불필요한 Plan 우회를 줄이도록 Claude Code에 실험 beta 비활성화를 요청합니다. 명시적 Advisor 설정은 이 조치로 변경하지 않습니다. 실제 Claude Code 버전에서 해당 설정이 어떻게 적용되는지는 별도 확인이 필요합니다. 일반 OpenRouter 세션은 실험 beta와 Advisor 도구를 비활성화하며, 일반 Local 세션은 기존 설정을 유지합니다. 프록시는 미지원 네이티브 요청을 임의로 변환하지 않고 기존 Plan 경로로 보냅니다. 명시적인 호환·제한 모드는 별도 정책을 적용합니다.
+일반 CLI 백엔드 세션은 불필요한 Plan 우회를 줄이도록 Claude Code에 실험 beta 비활성화를 요청합니다. 일반 OpenRouter 세션도 beta와 Advisor 비활성화를 요청합니다. 일반 Local 단독 세션은 MCP ToolSearch가 동작하도록 beta를 강제로 끄지 않으며, 사용자가 별도로 설정한 beta 비활성화 값은 유지합니다. 기존 Advisor 비활성화 정책은 유지하고, 미지원 네이티브 요청은 Plan으로 보냅니다. Local과 OpenRouter를 함께 설정한 dual 세션은 OpenRouter의 안정 프로토콜을 적용합니다. 변경은 새 세션에 적용되며 실제 경로는 라우팅 로그에서 확인하세요. Plan 사용을 차단하려면 `-LocalCompat` 또는 `-OpenRouterCompat`을 사용하세요.
 
 CLI 백엔드 오류에 `CLI diagnostic: ...`이 표시되면 `unsupported_request`는 브리지가 요청 형식을 지원하지 않은 것이고, `not_logged_in`은 CLI 로그인 확인이 필요하다는 뜻입니다. `cli_process_failed`는 CLI 프로세스 비정상 종료, `cli_turn_failed`는 Codex 실패 이벤트, `cli_empty_output`은 Codex 이벤트가 비어 있었다는 뜻입니다. `cli_reported_rate_limit`·`cli_reported_context_limit`은 CLI가 실패 이벤트에서 속도 또는 문맥 한도를 명시한 경우이며, 실제 계정 상태의 확정 판정은 아닙니다. `cli_failed`는 세부 단계가 확인되지 않은 경우이며, `invalid_response`·`invalid_tool_call`은 응답 검증 실패입니다. 기존 세션에는 이 상세 코드가 없을 수 있으므로 새 세션에서 확인하세요. 코드는 원인을 좁히는 정보이며 요청 내용이나 CLI 출력 원문은 포함하지 않습니다.
 

@@ -298,7 +298,7 @@ for (const provider of ['openrouter', 'local']) {
         content: body.messages.length === 1 ? [tool] : [{ type: 'text', text: 'history preserved' }],
         stop_reason: body.messages.length === 1 ? 'tool_use' : 'end_turn' });
     }, config);
-    const body = requestBody(SONNET);
+    const body = requestBody(SONNET, { tools: [{ name: 'ReadHistory', input_schema: { type: 'object' } }] });
     const first = await (await request(body, { headers: proHeaders })).json();
     assert.deepEqual(first.content, [tool]);
     const followup = { ...body, messages: [...body.messages, { role: 'assistant', content: first.content },
@@ -579,7 +579,7 @@ test('output-limit responses with a tool block retain their truncation stop reas
   const tool = { type: 'tool_use', id: 'fixture-call', name: 'Read', input: {} };
   const { calls, request } = await fixture(t, (_url, options) => Response.json({ ...META, type: 'message',
     model: JSON.parse(options.body).model, content: [tool], stop_reason: 'max_tokens' }));
-  const response = await request(requestBody(SONNET), { headers: proHeaders });
+  const response = await request(requestBody(SONNET, { tools: [{ name: 'Read', input_schema: { type: 'object' } }] }), { headers: proHeaders });
   assert.equal(response.status, 200);
   assert.equal((await response.json()).stop_reason, 'max_tokens');
   assert.equal(calls.length, 1);
@@ -594,7 +594,7 @@ for (const provider of ['local', 'openrouter']) {
         frame('content_block_start', { index: 0, content_block: { type: 'tool_use', id: 'fixture-call', name: 'Read', input: { type: 'thinking' } } }) +
         frame('content_block_stop', { index: 0 }) + frame('message_delta', { delta: { stop_reason: 'tool_use' } }) + frame('message_stop')]);
     }, config);
-    const response = await request(requestBody(SONNET, { stream: true }), { headers: proHeaders });
+    const response = await request(requestBody(SONNET, { stream: true, tools: [{ name: 'Read', input_schema: { type: 'object' } }] }), { headers: proHeaders });
     assert.equal(response.status, 200);
     assert.match(await response.text(), /fixture-call/);
     assert.equal(calls.length, 1);
@@ -651,7 +651,7 @@ for (const provider of ['local', 'openrouter']) {
         frame('content_block_start', { index: 0, content_block: { type: 'tool_use', id: 'fixture-call', name: 'Read', input: {} } }) +
         frame('content_block_stop', { index: 0 }) + frame('message_delta', { delta: { stop_reason: 'end_turn' } }) + frame('message_stop')]);
     }, config);
-    const response = await request(requestBody(SONNET, { stream: true }), { headers: proHeaders });
+    const response = await request(requestBody(SONNET, { stream: true, tools: [{name:'Read',input_schema:{type:'object'}}] }), { headers: proHeaders });
     assert.equal(response.status, 503);
     assert.ok(calls.every(call => call.url !== proURL));
   });
@@ -1066,7 +1066,7 @@ test('Local-only mode validates JSON and converts ordered text/tool blocks to CL
     usage: { input_tokens: 12, output_tokens: 8 } };
   const { calls, request } = await fixture(t, () => Response.json(message), { provider: 'local', localOnly: true,
     localUrl: 'http://127.0.0.1:11434/v1/messages', localModel: 'fixture-local' });
-  const response = await request(requestBody(SONNET, { stream: true }), { headers: proHeaders });
+  const response = await request(requestBody(SONNET, { stream: true, tools: [{ name: 'Read', input_schema: { type: 'object' } }] }), { headers: proHeaders });
   assert.equal(response.status, 200);
   assert.equal(calls[0].parsedBody.stream, false);
   const events = (await response.text()).split('\n\n').filter(Boolean).map(frame => JSON.parse(frame.split('\n').find(line => line.startsWith('data: ')).slice(6)));
@@ -1511,10 +1511,11 @@ for (const [label, middle] of [
   test(`external SSE rejects ${label} before sending any failed tools`, async t => {
     const events = frame('message_start') + middle + frame('message_delta') + frame('message_stop');
     const { calls, request } = await fixture(t, url => url === proURL ? new Response('native rejection', { status: 401 }) : sseResponse([events]));
-    const response = await request(requestBody(SONNET, { stream: true }), { headers: proHeaders });
+    const response = await request(requestBody(SONNET, { stream: true, tools: [{ name: 'Read', input_schema: { type: 'object' } }] }), { headers: proHeaders });
     assert.equal(response.status, 503);
     assert.doesNotMatch(await response.text(), /native rejection/);
-    assert.equal(calls.length, 4);
+    const invalidInput = ['tool primitive JSON', 'tool array JSON'].includes(label);
+    assert.equal(calls.length, invalidInput ? 1 : 4);
     assert.ok(calls.every(call => call.url === externalURL));
   });
 }
@@ -1523,7 +1524,7 @@ test('complete SSE tool input JSON across deltas succeeds and restores native cl
   const events = frame('message_start') + toolStart() + toolDelta('{"path":') + toolDelta('"fixture"}') + toolStop() +
     frame('message_delta', { delta: { stop_reason: 'tool_use' } }) + frame('message_stop');
   const { calls, request } = await fixture(t, () => sseResponse([events.slice(0, 200), events.slice(200)]));
-  const response = await request(requestBody(SONNET, { stream: true }), { headers: proHeaders });
+  const response = await request(requestBody(SONNET, { stream: true, tools: [{ name: 'Read', input_schema: { type: 'object' } }] }), { headers: proHeaders });
   assert.equal(response.status, 200);
   const text = await response.text();
   assert.match(text, /claude-sonnet-4-6/);
@@ -1538,7 +1539,7 @@ for (const [label, middle] of [
   test(`argument-less tool_use with ${label} succeeds without retry`, async t => {
     const events = frame('message_start') + middle + frame('message_delta', { delta: { stop_reason: 'tool_use' } }) + frame('message_stop');
     const { calls, request } = await fixture(t, () => sseResponse([events]));
-    const response = await request(requestBody(SONNET, { stream: true }), { headers: proHeaders });
+    const response = await request(requestBody(SONNET, { stream: true, tools: [{ name: 'Read', input_schema: { type: 'object' } }] }), { headers: proHeaders });
     assert.equal(response.status, 200);
     assert.match(await response.text(), /tool_fixture/);
     assert.equal(calls.length, 1);
@@ -1759,6 +1760,79 @@ test('ordinary mode never asks external for thinking and rejects a thinking repl
   assert.deepEqual(calls[0].parsedBody.thinking, { type: 'disabled' });
   await (await request(requestBody(SONNET), { headers: proHeaders })).text();
   assert.equal(calls[1].url, externalURL);
+});
+
+test('Plan SSE relays native bytes and measures terminal outcome', async t => {
+  for (const [event,ok] of [['error',false],['message_stop',true],['ping',false]]) {
+    const raw = 'event: ' + event + '\r\ndata: ' + JSON.stringify({type:event}) + '\r\n\r\n';
+    const chunks = [...new TextEncoder().encode(raw)].map(b => Uint8Array.of(b));
+    const {request} = await fixture(t, () => new Response(new ReadableStream({
+      start(controller) { for (const chunk of chunks) controller.enqueue(chunk); controller.close(); },
+    }), {headers:{'content-type':'text/event-stream'}}));
+    const r = await request(requestBody(OPUS,{stream:true}),{headers:proHeaders});
+    assert.equal(r.status,200);
+    const text = await r.text();
+    assert.equal(text,raw);
+    const metrics = await (await request(null,{path:'/api/metrics',method:'GET'})).json();
+    assert.equal(metrics.failed,Number(!ok));
+    assert.equal(metrics.efficiency.first_call_success,Number(ok));
+  }
+});
+
+for (const terminal of ['message_stop','error']) {
+  test(`Plan ends on ${terminal} even if upstream stays open`, async t => {
+    const raw = frame('message_start') + frame(terminal);
+    let cancelled = false;
+    const {request} = await fixture(t, () => new Response(new ReadableStream({
+      start(controller) { controller.enqueue(new TextEncoder().encode(raw)); },
+      cancel() { cancelled = true; },
+    }), {headers:{'content-type':'text/event-stream'}}), {planIdleMs:100});
+    const reply = await request(requestBody(OPUS,{stream:true}),{headers:proHeaders});
+    assert.equal(await reply.text(),raw);
+    assert.equal(cancelled,true);
+    const metrics = await (await request(null,{path:'/api/metrics',method:'GET'})).json();
+    assert.equal(metrics.failed,Number(terminal === 'error'));
+    assert.equal(metrics.ok,Number(terminal === 'message_stop'));
+  });
+}
+
+test('Plan JSON error preserves the envelope and does not seed Local recovery', async t => {
+  const headers = {...proHeaders,'x-claude-code-session-id':'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'};
+  const raw = '{ "type": "error", "error": {"type":"overloaded_error"} }';
+  const {request} = await fixture(t, (url,options) => url === proURL
+    ? new Response(raw,{headers:{'content-type':'application/json'}})
+    : Response.json({...META,type:'message',model:JSON.parse(options.body).model,
+      content:[{type:'text',text:'ok'}],stop_reason:'end_turn'}),
+    {provider:'local',localUrl:'http://127.0.0.1:11434/v1/messages',localModel:'fixture'});
+  const reply = await request(requestBody(OPUS),{headers});
+  assert.equal(reply.status,200);
+  assert.equal(await reply.text(),raw);
+  const next = await request(requestBody(SONNET),{headers});
+  assert.equal(next.status,200);
+  await next.text();
+  const metrics = await (await request(null,{path:'/api/metrics',method:'GET'})).json();
+  assert.equal(metrics.failed,1);
+  assert.equal(metrics.ok,1);
+  assert.equal(metrics.efficiency.first_call_success,1);
+  assert.equal(metrics.efficiency.eligible_after_plan,0);
+});
+
+test('incomplete Plan JSON produces a complete JSON error and a failed request', async t => {
+  for (const disconnect of [false,true]) {
+    const {request} = await fixture(t, () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('{"type":'));
+        if (disconnect) setImmediate(() => controller.error(new Error('fixture disconnect')));
+        else controller.close();
+      },
+    }), {headers:{'content-type':'application/json'}}));
+    const r = await request(requestBody(OPUS),{headers:proHeaders});
+    assert.equal(r.status,502);
+    assert.equal((await r.json()).type,'error');
+    const metrics = await (await request(null,{path:'/api/metrics',method:'GET'})).json();
+    assert.equal(metrics.failed,1);
+    assert.equal(metrics.efficiency.first_call_success,0);
+  }
 });
 
 test('stalled Plan stream is cut after the idle timeout', async t => {
@@ -2047,3 +2121,32 @@ test('the retry budget caps the aggregate backoff tail and reports it', async t 
   const metrics = await (await request(undefined, { method: 'GET', path: '/api/metrics' })).json();
   assert.equal(metrics.retryBudgetExceeded >= 1, true, 'budget exhaustion is observable');
 });
+
+for (const stream of [false, true]) {
+  for (const scenario of ['parallel', 'duplicate', 'undeclared']) {
+    test(`tool identity validation for ${scenario} (stream=${stream})`, async t => {
+      const tools = ['Read', 'List'].map(name => ({ name, input_schema: { type: 'object' } }));
+      const blocks = [
+        { type: 'tool_use', id: 'first', name: 'Read', input: {} },
+        { type: 'tool_use', id: scenario === 'duplicate' ? 'first' : 'second',
+          name: scenario === 'undeclared' ? 'UnknownTool' : 'List', input: {} },
+      ];
+      const { calls, request } = await fixture(t, (_url, options) => {
+        const model = JSON.parse(options.body).model;
+        if (!stream) return Response.json({ ...META, type: 'message', model, content: blocks, stop_reason: 'tool_use' });
+        return sseResponse([frame('message_start', { message: { ...META, model } }) +
+          blocks.map((content_block, index) => frame('content_block_start', { index, content_block }) +
+            frame('content_block_stop', { index })).join('') +
+          frame('message_delta', { delta: { stop_reason: 'tool_use' } }) + frame('message_stop')]);
+      });
+      const response = await request(requestBody(SONNET, { tools, stream }), { headers: proHeaders });
+      assert.equal(response.ok, scenario === 'parallel');
+      const body = await response.text();
+      if (response.ok) {
+        assert.match(body, /"first"/);
+        assert.match(body, /"second"/);
+      } else assert.doesNotMatch(body, /"first"|UnknownTool/);
+      assert.equal(calls.length, 1);
+    });
+  }
+}

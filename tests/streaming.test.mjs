@@ -28,13 +28,14 @@ function frames(model, { text = 'hello', extraFrames = [] } = {}) {
   ];
 }
 
-async function start({ passthrough = false, chunks = null, planCalls = [], beforeFinal = null } = {}) {
+async function start({ passthrough = false, chunks = null, planCalls = [], externalCalls = [], beforeFinal = null } = {}) {
   const server = createProxy({
     key: 'sk-or-stream', nonce: NONCE, openrouterModel: 'stream/model', retryDelayMs: 0,
     attemptTimeoutMs: 8000, streamPassthrough: passthrough,
     fetchImpl: async (url, request) => {
       if (url === PLAN) { planCalls.push(url); return jsonReply('plan'); }
       if (url !== EXTERNAL) throw new Error('unexpected url ' + url);
+      externalCalls.push(url);
       const body = JSON.parse(request.body);
       const pieces = chunks || frames(body.model);
       const stream = new ReadableStream({
@@ -65,7 +66,7 @@ async function request(base) {
   const response = await fetch(base, { method: 'POST',
     headers: { 'content-type': 'application/json', 'x-local-route-token': NONCE,
       authorization: 'Bearer sk-ant-oat-stream', 'anthropic-beta': BETA },
-    body: JSON.stringify({ model: MODEL, max_tokens: 64, stream: true,
+    body: JSON.stringify({ model: MODEL, max_tokens: 64, stream: true, tools: [{ name: 'Read', input_schema: { type: 'object' } }],
       messages: [{ role: 'user', content: 'hello' }] }) });
   const reader = response.body.getReader();
   const first = await reader.read();
@@ -328,6 +329,41 @@ test('truncated tool JSON fails closed instead of publishing a partial tool call
     assert.equal(planCalls.length, 0);
   } finally { server.closeAllConnections(); server.close(); }
 });
+
+for (const reason of ['undeclared_tool', 'duplicate_tool_id']) {
+  test(`committed SSE records ${reason} and withholds the rejected block`, async t => {
+    const duplicate = reason === 'duplicate_tool_id';
+    const chunks = MIXED.slice(0, duplicate ? 7 : 4);
+    const index = duplicate ? 2 : 1;
+    chunks.push(frame('content_block_start', { index, content_block: {
+      type: 'tool_use', id: duplicate ? 'toolu_mixed' : 'bad', name: duplicate ? 'Read' : 'Unknown',
+      input: { marker: 'rejected-frame' },
+    } }));
+    const log = t.mock.method(console, 'error', () => {});
+    const planCalls = [], externalCalls = [];
+    const { server, base } = await start({ passthrough: true, chunks, planCalls, externalCalls });
+    try {
+      const result = await request(base);
+      assert.equal(result.status, 200);
+      assert.match(result.body, /reading the file/);
+      assert.match(result.body, /event: error/);
+      assert.doesNotMatch(result.body, /rejected-frame|message_stop/);
+      assert.equal(externalCalls.length, 1);
+      assert.equal(planCalls.length, 0);
+      const metrics = await (await fetch(new URL('/api/metrics',base),
+        {headers:{'x-local-route-token':NONCE}})).json();
+      assert.equal(metrics.failed,1);
+      assert.equal(metrics.efficiency.measured_calls,1);
+      assert.equal(metrics.efficiency.observed_input,META.usage.input_tokens);
+      assert.equal(metrics.efficiency.observed_output,0);
+      assert.equal(metrics.efficiency.repeat_calls,0);
+      const entry = log.mock.calls.map(call => call.arguments[0]).find(line => line.includes('"stream_broken"'));
+      assert.ok(entry);
+      assert.equal(JSON.parse(entry).category, 'validation');
+      assert.equal(JSON.parse(entry).validation, reason);
+    } finally { server.closeAllConnections(); server.close(); }
+  });
+}
 
 test('passthrough ends the stream on truncated tool JSON after text was sent', async () => {
   const planCalls = [];

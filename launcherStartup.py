@@ -14,7 +14,7 @@ from urllib.parse import quote
 from urllib.request import Request, ProxyHandler, build_opener
 
 # The write token must only reach the authenticated loopback dashboard.
-urlopen = build_opener(ProxyHandler({})).open
+
 
 ROOT = Path(__file__).resolve().parent
 _bootstrap_lock = None
@@ -49,6 +49,8 @@ if __name__ == "__main__":
 
 import routeDashboard as dash
 import routeVersion
+
+urlopen = build_opener(ProxyHandler({}), dash._NoRedirect()).open
 
 
 class UnsafeUpdate(Exception):

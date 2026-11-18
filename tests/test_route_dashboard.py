@@ -35,6 +35,13 @@ def route_line(stamp, payload):
     return f"{stamp} {json.dumps(payload)}\n"
 
 
+class PlanDetailTests(unittest.TestCase):
+    def test_future_reasons_count_toward_other(self):
+        details = {"future_a": 2, "future_b": 3, "other": 1, "new_schema": 4}
+        result = dash._plan_comparison({"planBlockerDetails": details})
+        self.assertEqual(result["plan_blocker_details"], {"other": 6, "new_schema": 4})
+
+
 class SnapshotErrorRedactionTests(unittest.TestCase):
     def test_refresh_error_never_exposes_exception_text(self):
         state = {"data": {"fixture": True}, "error": None, "reported": None}
@@ -96,6 +103,19 @@ class RouteLogTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.log = self.root / ".route.log"
         self.enterContext(mock.patch.object(dash, "ROUTE_LOG", self.log))
+
+    def test_stream_failure_counts_once_in_each_window_and_instance(self):
+        now = datetime(2026, 10, 25, 3, 0, tzinfo=timezone.utc)
+        base = {"provider": "local", "instanceId": "abcd1234abcd1234"}
+        events = [{**base, "event": "route_selected"},
+                  {**base, "event": "stream_broken", "category": "validation", "validation": "duplicate_tool_id"}]
+        self.log.write_text("".join(route_line(now.isoformat(), e) for e in events), encoding="utf-8")
+        state = dash.routing_state(dash.parse_route_log(), now=now)
+        for window in (state, state["short"]):
+            self.assertEqual(window["failures"], [("validation:duplicate_tool_id", 1)])
+            self.assertEqual(window["providers"]["local"]["failures"], 1)
+            self.assertEqual(window["counts"]["external"], 1)
+        self.assertEqual(state["instances"][0]["failures"], 1)
 
     def test_recent_cli_backend_diagnostic_is_allowlisted(self):
         now = datetime(2026, 10, 25, 3, 0, tzinfo=timezone.utc)
@@ -394,7 +414,9 @@ class SessionScanTests(unittest.TestCase):
         self.append([self.assistant("msg_other2", tokens=(1, 1, 0, 0))])
         third = dash.scan_sessions(projects=self.projects, now=datetime(2026, 10, 25, 11, 0))
         self.assertEqual(third["totals"]["external"], [11, 3, 0, 4])
-        # A transcript untouched for a week drops out of the scan.
+        # Pin the fixture mtime to the simulated scan clock.
+        stamp = datetime(2026, 10, 25, 11, 0).timestamp()
+        os.utime(self.session, (stamp, stamp))
         older = dash.scan_sessions(projects=self.projects, now=datetime(2026, 11, 25, 11, 0))
         self.assertEqual(older["session_count"], 0)
 
@@ -2855,7 +2877,7 @@ class UsageStatsTests(unittest.TestCase):
                 self.send_response(200 if self.headers.get("x-local-route-token") == secret else 403)
                 self.end_headers()
                 self.wfile.write(json.dumps({"instanceId": instance, "configuration": {"provider": "local", "model": "fixture"},
-                                             "requests": 7, "failed": 1, "inflightRequests": 2,
+                                             "requests": 7, "failed": 1, "inflightRequests": 2, "routes": {"external": 4, "plan": 2},
                                              "process": {"rssBytes": 1048576}, "localAdmission": {"queued": 1}, "routingTimingMs": {"total": {"p95": 50}}}).encode())
         server = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -2869,6 +2891,7 @@ class UsageStatsTests(unittest.TestCase):
                 self.assertEqual(len(sessions), 1)
                 self.assertEqual((sessions[0]["status"], sessions[0]["inflight"], sessions[0]["queued"], sessions[0]["rss_bytes"]), ("active", 2, 1, 1048576))
                 self.assertEqual((sessions[0]["requested_model"], sessions[0]["reported_model"]), ("fixture", None))
+                self.assertEqual((sessions[0]["route_external"], sessions[0]["route_plan"]), (4, 2))
                 self.assertNotIn(secret, json.dumps(sessions))
         finally:
             server.shutdown()
@@ -3077,6 +3100,26 @@ class UsageStatsTests(unittest.TestCase):
             self.assertEqual(state["host_resources"]["cpu_percent"], 42.0)
             self.assertEqual(state["aggregate_sessions"]["active_instances"], 1)
             self.assertNotIn("private", json.dumps(state))
+
+    def test_refresh_uses_current_collection_completeness_for_totals(self):
+        import types
+        class Ledger:
+            def __init__(self, _root): pass
+            def collect(self): return {"pending": False, "errors": []}
+            def report(self, period): return {"period": period, "rows": []}
+        rows = [{"status":"active", "provider":"local", "requests":5}]
+        state = {"at":0.0, "reports":{}, "sessions":[], "error":None, "collection":None,
+                 "sessions_partial":False, "aggregate_sessions":{}}
+        with (mock.patch.object(dash, "_USAGE_STATS", state),
+              mock.patch.dict(sys.modules, {"usage_ledger":types.SimpleNamespace(UsageLedger=Ledger)}),
+              mock.patch.object(dash, "_usage_live_sessions", side_effect=[(rows, True), (rows, False)]),
+              mock.patch.object(dash, "_sample_host_resources", return_value={})):
+            dash._refresh_usage_stats(now=100)
+            self.assertTrue(state["aggregate_sessions"]["partial"])
+            self.assertIsNone(state["aggregate_sessions"]["requests"])
+            dash._refresh_usage_stats(now=111)
+            self.assertFalse(state["aggregate_sessions"]["partial"])
+            self.assertEqual(state["aggregate_sessions"]["requests"], 5)
 
 
 class InsightTests(unittest.TestCase):
@@ -4674,6 +4717,15 @@ class HostResourceMonitoringTests(unittest.TestCase):
         self.assertIsNone(aggregate["by_provider"]["local"]["rss_bytes"])
         self.assertIsNone(aggregate["by_provider"]["openrouter"]["rss_bytes"],
                           "no authenticated active instance must be unknown, not zero")
+
+    def test_route_counts_are_complete_only_when_all_active_instances_report(self):
+        rows = [{"provider": "local", "status": "active", "route_external": 4, "route_plan": 2},
+                {"provider": "local", "status": "active", "route_external": 3, "route_plan": 1}]
+        with mock.patch.object(dash, "_USAGE_STATS", {"sessions_partial": False}):
+            aggregate = dash._aggregate_live_metrics(rows)
+            self.assertEqual((aggregate["route_external"], aggregate["route_plan"]), (7, 3))
+            rows[1]["route_plan"] = None
+            self.assertIsNone(dash._aggregate_live_metrics(rows)["route_plan"])
 
     def test_partial_metric_coverage_does_not_masquerade_as_complete_sum(self):
         rows = [

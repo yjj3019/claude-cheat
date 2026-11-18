@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+import { isDeepStrictEqual } from 'node:util';
 import http from 'node:http';
 import http2 from 'node:http2';
 import { once } from 'node:events';
@@ -82,6 +83,51 @@ async function readBoundedBody(body, limit, signal, onProgress) {
     reader.releaseLock();
   }
   return { text: Buffer.concat(chunks).subarray(0, limit).toString('utf8'), truncated };
+}
+
+// Observe lifecycle events without rewriting native SSE or retaining large content deltas.
+function planStreamObserver() {
+  const decoder = new TextDecoder();
+  let line = '', skipLine = false, afterCR = false, previousCRLF = false;
+  let event = '', data = '', hasData = false, stopped = false, failed = false;
+  const endLine = () => {
+    if (!line && !skipLine) {
+      let type = event;
+      if (!type && data) {
+        try { type = JSON.parse(data).type; } catch { /* Non-lifecycle payload. */ }
+      }
+      if (hasData && type === 'error') failed = true;
+      if (hasData && type === 'message_stop') stopped = true;
+      event = ''; data = ''; hasData = false;
+    } else if (line.startsWith('event:')) {
+      event = skipLine ? '' : line.slice(6).trim();
+    } else if (line === 'data' || line.startsWith('data:')) {
+      hasData = true;
+      if (!event && !skipLine && data.length + line.length < 8192) data += line.slice(5) + '\n';
+    }
+    line = ''; skipLine = false;
+  };
+  return {
+    write(bytes) {
+      const text = decoder.decode(bytes, {stream:true});
+      for (const part of text.split(/(\r|\n)/)) {
+        if (!part) continue;
+        if (part === '\n' && afterCR) { afterCR = false; previousCRLF = true; continue; }
+        if (afterCR || part === '\n') previousCRLF = false;
+        afterCR = part === '\r';
+        if (afterCR || part === '\n') endLine();
+        else if (!skipLine) {
+          const room = 8192 - line.length;
+          line += part.slice(0, room);
+          skipLine = part.length > room;
+        }
+      }
+    },
+    // A CRLF delimiter may straddle two reads. Forward its LF before cancelling upstream.
+    get terminalFrameSent() { return (failed || stopped) && !(afterCR && previousCRLF); },
+    get failed() { return failed; },
+    get stopped() { return stopped; },
+  };
 }
 
 // Anthropic accepts only ^[a-zA-Z0-9_-]{1,64}$ tool ids. Third-party providers mint ids like
@@ -176,17 +222,23 @@ const ROUTE_LOG_RETRY_MAX_MS = 200;
 const routeInstanceId = typeof process.env.ROUTE_INSTANCE_ID === 'string' &&
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(process.env.ROUTE_INSTANCE_ID)
   ? process.env.ROUTE_INSTANCE_ID : null;
+const codeHash = (() => {
+    try {
+      return createHash('sha256').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex').slice(0, 12);
+    } catch { return null; }
+  })();
+const releaseVersion = (() => {
+  try {
+    const value = readFileSync(new URL('./VERSION', import.meta.url), 'utf8').trim();
+    return /^\d+\.\d+\.\d+$/.test(value) ? value : null;
+  } catch { return null; }
+})();
 let routeMirror = null;
 if (routeLogPath) {
   delete process.env.ROUTE_LOG_PATH;
   const emit = console.error.bind(console);
   const codeStamp = (() => {
     try { return statSync(fileURLToPath(import.meta.url)).mtime.toISOString(); } catch { return null; }
-  })();
-  const codeHash = (() => {
-    try {
-      return createHash('sha256').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex').slice(0, 12);
-    } catch { return null; }
   })();
   const startLine = continued => `${new Date().toISOString()} --- proxy start` +
     `${continued ? ' continued=1' : ''}${routeInstanceId ? ` instance=${routeInstanceId}` : ''}` +
@@ -413,11 +465,11 @@ const SCHEMA_NODES = new Set(['additionalProperties', 'unevaluatedProperties', '
 // A model's own runtime restrictions do not describe the Claude Code tool host.
 // Keep all host/user policies authoritative; this guidance never grants permissions.
 const HOST_TOOL_ACCESS_GUIDANCE = 'Host tool access: Determine workspace access from the host-provided environment, applicable system and project instructions, and actual tool results. Do not infer that the host workspace is read-only merely from a separate model runtime or sandbox. Respect any explicit read-only restriction and all host permission decisions; do not bypass them. If appropriate tools are available, use them within those limits. Report an access restriction only when supported by the host instructions, environment, or tool results.';
-function withHostToolAccessGuidance(system) {
-  if (system === undefined) return HOST_TOOL_ACCESS_GUIDANCE;
-  if (typeof system === 'string') return system + '\n\n' + HOST_TOOL_ACCESS_GUIDANCE;
+function withHostToolAccessGuidance(system, guidance = HOST_TOOL_ACCESS_GUIDANCE) {
+  if (system === undefined) return guidance;
+  if (typeof system === 'string') return system + '\n\n' + guidance;
   // Preserve every original block and cache marker; the added text is never cached by itself.
-  return [...system, { type: 'text', text: HOST_TOOL_ACCESS_GUIDANCE }];
+  return [...system, { type: 'text', text: guidance }];
 }
 
 function compatibleSchema(schema) {
@@ -619,38 +671,228 @@ function withoutNullToolMetadata(body) {
   return messages === body.messages ? body : { ...body, messages };
 }
 
-function localInlineTools(body) {
+// A transformed conversation must not orphan or duplicate client tool results.
+// Unknown/server tool blocks are checked by the existing shape validator.
+function completeClientToolHistory(messages) {
+  let pending = new Set();
+  for (const message of messages) {
+    const blocks = Array.isArray(message?.content) ? message.content : [];
+    const calls = blocks.filter(block => block?.type === 'tool_use');
+    const results = blocks.filter(block => block?.type === 'tool_result');
+    if (pending.size) {
+      if (message?.role !== 'user' || results.length !== pending.size) return false;
+      for (const result of results) {
+        if (typeof result.tool_use_id !== 'string' || !pending.delete(result.tool_use_id)) return false;
+      }
+      if (pending.size) return false;
+    } else if (results.length) return false;
+    if (calls.length) {
+      if (message?.role !== 'assistant') return false;
+      for (const call of calls) {
+        if (typeof call.id !== 'string' || !call.id || pending.has(call.id)) return false;
+        pending.add(call.id);
+      }
+    }
+  }
+  return pending.size === 0;
+}
+
+function unexpectedInlineFields(tool) {
+  const payload = tool.type === 'tool_reference' ? 'name' : 'definition';
+  return Object.keys(tool).some(key => key !== 'type' && key !== payload);
+}
+
+// Only accept the schema subset that the response gate below fully checks.
+// Without an instance, walk every subschema to decide whether a new tool can be admitted.
+const schemaOnly = Symbol('schema only');
+const numericBounds = ['minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum'];
+const schemaKeys = new Set(['type', 'description', 'title', 'enum', 'const', 'properties', 'required',
+  'additionalProperties', 'items', 'minItems', 'maxItems', ...numericBounds]);
+const schemaTypes = new Set(['object', 'array', 'integer', 'number', 'boolean', 'null', 'string']);
+const record = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+function matchesActiveSchema(schema, value = schemaOnly, depth = 0) {
+  const checking = value === schemaOnly;
+  if (typeof schema === 'boolean') return checking || schema;
+  if (depth > 32 || !record(schema) || Object.keys(schema).some(k => !schemaKeys.has(k)) ||
+      (Object.hasOwn(schema, 'type') && !schemaTypes.has(schema.type)) ||
+      (Object.hasOwn(schema, 'enum') && (!Array.isArray(schema.enum) || !schema.enum.length)) ||
+      (Object.hasOwn(schema, 'properties') && !record(schema.properties)) ||
+      (Object.hasOwn(schema, 'required') && (!Array.isArray(schema.required) ||
+        !schema.required.every(k => typeof k === 'string'))) ||
+      numericBounds.some(k => Object.hasOwn(schema, k) && !Number.isFinite(schema[k])) ||
+      ['minItems', 'maxItems'].some(k => Object.hasOwn(schema, k) &&
+        (!Number.isSafeInteger(schema[k]) || schema[k] < 0))) throw new Error('Unsupported tool schema');
+
+  const props = schema.properties ?? {};
+  if (checking) {
+    const children = Object.values(props);
+    for (const key of ['additionalProperties', 'items']) if (Object.hasOwn(schema, key)) children.push(schema[key]);
+    return children.every(child => matchesActiveSchema(child, schemaOnly, depth + 1));
+  }
+  const type = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
+  if (schema.type === 'integer' ? !Number.isSafeInteger(value) : schema.type && schema.type !== type) return false;
+  if (schema.enum && !schema.enum.some(item => isDeepStrictEqual(item, value))) return false;
+  if (Object.hasOwn(schema, 'const') && !isDeepStrictEqual(schema.const, value)) return false;
+  if (type === 'number') return !(value < schema.minimum || value > schema.maximum ||
+    value <= schema.exclusiveMinimum || value >= schema.exclusiveMaximum);
+  if (type === 'array') return !(value.length < schema.minItems || value.length > schema.maxItems) &&
+    (!Object.hasOwn(schema, 'items') || value.every(item => matchesActiveSchema(schema.items, item, depth + 1)));
+  if (type !== 'object') return true;
+  if (schema.required?.some(k => !Object.hasOwn(value, k))) return false;
+  return Object.entries(value).every(([key, item]) => {
+    const child = Object.hasOwn(props, key) ? props[key] : schema.additionalProperties;
+    return child === undefined || matchesActiveSchema(child, item, depth + 1);
+  });
+}
+
+function callableTools(body) {
+  const loaded = new Set();
+  let searchCalls = new Set();
+  const searchNames = new Set((body.tools || []).filter(tool =>
+    tool.name === 'ToolSearch' || tool.type?.startsWith('tool_search_tool_')).map(tool => tool.name));
+  for (const message of body.messages) {
+    const preceding = searchCalls;
+    searchCalls = new Set();
+    if (message.role === 'assistant' && Array.isArray(message.content)) {
+      for (const call of message.content) {
+        if (call?.type === 'tool_use' && searchNames.has(call.name)) searchCalls.add(call.id);
+      }
+    }
+    if (message.role !== 'user' || !Array.isArray(message.content)) continue;
+    for (const block of message.content) {
+      if (block?.type !== 'tool_result' || !preceding.has(block.tool_use_id) || block.is_error || !Array.isArray(block.content)) continue;
+      for (const item of block.content) if (item?.type === 'tool_reference') loaded.add(item.tool_name);
+    }
+  }
+  return new Set((body.tools || []).filter(t => !t.defer_loading || loaded.has(t.name)).map(t => t.name));
+}
+
+function checkToolIdentity(call, allowed, seen) {
+  if (seen.has(call.id)) throw new Error('Duplicate tool call id');
+  if (!allowed?.has(call.name)) {
+    const error = new Error('Undeclared tool call');
+    error.toolKind = ['Read','Write','Edit','Bash','ToolSearch','TodoWrite','Agent','Skill','Grep','Glob'].includes(call.name)
+      ? call.name : call.name.startsWith('mcp__') ? 'mcp' : 'other';
+    throw error;
+  }
+  seen.add(call.id);
+}
+
+function validToolSelection(choice, calls) {
+  if (!choice) return true;
+  if (choice.disable_parallel_tool_use === true && calls.length > 1) return false;
+  switch (choice.type) {
+    case 'auto': return true;
+    case 'none': return calls.length === 0;
+    case 'any': return calls.length > 0;
+    case 'tool': return calls.length > 0 && calls.every(call => call.name === choice.name);
+    default: return false;
+  }
+}
+
+function localInlineTools(body, diagnosis = {}, allowSingleAddition = false) {
+  const rejectShape = reason => { diagnosis.reason = reason; return null; };
   body = withoutNullToolMetadata(body);
   if (!Array.isArray(body.messages) || (body.tools !== undefined && !Array.isArray(body.tools))) return null;
+  if (!completeClientToolHistory(body.messages)) return rejectShape('incomplete_tool_history');
   const tools = [...(body.tools || [])], messages = [];
   const sameDefinition = (first, second) => {
     const a = { ...first }, b = { ...second };
     delete a.cache_control; delete b.cache_control;
-    return JSON.stringify(a) === JSON.stringify(b);
+    return isDeepStrictEqual(a, b);
   };
-  for (const message of body.messages) {
+  let sawAssistant = false;
+  for (const [messageIndex, message] of body.messages.entries()) {
+    if (message?.role === 'assistant') sawAssistant = true;
     if (!message || typeof message !== 'object') return null;
     if (!Array.isArray(message.content)) { messages.push(message); continue; }
     const content = [];
+    let repeatedDeclaration = false;
     for (const block of message.content) {
       if (block?.type !== 'tool_addition') { content.push(block); continue; }
       if (!['user', 'system'].includes(message.role) || Object.keys(block).some(key => !['type', 'tool', 'cache_control'].includes(key)) ||
           !block.tool || typeof block.tool !== 'object' || Array.isArray(block.tool)) return null;
-      if (block.tool.type !== 'tool_definition' || Object.keys(block.tool).some(key => !['type', 'definition'].includes(key))) return null;
+      if (block.tool.type === 'tool_reference') {
+        // Resolve only a final system addition against one uniquely declared tool.
+        // Earlier additions can change the meaning of prior turns and stay on Plan.
+        if (message.role !== 'system' || messageIndex !== body.messages.length - 1 ||
+            sawAssistant ||
+            unexpectedInlineFields(block.tool) ||
+            typeof block.tool.name !== 'string') return null;
+        const matches = tools.map((tool, index) => tool?.name === block.tool.name ? index : -1).filter(index => index >= 0);
+        if (matches.length !== 1) return rejectShape('unresolved_tool_reference');
+        const index = matches[0], existing = tools[index];
+        const cache = block.cache_control;
+        if (cache !== undefined && (!cache || cache.type !== 'ephemeral' ||
+            Object.keys(cache).some(key => !['type', 'ttl'].includes(key)) ||
+            (cache.ttl !== undefined && !['5m', '1h'].includes(cache.ttl)) ||
+            (existing.cache_control !== undefined && !isDeepStrictEqual(existing.cache_control, cache)))) return null;
+        tools[index] = { ...existing, ...(existing.defer_loading === true ? {defer_loading:false} : {}),
+          ...(cache !== undefined ? {cache_control:cache} : {}) };
+        continue;
+      }
+      if (block.tool.type !== 'tool_definition' || unexpectedInlineFields(block.tool)) return null;
+      // A top-level tool applies to the whole conversation. Moving a later
+      // declaration there would retroactively expose or replace it in earlier
+      // assistant turns, so retain the native route in that case.
       const definition = block.tool.definition;
       if (!definition || typeof definition !== 'object' || Array.isArray(definition) || typeof definition.name !== 'string') return null;
+      const matches = tools.filter(previous => previous?.name === definition.name);
+      const hasCacheBoundary = Object.hasOwn(block, 'cache_control') || Object.hasOwn(definition, 'cache_control');
+      for (const owner of [block, definition]) {
+        if (!Object.hasOwn(owner, 'cache_control')) continue;
+        const cache = owner.cache_control;
+        if (!cache || cache.type !== 'ephemeral' || Object.keys(cache).some(k => !['type', 'ttl'].includes(k)) ||
+            (cache.ttl !== undefined && !['5m', '1h'].includes(cache.ttl))) return rejectShape('cache_conflict');
+      }
+      if (!hasCacheBoundary && matches.length === 1 && !matches[0].defer_loading &&
+          isDeepStrictEqual(matches[0], definition)) {
+        repeatedDeclaration = true;
+        continue;
+      }
+      if (sawAssistant) {
+        const blockChange = detail => {
+          diagnosis.detail = detail;
+          return rejectShape('mid_history_tool_change');
+        };
+        if (hasCacheBoundary) return blockChange('cache_boundary');
+        if (!allowSingleAddition || matches.length || !/^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+$/.test(definition.name) ||
+            definition.name.length > 128) return blockChange('declaration_conflict');
+        if (definition.defer_loading) return blockChange('new_deferred_tool');
+        try { matchesActiveSchema(definition.input_schema); }
+        catch (error) {
+          if (error.message === 'Unsupported tool schema') return blockChange('new_schema');
+          throw error;
+        }
+        if (diagnosis.addedTool || body.messages.some(m => Array.isArray(m?.content) && m.content.some(b =>
+            b?.type === 'tool_removal'))) return blockChange('multiple_changes');
+        if (messages.some(m => Array.isArray(m.content) && m.content.some(b => b?.type === 'tool_use' &&
+            b.name === definition.name))) return blockChange('previous_use');
+        diagnosis.addedTool = definition.name;
+        content.push({type:'text', text:'Tool availability update: ' + definition.name + ' became available at this turn.'});
+
+      }
       const tool = { ...definition };
       if (block.cache_control !== undefined) {
-        const cache = block.cache_control;
-        if (!cache || cache.type !== 'ephemeral' || Object.keys(cache).some(key => !['type', 'ttl'].includes(key)) ||
-            (cache.ttl !== undefined && !['5m', '1h'].includes(cache.ttl)) ||
-            (tool.cache_control !== undefined && JSON.stringify(tool.cache_control) !== JSON.stringify(cache))) return null;
-        tool.cache_control = cache;
+        if (tool.cache_control !== undefined && !isDeepStrictEqual(tool.cache_control, block.cache_control))
+          return rejectShape('cache_conflict');
+        tool.cache_control = block.cache_control;
       }
       const index = tools.findIndex(previous => previous?.name === tool.name);
       if (index < 0) tools.push(tool);
-      else if (tools[index].defer_loading === true || sameDefinition(tools[index], tool)) tools[index] = tool;
-      else return null;
+      else {
+        const existing = tools[index];
+        if (existing.defer_loading !== true && !sameDefinition(existing, tool)) return null;
+        if (existing.cache_control !== undefined) {
+          if (tool.cache_control !== undefined && !isDeepStrictEqual(existing.cache_control, tool.cache_control)) return rejectShape('cache_conflict');
+          tool.cache_control = existing.cache_control;
+        }
+        tools[index] = tool;
+      }
+    }
+    if (!content.length && repeatedDeclaration) {
+      content.push({type:'text', text:'Previously declared tools remain available.'});
     }
     if (!content.length) return null;
     messages.push({ ...message, content });
@@ -716,6 +958,68 @@ function unsupportedBetas(beta, localCompat = false) {
     !BASELINE_BETAS.has(x) && !(localCompat && COMPAT_BETAS.has(x)) &&
     !/^oauth-\d{4}-\d{2}-\d{2}$/.test(x) && !['claude-code-20250219', 'prompt-caching-2024-07-31'].includes(x));
 }
+// These headers enable tool changes inside messages. A request that contains no
+// such blocks has no tool-change operation to translate. All other beta names
+// remain conservative: their absence of visible fields does not prove equivalence.
+function unusedToolChangeBetas(body, beta) {
+  const betas = unsupportedBetas(beta);
+  if (!betas.length || betas.some(name => !['inline-tools-2026-09-15',
+      'mid-conversation-tool-changes-2026-07-01'].includes(name))) return false;
+  if (!Array.isArray(body.messages) || !completeClientToolHistory(body.messages)) return false;
+  return !body.messages.some(message => Array.isArray(message?.content) &&
+    message.content.some(block => ['tool_addition', 'tool_removal'].includes(block?.type)));
+}
+// Opt-in diagnostic: emit only fixed names and structural counts, never request
+// text, tool names, schemas, opaque fields, or unknown header values.
+function localBetaDiagnostic(body, beta) {
+  const supported = new Set([...COMPAT_BETAS, 'thinking-token-count-2026-05-13']);
+  const names = unsupportedBetas(beta);
+  const candidate = localInlineTools(body);
+  const fields = ['context_management', 'thinking', 'output_config', 'tool_choice'];
+  const blockTypes = new Set(['tool_use', 'tool_result', 'tool_reference', 'tool_addition', 'tool_removal', 'thinking', 'redacted_thinking']);
+  const blocks = Object.fromEntries([...blockTypes].map(type => [type, 0]));
+  const additions = [];
+  for (const message of Array.isArray(body.messages) ? body.messages : []) {
+    for (const block of Array.isArray(message?.content) ? message.content : []) {
+      if (blockTypes.has(block?.type)) blocks[block.type] = Math.min(65535, blocks[block.type] + 1);
+      if (block?.type === 'tool_addition' && additions.length < 32) {
+        const tool = block.tool, definition = tool?.definition;
+        const kind = ['tool_definition', 'tool_reference'].includes(tool?.type) ? tool.type : 'other';
+        const definitionKind = definition?.type === undefined ? 'unspecified' :
+          ['custom', 'mcp_toolset'].includes(definition?.type) ? definition.type : 'other';
+        additions.push({ role: ['user', 'assistant', 'system'].includes(message?.role) ? message.role : 'other',
+          kind, definition_kind: definitionKind,
+          final_message: message === body.messages[body.messages.length - 1],
+          definition_has_name: typeof definition?.name === 'string',
+          definition_has_schema: Boolean(definition?.input_schema),
+          reference_uses_name: typeof tool?.name === 'string',
+          reference_uses_tool_name: typeof tool?.tool_name === 'string',
+          reference_matches_declared: Boolean(Array.isArray(body.tools) && body.tools.some(item => item?.name === (tool?.name || tool?.tool_name))),
+          has_cache_control: Object.hasOwn(block, 'cache_control'),
+          extra_block_fields: Object.keys(block).some(key => !['type','tool','cache_control'].includes(key)),
+          extra_tool_fields: Boolean(tool && unexpectedInlineFields(tool)) });
+      }
+      if (block?.type === 'tool_result' && Array.isArray(block.content)) {
+        for (const nested of block.content) if (nested?.type === 'tool_reference')
+          blocks.tool_reference = Math.min(65535, blocks.tool_reference + 1);
+      }
+    }
+  }
+  return { known_betas: [...new Set(names.filter(name => supported.has(name)))].sort(),
+    unknown_beta_count: names.filter(name => !supported.has(name)).length,
+    tool_count: Math.min(65535, Array.isArray(body.tools) ? body.tools.length : 0),
+    deferred_count: Math.min(65535, Array.isArray(body.tools) ? body.tools.filter(tool => tool?.defer_loading === true).length : 0),
+    fields: fields.filter(name => Object.hasOwn(body, name)), blocks, additions,
+    tool_shapes: candidate && Array.isArray(candidate.tools) ? candidate.tools.map(tool => ({
+      kind: tool?.type === undefined || tool?.type === 'custom' ? 'custom' :
+        tool?.type === 'advisor_20260301' ? 'advisor' :
+        /^tool_search_tool_(regex|bm25)_\d{8}$/.test(tool?.type || '') ? 'tool_search' : 'other',
+      has_schema: Boolean(tool?.input_schema),
+      has_extra_fields: Boolean(tool && Object.keys(tool).some(key => !['name','description','input_schema','cache_control','type','defer_loading','strict','eager_input_streaming'].includes(key)))
+    })).slice(0, 64) : [],
+    compat_exclusion: compatExclusion(body, ''),
+    transformed_exclusion: candidate ? compatExclusion(candidate, '') : 'not_transformable' };
+}
 function externalExclusion(body, beta, localOnly = false, localCompat = false) {
   // Unknown betas/fields belong to the subscription API and are never stripped; native reasoning is
   // the one exception, dropped from the external copy because no other provider can verify it.
@@ -753,7 +1057,9 @@ function externalExclusion(body, beta, localOnly = false, localCompat = false) {
       contentDetail = 'unsupported_tool_caller';
       return false;
     }
-    return block.type !== 'tool_result' || contentOK(block.content, true);
+    // Anthropic permits an omitted tool_result content; preserve that distinction
+    // rather than rewriting it to an empty string or routing it as an unknown block.
+    return block.type !== 'tool_result' || !Object.hasOwn(block, 'content') || contentOK(block.content, true);
   }));
   if (!body.messages.every(message => contentOK(message.content)) ||
       (body.system !== undefined && !contentOK(body.system))) return contentDetail;
@@ -794,7 +1100,7 @@ const STREAM_EVENTS = new Set(['message_start', 'content_block_start', 'content_
 
 // Validates one SSE frame and returns the text to forward. Throws on anything the
 // client could not accept, which is what keeps a bad reply from reaching the session.
-function streamValidator(model, clientModel, strictMeta, rejectThinking = false) {
+function streamValidator(model, clientModel, strictMeta, rejectThinking = false, choice = null, allowedTools = null) {
   let started = false, delta = false, stopped = false, usable = false, stopReason;
   // Frames may only leave the proxy once the reply provably has usable content: until
   // then a failure must stay recoverable by the selected provider's retry policy.
@@ -804,6 +1110,8 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false)
   const diagnosticCounts = {};
   let diagnosticUsage = {};
   let measuredInput = null, measuredOutput = null;
+  const chosenCalls = [];
+  const seenIds = new Set();
   const thinking = block => ['thinking', 'redacted_thinking'].includes(block?.type);
   // One pass over the frame's lines replaces three split(/\r?\n/) arrays per frame: the
   // joined `data:` payload and the first `event:` name the previous code built twice.
@@ -834,7 +1142,7 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false)
     get stopped() { return stopped; },
     get publishable() { return publishable && started; },
     get reportedModel() { return reportedModel; },
-    get usage() { return { input_tokens: measuredInput, output_tokens: measuredOutput }; },
+    get usage() { return { ...diagnosticUsage, input_tokens: measuredInput, output_tokens: measuredOutput }; },
     validate(frame) {
       const { data, named } = parseFrame(frame);
       if (!data) return frame + '\n\n';
@@ -865,6 +1173,8 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false)
         }
         indices.add(event.index);
         const type = event.content_block.type;
+        if (type === 'tool_use') checkToolIdentity(event.content_block, allowedTools, seenIds);
+        if (choice && type === 'tool_use') chosenCalls.push({name:event.content_block.name});
         if (DIAGNOSTIC_BLOCK_TYPES.includes(type)) diagnosticCounts[type] = Math.min(65535, (diagnosticCounts[type] || 0) + 1);
         usable ||= usableContent(event.content_block);
         blocks.set(event.index, { type: event.content_block.type, json: '', hasJson: false });
@@ -918,6 +1228,7 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false)
     },
     finish() {
       if (!started || !stopped) throw new Error('Truncated stream');
+      if (choice && !(CONTROL_STOPS.has(stopReason) && !chosenCalls.length) && !validToolSelection(choice, chosenCalls)) throw new Error('Invalid tool selection');
       if (!usable && !CONTROL_STOPS.has(stopReason)) throw emptyResponseError(
         'stream_without_usable_content', 'sse', stopReason, diagnosticCounts, diagnosticUsage);
       if (rejectThinking && sawThinking) throw new Error('Thinking response in ordinary mode');
@@ -925,7 +1236,7 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false)
   };
 }
 
-async function bufferedResponse(upstream, model, clientModel, stream, signal, onProgress, strictMeta = false, onFrame = null, rejectThinking = false, onDrain = null, onChunk = null) {
+async function bufferedResponse(upstream, model, clientModel, stream, signal, onProgress, strictMeta = false, onFrame = null, rejectThinking = false, onDrain = null, onChunk = null, choice = null, allowedTools = null, observeUsage = null) {
   if (!upstream.ok) throw new Error('External request failed');
   const sse = (upstream.headers.get('content-type') || '').includes('text/event-stream');
   if (!upstream.body) throw emptyResponseError('missing_body', sse ? 'sse' : 'json');
@@ -936,7 +1247,8 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal, on
   const output = [];
   let size = 0, eventPending = '', forwarded = false, lastChunkAtMs = null;
   const eventDecoder = new TextDecoder();
-  const validator = sse ? streamValidator(model, clientModel, strictMeta, rejectThinking) : null;
+  const validator = sse ? streamValidator(model, clientModel, strictMeta, rejectThinking, choice, allowedTools) : null;
+  if (validator && observeUsage) observeUsage(() => validator.usage);
   const cancel = () => { reader.cancel().catch(() => {}); };
   signal.addEventListener('abort', cancel, { once: true });
   const drainIfNeeded = async () => {
@@ -1012,6 +1324,10 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal, on
     const text = (chunks.length === 1 ? chunks[0] : Buffer.concat(chunks)).toString('utf8');
     if (!text.trim()) throw emptyResponseError('empty_body', 'json');
     const response = JSON.parse(text);
+    if (observeUsage) {
+      const reported = safeResponseUsage(response?.usage);
+      observeUsage(() => reported);
+    }
     if (response.type !== 'message' || response.model !== model || !Array.isArray(response.content) ||
         !response.content.every(validContentBlock) || !STOP_REASONS.has(response.stop_reason) ||
         (response.stop_reason === 'tool_use' && !response.content.some(block => block.type === 'tool_use')) ||
@@ -1024,6 +1340,13 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal, on
       for (const block of response.content) counts[block.type] = Math.min(65535, (counts[block.type] || 0) + 1);
       throw emptyResponseError(response.content.length ? 'content_without_usable_output' : 'empty_content',
         'json', response.stop_reason, counts, response.usage);
+    }
+    const seenIds = new Set();
+    for (const block of response.content) if (block.type === 'tool_use') checkToolIdentity(block, allowedTools, seenIds);
+    if (choice) {
+      const calls = response.content.filter(block => block.type === 'tool_use');
+      if (!(CONTROL_STOPS.has(response.stop_reason) && !calls.length) && !validToolSelection(choice, calls))
+        throw new Error('Invalid tool selection');
     }
     const reportedModel = response.model;
     response.model = clientModel;
@@ -1188,7 +1511,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
   // mode keeps its 30s silence window by design.
   attemptTimeoutMs = localOnly || openrouterCompat
     ? localAdmissionEnv('ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS', 120000, 30000, 900000) : 30000,
-  planHeaderMs = 120000, planIdleMs = 300000, attemptCeilingMs = 300000, now = Date.now,
+  localFirstByteTimeoutMs = attemptTimeoutMs, planHeaderMs = 120000, planIdleMs = 300000, attemptCeilingMs = 300000, now = Date.now,
   // P1 step budget: the aggregate retry wait (backoff plus honored Retry-After hints) across one
   // request must not exceed this; 0 disables the cap. Per-wait retryMaxWaitMs still applies.
   retryBudgetMs = Number.isFinite(Number(process.env.ROUTE_RETRY_BUDGET_MS))
@@ -1292,7 +1615,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
     }
   }
   if (!isSonnet(fallbackModel)) throw new Error('Fallback must be a native Sonnet model');
-  for (const value of [retryDelayMs, cooldownMs, attemptTimeoutMs, planHeaderMs, planIdleMs, attemptCeilingMs, retryBudgetMs])
+  for (const value of [retryDelayMs, cooldownMs, attemptTimeoutMs, localFirstByteTimeoutMs, planHeaderMs, planIdleMs, attemptCeilingMs, retryBudgetMs])
     if (!Number.isFinite(value) || value < 0) throw new Error('Invalid routing timeout');
   if (!Number.isFinite(requestIdleTimeoutMs) || requestIdleTimeoutMs < 0) throw new Error('Invalid request idle timeout');
   if (!Number.isFinite(retryMaxWaitMs) || retryMaxWaitMs < 0) throw new Error('Invalid retry wait');
@@ -1457,6 +1780,13 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
   const localAttemptBuckets = Object.fromEntries(
     ['small_solo', 'small_shared', 'medium_solo', 'medium_shared', 'large_solo', 'large_shared']
       .map(name => [name, { attempts: 0, timeouts: 0 }]));
+  const planBlockers = Object.create(null);
+  const planBlockerDetails = Object.create(null);
+  const efficiency = { logical_messages: 0, upstream_calls: 0, repeat_calls: 0, measured_calls: 0,
+    observed_input: 0, observed_output: 0, cache_read: 0, cache_write: 0, repeat_tokens: 0, first_call_success: 0, eligible_after_plan: 0, first_local_returns: 0, local_returns: 0, instance_followups: 0 };
+  const pendingReturns = new Map();
+  let unknownPlan = false;
+  let preferLocalJsonUntil = 0;
   const attemptCounts = { external: 0, plan: 0 };
   const recordTiming = (phase, elapsed) => {
     const samples = routingTiming[phase];
@@ -1528,7 +1858,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
     routingTimingMs: Object.fromEntries(Object.entries(routingTiming).map(([name, values]) => [name, latencySummary(values)])),
     externalTimeouts: { kinds: { ...timeoutKinds }, stages: { ...timeoutStages },
       localAttempts: Object.fromEntries(Object.entries(localAttemptBuckets).map(([name, row]) => [name, { ...row }])) },
-    attemptCounts: { ...attemptCounts },
+    attemptCounts: { ...attemptCounts }, efficiency: { ...efficiency }, planBlockers: { ...planBlockers }, planBlockerDetails: { ...planBlockerDetails }, proxyBuild: { version: releaseVersion, hash: codeHash },
     ...(provider === 'cli' ? { cliActivity: { ...cliActivity }, cliFailures: { ...cliFailures },
       cliUsage: { ...tokenFlow.cli }, cliProcessMs: latencySummary(cliProcessTiming) } : {}),
     modelPerformance: Object.fromEntries(Object.entries(modelPerformance).map(([name, value]) => [name, { ...value }])),
@@ -1747,7 +2077,8 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
     const countTokens = req.url.startsWith('/v1/messages/count_tokens');
     const bodyCap = countTokens ? COUNT_TOKENS_MAX_RESPONSE : MAX_RESPONSE;
     const client = new AbortController();
-    let recordRequest = () => {}, responseFailed = false;
+    let budgetTimer;
+    let recordRequest = () => {}, responseFailed = false, planNonStream = false;
     // A request owns one inflight slot until it is released. An early rejection (bad JSON,
     // oversized body) never reaches recordRequest, and a client that vanishes mid-body never
     // finishes its response, so release on 'close' too: a leaked slot makes every later
@@ -1857,6 +2188,15 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
       try { body = timeSync('body_parse', () => JSON.parse(raw.toString('utf8'))); } catch { return reject(400, 'Invalid JSON'); }
       if (!body || typeof body !== 'object' || Array.isArray(body)) return reject(403, 'Unsupported request fields');
       const model = body.model;
+      // Opt-in correlation aid only: this does not identify or reroute a classifier.
+      // No request content, tool names, headers, or client identifiers are recorded.
+      if (process.env.ROUTE_AUTO_DIAGNOSTICS === '1') {
+        logEvent({ event: 'auto_request_diagnostic', at: new Date().toISOString(),
+          family: modelFamily(model), stream: body.stream === true,
+          max_tokens: Number.isSafeInteger(body.max_tokens) && body.max_tokens > 0 && body.max_tokens <= 10000000 ? body.max_tokens : null,
+          message_count: Math.min(Array.isArray(body.messages) ? body.messages.length : 0, 65535),
+          tool_count: Math.min(Array.isArray(body.tools) ? body.tools.length : 0, 65535) });
+      }
       // Only sessions with a route log record the shape; it is a measurement, not routing input.
       if (routeLogPath) {
         try {
@@ -1867,9 +2207,18 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
       // Everything from here to the response is a routed request; count it once.
       const startedAt = performance.now();
       // Whole-request budget (0 = off). It bounds queue wait plus every attempt and retry
-      // wait together; exceeding it stops the request before new work starts, never by
-      // replacing an answer that already reached the client.
+      // wait together. A committed stream reports expiry in-band.
       const budgetDeadline = requestBudgetMs > 0 ? startedAt + requestBudgetMs : null;
+      const expireBudget = () => {
+        if (client.signal.aborted) return;
+        logEvent({ event: 'request_budget_exhausted' });
+        client.abort('request_budget');
+      };
+      const checkBudget = () => {
+        if (budgetDeadline !== null && performance.now() >= budgetDeadline) expireBudget();
+        client.signal.throwIfAborted();
+      };
+      if (budgetDeadline !== null) budgetTimer = setTimeout(expireBudget, requestBudgetMs);
       let firstByteMs = null;
       const noteFirstByte = () => { if (firstByteMs === null) firstByteMs = performance.now() - startedAt; };
       metrics.requests += 1;
@@ -1886,7 +2235,31 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
         if (chunk) metrics.bytesOut += Buffer.byteLength(chunk);
         return originalEnd(chunk, encoding, callback);
       };
+      let localRoutePendingLog = false;
       let routeKind = null, routeReason = null, fallbackFailure = null, recorded = false, performanceSample = null;
+      const sessionHeader = req.headers['x-claude-code-session-id'];
+      const conversationKey = typeof sessionHeader === 'string' &&
+        /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(sessionHeader) ? sessionHeader.toLowerCase() : null;
+      let returnCandidate, firstLocalAttempt = false;
+      let callNumber = 0;
+      function beginCall(name) {
+        if (countTokens) return;
+        if (++callNumber > 1) efficiency.repeat_calls++;
+        efficiency.upstream_calls++;
+        if (routeLogPath) logEvent({ event: 'inference_attempt', provider: name, attempt: callNumber });
+      }
+      function recordCallUsage(name, usage) {
+        if (countTokens) return;
+        const fields = safeResponseUsage(usage);
+        if (!Object.keys(fields).length) return;
+        efficiency.measured_calls++;
+        efficiency.observed_input += fields.input_tokens || 0;
+        efficiency.observed_output += fields.output_tokens || 0;
+        efficiency.cache_read += fields.cache_read_input_tokens || 0;
+        efficiency.cache_write += fields.cache_creation_input_tokens || 0;
+        if (callNumber > 1) efficiency.repeat_tokens += Object.values(fields).reduce((a,b) => a+b, 0);
+        if (routeLogPath) logEvent({ event: 'inference_usage', provider: name, attempt: callNumber, usage: fields });
+      }
       let usageProvider = 'unknown', usageRequestedModel = null, usageReportedModel = null;
       const openPhases = new Set();
       const phaseMs = {};
@@ -1909,6 +2282,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
       };
       recordRequest = aborted => {
         if (recorded) return;
+        if (localRoutePendingLog) logEvent({event:'route_selected',provider:'local',reason:'replacement'});
         recorded = true;
         releaseTurn();
         const completedAt = performance.now();
@@ -1972,7 +2346,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
           history.outputTokens += performanceSample.outputTokens;
           history.tokenElapsedMs += elapsed;
         }
-        if (routeKind) {
+        if (routeKind && !localRoutePendingLog) {
           const bucket = metrics.latency[routeKind];
           bucket.push(elapsed);
           if (bucket.length > LATENCY_WINDOW) bucket.shift();
@@ -1996,6 +2370,26 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
         }
         // Count logical messages only; token counting is a different API operation.
         if (!req.url.startsWith('/v1/messages/count_tokens')) {
+          efficiency.logical_messages++;
+          if (!aborted && !responseFailed && res.statusCode < 400) {
+            if (callNumber === 1) efficiency.first_call_success++;
+            if (routeKind === 'plan') {
+              if (!conversationKey) unknownPlan = true;
+              else {
+                pendingReturns.delete(conversationKey);
+                pendingReturns.set(conversationKey, { attempted: false, completed: false });
+                if (pendingReturns.size > 1024) pendingReturns.delete(pendingReturns.keys().next().value);
+              }
+            }
+            if (returnCandidate && routeKind === 'external' && usageProvider === 'local') {
+              if (firstLocalAttempt) efficiency.first_local_returns++;
+              if (!returnCandidate.completed) {
+                returnCandidate.completed = true;
+                efficiency.local_returns++;
+                if (pendingReturns.get(conversationKey) === returnCandidate) pendingReturns.delete(conversationKey);
+              }
+            }
+          }
           const ok = !aborted && !responseFailed && res.statusCode < 400;
           const validTokens = n => Number.isSafeInteger(n) && n >= 0 && n <= 2**31 - 1 ? n : null;
           const inputTokens = ok && routeKind === 'external' ? validTokens(performanceSample?.inputTokens) : null;
@@ -2024,6 +2418,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
       if (!compatAlias && !configuredAlias && !altRequested && !isPro(model) && !isSonnet(model) && model !== DEEPSEEK) return reject(403, 'Model blocked');
       const oauthOK = /^Bearer\s+sk-ant-oat/.test(req.headers.authorization || '') && !req.headers['x-api-key'] &&
         (req.headers['anthropic-beta'] || '').includes('oauth-');
+      let planBlocker = null, blockerDetail = null;
       const sendPro = async (reason = 'native_feature', detail) => {
         const selectedProvider = altRequested ? altProvider : provider;
         const providerFailureOnly = !noPlan && reason !== 'native_feature';
@@ -2051,6 +2446,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
               invalid_request: [`${errorPrefix}_invalid_request`, selectedProvider === 'cli'
                 ? 'CLI bridge returned HTTP 400; see any diagnostic code for the reported stage.'
                 : `${label} server rejected the request.`],
+              context_limit: [`${errorPrefix}_context_limit`, `${label} context limit exceeded. Reduce the output token budget or conversation size; tool definitions also consume context.`],
               empty_response: [`${errorPrefix}_empty_response`, `${label} server returned an empty response.`],
               upstream_error: [`${errorPrefix}_upstream_error`, `${label} server request failed. Check the ${errorPrefix} routing log.`],
             };
@@ -2060,7 +2456,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
                 [`${errorPrefix}_cooldown`, `${label} retry cooldown is active. Previous failure: ${(descriptions[circuitState.lastFailure] || descriptions.upstream_error)[1]}`];
             if (reason === 'circuit_open') previousErrorCode = (descriptions[circuitState.lastFailure] || descriptions.upstream_error)[0];
             if (!recoveryInProgress) retryAfterSeconds = remaining;
-            const retryHint = recoveryInProgress ? '' : remaining > 0 ?
+            const retryHint = recoveryInProgress || (reason === 'fallback' && ['invalid_request', 'context_limit'].includes(detail)) ? '' : remaining > 0 ?
               ` Wait ${remaining} second${remaining === 1 ? '' : 's'} before a new request.` :
               ` Send a new request to check ${label} recovery.`;
             const cliDiagnostic = selectedProvider === 'cli' && cliBackendError && reason === 'fallback'
@@ -2075,7 +2471,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
           const status = providerFailureOnly && reason === 'fallback' && [429, 529].includes(failureStatus) ? failureStatus :
             providerFailureOnly && ['fallback', 'circuit_open'].includes(reason)
             ? ({ [`${errorPrefix}_authentication_failed`]: 403, [`${errorPrefix}_payment_required`]: 402,
-              [`${errorPrefix}_invalid_request`]: 400 }[code] || 503) : 400;
+              [`${errorPrefix}_invalid_request`]: 400, [`${errorPrefix}_context_limit`]: 400 }[code] || 503) : 400;
           const waitSeconds = reason === 'fallback' && retryAfterHintMs !== null
             ? Math.ceil(retryAfterHintMs / 1000) : retryAfterSeconds;
           return reject(status, message,
@@ -2095,8 +2491,10 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
           || (configuredAlias && !isPro(model) && !isSonnet(model)) ? fallbackModel : model;
         usageProvider = 'plan'; usageRequestedModel = planModel; usageReportedModel = null;
         noteRoute('plan', reason);
+        if (blockerDetail) planBlockerDetails[blockerDetail] = (planBlockerDetails[blockerDetail] || 0) + 1;
+        if (planBlocker) planBlockers[planBlocker] = (planBlockers[planBlocker] || 0) + 1;
         logEvent({ event: 'route_selected', provider: 'plan', reason, ...(detail ? { detail } : {}),
-          model: planModel,
+          model: planModel, ...(planBlocker ? { blocker: planBlocker } : {}), ...(blockerDetail ? { blocker_detail: blockerDetail } : {}),
           ...(betas.length ? { beta_features: betaFeatures, unsupported_beta_count: betas.length } : {}) });
         const headers = {};
         for (const [name, value] of Object.entries(req.headers))
@@ -2115,6 +2513,8 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
         const finishPlan = startPhase('plan');
         try {
         metrics.attempts += 1;
+        checkBudget();
+        beginCall('plan');
         attemptCounts.plan += 1;
         const upstream = await abortable(fetchImpl('https://api.anthropic.com' + req.url,
           { method: 'POST', headers, body: proBody, redirect: 'error', signal: plan.signal }), plan.signal);
@@ -2148,6 +2548,19 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
           res.end(scrubbed);
           return;
         }
+        const mediaType = (upstream.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+        planNonStream = mediaType !== 'text/event-stream';
+        if (upstream.ok && (mediaType === 'application/json' || mediaType.endsWith('+json'))) {
+          arm(planIdleMs);
+          const result = await readBoundedBody(upstream.body, MAX_RESPONSE, plan.signal, () => arm(planIdleMs));
+          if (result.truncated) throw new Error('Plan JSON response too large');
+          checkBudget();
+          if (JSON.parse(result.text)?.type === 'error') responseFailed = true;
+          res.writeHead(upstream.status, responseHeaders);
+          res.end(result.text);
+          return;
+        }
+        const observer = mediaType === 'text/event-stream' ? planStreamObserver() : null;
         res.writeHead(upstream.status, responseHeaders);
         if (upstream.body) {
           const reader = upstream.body.getReader();
@@ -2159,14 +2572,16 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
               const { done, value } = await abortable(reader.read(), plan.signal);
               client.signal.throwIfAborted();
               if (done) break;
+              observer?.write(value);
               if (!res.write(value)) {
                 try {
                   await once(res, 'drain', { signal: plan.signal });
                 } catch (error) {
-                  if (plan.signal.aborted) res.destroy();
+                  if (plan.signal.aborted && client.signal.reason !== 'request_budget') res.destroy();
                   throw error;
                 }
               }
+              if (observer?.terminalFrameSent) break;
             }
           } finally {
             client.signal.removeEventListener('abort', cancel);
@@ -2174,6 +2589,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
             reader.releaseLock();
           }
         }
+        if (observer && (observer.failed || !observer.stopped)) responseFailed = true;
         res.end();
         } finally {
           finishPlan();
@@ -2183,13 +2599,20 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
       };
       let nativeDetail = req.url.startsWith('/v1/messages/count_tokens') ? 'token_count' : compatProfile ?
         compatExclusion(body, req.headers['anthropic-beta']) : isPro(model) ? 'plan_model' : externalExclusion(body, req.headers['anthropic-beta'], localOnly);
+      // Re-evaluate the entire body before omitting an unused tool-change header.
+      // Restrict this to ordinary Local: compatibility modes have their own contract.
+      if (nativeDetail === 'unsupported_beta' && provider === 'local' && !altRequested && !noPlan &&
+          unusedToolChangeBetas(body, req.headers['anthropic-beta'])) {
+        nativeDetail = externalExclusion(body, '', localOnly);
+      }
       // Preserve MCP/tool-search request shapes without disabling client integrations.
       // Ordinary thinking stays disabled so Local signatures never contaminate Plan fallback.
       // Eligible requests already use the original body; only build a compatibility copy
       // when it could rescue a native-feature exclusion.
       const localCompatTarget = altRequested ? altProvider === 'local' : provider !== 'openrouter';
+      const shapeDiagnosis = {};
       const localBody = localCompatTarget && !localOnly &&
-        nativeDetail && !['token_count', 'plan_model'].includes(nativeDetail) ? localInlineTools(body) : null;
+        nativeDetail && !['token_count', 'plan_model'].includes(nativeDetail) ? localInlineTools(body, shapeDiagnosis, (altRequested ? altProvider : provider) === 'local') : null;
       const localRequestCompat = localBody &&
         nativeDetail && !['token_count', 'plan_model'].includes(nativeDetail) &&
         !body.messages.some(message => Array.isArray(message.content) && message.content.some(block =>
@@ -2202,14 +2625,41 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
           message.content.some(block => block?.type === 'tool_addition')) ? localInlineTools(body) : null;
       const openrouterRequestCompat = openrouterBody && !externalExclusion(openrouterBody, '');
       if (localRequestCompat || openrouterRequestCompat) nativeDetail = null;
+      if (process.env.ROUTE_BETA_DIAGNOSTICS === '1' && provider === 'local' &&
+          nativeDetail === 'unsupported_beta') {
+        logEvent({ event: 'local_beta_diagnostic', ...localBetaDiagnostic(body, req.headers['anthropic-beta']) });
+      }
+      if (nativeDetail && (altRequested ? altProvider : provider) === 'local') {
+        if (nativeDetail === 'unsupported_beta' && unsupportedBetas(req.headers['anthropic-beta'], true).length)
+          planBlocker = 'unknown_beta';
+        else if (localBody && compatExclusion(localBody, '') === 'unsupported_tool_definition' &&
+            localBody.tools?.some(tool => tool?.type === 'advisor_20260301')) planBlocker = 'native_advisor_declared';
+        else planBlocker = shapeDiagnosis.reason || (localBody && compatExclusion(localBody, '')) ||
+          (nativeDetail === 'unsupported_beta' && !localBody ? 'unconverted_request' : nativeDetail);
+      }
+      if (planBlocker === 'mid_history_tool_change') blockerDetail = shapeDiagnosis.detail;
       if (nativeDetail) return await sendPro('native_feature', nativeDetail);
-      const forceJson = noPlan || localRequestCompat || openrouterRequestCompat || provider === 'cli';
+      let forceJson = noPlan || localRequestCompat || openrouterRequestCompat || provider === 'cli';
       // The alternate model id selects the second provider; anything else keeps the session's
       // primary provider, so a single-provider session behaves exactly as before.
       const target = altRequested
         ? { name: altProvider, model: altModel, url: altExternalUrl, key: altKey, openrouter: altProvider === 'openrouter' }
         : { name: provider, model: provider !== 'openrouter' ? localModel : openrouterModel, url: externalUrl,
             key: provider !== 'openrouter' ? localKey : key, openrouter: provider === 'openrouter' };
+      if (target.name === 'local' && !countTokens && !conversationKey && unknownPlan) {
+        unknownPlan = false;
+        efficiency.instance_followups++;
+      }
+      if (target.name === 'local' && !countTokens && conversationKey) {
+        returnCandidate = pendingReturns.get(conversationKey);
+        if (returnCandidate && !returnCandidate.attempted) {
+          returnCandidate.attempted = true;
+          firstLocalAttempt = true;
+          efficiency.eligible_after_plan++;
+        }
+      }
+      let retryingWrongStream = false;
+      if (target.name === 'local' && body.stream === true && now() < preferLocalJsonUntil) forceJson = true;
       usageProvider = target.name;
       usageRequestedModel = target.name === 'cli' ? cliRequestedModel : target.model;
       circuitState = circuits[target.name];
@@ -2245,6 +2695,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
         finally { finishQueue(); }
       }
       if (!releaseLocal) {
+        checkBudget();
         logEvent({ event: 'local_admission_rejected', provider: 'local', reason: 'local_busy' });
         return await sendPro('local_busy');
       }
@@ -2286,8 +2737,16 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
           externalBody.system = stabilizeSystem(externalBody.system);
         }
         // CLI backends receive equivalent guidance in their adapter; do not duplicate it.
+        const allowedTools = callableTools(externalBody);
+        let localToolGuidance = '';
+        if (target.name === 'local') {
+          const names = [...allowedTools];
+          localToolGuidance = ' Use only callable tools explicitly declared for this request, with their exact names. ' +
+            'For a conversational reply or remembering something within this conversation, respond in text unless a tool is required.';
+          if (names.length <= 16) localToolGuidance += ' Callable tools: ' + (names.join(', ') || '(none)') + '.';
+        }
         if (target.name === 'local' || target.name === 'openrouter') {
-          externalBody.system = withHostToolAccessGuidance(externalBody.system);
+          externalBody.system = withHostToolAccessGuidance(externalBody.system, HOST_TOOL_ACCESS_GUIDANCE + localToolGuidance);
         }
         // Keep client account/session identifiers off third-party providers: the count_tokens
         // request body is assembled from the client message, and its metadata carries no
@@ -2295,11 +2754,17 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
         if (req.url.startsWith('/v1/messages/count_tokens')) delete externalBody.metadata;
         // Serialize once: the retry loop reuses the same payload, and a large history would
         // otherwise be stringified up to four times.
-        const externalPayload = JSON.stringify(externalBody);
+        let externalPayload = JSON.stringify(externalBody);
+        if (process.env.ROUTE_SIZE_DIAGNOSTICS === '1') {
+          const bytes = value => value === undefined ? 0 : Buffer.byteLength(JSON.stringify(value));
+          logEvent({ event: 'payload_size', provider: target.name, tools_bytes: bytes(externalBody.tools),
+            system_bytes: bytes(externalBody.system), messages_bytes: bytes(externalBody.messages) });
+        }
         let routeLogged = false;
         const logReplacement = () => {
           if (routeLogged) return;
           routeLogged = true;
+          localRoutePendingLog = false;
           usageProvider = target.name;
           usageRequestedModel = target.name === 'cli' ? cliRequestedModel : target.model;
           logEvent({ event: 'route_selected', provider: target.name, reason: 'replacement', model: provider === 'cli' ? cliReportedModel : externalModel });
@@ -2311,8 +2776,10 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
         if (credential) headers.authorization = `Bearer ${credential}`;
         const attempts = noPlan || provider === 'cli' ? 1 : 4;
         // Permanent 4xx will not change on retry; request-level ones must not open the provider-wide circuit.
-        let requestRejected = false, outputBudgetExhausted = false, retryBudgetLeft = retryBudgetMs;
+        let correctedToolRequest = false;
+        let requestRejected = false, outputBudgetExhausted = false, retryBudgetLeft = retryBudgetMs, localContextLimit = false;
         for (let attempt = 0; attempt < attempts; attempt++) {
+          checkBudget();
           failureStatus = null; retryAfterHintMs = null;
           metrics.attempts += 1;
           if (attempt === 0) metrics.externalAttempts += 1;
@@ -2320,7 +2787,8 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
           client.signal.throwIfAborted();
           const controller = new AbortController();
           const cancel = () => {
-            controller.abort('client_close');
+            controller.abort(client.signal.reason);
+            if (client.signal.reason === 'request_budget') return;
             // Observation only: the client went away while an upstream attempt was open.
             // This says nothing about whether the provider kept computing the answer.
             logEvent({ event: 'client_cancelled_during_attempt', provider: target.name,
@@ -2339,9 +2807,14 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
             timeoutKind = kind;
             controller.abort('attempt_timeout');
           };
-          const arm = () => { clearTimeout(timer); timer = setTimeout(() => timeout('deadline'), attemptTimeoutMs); };
+          const arm = () => {
+            const wait = target.name === 'local' && !noPlan && !receivedBody ? localFirstByteTimeoutMs : attemptTimeoutMs;
+            clearTimeout(timer);
+            timer = setTimeout(() => timeout('deadline'), wait);
+          };
           arm();
           const ceiling = noPlan ? undefined : setTimeout(() => timeout('ceiling'), attemptCeilingMs);
+          let readAttemptUsage;
           let status, retryAfterMs = 0, congested = false;
           const finishAttempt = startPhase('externalAttempt');
           let finishCli = () => {};
@@ -2356,14 +2829,21 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
           }
           try {
             const operation = (async () => {
+              if (target.name === 'local' && !routeKind) {
+                noteRoute('external', 'replacement');
+                localRoutePendingLog = true;
+              }
+              beginCall(target.name);
               attemptCounts.external += 1;
               const response = await fetchImpl(target.url, { method: 'POST', headers,
                 body: externalPayload, redirect: 'error', signal: controller.signal });
-              if (!controller.signal.aborted) {
-                receivedHeaders = true;
-                recordTiming('externalHeaders', performance.now() - attemptStarted);
-                phaseMs.externalHeaders = Number((performance.now() - attemptStarted).toFixed(2));
+              if (controller.signal.aborted) {
+                response.body?.cancel().catch(() => {});
+                controller.signal.throwIfAborted();
               }
+              receivedHeaders = true;
+              recordTiming('externalHeaders', performance.now() - attemptStarted);
+              phaseMs.externalHeaders = Number((performance.now() - attemptStarted).toFixed(2));
               status = response.status;
               if (target.name === 'cli' && status === 429) cliActivity.rejected += 1;
               if (!response.ok && target.name === 'cli') {
@@ -2385,7 +2865,16 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
                     lastRateLimit = { status, retryAfterMs: hint, at: new Date().toISOString() };
                   }
                 }
-                await response.body?.cancel();
+                if (target.name === 'local' && status === 400 && response.body) {
+                  const diagnostic = await readBoundedBody(response.body, MAX_ERROR_BODY, controller.signal);
+                  if (!diagnostic.truncated) {
+                    try {
+                      const parsed = JSON.parse(diagnostic.text);
+                      const message = typeof parsed?.error?.message === 'string' ? parsed.error.message : '';
+                      localContextLimit = /maximum context length/i.test(message) && /tokens?/i.test(message);
+                    } catch { /* unrecognised provider errors remain generic */ }
+                  }
+                } else await response.body?.cancel();
                 throw new Error('External request failed');
               }
               // Ordinary-mode streams are forwarded frame by frame; anything that needs a
@@ -2405,7 +2894,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
                 res.once('close', done);
               });
               const passthroughEnabled = streamPassthrough === true || streamPassthrough === '1' || streamPassthrough === '2';
-              const streaming = passthroughEnabled && !forceJson && body.stream === true;
+              const streaming = passthroughEnabled && !forceJson && body.stream === true && !body.tool_choice;
               const validated = await bufferedResponse(response, externalModel, model, forceJson ? false : body.stream,
                 controller.signal, () => {
                   if (!receivedBody && !controller.signal.aborted) {
@@ -2419,7 +2908,19 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
                 gap => {
                   chunkCadence.push(Number(gap.toFixed(2)));
                   if (chunkCadence.length > LATENCY_WINDOW) chunkCadence.shift();
-                });
+                }, body.tool_choice, allowedTools,
+                target.name !== 'cli' || response.headers.get('x-cli-usage-measured') === 'true'
+                  ? read => { readAttemptUsage = read; } : null);
+              if (localRequestCompat && shapeDiagnosis.addedTool) {
+                const calls = JSON.parse(validated.text).content.filter(block => block.type === 'tool_use');
+                for (const block of calls) {
+                  const matches = localBody.tools.filter(t => t.name === block.name);
+                  if (matches.length !== 1 || !allowedTools.has(block.name))
+                    throw new Error('Invalid content block');
+                  const schema = matches[0].input_schema;
+                  if (!matchesActiveSchema(schema, block.input)) throw new Error('Invalid tool input');
+                }
+              }
               if (compatProfile) {
                 const content = JSON.parse(validated.text).content;
                 if (content.some(block => Object.keys(block).some(name =>
@@ -2475,7 +2976,10 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
               return result;
             })();
             const response = await abortable(operation, controller.signal);
-            client.signal.throwIfAborted();
+            checkBudget();
+            if (retryingWrongStream) preferLocalJsonUntil = now() + 60000;
+            recordCallUsage(target.name, { input_tokens: response.inputTokens, output_tokens: response.outputTokens,
+              cache_read_input_tokens: response.cacheReadTokens, cache_creation_input_tokens: response.cacheCreationTokens });
             succeeded = true;
             if (claimedGeneration === circuitState.generation) {
               if (circuitState.openUntil) logEvent({ event: 'circuit_recovered', provider: target.name });
@@ -2497,7 +3001,13 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
             res.end(response.text);
             return;
           } catch (error) {
+            const observed = readAttemptUsage ? readAttemptUsage() : emptyResponseDiagnostics.get(error)?.usage;
+            if (!succeeded) recordCallUsage(target.name, observed);
             client.signal.throwIfAborted();
+            const toolErrors = new Map([['Unsupported tool schema','unsupported_tool_schema'], ['Invalid tool input','invalid_tool_input'],
+              ['Duplicate tool call id','duplicate_tool_id'], ['Undeclared tool call','undeclared_tool'], ['Invalid tool selection','invalid_tool_selection']]);
+            const toolError = toolErrors.get(error?.message);
+            if (toolError) requestRejected = true;
             // Headers on the wire means the client already has part of the answer: retrying
             // would duplicate it and falling back is impossible, so finish the stream. The
             // failure is still a provider failure: record it in the circuit so repeated
@@ -2513,7 +3023,8 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
                 metrics.circuitOpens += 1;
                 logEvent({ event: 'circuit_open', provider: target.name, failure: failureClass });
               }
-              logEvent({ event: 'stream_broken', provider: target.name, category: 'upstream' });
+              logEvent({ event: 'stream_broken', provider: target.name, category: toolError ? 'validation' : 'upstream',
+                ...(toolError && { validation: toolError }) });
               try {
                 res.write(`event: error\ndata: ${JSON.stringify({ type: 'error',
                   error: { type: 'api_error', message: 'upstream stream failed' } })}\n\n`);
@@ -2521,7 +3032,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
               res.end();
               return;
             }
-            const validation = { 'Wrong response model': 'wrong_model', 'Invalid content block': 'invalid_content_block',
+            const validation = toolError || { 'Wrong response model': 'wrong_model', 'Invalid content block': 'invalid_content_block',
               'Incomplete message': 'incomplete_message', 'Invalid response': 'expected_sse', 'Unexpected SSE response': 'unexpected_sse',
               'Invalid content delta': 'invalid_delta', 'Truncated stream': 'truncated_stream',
               'Empty message response': 'empty_response', 'Invalid message response': 'invalid_message',
@@ -2538,9 +3049,10 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
             }
             providerFailure = controller.signal.reason === 'attempt_timeout' ? 'timeout' :
               status === 401 || status === 403 ? 'authentication_failed' : status === 402 ? 'payment_required' :
+              localContextLimit ? 'context_limit' :
               !noPlan && [400, 404, 405, 413, 415, 422].includes(status) ? 'invalid_request' : validation === 'empty_response' ? 'empty_response' : 'upstream_error';
             if (Number.isInteger(status)) failureStatus = status;
-            failureClass = failureClassOf(status, controller.signal.reason === 'attempt_timeout');
+            failureClass = toolError ? 'request' : failureClassOf(status, controller.signal.reason === 'attempt_timeout');
             congested = target.name === 'local' &&
               ([429, 503, 529].includes(status) || controller.signal.reason === 'attempt_timeout');
             logEvent({ event: 'external_attempt_failed', provider: target.name, attempt: attempt + 1,
@@ -2552,17 +3064,42 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
                   ? externalBody.output_config.effort : null,
               } } : {}),
               ...(Number.isInteger(status) ? { status } : {}), ...(validation ? { validation } : {}),
+              ...(toolError === 'undeclared_tool' ? { tool_kind: error.toolKind, callable_count: allowedTools.size } : {}),
+              ...(timeoutKind ? { timeout_stage: receivedBody ? 'stream' : receivedHeaders ? 'body' : 'headers' } : {}),
               ...(['missing_body', 'empty_body', 'empty_content', 'content_without_usable_output',
                 'stream_without_usable_content'].includes(error?.validationDetail) ? { validation_detail: error.validationDetail } : {}),
               ...(emptyResponseDiagnostics.has(error) ? { response_diagnostic: emptyResponseDiagnostics.get(error) } : {}),
               ...(retryAfterMs ? { retry_after_ms: retryAfterMs } : {}),
               failure: failureClass,
               category: controller.signal.reason === 'attempt_timeout' ? 'timeout' : 'upstream' });
+            // Some Local servers label SSE with a different model id while their JSON
+            // endpoint reports the requested id. Retry once in JSON before publishing
+            // anything, and keep the normal exact-model validation on the retry.
+            if (target.name === 'local' && validation === 'wrong_model' && !forceJson &&
+                body.stream === true && attempt + 1 < attempts) {
+              retryingWrongStream = true;
+              forceJson = true;
+              externalBody.stream = false;
+              externalPayload = JSON.stringify(externalBody);
+              logEvent({ event: 'local_stream_json_retry', provider: 'local', reason: 'wrong_model' });
+            }
+            if (toolError === 'undeclared_tool' && target.name === 'local' && !noPlan) {
+              const auto = !body.tool_choice || body.tool_choice.type === 'auto';
+              if (auto && !shapeDiagnosis.addedTool && allowedTools.size && !correctedToolRequest && attempt + 1 < attempts) {
+                correctedToolRequest = true;
+                requestRejected = false;
+                externalBody.system = withHostToolAccessGuidance(externalBody.system,
+                  'The previous generation selected an unavailable tool. Generate a fresh response. Use plain text when possible, or an exact callable tool name from the supplied definitions.');
+                externalPayload = JSON.stringify(externalBody);
+              } else {
+                return reject(422, '[local_undeclared_tool] Local model requested a tool unavailable in this request.');
+              }
+            }
             controller.abort('attempt_failed');
             // This attempt is discarded, so its first byte is not the response's.
             firstByteMs = null;
             // 404 is request-level too: a renamed model must not open the provider circuit.
-            if ([400, 404, 413, 422].includes(status) || error?.message === 'Thinking response in ordinary mode') requestRejected = true;
+            if (error?.message === 'Invalid tool selection' || [400, 404, 413, 422].includes(status) || error?.message === 'Thinking response in ordinary mode') requestRejected = true;
             if (requestRejected || [401, 402, 403, 404, 405, 415].includes(status)) break;
           } finally {
             if (localBucket) {
@@ -2590,11 +3127,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
           if (attempt + 1 < attempts && retryBudgetMs > 0 && retryBudgetLeft <= 0) budgetExhausted = true;
           // Whole-request budget: once the remaining time cannot cover the next wait and
           // attempt, report the existing failure instead of starting more work.
-          if (!budgetExhausted && attempt + 1 < attempts && budgetDeadline !== null &&
-              performance.now() >= budgetDeadline) {
-            budgetExhausted = true;
-            logEvent({ event: 'request_budget_exhausted', provider: target.name, status: failureStatus ?? null });
-          }
+          checkBudget();
           if (budgetExhausted) {
             metrics.retryBudgetExceeded += 1;
             logEvent({ event: 'retry_budget_exhausted', provider: target.name, status: failureStatus ?? null });
@@ -2643,16 +3176,21 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
         await sendPro('fallback', providerFailure);
       }
     } catch {
-      if (!client.signal.aborted) {
+      const budgetExpired = client.signal.reason === 'request_budget';
+      if (budgetExpired || !client.signal.aborted) {
         responseFailed = true;
-        logEvent({ event: 'route_failed', category: 'upstream' });
-        if (res.headersSent) {
+        logEvent({ event: 'route_failed', category: budgetExpired ? 'request_budget' : 'upstream' });
+        if (res.headersSent && planNonStream) {
+          res.destroy();
+        } else if (res.headersSent) {
           // Part of the answer is already on the wire: report the failure inside the stream.
           try {
             res.write(`event: error\ndata: ${JSON.stringify({ type: 'error',
-              error: { type: 'api_error', message: 'upstream stream failed' } })}\n\n`);
+              error: { type: 'api_error', message: budgetExpired ? '[request_budget_exhausted] Request deadline exceeded.' : 'upstream stream failed' } })}\n\n`);
           } catch {}
           res.end();
+        } else if (budgetExpired) {
+          reject(504, '[request_budget_exhausted] Request deadline exceeded.');
         } else if (failureStatus === 429 || failureStatus === 529) {
           // The provider already explained the refusal. A generic 502 would hide both the
           // cause and the wait the client has to observe, so surface its status and hint.
@@ -2663,6 +3201,8 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
           reject(502, 'Upstream request failed');
         }
       }
+    } finally {
+      clearTimeout(budgetTimer);
     }
   });
   // Bound the listener itself: one client cannot open an unbounded number of sockets, and
@@ -2724,6 +3264,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     provider: process.env.SONNET_PROVIDER || 'openrouter', localUrl: process.env.LOCAL_LLM_URL,
     localModel: process.env.LOCAL_LLM_MODEL, localKey: process.env.LOCAL_LLM_API_KEY,
     cliKind: process.env.CLI_KIND, cliRequestedModel: process.env.CLI_MODEL,
+    localFirstByteTimeoutMs: localAdmissionEnv('ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS', 120000, 30000, 900000),
     attemptTimeoutMs: process.env.SONNET_PROVIDER === 'cli' ? (Number(process.env.CLI_TIMEOUT_S) || 60) * 1000
       : process.env.ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS === undefined ? undefined
         : localAdmissionEnv('ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS', 120000, 30000, 900000),

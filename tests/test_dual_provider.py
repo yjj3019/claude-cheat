@@ -172,7 +172,11 @@ class DualSessionTests(DualProviderTestCase):
         write_config(self.root, BOTH)
         env, proxy_env = self.run_session("local")
         self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", env)
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_ADVISOR_TOOL"], "1")
         self.assertNotIn("ROUTE_ALT_PROVIDER", proxy_env)
+        os.environ["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
+        env, _ = self.run_session("local")
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"], "1")
 
     def test_the_handoff_record_keeps_the_alternate_topology_without_secrets(self):
         write_config(self.root, BOTH + DUAL)

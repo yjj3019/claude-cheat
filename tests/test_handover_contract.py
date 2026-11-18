@@ -94,6 +94,46 @@ class HandoverTimeoutTests(unittest.TestCase):
 
 
 class HandoverErrorTests(unittest.TestCase):
+    def test_local_auth_clients_stop_at_redirect(self):
+        import launcherStartup
+        followed = []
+        class Redirect(BaseHTTPRequestHandler):
+            def reply(self):
+                if self.path == "/target":
+                    followed.append(self.command)
+                    self.send_response(200)
+                else:
+                    self.send_response(302)
+                    self.send_header("location", "/target")
+                self.end_headers()
+            do_GET = do_HEAD = do_POST = reply
+            def log_message(self, *args):
+                pass
+        with ThreadingHTTPServer(("127.0.0.1", 0), Redirect) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                port = server.server_address[1]
+                self.assertFalse(advisor.verify_owned_proxy(port, "synthetic"))
+                with self.assertRaisesRegex(RuntimeError, "302"):
+                    advisor.request_handover(port, "synthetic")
+                req = urllib.request.Request(f"http://127.0.0.1:{port}/api/browser", data=b"{}",
+                                             headers={"x-dashboard-token": "synthetic"})
+                with self.assertRaises(urllib.error.HTTPError) as failure:
+                    launcherStartup.urlopen(req, timeout=2)
+                failure.exception.close()
+                self.assertEqual(failure.exception.code, 302)
+                self.assertEqual(followed, [])
+            finally:
+                server.shutdown()
+                thread.join()
+
+    def test_invalid_and_oversized_reports(self):
+        for status, report in [(200, []), (409, []), (200, {"padding": "x"*65536}), (409, {"padding": "x"*65536})]:
+            with self.subTest(status=status), StubServer(status, report) as port:
+                with self.assertRaises(RuntimeError):
+                    advisor.request_handover(port, "nonce")
+
     def test_a_reverted_drain_is_reported_as_a_retry_not_a_refusal(self):
         with StubServer(409, {"drained": False, "reverted": True, "inflight": 1,
                               "reason": "drain_timeout"}) as port:

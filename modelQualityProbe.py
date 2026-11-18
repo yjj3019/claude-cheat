@@ -16,6 +16,48 @@ TOOL = {"name": "Lookup", "description": "Look up the requested key.",
                          "required": ["key"], "additionalProperties": False}}
 
 
+def evaluate_token_counter(call, model, measure=None):
+    """Probe whether a counter notices synthetic text and tool definitions.
+
+    Positive results are only a sanity check, never proof of exact accounting.
+    The caller supplies the transport and receives no real conversation content.
+    """
+    base = {"model": model, "messages": [{"role": "user", "content": "short"},
+            {"role": "assistant", "content": "acknowledged"}, {"role": "user", "content": "hello"}]}
+    long_text = "synthetic probe description " * 500
+    tool = {"name": "counter_probe", "description": long_text,
+            "input_schema": {"type": "object", "properties": {}}}
+    cases = {
+        "base": base,
+        "tool": {**base, "tools": [tool]},
+        "text": {**base, "messages": [*base["messages"][:-1], {"role": "user", "content": long_text}]},
+        "system": {**base, "system": long_text},
+        "history": {**base, "messages": [{"role": "user", "content": long_text},
+                    *base["messages"][1:]]},
+    }
+    values = [call(body) for body in cases.values()]
+    if any(type(value) is not int or value < 0 for value in values):
+        return {"status": "invalid_response", "usable_for_budget": False}
+    base_count, tool_count, text_count, system_count, history_count = values
+    text_observed = text_count > base_count
+    tool_observed = tool_count > base_count
+    system_observed = system_count > base_count
+    history_observed = history_count > base_count
+    result = {"status": "sanity_passed" if all((text_observed, tool_observed, system_observed, history_observed)) else "incomplete",
+              "text_observed": text_observed, "tool_observed": tool_observed,
+              "system_observed": system_observed, "history_observed": history_observed,
+              "usable_for_budget": False}
+    if measure is not None:
+        measured = [measure(body) for body in cases.values()]
+        valid = all(type(value) is int and value >= 0 for value in measured)
+        result["usage_comparison"] = ("matches" if measured == values else "mismatch") if valid else "unreported"
+        if result["usage_comparison"] == "mismatch":
+            result["status"] = "incomplete"
+        elif result["usage_comparison"] == "unreported" and result["status"] == "sanity_passed":
+            result["status"] = "unverified"
+    return result
+
+
 def evaluate(call, model, deadline=None):
     """Check a single proposed tool call and a synthetic result continuation."""
     started = time.monotonic()

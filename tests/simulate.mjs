@@ -116,6 +116,7 @@ function payload(scenario, index) {
   const messages = [{ role: 'user', content: `sim ${scenario} ${index}` }];
   const body = { model: MODEL, max_tokens: 64, messages, metadata: { scenario } };
   if (scenario === 'tools') {
+    body.tools = [{ name: 'Read', input_schema: { type: 'object' } }];
     body.messages.push({ role: 'assistant', content: [
       { type: 'thinking', thinking: 'sim', signature: 'sig' },
       { type: 'text', text: 'cited', citations: [{ type: 'char_location', cited_text: 'x', document_index: 0,

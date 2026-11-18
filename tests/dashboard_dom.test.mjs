@@ -116,6 +116,40 @@ test('usage statistics distinguish unreported tokens and show observed session s
   assert.match(context.nodes.get('usage-status').textContent,/누락/);
 });
 
+test('usage filters historical details and chart by selected instance', () => {
+  const context=buildContext(); const sandbox={...context,globalThis:null}; sandbox.globalThis=sandbox;
+  vm.createContext(sandbox); vm.runInContext(ASSETS.usage,sandbox,{filename:'usage.js'});
+  const a='a'.repeat(32), b='b'.repeat(32);
+  const row=(id,model,tokens)=>({bucket:'2026-10-29',provider:'local',instance_id:id,requested_model:model,
+    requests:1,failed:0,input_samples:1,input_tokens:tokens,output_samples:1,output_tokens:1});
+  const payload={status:'ready',report:{rows:[row(a,'first-model',11),row(b,'second-model',29)]},sessions:[]};
+  sandbox.renderUsage(payload);
+  assert.match(context.nodes.get('usage-grid').innerHTML,/first-model/);
+  assert.match(context.nodes.get('usage-grid').innerHTML,/second-model/);
+  vm.runInContext(`usageInstance='${a}'`,sandbox);
+  sandbox.renderUsage(payload);
+  const html=context.nodes.get('usage-grid').innerHTML;
+  assert.match(html,/first-model/); assert.doesNotMatch(html,/second-model/);
+  assert.match(html,/최대 11 토큰/);
+});
+
+test('Plan reasons compare sessions by release and code hash with explicit missing reports', () => {
+  const context=buildContext(), sandbox={...context,globalThis:null}; sandbox.globalThis=sandbox;
+  vm.createContext(sandbox); vm.runInContext(ASSETS.usage,sandbox);
+  const session={status:'active',provider:'local',proxy_version:'1.0.7',proxy_hash:'abc123def456'};
+  sandbox.renderUsage({status:'ready',report:{rows:[]},sessions:[
+    {...session,instance_id:'first',plan_blockers:{unknown_beta:2}},
+    {...session,instance_id:'second',plan_blockers:{unknown_beta:3}},
+    {...session,instance_id:'third'},
+    {...session,instance_id:'fourth',proxy_hash:'987654abcdef',plan_blockers:{}}
+  ]});
+  const html=context.nodes.get('usage-grid').innerHTML;
+  assert.match(html,/abc123def456<\/td><td>2 \/ 3<\/td><td>unknown_beta 5/);
+  assert.match(html,/987654abcdef<\/td><td>1 \/ 1<\/td><td>0건/);
+  assert.match(html,/unknown_beta 2/);
+  assert.match(html,/unknown_beta 3/);
+});
+
 test('usage telemetry exposes host resources, complete-session admission reasons and coverage', () => {
   const context=buildContext(); const sandbox={...context,globalThis:null}; sandbox.globalThis=sandbox;
   vm.createContext(sandbox); vm.runInContext(ASSETS.usage,sandbox,{filename:'usage.js'});

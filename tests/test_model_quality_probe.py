@@ -2,6 +2,7 @@
 import contextlib
 import io
 import json
+import sys
 import unittest
 from unittest.mock import patch
 
@@ -9,6 +10,7 @@ import cliBackend
 import modelQualityProbe as probe
 import routeConfig
 import routeDashboard as dashboard
+from tests import live_smoke
 from tests.live_cli_smoke import _request_adapter
 
 
@@ -17,6 +19,63 @@ def tool_call(key="code", tool_id="synthetic-id"):
 
 
 class ModelQualityProbeTest(unittest.TestCase):
+    def test_token_counter_flags_missing_tools_without_treating_sanity_as_proof(self):
+        def result_for(values):
+            counts = iter(values)
+            return probe.evaluate_token_counter(lambda _body: next(counts), 'fixture-model')
+        incomplete = result_for([8, 8, 1009, 900, 1000])
+        self.assertEqual(incomplete['status'], 'incomplete')
+        self.assertFalse(incomplete['tool_observed'])
+        self.assertEqual(result_for([8, 100, 1009, 900, 1000])['status'], 'sanity_passed')
+        self.assertFalse(result_for([8, 100, 1009, 900, 1000])['usable_for_budget'])
+        self.assertEqual(result_for([8, 100, 1009, 8, 1000])['status'], 'incomplete')
+        self.assertEqual(result_for([8, 100, 1009, 900, 8])['status'], 'incomplete')
+        self.assertEqual(result_for([True, 8, 9, 10, 11])['status'], 'invalid_response')
+        counts = iter([8, 100, 1009, 900, 1000]); measured = iter([85, 1336, 1009, 900, 1000])
+        comparison = probe.evaluate_token_counter(lambda _:next(counts), 'fixture', lambda _:next(measured))
+        self.assertEqual(comparison['usage_comparison'], 'mismatch')
+        self.assertEqual(comparison['status'], 'incomplete')
+
+    def test_last_message_only_counter_fails_history_check(self):
+        def count(body):
+            return len(body["messages"]) + len(body["messages"][-1]["content"]) + len(str(body.get("tools", ""))) + len(body.get("system", ""))
+        result = probe.evaluate_token_counter(count, "fixture")
+        self.assertFalse(result["history_observed"])
+        self.assertEqual(result["status"], "incomplete")
+
+    def test_live_local_requires_expected_model_shape_and_reply(self):
+        values = {"LOCAL_LLM_URL": "http://127.0.0.1:9", "LOCAL_LLM_MODEL": "fixture"}
+        reply = {"model": "fixture", "content": [{"type": "text", "text": "OK"}]}
+        for data, reason in [(reply, None), ([], "invalid_response"), ({**reply, "model": "wrong"}, "wrong_model"),
+                             ({**reply, "content": [{"type":"text","text":"other"}]}, "unexpected_reply")]:
+            with patch.object(live_smoke, "call", return_value=(200, data, 1)):
+                result = live_smoke.check_local(values)
+                self.assertEqual(result["inference"]["reason"], reason)
+                self.assertEqual(result["ok"], reason is None)
+
+    def test_cache_usage_conventions(self):
+        total = live_smoke.total_input_usage
+        self.assertEqual(total({"input_tokens": 8, "cache_read_input_tokens": 20, "cache_creation_input_tokens": 2}), 30)
+        self.assertIsNone(total({"input_tokens": 8, "prompt_tokens_details": {}}))
+        self.assertIsNone(total({"input_tokens": 8, "cache_read_input_tokens": True}))
+
+    def test_live_counter_probe_reports_incomplete_as_failure(self):
+        values = {"LOCAL_LLM_URL":"http://127.0.0.1:9/v1/messages", "LOCAL_LLM_MODEL":"fixture"}
+        outcomes = iter([(200, {"input_tokens":8}, 1), (200, {"input_tokens":8}, 1),
+                         (200, {"input_tokens":1009}, 1), (200, {"input_tokens":900}, 1),
+                         (200, {"input_tokens":1000}, 1), (200, {"usage":{"input_tokens":85}}, 1),
+                         (200, {"usage":{"input_tokens":1336}}, 1),
+                         (200, {"usage":{"input_tokens":1009}}, 1),
+                         (200, {"usage":{"input_tokens":900}}, 1),
+                         (200, {"usage":{"input_tokens":1000}}, 1)])
+        with (patch.object(live_smoke, 'load', return_value=values),
+              patch.object(live_smoke, 'check_local', return_value={"ok":True}),
+              patch.object(live_smoke, 'call', side_effect=lambda *args, **kwargs: next(outcomes)),
+              patch.object(sys, 'argv', ['live_smoke.py','--provider','local','--token-counter','--json']),
+              contextlib.redirect_stdout(io.StringIO()) as output):
+            self.assertEqual(live_smoke.main(), 1)
+        self.assertEqual(json.loads(output.getvalue())['token_counter']['status'], 'incomplete')
+
     def test_requires_explicit_opt_in_before_backend_initialization(self):
         with patch.object(probe, "configured_call") as configured, contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit) as error:

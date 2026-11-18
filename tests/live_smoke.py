@@ -23,6 +23,17 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import routeDashboard as dash  # noqa: E402  (local import: shares the config parser)
+import modelQualityProbe  # noqa: E402
+
+
+def total_input_usage(usage):
+    if not isinstance(usage, dict) or "input_tokens" not in usage:
+        return None
+    if any(key in usage for key in ("prompt_tokens", "prompt_tokens_details", "input_tokens_details")):
+        return None
+    counts = [usage.get(key, 0) for key in
+              ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")]
+    return sum(counts) if all(type(n) is int and n >= 0 for n in counts) else None
 
 
 def load(provider):
@@ -85,10 +96,20 @@ def check_local(values):
     try:
         status, data, _ = call(url, key, {"model": model, "max_tokens": 512, "stream": False,
                                           "messages": [{"role": "user", "content": "Reply with exactly OK"}]}, timeout=60)
-        text = "".join(block.get("text", "") for block in (data.get("content") or [])
-                       if isinstance(block, dict) and block.get("type") == "text").strip()
+        reason = None
+        try:
+            text = dash._connection_reply_text(data)
+        except ValueError:
+            text, reason = "", "invalid_response"
+        if not reason:
+            if status != 200:
+                reason = "upstream_error"
+            elif data.get("model") != model:
+                reason = "wrong_model"
+            elif text != "OK":
+                reason = "unexpected_reply"
         result["inference"] = {"status": status, "ms": round((time.perf_counter() - started) * 1000, 1),
-                               "reply": text[:40], "ok": status == 200 and bool(text)}
+                               "ok": reason is None, "reason": reason, "reply": text[:40]}
     except (urllib.error.URLError, OSError, ValueError) as error:
         result["inference"] = {"ok": False, "error": type(error).__name__}
     result["ok"] = bool(result.get("inference", {}).get("ok"))
@@ -102,7 +123,10 @@ def main():
     parser.add_argument("--provider", choices=("openrouter", "local"), default="openrouter")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--token-counter", action="store_true", help="also check whether Local token counts include a synthetic tool definition")
     options = parser.parse_args()
+    if options.token_counter and (options.provider != "local" or options.dry_run):
+        parser.error("--token-counter requires --provider local without --dry-run")
 
     values = load(options.provider)
     spec = dash.CONFIG_FILES[options.provider]
@@ -113,6 +137,20 @@ def main():
                   "file": str(spec["path"])}
     else:
         report = check_openrouter(values) if options.provider == "openrouter" else check_local(values)
+        if options.token_counter and report.get("ok"):
+            def count(payload):
+                status, data, _ = call(values["LOCAL_LLM_URL"].rstrip("/") + "/count_tokens",
+                                       values.get("LOCAL_LLM_API_KEY", ""), payload, timeout=30)
+                return data.get("input_tokens") if status == 200 and isinstance(data, dict) else None
+            def measure(payload):
+                status, data, _ = call(values["LOCAL_LLM_URL"], values.get("LOCAL_LLM_API_KEY", ""),
+                                       {**payload, "max_tokens": 32, "stream": False}, timeout=60)
+                usage = data.get("usage") if status == 200 and isinstance(data, dict) else None
+                return total_input_usage(usage)
+            try:
+                report["token_counter"] = modelQualityProbe.evaluate_token_counter(count, values["LOCAL_LLM_MODEL"], measure)
+            except (urllib.error.URLError, OSError, ValueError, TimeoutError):
+                report["token_counter"] = {"status": "unavailable", "usable_for_budget": False}
 
     if options.json:
         print(json.dumps(report, ensure_ascii=False))
@@ -126,11 +164,15 @@ def main():
             print(f"  key.{name}: {value}")
         for name, value in (report.get("inference") or {}).items():
             print(f"  inference.{name}: {value}")
+        for name, value in (report.get("token_counter") or {}).items():
+            print(f"  token_counter.{name}: {value}")
 
     if options.dry_run:
         return 0 if all(values.get(name) for name in spec["required"]) else 2
     if report.get("reason") == "configuration_missing":
         return 2
+    if options.token_counter and report.get("token_counter", {}).get("status") != "sanity_passed":
+        return 1
     return 0 if report.get("ok") else 1
 
 
