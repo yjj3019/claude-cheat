@@ -3,19 +3,24 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
+import cliBackend
 from usage_ledger import UsageLedger
 
 
 NODE_FIXTURE = r"""
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createProxy } from './claudeRouteProxy.mjs';
 import { listenSafe } from './tests/listenSafe.mjs';
 const root = process.argv[1];
+const bridge = process.argv[2] === 'cli' ? JSON.parse(readFileSync(0, 'utf8')) : null;
 const model = 'fixture-model';
 const answer = (m, usage) => ({ id: 'fixture', type: 'message', role: 'assistant', model: m,
   content: [{ type: 'text', text: 'fixture reply' }], stop_reason: 'end_turn', usage });
@@ -25,11 +30,18 @@ async function instance(fallback, stream = false) {
   const directory = join(root, '.usage-stats', 'instances', id);
   await mkdir(directory, { recursive: true });
   const events = join(directory, 'events.jsonl');
-  const server = createProxy({ nonce: 'test-nonce', provider: (stream || fallback) ? 'openrouter' : 'local', localModel: model,
+  const config = bridge
+    ? { provider: 'cli', localModel: 'cli/grok', cliKind: 'grok', localKey: bridge.token, localUrl: bridge.url }
+    : { provider: (stream || fallback) ? 'openrouter' : 'local', localModel: model, localUrl: 'http://127.0.0.1:11434/v1/messages' };
+  const server = createProxy({ ...config, nonce: 'test-nonce',
     key: 'sk-or-fixture', openrouterModel: model, streamPassthrough: stream,
-    localUrl: 'http://127.0.0.1:11434/v1/messages', retryDelayMs: 1, cooldownMs: 0,
+    retryDelayMs: 1, cooldownMs: 0,
     instanceId: id, usageEventsPath: events,
-    fetchImpl: async url => {
+    fetchImpl: async (url, options) => {
+      if (bridge) {
+        if (url !== bridge.url) throw Error('unexpected fixture destination');
+        return fetch(url, options);
+      }
       // fallback machine: the openrouter external leg fails (500), then the plan leg answers.
       if (fallback && !url.includes('api.anthropic.com')) return new Response('unavailable', {status: 500});
       if (fallback) return Response.json(answer('claude-sonnet-5-5', {input_tokens: 11, output_tokens: 7}));
@@ -46,8 +58,8 @@ async function instance(fallback, stream = false) {
   return {id, events, stream, fallback, url: `http://127.0.0.1:${server.address().port}/v1/messages`};
 }
 try {
-  const sessions = await Promise.all([instance(false), instance(true), ...(process.argv[2] === 'stream' ? [instance(false,true)] : [])]);
-  const request = {model: 'claude-sonnet-5-5', max_tokens: 32, messages: [{role:'user',content:'private fixture'}]};
+  const sessions = bridge ? [await instance(false)] : await Promise.all([instance(false), instance(true), ...(process.argv[2] === 'stream' ? [instance(false,true)] : [])]);
+  const request = {model: 'claude-sonnet-5-5', max_tokens: 32, messages: [{role:'user',content:bridge ? 'x'.repeat(40000) : 'private fixture'}]};
   const results = await Promise.all(sessions.map(s => fetch(s.url, {method:'POST',
     headers: {'content-type':'application/json','x-local-route-token':'test-nonce',
       authorization:'Bearer sk-ant-oat-fixture','anthropic-beta':'oauth-2025-04-20'},
@@ -75,6 +87,55 @@ try {
 
 @unittest.skipUnless(shutil.which("node"), "node is required")
 class UsageEndToEndTests(unittest.TestCase):
+    def test_long_grok_prompt_from_bridge_through_proxy_to_usage_ledger(self):
+        root_dir = Path(__file__).resolve().parent.parent
+        with tempfile.TemporaryDirectory() as temp:
+            fake = Path(temp) / "fake_grok.py"
+            fake.write_text("""import json, sys
+from pathlib import Path
+args = sys.argv[1:]
+def flag(name): return args[args.index(name) + 1]
+assert '-p' not in args and all('x' * 40 not in arg for arg in args)
+assert sys.stdin.buffer.read() == b''
+assert flag('--output-format') == 'json' and 'properties' in json.loads(flag('--json-schema'))
+assert '--disable-web-search' in args and '--no-subagents' in args and flag('--disallowed-tools')
+source = Path(flag('--prompt-file'))
+assert source.parent == Path.cwd()
+request = json.loads(source.read_text(encoding='utf-8').split('REQUEST_JSON:\\n', 1)[1])
+assert request['messages'][0]['content'] == 'x' * 40000
+usage = json.loads(Path(__file__).with_suffix('.json').read_text(encoding='utf-8'))
+print(json.dumps({'stopReason': 'end_turn', 'model': 'fixture-native',
+                  'text': json.dumps({'text': 'ok', 'tool_calls': []}),
+                  'usage': usage}))
+""", encoding="utf-8")
+            with patch.multiple(cliBackend.routeCli, find_binary=lambda *_: {"path": str(fake)},
+                                resolve_command=lambda _: [sys.executable, str(fake)],
+                                probe_version=lambda *_: {"ok": True, "version": "1.0.77"}), \
+                 cliBackend.serve({"CLI_KIND": "grok"}) as (_, url, token):
+                for name, usage in (
+                    ("input", {"input_tokens": 7, "cache_read_input_tokens": 0}),
+                    ("output", {"output_tokens": 0}),
+                    ("cache", {"cache_creation_input_tokens": 2}),
+                    ("unknown", {}),
+                    ("complete", {"input_tokens": 0, "output_tokens": 9}),
+                ):
+                    with self.subTest(case=name):
+                        fake.with_suffix(".json").write_text(json.dumps(usage), encoding="utf-8")
+                        workspace = Path(temp) / name
+                        result = subprocess.run(["node", "--input-type=module", "-e", NODE_FIXTURE, str(workspace), "cli"],
+                                                input=json.dumps({"url": url, "token": token}), cwd=root_dir,
+                                                text=True, capture_output=True, timeout=30)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        ledger = UsageLedger(workspace)
+                        self.assertEqual(ledger.collect()["events_inserted"], 1)
+                        row, = ledger.report("day")["rows"]
+                        self.assertEqual((row["provider"], row["reported_model"], row["ok"]), ("cli", "fixture-native", 1))
+                        for field in ("input", "output"):
+                            key = field + "_tokens"
+                            self.assertEqual((row[key], row[field + "_samples"]), (usage.get(key), int(key in usage)))
+                        self.assertEqual(row["cache_read_tokens"], usage.get("cache_read_input_tokens"))
+                        self.assertEqual(row["cache_creation_tokens"], usage.get("cache_creation_input_tokens"))
+
     def test_two_proxy_sessions_to_ledger_and_repeat_collection(self):
         root_dir = Path(__file__).resolve().parent.parent
         with tempfile.TemporaryDirectory() as temp:

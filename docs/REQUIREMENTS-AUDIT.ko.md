@@ -31,7 +31,7 @@
 
 ## 남은 확인 사항
 
-- Grok(2026-11-07 침투 테스트 갱신): 1.0.77의 실왕복("Reply with exactly OK" → "OK", JSON 구조화 출력)이 검증되어 백엔드가 활성화됐습니다. 어댑터는 `-p <프롬프트>` 단일 턴에 `--disable-web-search`·`--no-subagents`를 붙이고, `--disallowed-tools`로 파일시스템·터미널 빌트인 도구 15종(run_terminal_command·search_replace·read_file 등)을 제거합니다. 침투 테스트 결과: 파일 쓰기·터미널 실행 시도가 도구 제거 후 "cannot"으로 거부되고 파일이 생성되지 않았으며, 서브에이전트는 NO_SUBAGENT, 웹 검색은 NO_WEB으로 거부됐습니다. `--always-approve`·`--permission-mode` 우회 플래그는 어댑터가 붙이지 않습니다(정적 확인). `--safe-mode`·stdin 프롬프트·`--effort`는 Grok에 없어 프롬프트가 argv에 실립니다(짧은 백엔드 프롬프트만). 환경 변수 허용목록에서 ANTHROPIC_*·OPENROUTER_* 비밀은 전달되지 않습니다. 향후 Grok 버전은 같은 절차로 재검증 전까지 실패 닫기(fail-closed)됩니다.
+- Grok(2026-11-07 침투 테스트 갱신): 1.0.77의 실왕복("Reply with exactly OK" → "OK", JSON 구조화 출력)이 검증되어 백엔드가 활성화됐습니다. 현재 어댑터는 요청별 임시 파일의 경로를 `--prompt-file`로 전달하고 단일 턴에 `--disable-web-search`·`--no-subagents`를 붙이고, `--disallowed-tools`로 파일시스템·터미널 빌트인 도구 15종(run_terminal_command·search_replace·read_file 등)을 제거합니다. 침투 테스트 결과: 파일 쓰기·터미널 실행 시도가 도구 제거 후 "cannot"으로 거부되고 파일이 생성되지 않았으며, 서브에이전트는 NO_SUBAGENT, 웹 검색은 NO_WEB으로 거부됐습니다. `--always-approve`·`--permission-mode` 우회 플래그는 어댑터가 붙이지 않습니다(정적 확인). 프롬프트 파일은 요청 종료 시 정리합니다. 환경 변수 허용목록에서 ANTHROPIC_*·OPENROUTER_* 비밀은 전달되지 않습니다. 향후 Grok 버전은 같은 절차로 재검증 전까지 실패 닫기(fail-closed)됩니다.
 - 최신 전면 Claude Code 인증 점검은 로그인되지 않은 상태였습니다. 인증 파일은 변경하지 않았으며 사용자 로그인 없이 최신 런처의 실제 전체 대화를 완료했다고 주장하지 않습니다.
 - 합성 테스트는 네트워크 오류·취소·모델 보고·도구 왕복의 계약을 확인합니다. 모든 모델과 모든 Claude 고유 기능의 동일성을 증명하지 않습니다.
 - 소스 변경 전 시작한 사용자 프록시는 최신 코드가 아닙니다. 대시보드 갱신만으로 해당 프로세스의 코드가 교체되지는 않습니다.

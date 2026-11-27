@@ -198,9 +198,7 @@ def _reported(result):
     if not isinstance(usage, dict) or any(key in usage and (type(usage[key]) is not int or usage[key] < 0)
                                           for key in fields):
         raise BackendError("invalid_usage")
-    usage = {key: value for key, value in usage.items() if key in (
-        "input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
-        and type(value) is int and value >= 0} if isinstance(usage, dict) else {}
+    usage = {key: usage[key] for key in fields if key in usage}
     models = result.get("modelUsage") or {}
     model = result.get("model")
     if not model and isinstance(models, dict) and len(models) == 1:
@@ -254,8 +252,7 @@ def parse_output(kind, text):
         value = _json(value) if value is not None else None
         if not isinstance(value, dict):
             raise BackendError("cli_failed")
-        model = result.get("model") if isinstance(result.get("model"), str) else None
-        usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+        model, usage = _reported(result)
         return value, model, usage
     if kind == "codex":
         events = [_json(line) for line in text.splitlines() if line.strip()]
@@ -476,21 +473,25 @@ class Backend:
                     argv += ["-c", "model_reasoning_effort=" + json.dumps(native_effort)]
                 argv += ["-"]
             elif self.kind == "grok":
-                # Grok 1.0.77 headless mode: `-p/--single` takes the prompt as its VALUE
-                # (not the Claude Code flag style), and it has no --safe-mode/--settings
-                # equivalent. Containment (verified 2026-11-07 against 1.0.77):
+                # Keep long conversations out of the Windows command line. The file
+                # belongs to this request's temporary directory, including on failure.
+                encoded = prompt.encode("utf-8")
+                if len(encoded) > MAX_BYTES:
+                    raise BackendError("request_too_large")
+                prompt_file = Path(directory) / "prompt.txt"
+                prompt_file.write_bytes(encoded)
+                prompt = ""
+                # Containment (verified 2026-11-07 against 1.0.77):
                 # --disable-web-search/--no-subagents block those surfaces, and
                 # --disallowed-tools removes every builtin filesystem/execution tool —
                 # a write/terminal attempt then answers "cannot" instead of executing.
                 # The CLI refuses unknown flags, so a future removal fails closed.
-                argv = self.command + ["-p", prompt, "--output-format", "json",
+                argv = self.command + ["--prompt-file", str(prompt_file), "--output-format", "json",
                                        "--disable-web-search", "--no-subagents",
                                        "--disallowed-tools", GROK_DENIED_TOOLS,
                                        "--json-schema", json.dumps(SCHEMA)]
                 if self.model:
                     argv += ["-m", self.model]
-                # The prompt travels in argv here: Grok has no stdin prompt mode, so the
-                # prompt stays out of process listings only for the other kinds.
             else:
                 argv = self.command + ["-p", "--output-format", "json", "--safe-mode", "--strict-mcp-config",
                                        "--mcp-config", '{"mcpServers":{}}', "--disable-slash-commands",
@@ -513,7 +514,8 @@ class Backend:
                    "model": self.protocol_model, "content": content,
                    "stop_reason": "tool_use" if value["tool_calls"] else "end_turn", "stop_sequence": None,
                    "usage": {"input_tokens": 0, "output_tokens": 0, **usage}}
-        return message, {"reported_model": reported_model, "usage_measured": measured, **timing}
+        return message, {"reported_model": reported_model, "usage_measured": measured,
+                         "usage_fields": list(usage), **timing}
 
 
 @contextlib.contextmanager
@@ -571,6 +573,8 @@ def serve(values):
                 if isinstance(error_code, str) and error_code in PUBLIC_ERROR_CODES:
                     self.send_header("X-CLI-Error-Code", error_code)
                 self.send_header("X-CLI-Usage-Measured", "true" if (metadata or {}).get("usage_measured") else "false")
+                if metadata is not None and "usage_fields" in metadata:
+                    self.send_header("X-CLI-Usage-Fields", ",".join(metadata["usage_fields"]))
                 model = (metadata or {}).get("reported_model")
                 if model:
                     self.send_header("X-CLI-Reported-Model", model)

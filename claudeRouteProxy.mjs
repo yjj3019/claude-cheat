@@ -497,8 +497,8 @@ const CLI_ERROR_CODES = new Set(['invalid_request', 'unsupported_request', 'wron
 // Keep diagnostics separate from throwable provider objects: an upstream cannot inject
 // arbitrary error properties into the log. Only bounded enums/counts leave this boundary.
 const emptyResponseDiagnostics = new WeakMap();
-function safeResponseUsage(usage) {
-  return Object.fromEntries(DIAGNOSTIC_USAGE_FIELDS.filter(name =>
+function safeResponseUsage(usage, fields = DIAGNOSTIC_USAGE_FIELDS) {
+  return Object.fromEntries(fields.filter(name =>
     Number.isSafeInteger(usage?.[name]) && usage[name] >= 0).map(name => [name, usage[name]]));
 }
 function emptyResponseError(detail, format, stopReason, counts = {}, usage = {}) {
@@ -2817,6 +2817,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
           arm();
           const ceiling = noPlan ? undefined : setTimeout(() => timeout('ceiling'), attemptCeilingMs);
           let readAttemptUsage;
+          let usageFields = DIAGNOSTIC_USAGE_FIELDS;
           let status, retryAfterMs = 0, congested = false;
           const finishAttempt = startPhase('externalAttempt');
           let finishCli = () => {};
@@ -2847,6 +2848,15 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
               recordTiming('externalHeaders', performance.now() - attemptStarted);
               phaseMs.externalHeaders = Number((performance.now() - attemptStarted).toFixed(2));
               status = response.status;
+              if (target.name === 'cli') {
+                const reported = response.headers.get('x-cli-usage-fields');
+                if (reported !== null) {
+                  const names = new Set(reported.split(',').map(name => name.trim()));
+                  usageFields = DIAGNOSTIC_USAGE_FIELDS.filter(name => names.has(name));
+                } else if (response.headers.get('x-cli-usage-measured') !== 'true') {
+                  usageFields = [];
+                }
+              }
               if (target.name === 'cli' && status === 429) cliActivity.rejected += 1;
               if (!response.ok && target.name === 'cli') {
                 const reported = response.headers.get('x-cli-error-code');
@@ -2911,8 +2921,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
                   chunkCadence.push(Number(gap.toFixed(2)));
                   if (chunkCadence.length > LATENCY_WINDOW) chunkCadence.shift();
                 }, body.tool_choice, allowedTools,
-                target.name !== 'cli' || response.headers.get('x-cli-usage-measured') === 'true'
-                  ? read => { readAttemptUsage = read; } : null);
+                usageFields.length ? read => { readAttemptUsage = read; } : null);
               if (localRequestCompat && shapeDiagnosis.addedTool) {
                 const calls = JSON.parse(validated.text).content.filter(block => block.type === 'tool_use');
                 for (const block of calls) {
@@ -2954,20 +2963,14 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
               }
               // SSE usage is available only after the complete stream validates. CLI bridge
               // placeholders are never measurements unless the bridge confirms them.
-              let inputTokens = null, outputTokens = null, cacheRead = null, cacheWrite = null;
-              if (target.name !== 'cli' || response.headers.get('x-cli-usage-measured') === 'true') {
-                const usage = validated.contentType === 'application/json' ? JSON.parse(validated.text).usage : validated.usage;
-                if (Number.isSafeInteger(usage?.input_tokens) && usage.input_tokens >= 0) inputTokens = usage.input_tokens;
-                if (Number.isSafeInteger(usage?.output_tokens) && usage.output_tokens >= 0) outputTokens = usage.output_tokens;
-                if (Number.isSafeInteger(usage?.cache_read_input_tokens) && usage.cache_read_input_tokens >= 0) cacheRead = usage.cache_read_input_tokens;
-                if (Number.isSafeInteger(usage?.cache_creation_input_tokens) && usage.cache_creation_input_tokens >= 0) cacheWrite = usage.cache_creation_input_tokens;
-              }
+              const reportedUsage = validated.contentType === 'application/json' ? JSON.parse(validated.text).usage : validated.usage;
+              const usage = safeResponseUsage(reportedUsage, usageFields);
               const result = forceJson && body.stream === true ? jsonMessageStream(validated.text, !compatProfile) : validated;
               result.reportedModel = validated.reportedModel;
-              result.outputTokens = outputTokens;
-              result.inputTokens = inputTokens;
-              result.cacheReadTokens = cacheRead;
-              result.cacheCreationTokens = cacheWrite;
+              result.outputTokens = usage.output_tokens ?? null;
+              result.inputTokens = usage.input_tokens ?? null;
+              result.cacheReadTokens = usage.cache_read_input_tokens ?? null;
+              result.cacheCreationTokens = usage.cache_creation_input_tokens ?? null;
               if (provider === 'cli') {
                 result.cliReportedModel = response.headers.get('x-cli-reported-model');
                 result.cliUsageMeasured = response.headers.get('x-cli-usage-measured') === 'true';
@@ -3003,7 +3006,9 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
             res.end(response.text);
             return;
           } catch (error) {
-            const observed = readAttemptUsage ? readAttemptUsage() : emptyResponseDiagnostics.get(error)?.usage;
+            const diagnostic = emptyResponseDiagnostics.get(error);
+            if (diagnostic && target.name === 'cli') diagnostic.usage = safeResponseUsage(diagnostic.usage, usageFields);
+            const observed = safeResponseUsage(readAttemptUsage ? readAttemptUsage() : diagnostic?.usage, usageFields);
             if (!succeeded) recordCallUsage(target.name, observed);
             client.signal.throwIfAborted();
             const toolErrors = new Map([['Unsupported tool schema','unsupported_tool_schema'], ['Invalid tool input','invalid_tool_input'],
