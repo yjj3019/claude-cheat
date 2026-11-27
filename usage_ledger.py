@@ -8,8 +8,10 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
+import threading
 import time
 import uuid
+import weakref
 
 SCHEMA_VERSION = 3
 MAX_BATCH = 512
@@ -114,12 +116,86 @@ def _event(instance, value):
             version, cache_read, cache_write)
 
 
+class _DirectoryScan:
+    """Retain at most one physical page and its open iterator for a workspace."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.stream = None
+        self.position = 0
+        self.page = None
+
+    def close(self):
+        if self.stream is not None:
+            self.stream.close()
+            self.stream = None
+        self.position = 0
+        self.page = None
+
+    def __del__(self):
+        self.close()
+
+    def read(self, root, offset, result):
+        with self.lock:
+            if self.page:
+                start, entries, end, more = self.page
+                if start < offset < end:
+                    return [row for row in entries if row[0] > offset], more, end
+            if self.stream is None or self.position > offset or not offset:
+                self.close()
+                self.stream = os.scandir(root)
+            entries = []
+            try:
+                for _ in range(MAX_SCAN_ENTRIES):
+                    entry = next(self.stream)
+                    self.position += 1
+                    # Restoring a checkpoint after a process restart also consumes
+                    # the physical enumeration budget, across as many calls as needed.
+                    if self.position <= offset:
+                        continue
+                    try:
+                        identity = _instance(entry.name)
+                    except LedgerError:
+                        continue
+                    if entry.is_symlink() or not entry.is_dir(follow_symlinks=False) or getattr(Path(entry.path), "is_junction", lambda: False)():
+                        if "unsafe_source" not in result["errors"]:
+                            result["errors"].append("unsafe_source")
+                        continue
+                    path = Path(entry.path) / "events.jsonl"
+                    if path.exists() or path.is_symlink():
+                        entries.append((self.position, identity, path))
+                        if len(entries) >= MAX_DISCOVERY:
+                            break
+                more = max(offset, self.position)
+            except StopIteration:
+                more = 0
+                self.stream.close()
+                self.stream = None
+            except OSError:
+                self.close()
+                raise
+            self.page = (offset, entries, self.position, more)
+            return entries, more, self.position
+
+
+_scans = weakref.WeakValueDictionary()
+_scans_lock = threading.Lock()
+
+
 class UsageLedger:
     """A workspace-local ledger. No retention deletion is performed."""
 
     def __init__(self, root):
         self.directory = Path(root) / ".usage-stats"
         self.path = self.directory / "usage.sqlite3"
+        with _scans_lock:
+            self._scan = _scans.get(self.directory)
+            if self._scan is None:
+                self._scan = _scans[self.directory] = _DirectoryScan()
+
+    def close_scan(self):
+        with self._scan.lock:
+            self._scan.close()
 
     def _safe_path(self, *, create):
         if self.directory.is_symlink() or getattr(self.directory, "is_junction", lambda: False)():
@@ -130,6 +206,19 @@ class UsageLedger:
             raise LedgerError("unsafe_store")
 
     def _connect(self, create=False):
+        deadline = time.monotonic() + 0.2
+        while True:
+            try:
+                return self._open_connection(create)
+            except sqlite3.Error as error:
+                # Concurrent first opens may fail the WAL mode switch immediately,
+                # even with SQLite's busy handler installed.
+                if ((getattr(error, "sqlite_errorcode", 0) & 255) not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+                        or time.monotonic() >= deadline):
+                    raise LedgerError("storage_unavailable") from None
+                time.sleep(0.01)
+
+    def _open_connection(self, create):
         try:
             self._safe_path(create=create)
         except OSError:
@@ -153,12 +242,20 @@ class UsageLedger:
             # (re)set on every rw connection; leaving it at the FULL default would defeat
             # the WAL writer batching the write-ahead flush costs (S1).
             db.execute("PRAGMA synchronous=NORMAL")
+            if not create:
+                db.execute("BEGIN")
             version = db.execute("PRAGMA user_version").fetchone()[0]
+            if version == 0 and not create and not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").fetchone():
+                # Another collector may have just created the empty file.
+                db.close()
+                return None
+            if create and version in (0, 1, 2):
+                db.execute("BEGIN IMMEDIATE")
+                version = db.execute("PRAGMA user_version").fetchone()[0]
             if version == 0 and create:
                 if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").fetchone():
                     raise LedgerError("unsupported_schema")
-                db.executescript("""
-                    BEGIN IMMEDIATE;
+                schema = """
                     CREATE TABLE events (
                       instance_id TEXT NOT NULL, event_seq INTEGER NOT NULL, timestamp REAL NOT NULL,
                       provider TEXT NOT NULL, requested_model TEXT, reported_model TEXT,
@@ -173,24 +270,25 @@ class UsageLedger:
                     CREATE TABLE collector_issues (instance_id TEXT NOT NULL, code TEXT NOT NULL,
                       count INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(instance_id, code));
                     PRAGMA user_version=3;
-                    COMMIT;
-                """)
+                """
+                for statement in schema.split(";"):
+                    if statement.strip():
+                        db.execute(statement)
             elif version in (1, 2) and create:
-                db.execute("BEGIN IMMEDIATE")
-                if db.execute("PRAGMA user_version").fetchone()[0] == version:
-                    if version == 1:
-                        db.execute("ALTER TABLE events ADD COLUMN event_version INTEGER NOT NULL DEFAULT 1")
-                    db.execute("ALTER TABLE events ADD COLUMN cache_read_tokens INTEGER")
-                    db.execute("ALTER TABLE events ADD COLUMN cache_creation_tokens INTEGER")
-                    db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-                db.commit()
+                if version == 1:
+                    db.execute("ALTER TABLE events ADD COLUMN event_version INTEGER NOT NULL DEFAULT 1")
+                db.execute("ALTER TABLE events ADD COLUMN cache_read_tokens INTEGER")
+                db.execute("ALTER TABLE events ADD COLUMN cache_creation_tokens INTEGER")
+                db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             elif version not in (1, 2, SCHEMA_VERSION):
                 raise LedgerError("unsupported_schema")
+            if db.in_transaction:
+                db.commit()
             return db
         except (sqlite3.Error, OSError, LedgerError) as error:
             if "db" in locals():
                 db.close()
-            if isinstance(error, LedgerError):
+            if isinstance(error, (sqlite3.Error, LedgerError)):
                 raise
             raise LedgerError("storage_unavailable") from None
 
@@ -205,7 +303,8 @@ class UsageLedger:
         db = self._connect(create=True)
         try:
             with db:
-                inserted = self._insert_rows(db, rows)
+                db.execute("BEGIN IMMEDIATE")
+                inserted, _ = self._insert_rows(db, rows)
             return {"inserted": inserted, "duplicates": len(rows) - inserted}
         except sqlite3.Error:
             raise LedgerError("storage_unavailable") from None
@@ -213,8 +312,8 @@ class UsageLedger:
             db.close()
 
     @staticmethod
-    def _insert_rows(db, rows):
-        inserted = 0
+    def _insert_rows(db, rows, *, skip_conflicts=False):
+        inserted = conflicts = 0
         for row in rows:
             existing = db.execute("SELECT instance_id,event_seq,timestamp,provider,requested_model,reported_model,"
                                   "usage_measured,input_tokens,output_tokens,status,elapsed_ms,event_version,"
@@ -222,11 +321,49 @@ class UsageLedger:
                                   "FROM events WHERE instance_id=? AND event_seq=?", row[:2]).fetchone()
             if existing is not None:
                 if tuple(existing) != tuple(row):
-                    raise LedgerError("event_conflict")
+                    if not skip_conflicts:
+                        raise LedgerError("event_conflict")
+                    conflicts += 1
             else:
                 db.execute("INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", row)
                 inserted += 1
-        return inserted
+        return inserted, conflicts
+
+    @staticmethod
+    def _cursor(db, instance):
+        return db.execute(
+            "SELECT device,inode,offset,EXISTS(SELECT 1 FROM collector_state WHERE name=?) "
+            "FROM cursors WHERE instance_id=?", ("discard_line:" + instance, instance)).fetchone()
+
+    def source_ready_for_cleanup(self, directory, cutoff):
+        """Only retire an old event file whose committed cursor reached its end."""
+        path = directory / "events.jsonl"
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return True
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not info.st_ino
+                or info.st_mtime >= cutoff):
+            return False
+        if info.st_size == 0:
+            return True
+        instance = _instance(directory.name)
+        db = self._connect(create=False)
+        if db is None:
+            return False
+        try:
+            cursor = db.execute("SELECT device,inode,offset,invalid_lines FROM cursors WHERE instance_id=?",
+                                (instance,)).fetchone()
+            if cursor != (str(info.st_dev), str(info.st_ino), info.st_size, 0):
+                return False
+            # A late append or file replacement during the SQLite read defers cleanup.
+            current = path.lstat()
+            return (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_nlink) == (
+                info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, 1)
+        except sqlite3.Error:
+            return False
+        finally:
+            db.close()
 
     def collect(self):
         """Consume bounded bytes from per-instance append-only logs, atomically with cursors.
@@ -243,47 +380,46 @@ class UsageLedger:
         if not root.exists():
             return result
         try:
-            paths = []
-            with os.scandir(root) as scan:
-                for scanned, entry in enumerate(scan):
-                    if scanned >= MAX_SCAN_ENTRIES:
-                        result["pending"] = True
-                        result["errors"].append("instance_discovery_limit")
-                        break
-                    try:
-                        identity = _instance(entry.name)
-                    except LedgerError:
-                        continue
-                    if entry.is_symlink() or not entry.is_dir(follow_symlinks=False) or getattr(Path(entry.path), "is_junction", lambda: False)():
-                        result["errors"].append("unsafe_source")
-                        continue
-                    path = Path(entry.path) / "events.jsonl"
-                    if not path.exists() and not path.is_symlink():
-                        continue
-                    if len(paths) >= MAX_DISCOVERY:
-                        result["pending"] = True
-                        result["errors"].append("instance_discovery_limit")
-                        break
-                    paths.append((identity, path))
-            if not paths:
-                if "instance_discovery_limit" in result["errors"]:
-                    db = self._connect(create=True)
-                    try:
-                        with db:
-                            db.execute("INSERT INTO collector_state VALUES ('discovery_limited','1') ON CONFLICT(name) DO NOTHING")
-                    finally:
-                        db.close()
+            # Resume physical enumeration before testing entries for event files. The
+            # offset is only a scan hint; each pass wraps so directory changes self-heal.
+            scan_offset = 0
+            prior = self._connect(create=False)
+            if prior is not None:
+                try:
+                    row = prior.execute("SELECT value FROM collector_state WHERE name='discovery_offset'").fetchone()
+                    scan_offset = int(row[0]) if row else 0
+                finally:
+                    prior.close()
+            page, next_offset, observed = self._scan.read(root, scan_offset, result)
+            paths = [(identity, path) for _, identity, path in page]
+            positions = {identity: pos for pos, identity, _ in page}
+            if next_offset:
+                result["pending"] = True
+                result["errors"].append("instance_discovery_limit")
+            if not paths and not (scan_offset or next_offset):
                 return result
-            paths.sort(key=lambda x: x[0])
             db = self._connect(create=True)
             try:
-                # The enumeration limit can hide instances. Persist the historical coverage
-                # gap even if a later scan no longer hits the limit; never imply completeness.
-                if "instance_discovery_limit" in result["errors"]:
+                if scan_offset or next_offset:
                     with db:
-                        db.execute("INSERT INTO collector_state VALUES ('discovery_limited','1') ON CONFLICT(name) DO NOTHING")
+                        db.execute("BEGIN IMMEDIATE")
+                        probe = db.execute("SELECT value FROM collector_state WHERE name='discovery_probe'").fetchone()
+                        if probe and observed > int(probe[0]):
+                            # A real entry beyond the limit confirms the historical gap.
+                            db.execute("INSERT OR IGNORE INTO collector_state VALUES ('discovery_limited','1')")
+                            db.execute("DELETE FROM collector_state WHERE name='discovery_probe'")
+                        elif not next_offset:
+                            db.execute("DELETE FROM collector_state WHERE name='discovery_probe'")
+                        elif not probe:
+                            # Exactly reaching either cap is ambiguous until the next read.
+                            db.execute("INSERT OR IGNORE INTO collector_state SELECT 'discovery_probe',? "
+                                       "WHERE NOT EXISTS (SELECT 1 FROM collector_state WHERE name='discovery_limited')",
+                                       (str(next_offset),))
                 last = db.execute("SELECT value FROM collector_state WHERE name='last_instance'").fetchone()
-                if last:
+                paged = bool(scan_offset or next_offset)
+                if not paged:
+                    paths.sort(key=lambda x: x[0])
+                if last and not paged:
                     split = next((i for i, (name, _) in enumerate(paths) if name > last[0]), 0)
                     paths = paths[split:] + paths[:split]
                 budget = MAX_COLLECT_BYTES
@@ -296,6 +432,8 @@ class UsageLedger:
                     last_visited = instance
                     try:
                         # Launchers may register before their first request creates the log.
+                        if path.parent.is_symlink() or getattr(path.parent, "is_junction", lambda: False)():
+                            raise LedgerError("unsafe_source")
                         if not path.exists() and not path.is_symlink():
                             continue
                         if path.is_symlink() or not path.is_file() or path.stat().st_nlink != 1:
@@ -305,28 +443,44 @@ class UsageLedger:
                             info = os.fstat(stream.fileno())
                             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or not info.st_ino or (info.st_dev, info.st_ino) != (path.stat().st_dev, path.stat().st_ino):
                                 raise LedgerError("unsafe_source")
-                            cursor = db.execute("SELECT device,inode,offset FROM cursors WHERE instance_id=?", (instance,)).fetchone()
+                            cursor = self._cursor(db, instance)
                             offset = cursor[2] if cursor else 0
                             if cursor and ((cursor[0], cursor[1]) != (str(info.st_dev), str(info.st_ino)) or info.st_size < offset):
                                 raise LedgerError("source_changed")
                             stream.seek(offset)
                             chunk = stream.read(min(MAX_FILE_CHUNK, budget))
                         budget -= len(chunk)
-                        last_newline = chunk.rfind(b"\n")
-                        if last_newline < 0:
-                            if len(chunk) == MAX_FILE_CHUNK:
-                                raise LedgerError("line_too_long")
-                            result["pending"] |= bool(chunk)
+                        discarding = bool(cursor and cursor[3])
+                        oversized = not discarding and len(chunk) == MAX_FILE_CHUNK and b"\n" not in chunk
+                        consumed = chunk.rfind(b"\n") + 1
+                        complete = chunk[:consumed]
+                        if discarding:
+                            complete = complete.partition(b"\n")[2]
+                        if (oversized or discarding) and not consumed:
+                            consumed = len(chunk)
+                        result["pending"] |= (offset + consumed < info.st_size or bool(chunk and not consumed)
+                                              or ((oversized or discarding) and b"\n" not in chunk))
+                        if not consumed:
                             continue
-                        complete = chunk[:last_newline + 1]
-                        result["pending"] |= len(complete) < len(chunk) or offset + len(complete) < info.st_size
-                        rows, invalid = [], 0
+                        rows, invalid = [], int(oversized)
                         for line in complete.splitlines():
                             try:
                                 rows.append(_event(instance, json.loads(line)))
                             except (ValueError, UnicodeError, RecursionError, TypeError):
                                 invalid += 1
                         with db:
+                            db.execute("BEGIN IMMEDIATE")
+                            if self._cursor(db, instance) != cursor:
+                                # A peer already committed this portion of the source.
+                                result["pending"] = True
+                                continue
+                            issues = {}
+                            discard_key = "discard_line:" + instance
+                            if oversized:
+                                db.execute("INSERT INTO collector_state VALUES (?, '1')", (discard_key,))
+                                issues["line_too_long"] = 1
+                            if discarding and b"\n" in chunk:
+                                db.execute("DELETE FROM collector_state WHERE name=?", (discard_key,))
                             previous = db.execute("SELECT MAX(event_seq) FROM events WHERE instance_id=?", (instance,)).fetchone()[0] or 0
                             gap = False
                             for row in rows:
@@ -334,12 +488,19 @@ class UsageLedger:
                                     gap = True
                                 previous = max(previous, row[1])
                             if gap:
-                                db.execute("INSERT INTO collector_issues VALUES (?,?,1) ON CONFLICT(instance_id,code) DO UPDATE SET count=count+1", (instance, "sequence_gap"))
-                            inserted = self._insert_rows(db, rows)
+                                issues["sequence_gap"] = 1
+                            inserted, conflicts = self._insert_rows(db, rows, skip_conflicts=True)
+                            if conflicts:
+                                issues["event_conflict"] = conflicts
+                                invalid += conflicts
+                            for code, count in issues.items():
+                                db.execute("INSERT INTO collector_issues VALUES (?,?,?) ON CONFLICT(instance_id,code) "
+                                           "DO UPDATE SET count=count+excluded.count", (instance, code, count))
                             db.execute("INSERT INTO cursors VALUES (?,?,?,?,?) ON CONFLICT(instance_id) DO UPDATE SET offset=excluded.offset,invalid_lines=cursors.invalid_lines+excluded.invalid_lines",
-                                       (instance, str(info.st_dev), str(info.st_ino), offset + len(complete), invalid))
+                                       (instance, str(info.st_dev), str(info.st_ino), offset + consumed, invalid))
+                        result["errors"].extend(code for code in issues if code not in result["errors"])
                         result["events_inserted"] += inserted
-                        result["duplicates"] += len(rows) - inserted
+                        result["duplicates"] += len(rows) - inserted - conflicts
                         result["invalid_lines"] += invalid
                     except (OSError, LedgerError) as error:
                         code = str(error) if isinstance(error, LedgerError) else "source_unavailable"
@@ -351,6 +512,13 @@ class UsageLedger:
                 if last_visited is not None:
                     with db:
                         db.execute("INSERT INTO collector_state VALUES ('last_instance',?) ON CONFLICT(name) DO UPDATE SET value=excluded.value", (last_visited,))
+                if paged:
+                    if last_visited is not None and last_visited != paths[-1][0]:
+                        next_offset = positions[last_visited]
+                        result["pending"] = True
+                    with db:
+                        db.execute("INSERT INTO collector_state VALUES ('discovery_offset',?) "
+                                   "ON CONFLICT(name) DO UPDATE SET value=excluded.value", (str(next_offset),))
                 # Unvisited files are not automatically backlog: old sessions may be fully collected.
                 if len(paths) > MAX_COLLECT_FILES and not result["pending"]:
                     remaining = paths[MAX_COLLECT_FILES:]
@@ -407,7 +575,7 @@ class UsageLedger:
                 response["collection_started"] = dt.datetime.fromtimestamp(first, dt.timezone.utc).isoformat()
             response["invalid_lines"] = db.execute("SELECT COALESCE(SUM(invalid_lines),0) FROM cursors").fetchone()[0]
             response["collection_issues"] = [row[0] for row in db.execute("SELECT DISTINCT code FROM collector_issues ORDER BY code")]
-            if db.execute("SELECT 1 FROM collector_state WHERE name='discovery_limited'").fetchone():
+            if db.execute("SELECT 1 FROM collector_state WHERE name IN ('discovery_limited','discovery_probe')").fetchone():
                 response["collection_issues"].append("instance_discovery_limit")
             if response["invalid_lines"] or response["collection_issues"]:
                 response["coverage"] = "partial"
@@ -417,10 +585,11 @@ class UsageLedger:
             response["model_provenance_unverified"] = db.execute(
                 "SELECT COUNT(*) FROM events WHERE " + ("event_version < 2" if version >= 2 else "1")
                 + " AND timestamp >= ? AND timestamp <= ?", (start_epoch, local.timestamp())).fetchone()[0]
+            cache_columns = ", SUM(cache_read_tokens), SUM(cache_creation_tokens)" if version >= 3 else ", NULL, NULL"
             sql = f"""SELECT {bucket} AS bucket, provider, requested_model, {model} AS actual_model, instance_id,
                 COUNT(*), SUM(status='ok'), SUM(status='failed'), SUM(status='aborted'),
                 COUNT(input_tokens), SUM(input_tokens), COUNT(output_tokens), SUM(output_tokens),
-                AVG(elapsed_ms), MAX(elapsed_ms)
+                AVG(elapsed_ms), MAX(elapsed_ms){cache_columns}
                 FROM events WHERE timestamp >= ? AND timestamp <= ?
                 GROUP BY bucket, provider, requested_model, actual_model, instance_id
                 ORDER BY bucket DESC, provider, actual_model, instance_id LIMIT ?"""
@@ -428,21 +597,7 @@ class UsageLedger:
             keys = ("bucket", "provider", "requested_model", "reported_model", "instance_id", "requests",
                     "ok", "failed", "aborted", "input_samples", "input_tokens", "output_samples",
                     "output_tokens", "mean_elapsed_ms", "max_elapsed_ms")
-            # Prompt-cache sums ride along when the store carries the v3 columns; an older
-            # store (a test fixture or an un-migrated read) reports None instead of failing.
-            if version >= SCHEMA_VERSION:
-                cache_sql = f"""SELECT {bucket} AS bucket, provider, requested_model, {model} AS actual_model, instance_id,
-                    SUM(cache_read_tokens), SUM(cache_creation_tokens)
-                    FROM events WHERE timestamp >= ? AND timestamp <= ?
-                    GROUP BY bucket, provider, requested_model, actual_model, instance_id
-                    ORDER BY bucket DESC LIMIT ?"""
-                cache_rows = {}
-                for row in db.execute(cache_sql, (start_epoch, local.timestamp(), (MAX_ROWS + 1) * 10)):
-                    cache_rows[row[:5]] = (row[5], row[6])
-                for index, row in enumerate(result):
-                    read, write = cache_rows.get(tuple(row[:5]), (None, None))
-                    result[index] = row + (read, write)
-                keys += ("cache_read_tokens", "cache_creation_tokens")
+            keys += ("cache_read_tokens", "cache_creation_tokens")
             response["truncated"] = len(result) > MAX_ROWS
             response["rows"] = [dict(zip(keys, row)) for row in result[:MAX_ROWS]]
             response["storage_bytes"] = self.path.stat().st_size

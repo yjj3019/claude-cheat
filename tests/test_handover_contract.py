@@ -7,7 +7,13 @@ starting a replacement proxy while the previous one is still serving.
 """
 import json
 import os
+import shutil
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -160,6 +166,100 @@ class TakeoverGuardTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(mock.patch.object(advisor.shutil, "which", return_value="fixture"))
         self.enterContext(mock.patch.object(advisor, "provider_config", return_value={}))
+        self.auth = self.enterContext(mock.patch.object(advisor, "run_owned", return_value={
+            "loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "pro"}))
+
+    def test_auth_failure_for_every_provider_preserves_the_serving_proxy(self):
+        self.enterContext(mock.patch.object(advisor, "read_handoff", return_value={
+            "port": 48432, "nonce": "fixture", "mode": "ordinary"}))
+        self.enterContext(mock.patch.object(advisor, "port_open", return_value=True))
+        self.enterContext(mock.patch.object(advisor, "_prepared_cli"))
+        drain = self.enterContext(mock.patch.object(advisor, "request_handover"))
+        self.auth.return_value = {"loggedIn": False}
+        for provider in ("local", "openrouter", "cli"):
+            with self.subTest(provider=provider), self.assertRaises(advisor.PlanLoginError):
+                advisor.takeover(provider)
+        self.assertEqual(self.auth.call_count, 3)
+        drain.assert_not_called()
+
+    def test_takeover_preserves_a_background_frontend_still_starting(self):
+        record = {"port": 48432, "nonce": "fixture", "mode": "ordinary", "detach_pending": True}
+        with mock.patch.object(advisor, "read_handoff", return_value=record), \
+                mock.patch.object(advisor, "request_handover") as drain:
+            with self.assertRaisesRegex(RuntimeError, "startup is in progress"):
+                advisor.takeover("local")
+            drain.assert_not_called()
+
+    def test_legacy_keeper_is_identified_before_the_old_proxy_exits(self):
+        record = {"launcher_started": 200.0, "proxy_pid": 3}
+        with mock.patch.object(advisor, "_process_start_time", return_value=100.0):
+            self.assertTrue(advisor._detached_handoff(record))
+            self.assertFalse(advisor._detached_handoff({**record, "launcher_started": 99.0}))
+        with mock.patch.object(advisor, "_process_start_time", return_value=None):
+            self.assertFalse(advisor._detached_handoff(record))
+        self.assertFalse(advisor._detached_handoff({}))
+
+    def test_auto_takeover_aborts_if_the_global_pointer_changes_before_start_or_during_preflight(self):
+        a = {"mode": "ordinary", "instance_id": "a", "port": 12345, "nonce": "fixture", "provider":"local"}
+        b = {**a, "instance_id": "b", "port": 12346}
+        self.enterContext(mock.patch.object(advisor, "port_open", return_value=True))
+        drain = self.enterContext(mock.patch.object(advisor, "request_handover"))
+        for reads in ([b], [a, b]):
+            with self.subTest(reads=len(reads)), mock.patch.object(advisor, "read_handoff", side_effect=reads):
+                with self.assertRaisesRegex(RuntimeError, "Selected session changed"):
+                    advisor.takeover(expected_instance="a")
+        drain.assert_not_called()
+
+    def test_auto_drain_uses_one_connection_and_refuses_busy_changed_or_disconnected_proxy(self):
+        posts, probes = [], []
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+            def reply(self, payload):
+                body = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                if self.server.disconnect:
+                    self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+            def do_GET(self):
+                probes.append((self.path, self.client_address))
+                self.reply({"instanceId": self.server.instance, "inflightRequests": self.server.active})
+            def do_POST(self):
+                posts.append((self.path, self.client_address))
+                self.reply({"drained": True})
+            def log_message(self, *args):
+                pass
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                for server.instance, server.active, server.disconnect in (("other",0,False), ("chosen",1,False), ("chosen",0,True)):
+                    with self.assertRaises(RuntimeError):
+                        advisor.request_handover(server.server_port, "fixture", expected_instance="chosen")
+                self.assertEqual(posts, [])
+                server.disconnect = False
+                self.assertTrue(advisor.request_handover(server.server_port, "fixture", expected_instance="chosen")["drained"])
+                self.assertEqual(probes[-1], ("/api/metrics", posts[0][1]))
+                self.assertEqual(posts, [("/api/handover", probes[-1][1])])
+            finally:
+                server.shutdown()
+                thread.join()
+
+    def test_cli_takeover_checks_binary_version_and_response_before_drain(self):
+        record = {"port": 12345, "nonce": "fixture", "mode": "ordinary", "provider": "cli"}
+        self.enterContext(mock.patch.object(advisor, "read_handoff", return_value=record))
+        self.enterContext(mock.patch.object(advisor, "port_open", return_value=True))
+        drain = self.enterContext(mock.patch.object(advisor, "request_handover"))
+        for reason in ("not_found", "backend_version_unverified"):
+            with self.subTest(reason=reason), mock.patch.object(advisor.cliBackend, "Backend",
+                    side_effect=advisor.cliBackend.BackendError(reason)):
+                with self.assertRaisesRegex(RuntimeError, "existing session was not changed"):
+                    advisor.takeover("cli")
+        with mock.patch.object(advisor.cliBackend, "Backend"), mock.patch.object(advisor, "check_cli_backend", return_value=1):
+            with self.assertRaisesRegex(RuntimeError, "existing session was not changed"):
+                advisor.takeover("cli")
+        drain.assert_not_called()
 
     def test_invalid_replacement_config_never_drains_existing_session(self):
         for failure in (ValueError("private config"), OSError("private path")):
@@ -178,6 +278,58 @@ class TakeoverGuardTests(unittest.TestCase):
         patches = [mock.patch.object(advisor, "read_handoff", return_value=record),
                    mock.patch.object(advisor, "port_open", return_value=True)]
         return patches
+
+    def watch_handoff(self, tick):
+        self.enterContext(mock.patch.object(advisor, "port_open", return_value=True))
+        self.enterContext(mock.patch.object(advisor, "request_handover", return_value={"drained": True}))
+        self.enterContext(mock.patch.object(advisor, "wait_for_port_release", return_value=True))
+        self.enterContext(mock.patch.object(advisor, "routed_session"))
+        self.enterContext(mock.patch.object(advisor, "log_route_marker"))
+        clock = mock.Mock(wraps=advisor.time)
+        clock.sleep.side_effect = tick
+        self.enterContext(mock.patch.object(advisor, "time", clock))
+        return advisor.takeover("local")
+
+    @unittest.skipUnless(os.name == "nt", "uses Windows process creation time")
+    def test_watch_keeps_live_windows_owner_and_releases_after_exit(self):
+        path = Path(self.enterContext(tempfile.TemporaryDirectory())) / "handoff.json"
+        self.enterContext(mock.patch.object(advisor, "HANDOFF_FILE", path))
+        with subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                              stdin=subprocess.PIPE) as owner:
+            try:
+                advisor.write_handoff(port=12345, nonce="fixture", proxy_pid=1, provider="local",
+                                      cli_pid=owner.pid, mode="ordinary")
+                started = advisor.read_handoff()["launcher_started"]
+                self.assertGreater(started, 0)
+                ticks = []
+
+                def tick(_):
+                    ticks.append(1)
+                    self.assertLessEqual(len(ticks), 2)
+                    if len(ticks) == 2:
+                        owner.stdin.close()
+                        owner.wait(timeout=5)
+
+                self.assertEqual(self.watch_handoff(tick), 0)
+                self.assertEqual(len(ticks), 2)
+            finally:
+                owner.stdin.close()
+
+    def test_watch_detects_pid_reuse_before_first_poll(self):
+        record = {"port": 12345, "nonce": "fixture", "launcher_pid": os.getpid(),
+                  "launcher_started": 100.0, "mode": "ordinary"}
+        self.enterContext(mock.patch.object(advisor, "read_handoff", return_value=record))
+        self.enterContext(mock.patch.object(advisor, "_process_start_time", return_value=100.25))
+        self.assertEqual(self.watch_handoff([None, AssertionError("followed a reused PID")]), 0)
+
+    def test_watch_keeps_legacy_owner_when_creation_time_is_unavailable(self):
+        record = {"port": 12345, "nonce": "fixture", "launcher_pid": os.getpid(), "mode": "ordinary"}
+        self.enterContext(mock.patch.object(advisor, "read_handoff", return_value=record))
+        self.enterContext(mock.patch.object(advisor, "_process_start_time", return_value=None))
+        alive = self.enterContext(mock.patch.object(advisor.localProcessTree, "process_alive",
+                                                    side_effect=[True, False]))
+        self.assertEqual(self.watch_handoff([None, None, AssertionError("missed exit")]), 0)
+        self.assertEqual(alive.call_count, 2)
 
     def test_takeover_refuses_isolated_or_unknown_modes_before_draining(self):
         for mode in (None, "local_only", "local_compat", "openrouter_compat", "unknown"):
@@ -231,6 +383,7 @@ class TakeoverGuardTests(unittest.TestCase):
                                      return_value={"drained": True, "waitedMs": 0, "forced": False}),
                    mock.patch.object(advisor, "wait_for_port_release", return_value=True),
                    mock.patch.object(advisor, "_process_start_time", side_effect=[123.0, None]),
+                   mock.patch.object(advisor.localProcessTree, "process_alive", return_value=False),
                    mock.patch.object(advisor, "routed_session", mock.MagicMock()),
                    mock.patch.object(advisor.time, "sleep", fake_sleep)]
         for patch in patches:
@@ -305,6 +458,193 @@ class TakeoverGuardTests(unittest.TestCase):
         self.assertEqual(advisor.takeover("openrouter"), 0)
         handover.assert_called_once()
         marker.assert_called_once()
+
+
+class DetachedCliTests(unittest.TestCase):
+    def make_fixture(self, provider):
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        for name in ("claudeRouteProxy.mjs", "localAdmission.mjs"):
+            shutil.copyfile(advisor.ROOT / name, directory / name)
+        # Replace only the external CLI and subscription login. Both Python processes,
+        # the proxy, its authenticated bridge and session files use the production code.
+        wrapper = directory / "launch.py"
+        wrapper.write_text("""
+import os, shutil, sys
+from pathlib import Path
+import openrouterAdvisor as a
+a.ROOT = Path(__file__).resolve().parent
+a.__file__ = __file__
+a.HANDOFF_FILE = a.ROOT / "global.json"
+class Backend:
+    kind, protocol_model, model = "codex", "cli/codex", "fixture"
+    def __init__(self, values): pass
+    def generate(self, body, cancelled=None):
+        return {"id":"msg_fixture","type":"message","role":"assistant","model":self.protocol_model,
+                "content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn",
+                "usage":{"input_tokens":1,"output_tokens":1}}, {"reported_model":"fixture","usage_measured":True}
+a.cliBackend.Backend = Backend
+provider = os.environ["FIXTURE_PROVIDER"]
+configs = {
+    "cli": {"CLI_KIND":"codex"},
+    "local": {"LOCAL_LLM_URL":"http://127.0.0.1:1/v1/messages", "LOCAL_LLM_MODEL":"fixture"},
+    "openrouter": {"OPENROUTER_MODEL":"fixture/model", "OPENROUTER_API_KEY":"fixture"},
+}
+a.provider_config = lambda *args, **kw: {"SONNET_PROVIDER":provider, **configs[provider]}
+a.check_connection = lambda *args, **kw: 0
+a.dual_provider_setup = lambda *args: None
+a.run_owned = lambda *args, **kw: {"loggedIn":True,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"pro"}
+which = shutil.which
+a.shutil.which = lambda name: "fixture" if name == "claude" else which(name)
+if sys.argv[1:] == ["--own-cli-session"]:
+    sys.exit(a._own_cli_session())
+if sys.argv[1:2] == ["--keep-instance"]:
+    result = a.keep_instance_alive(Path(sys.argv[2]), poll_seconds=.05)
+    (a.ROOT / "keeper-ended").touch()
+    sys.exit(result)
+if "--takeover" in sys.argv[1:]:
+    if provider != "cli":
+        # Force the previous keeper to observe the closed port before rebind.
+        import time
+        release = a.wait_for_port_release
+        def observe_release(port):
+            result = release(port)
+            deadline = time.monotonic() + 10
+            while not (a.ROOT / "keeper-ended").exists():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("old keeper did not observe release")
+                time.sleep(.05)
+            return result
+        a.wait_for_port_release = observe_release
+    sys.exit(a.main(sys.argv[1:]))
+if provider == "cli":
+    with a.routed_session("cli", background=True, _detach_if=lambda: sys.argv[1:] != ["cancel"]):
+        pass
+else:
+    def frontend(*args):
+        import json
+        (a.ROOT / "frontend.json").write_text(json.dumps({"port":a.read_handoff()["port"]}))
+        if "error" in sys.argv:
+            raise OSError("synthetic frontend launch failed")
+        return 19 if "cancel" in sys.argv else 0
+    a.run_cli = frontend
+    a.prepare_blackbox_hook = lambda *args: None
+    sys.exit(a.launch(provider, cli_args=["--bg"]))
+""", encoding="utf-8")
+        env = {key: value for key, value in os.environ.items()
+               if key.upper() in {"PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "TEMP", "TMP",
+                                  "USERPROFILE", "APPDATA", "LOCALAPPDATA", "COMSPEC"}}
+        env.update(PYTHONPATH=str(advisor.ROOT), PYTHONDONTWRITEBYTECODE="1", FIXTURE_PROVIDER=provider)
+        return directory, wrapper, env
+
+    @unittest.skipUnless(shutil.which("node"), "Node proxy required")
+    def test_cli_message_after_launcher_exits_and_cleanup_after_stop(self):
+        directory, wrapper, env = self.make_fixture("cli")
+        run = subprocess.run([sys.executable, str(wrapper)], cwd=directory, env=env,
+                             capture_output=True, timeout=30)
+        self.assertEqual(run.returncode, 0)
+        index = directory / "global.json"
+        record = json.loads(index.read_text(encoding="utf-8"))
+        body = {"model": "claude-sonnet-5-5", "max_tokens": 64,
+                "messages": [{"role": "user", "content": "Test"}], "stream": False}
+        req = urllib.request.Request(f"http://127.0.0.1:{record['port']}/v1/messages",
+                                     data=json.dumps(body).encode(),
+                                     headers={"content-type": "application/json", "x-local-route-token": record["nonce"]})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        replacement = None
+        try:
+            with opener.open(req, timeout=5) as response:
+                self.assertEqual(json.load(response)["content"][0]["text"], "OK")
+            replacement = subprocess.Popen([sys.executable, str(wrapper), "--takeover", "--expect-instance",
+                                            record["instance_id"]], cwd=directory, env=env,
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                try:
+                    latest = json.loads(index.read_text(encoding="utf-8"))
+                except (FileNotFoundError, ValueError):
+                    latest = {}
+                if latest.get("launcher_pid") == replacement.pid:
+                    break
+                self.assertIsNone(replacement.poll(), "replacement exited before handoff")
+                time.sleep(0.1)
+            else:
+                self.fail("replacement failed to publish its handoff")
+            # Survive a full owner-watch interval after the original detached owner exits.
+            time.sleep(1.2)
+            with opener.open(req, timeout=5) as response:
+                self.assertEqual(json.load(response)["content"][0]["text"], "OK")
+        finally:
+            for pointer in (directory / ".usage-stats" / "instances").glob("*/handoff.json"):
+                pointer.unlink(missing_ok=True)
+            if replacement is not None:
+                try:
+                    replacement.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    replacement.kill()
+                    replacement.wait()
+                    self.fail("replacement did not release its proxy")
+        self.assertFalse(advisor.port_open(record["port"]))
+        self.assertFalse(index.exists())
+        cancelled = subprocess.run([sys.executable, str(wrapper), "cancel"], cwd=directory, env=env,
+                                   capture_output=True, timeout=30)
+        self.assertEqual(cancelled.returncode, 0)
+        self.assertFalse(index.exists(), "failed frontend startup must not leave a detached owner")
+
+    @unittest.skipUnless(shutil.which("node"), "Node proxy required")
+    def test_provider_background_frontend_failure_and_takeover_lifetime(self):
+        for provider in ("local", "openrouter"):
+            with self.subTest(provider=provider):
+                directory, wrapper, env = self.make_fixture(provider)
+                command = [sys.executable, str(wrapper)]
+                index = directory / "global.json"
+                instances = directory / ".usage-stats" / "instances"
+                for mode in ("error", "cancel"):
+                    failed = subprocess.run(command + [mode], cwd=directory, env=env,
+                                            capture_output=True, timeout=30)
+                    self.assertNotEqual(failed.returncode, 0)
+                    port = json.loads((directory / "frontend.json").read_text())["port"]
+                    self.assertFalse(advisor.port_open(port))
+                    self.assertFalse(index.exists())
+                    self.assertFalse(list(instances.glob("*/handoff.json")))
+                launcher = subprocess.Popen(command, cwd=directory, env=env,
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                replacement = None
+                try:
+                    self.assertEqual(launcher.wait(timeout=30), 0)
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline:
+                        record = json.loads(index.read_text(encoding="utf-8"))
+                        if record["launcher_pid"] != launcher.pid:
+                            break
+                        time.sleep(.05)
+                    self.assertNotEqual(record["launcher_pid"], launcher.pid)
+                    self.assertTrue(record["detached"])
+                    replacement = subprocess.Popen(command + ["--takeover", "--expect-instance", record["instance_id"]],
+                                                   cwd=directory, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    deadline = time.monotonic() + 15
+                    while time.monotonic() < deadline:
+                        latest = json.loads(index.read_text(encoding="utf-8"))
+                        if latest["launcher_pid"] == replacement.pid:
+                            break
+                        self.assertIsNone(replacement.poll())
+                        time.sleep(.05)
+                    self.assertEqual(latest["launcher_pid"], replacement.pid)
+                    self.assertTrue(latest["detached"])
+                    time.sleep(1.2)
+                    self.assertTrue(advisor.verify_owned_proxy(port=record["port"], nonce=record["nonce"]))
+                    self.assertFalse((instances / record["instance_id"] / "handoff.json").exists())
+                finally:
+                    for ptr in instances.glob("*/handoff.json"):
+                        ptr.unlink(missing_ok=True)
+                    if replacement is not None:
+                        try:
+                            replacement.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            replacement.kill()
+                            replacement.wait()
+                            self.fail("replacement did not stop")
+                self.assertFalse(advisor.port_open(record["port"]))
+                self.assertFalse(index.exists())
 
 
 class OwnedPortVerificationTests(unittest.TestCase):

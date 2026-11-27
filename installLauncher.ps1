@@ -128,75 +128,138 @@ function Remove-LegacyForwarders() {
     }
 }
 
-if ($Remove) {
-    foreach ($name in $commands.Keys) {
-        $path = Join-Path $destination $name
-        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
-        if (-not (Test-ManagedForwarder $path)) {
-            Write-Warning "kept $name (not created by this installer)"
-            continue
-        }
-        Remove-Item -LiteralPath $path -Force
-        Write-Host "removed $path"
-    }
-    Remove-LegacyForwarders
-    # Undo the user-PATH entry Add-UserPathEntry added for this install directory: only
-    # that exact entry, compared entry by entry (never a regex over the whole PATH).
-    $pathEntries = @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' | Where-Object { $_ })
-    $kept = @($pathEntries | Where-Object { $_.TrimEnd('\', '/') -ne $destination })
-    if ($kept.Count -ne $pathEntries.Count) {
-        [Environment]::SetEnvironmentVariable('Path', ($kept -join ';'), 'User')
-        Write-Host "removed user PATH entry: $destination"
-    }
-    return
+$pathReceipt = Join-Path $destination '.openclaude-user-path'
+$receiptText = "$marker - user PATH: $destination"
+function Test-PathReceipt {
+    return (Test-Path -LiteralPath $pathReceipt -PathType Leaf) -and
+        ([IO.File]::ReadAllText($pathReceipt) -ceq $receiptText)
 }
-
-if (-not (Test-Path -LiteralPath $destination)) {
-    New-Item -ItemType Directory -Path $destination -Force | Out-Null
-}
-
-foreach ($name in $commands.Keys) {
-    $targetScript, $label = $commands[$name]
-    $resolved = Join-Path $PSScriptRoot $targetScript
-    if (-not (Test-Path -LiteralPath $resolved)) {
-        Write-Warning "$targetScript is missing beside this installer; skipped $name"
-        continue
-    }
-    $path = Join-Path $destination $name
-    if ((Test-Path -LiteralPath $path) -and -not (Test-ManagedForwarder $path)) {
-        Write-Warning "kept $name (a file not created by this installer already exists)"
-        continue
-    }
-    [System.IO.File]::WriteAllBytes($path, (Get-ExpectedBytes $targetScript $label))
-    Write-Host "installed: $path"
-}
-
-Remove-LegacyForwarders
 
 # Register the default install directory in the *user* PATH so a new terminal can run the bare
 # command without editing Windows Environment Variables by hand. A custom -Target is never
 # registered (the caller chose it deliberately), and -NoPath opts out.
 function Add-UserPathEntry([string]$directory) {
-    $entries = @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' | Where-Object { $_ })
-    $normalized = $entries | ForEach-Object { $_.TrimEnd('\', '/') }
-    if ($normalized -contains $directory) { return $false }
-    $updated = (@($entries) + $directory) -join ';'
+    $rawPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $entries = @($rawPath -split ';' | Where-Object { $_ })
+    if (($entries | ForEach-Object { $_.TrimEnd('\', '/') }) -contains $directory) { return $false }
+    $owned = Test-PathReceipt
+    if (-not $owned -and (Test-Path -LiteralPath $pathReceipt)) {
+        throw 'Cannot record PATH ownership: receipt path already exists.'
+    }
+    $updated = if ($rawPath) { "$rawPath;$directory" } else { $directory }
     [Environment]::SetEnvironmentVariable('Path', $updated, 'User')
+    if (-not $owned) {
+        try {
+            # Publish ownership only after the registry accepted the new entry.
+            $stream = [IO.File]::Open($pathReceipt, [IO.FileMode]::CreateNew)
+            try {
+                $bytes = [Text.Encoding]::UTF8.GetBytes($receiptText)
+                $stream.Write($bytes, 0, $bytes.Length)
+            } finally { $stream.Dispose() }
+        } catch {
+            if ([Environment]::GetEnvironmentVariable('Path', 'User') -ceq $updated) {
+                [Environment]::SetEnvironmentVariable('Path', $rawPath, 'User')
+            }
+            throw
+        }
+    }
     return $true
 }
 
-$defaultTarget = Resolve-Directory (Join-Path $HOME '.local\bin')
-$onPath = ($env:PATH -split ';' | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\', '/') }) -contains $destination
-if (-not $onPath -and $destination -eq $defaultTarget -and -not $NoPath) {
-    if (Add-UserPathEntry $destination) {
-        Write-Host "added to user PATH: $destination (open a new terminal to use it there)"
+# cmd.exe cannot open a checkout path silently replaced by the OEM encoder.
+if (-not $Remove) {
+    $encoding = Get-BatchEncoding
+    $decoded = $encoding.GetString($encoding.GetBytes($origin))
+    if (-not [string]::Equals($decoded, $origin, [StringComparison]::Ordinal)) {
+        throw "The checkout path cannot be represented in Windows OEM code page $($encoding.CodePage). Move the checkout to a representable path and retry."
     }
-    $env:PATH = ($env:PATH.TrimEnd(';') + ';' + $destination)
-    $onPath = $true
 }
 
-if ($onPath) {
-    Write-Host 'run from any folder:  OpenClaude   |   OpenClaudeDashboard'
-} else {
-    Write-Warning "$destination is not on PATH; add this directory to your user PATH using Windows Environment Variables settings."
+function Invoke-LauncherUpdate {
+    if ($Remove) {
+        foreach ($name in $commands.Keys) {
+            $path = Join-Path $destination $name
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { continue }
+            if (-not (Test-ManagedForwarder $path)) {
+                Write-Warning "kept $name (not created by this installer)"
+                continue
+            }
+            Remove-Item -LiteralPath $path -Force
+            Write-Host "removed $path"
+        }
+        Remove-LegacyForwarders
+        if (-not $NoPath -and (Test-PathReceipt)) {
+            $rawPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+            $entries = [Collections.Generic.List[string]]::new()
+            if ($null -ne $rawPath) { $entries.AddRange([string[]]($rawPath -split ';')) }
+            for ($i = $entries.Count - 1; $i -ge 0; $i--) {
+                if ($entries[$i].TrimEnd('\', '/') -eq $destination) {
+                    $entries.RemoveAt($i)
+                    [Environment]::SetEnvironmentVariable('Path', ($entries -join ';'), 'User')
+                    Write-Host "removed user PATH entry: $destination"
+                    break
+                }
+            }
+            Remove-Item -LiteralPath $pathReceipt -Force
+        }
+        return
+    }
+
+    if (-not (Test-Path -LiteralPath $destination)) {
+        New-Item -ItemType Directory -Path $destination -Force | Out-Null
+    }
+
+    foreach ($name in $commands.Keys) {
+        $targetScript, $label = $commands[$name]
+        $resolved = Join-Path $PSScriptRoot $targetScript
+        if (-not (Test-Path -LiteralPath $resolved)) {
+            Write-Warning "$targetScript is missing beside this installer; skipped $name"
+            continue
+        }
+        $path = Join-Path $destination $name
+        if ((Test-Path -LiteralPath $path) -and -not (Test-ManagedForwarder $path)) {
+            Write-Warning "kept $name (a file not created by this installer already exists)"
+            continue
+        }
+        [System.IO.File]::WriteAllBytes($path, (Get-ExpectedBytes $targetScript $label))
+        Write-Host "installed: $path"
+    }
+
+    Remove-LegacyForwarders
+
+    $defaultTarget = Resolve-Directory (Join-Path $HOME '.local\bin')
+    $onPath = ($env:PATH -split ';' | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\', '/') }) -contains $destination
+    if ($destination -eq $defaultTarget -and -not $NoPath) {
+        # A running terminal can still contain an entry a previous uninstall removed
+        # from the persisted user PATH. Recheck the persistent value under the mutex.
+        if (Add-UserPathEntry $destination) {
+            Write-Host "added to user PATH: $destination (open a new terminal to use it there)"
+        }
+        if (-not $onPath) { $env:PATH = ($env:PATH.TrimEnd(';') + ';' + $destination) }
+        $onPath = $true
+    }
+
+    if ($onPath) {
+        Write-Host 'run from any folder:  OpenClaude   |   OpenClaudeDashboard'
+    } else {
+        Write-Warning "$destination is not on PATH; add this directory to your user PATH using Windows Environment Variables settings."
+    }
+}
+
+# The forwarders, user PATH and its ownership receipt are one installation.
+# The same account can run the installer in multiple Windows logon sessions.
+$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$mutex = [Threading.Mutex]::new($false, "Global\OpenClaude-LauncherInstaller-$sid")
+$acquired = $false
+try {
+    try {
+        $acquired = $mutex.WaitOne([TimeSpan]::FromSeconds(30))
+    } catch [Threading.AbandonedMutexException] {
+        $acquired = $true
+    }
+    if (-not $acquired) { throw 'Another launcher installation is still running. Retry shortly.' }
+    Invoke-LauncherUpdate
+} finally {
+    if ($acquired) { $mutex.ReleaseMutex() }
+    $mutex.Dispose()
 }

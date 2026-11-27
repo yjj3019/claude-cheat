@@ -1203,6 +1203,25 @@ class PageTests(unittest.TestCase):
         # Detection is only offered for the supported backends, not arbitrary PATH commands.
         self.assertIn("getElementById('cfg-cli-CLI_KIND')", dash.SETTINGS_PAGE)
 
+    def test_dead_session_sweep_keeps_handoff_reowned_during_pid_check(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(dash, "ROOT", Path(directory)):
+            folder = dash.ROOT / ".usage-stats" / "instances" / "fixture"
+            folder.mkdir(parents=True)
+            handoff = folder / "handoff.json"
+            old = {"launcher_pid": 101, "proxy_pid": 303}
+            new = {**old, "launcher_pid": 202}
+            handoff.write_text(json.dumps(old), encoding="utf-8")
+
+            def reown_during_check(pid):
+                self.assertEqual(pid, 101)
+                with dash.routeConfig.Store(handoff)._cross_process_lock():
+                    handoff.write_text(json.dumps(new), encoding="utf-8")
+                return False
+
+            with mock.patch.object(dash, "_process_alive", side_effect=reown_during_check):
+                dash._sweep_dead_handoffs()
+            self.assertEqual(json.loads(handoff.read_text(encoding="utf-8")), new)
+
     def test_dead_session_handoffs_are_swept_but_live_ones_kept(self):
         # A hard-killed launcher leaves handoff.json behind; the refresh loop must drop
         # the pointer once its launcher pid is provably gone and keep everything else.
@@ -1462,7 +1481,7 @@ class PortTests(unittest.TestCase):
         holder.listen(1)
         port = holder.getsockname()[1]
         try:
-            with mock.patch.object(dash, "_refresh_loop", lambda *args: None):
+            with mock.patch.object(dash.threading, "Thread"):
                 with self.assertRaises(SystemExit):
                     dash.serve(port=port)
         finally:
@@ -3743,8 +3762,13 @@ class OpenPageTests(unittest.TestCase):
             def server_close(self):
                 pass
 
-        with mock.patch.object(dash, "DashboardServer", return_value=Stub()),                 mock.patch.object(dash, "_refresh_loop"), mock.patch.object(dash, "_stop_previous"),                 mock.patch.object(dash, "_write_pid_record"), mock.patch.object(dash, "_read_pid_record",
-                                                                                 return_value=None),                 mock.patch.object(dash.webbrowser, "open") as opener,                 contextlib.redirect_stdout(io.StringIO()):
+        with (mock.patch.object(dash, "DashboardServer", return_value=Stub()),
+              mock.patch.object(dash.threading, "Thread"),
+              mock.patch.object(dash, "_stop_previous"),
+              mock.patch.object(dash, "_write_pid_record"),
+              mock.patch.object(dash, "_read_pid_record", return_value=None),
+              mock.patch.object(dash.webbrowser, "open") as opener,
+              contextlib.redirect_stdout(io.StringIO())):
             dash.serve(**kwargs)
         return opener
 
@@ -4939,6 +4963,29 @@ if __name__ == "__main__":
     unittest.main()
 
 class AutoUpdateTests(unittest.TestCase):
+    def test_watcher_passes_the_verified_instance_to_the_launcher(self):
+        fixture_id = "00000000-0000-4000-8000-000000000001"
+        session = {"port": 12345, "provider": "local", "instance_id": fixture_id}
+        temp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.object(dash, "UPDATE_LOCK_PATH", temp / "update"))
+        self.enterContext(mock.patch.object(dash, "UPDATE_INCOMPLETE", temp / "incomplete"))
+        self.enterContext(mock.patch.object(dash, "AUTO_UPDATE_LOG", temp / "log"))
+        self.enterContext(mock.patch.object(dash, "_AUTO_TAKEOVER_LAST", 0))
+        self.enterContext(mock.patch.object(dash, "_live_session", side_effect=[
+            (session, {"inflightRequests": 0}),  # Legacy metrics cannot identify the observed proxy.
+            (session, {"inflightRequests": 0, "instanceId": fixture_id})]))
+        self.enterContext(mock.patch.object(dash, "parse_route_log", return_value={}))
+        self.enterContext(mock.patch.object(dash, "_current_routing", return_value={"proxy_hash":"old"}))
+        self.enterContext(mock.patch.object(dash, "proxy_stale", return_value=True))
+        clock = mock.Mock(wraps=time)
+        clock.sleep.side_effect = [None, None, KeyboardInterrupt]
+        self.enterContext(mock.patch.object(dash, "time", clock))
+        spawn = self.enterContext(mock.patch.object(dash.subprocess, "Popen"))
+        with self.assertRaises(KeyboardInterrupt):
+            dash._auto_takeover_loop()
+        spawn.assert_called_once()
+        self.assertEqual(spawn.call_args.args[0][-3:], ["--takeover", "--expect-instance", fixture_id])
+
     def test_stale_idle_session_requests_a_takeover(self):
         routing = {"proxy_hash": "000000000000", "proxy_started_at": "2026-11-01T00:00:00+00:00"}
         session = {"provider": "openrouter", "port": 1234}

@@ -140,6 +140,11 @@ HISTORY_FIELDS = {
 }
 _HISTORY_PREFIX = "# openclaude-history-v1: "
 HISTORY_MAX_ENTRIES = 200
+HISTORY_MAX_VALUE_LENGTH = 1024
+
+
+def _history_values_fit(values):
+    return all(len(value) <= HISTORY_MAX_VALUE_LENGTH for value in values.values())
 
 
 def _history(text):
@@ -155,7 +160,7 @@ def _history(text):
                     or entry["id"] <= (entries[-1]["id"] if entries else 0)
                     or provider not in HISTORY_FIELDS or not isinstance(values, dict)
                     or set(values) != set(HISTORY_FIELDS[provider])
-                    or any(not isinstance(v, str) or len(v) > 1024 or FORBIDDEN.search(v)
+                    or any(not isinstance(v, str) or FORBIDDEN.search(v)
                            for v in values.values())):
                 raise ValueError()
         except (ValueError, TypeError, KeyError):
@@ -174,6 +179,8 @@ def _history_values(text, provider):
 
 
 def _history_append(text, entries, provider, values):
+    if not _history_values_fit(values):
+        raise ConfigError("history_value_too_long")
     entry = {"id": (entries[-1]["id"] if entries else 0) + 1,
              "provider": provider, "values": values}
     entries.append(entry)
@@ -503,7 +510,10 @@ class Store:
     def history(self, key):
         with _WRITE_LOCK, self._cross_process_lock():
             raw = self._read_bytes()
-            return {"entries": _history(self._decode(raw) or ""), "token": _history_token(raw, key)}
+            # Older writers could record model names too long for a restorable revision.
+            # Ignore only those revisions, retaining their IDs for ordering and retention.
+            entries = [entry for entry in _history(self._decode(raw) or "") if _history_values_fit(entry["values"])]
+            return {"entries": entries, "token": _history_token(raw, key)}
 
     def write_provider(self, provider, updates, validate=None, *, record_history=False,
                        restore_id=None, expected_token=None, history_key=None):
@@ -528,7 +538,7 @@ class Store:
                         or not hmac.compare_digest(_history_token(raw, history_key), expected_token)):
                     raise ConfigError("history_conflict")
                 target = next((entry for entry in entries if entry["id"] == restore_id
-                               and entry["provider"] == provider), None)
+                               and entry["provider"] == provider and _history_values_fit(entry["values"])), None)
                 if target is None:
                     raise ConfigError("history_not_found")
                 yaml_updates = dict(target["values"])
@@ -566,7 +576,7 @@ class Store:
             if record_history:
                 after = _history_values(text, provider)
                 if before != after:
-                    if not any(entry["provider"] == provider for entry in entries):
+                    if _history_values_fit(before) and not any(entry["provider"] == provider for entry in entries):
                         text = _history_append(text, entries, provider, before)
                     text = _history_append(text, entries, provider, after)
             self._atomic_write(text, raw, original is not None and raw.startswith(b"\xef\xbb\xbf"))

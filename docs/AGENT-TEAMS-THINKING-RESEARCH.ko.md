@@ -1,7 +1,7 @@
 # Agent Teams · 추론(thinking) 활성화 연구
 
 - 일자: 2026-11-12
-- 상태: **연구 + 우선순위 1~4 구현 완료, P1/T3 대기** — 권장 우선순위의 문서화·env 노출·검증·가시성 항목은 실장되고 10회 시뮬레이션으로 검증됨(§5). 남은 것은 사용자의 실제 로컬 서버 키가 필요한 P1 live probe와 그 결과에 따른 T3
+- 2026-11-27 실기 결과: 설정된 Local 모델은 도구 왕복에 성공했고 별도 thinking 요청은 평문으로 끝났다. 이 응답에서 변환할 추론 블록을 관찰하지 못해 T3 브리지는 적용하지 않았다. §4의 재현 명령과 [실행 기록](LIVE-VALIDATION.ko.md)을 참고한다.
 - 범위: `claudeRouteProxy.mjs`(라우팅), `openrouterAdvisor.py`(런처), `modelQualityProbe.py`(품질 검증), `routeDashboard.py`(대시보드), 테스트 스위트
 
 ## 0. 결론 요약
@@ -135,7 +135,7 @@ nativeDetail = compatProfile ? compatExclusion(body, beta)
 
 **T1 — 코드 0 (즉시 가능)**
 - thinking을 써야 하는 턴: 일반 모드 + 구독 → **자동 Plan 폴백**(현재 동작, 그대로 유지).
-- 로컬 thinking 프로토콜: `--local-compat` 세션 사용 — 서버가 thinking 블로크를 내면 Claude Code가 표시. **서버 능력 live 검증 필요** (§3.4 P1).
+- 로컬 thinking 프로토콜: `--local-compat` 세션 사용 — 서버가 thinking 블로크를 내면 Claude Code가 표시. 2026-11-27 설정 모델은 평문을 반환했다(§4).
 
 **T2 — 소규모 코드 (검증·가시성)**
 1. `modelQualityProbe.py`: thinking round-trip 단계 추가 — `thinking: {type:'enabled', budget_tokens:N}` 요청 → 응답에 thinking 블로크 존재/shape(서명 유무) 확인 → 결과 JSON에 `thinking_supported: yes|no|partial`.
@@ -152,11 +152,7 @@ nativeDetail = compatProfile ? compatExclusion(body, beta)
 
 ### 3.4 검증 계획
 
-- **P1 live probe (사용자 서버, 실제 키 필요 — 더미 키엔 401)**:
-  ```bash
-  python -c "import json,urllib.request; r=urllib.request.Request('http://172.21.135.113:4000/v1/messages', data=json.dumps({'model':'<모델ID>','max_tokens':256,'stream':False,'thinking':{'type':'enabled','budget_tokens':1024},'messages':[{'role':'user','content':'2+2는? 추론해'}]}).encode(), headers={'content-type':'application/json','authorization':'Bearer <실제키>','anthropic-version':'2023-06-01'}); print(json.dumps(json.loads(urllib.request.urlopen(r, timeout=120).read()), ensure_ascii=False, indent=1))"
-  ```
-  → `content`에 `thinking` 블로크가 있느냐가 T1/T3 분기점.
+- **P1 실기 검사**는 §4의 명령으로 실행한다. 결과에는 응답 본문과 키가 포함되지 않는다.
 - **P2 unit**: Plan 바디 unsigned thinking 제거 가드 테스트 (T3 시).
 - **P3 probe**: T2의 thinking round-trip + 대시보드 표시.
 
@@ -169,13 +165,13 @@ nativeDetail = compatProfile ? compatExclusion(body, beta)
 | 1 | A1+T1 문서화(모드 선택 가이드: 팀·thinking → `--local-compat`) | 0 | 즉시 "사용 가능" 경로 확보 | **완료** — README "모드 선택 가이드: Agent Teams와 추론(thinking)" + 대시보드 Local 설정 힌트(`localExtra`) |
 | 2 | A2 로컬 동시접수·타임아웃 env 노출 | 소 | 팀 실사용 병렬도 확보 | **완료** — `ROUTE_LOCAL_CONCURRENCY`(1–64)·`ROUTE_LOCAL_QUEUE_LIMIT`(0–256)·`ROUTE_LOCAL_QUEUE_WAIT_MS`(0–600000, 기존 60s 상한 완화)·`ROUTE_LOCAL_ATTEMPT_TIMEOUT_MS`(30s–15min, compat/local-only) + 런처 passthrough(잘못된 값은 무시+경고) + 테스트 |
 | 3 | T2 품질 검증 thinking round-trip + 대시보드 가시성 | 소 | 서버 능력 확인·사용자 안내 | **완료** — `modelQualityProbe.evaluate_thinking`(`--thinking` 옵트인 3번째 호출) + 도구 왕복 검사 결과·evidence에 `thinking` + `capabilities.thinking`/`agent_teams` + Local 설정 힌트 |
-| 4 | A3 시뮬레이션 + live 팀 검증, 대시보드 `agent_teams` 행 | 중(테스트) | 회귀 안전망 | **시뮬레이션 완료** — `tests/simulate_agent_teams_thinking.mjs`(10라운드, §5) + `capabilities.agent_teams` 행. **live 팀 검증은 사용자 인터랙티브 세션 필요**(아래 절차) |
-| 5 | P1 live probe → (서버가 thinking 미지원이면) T3 브릿지 | 중 | 로컬 thinking 패널(원하면) | **준비 완료** — `python modelQualityProbe.py --provider local --run --thinking` (실제 키 필요). T3는 P1 결과 대기(§3.3) |
+| 4 | A3 시뮬레이션 + live 팀 검증, 대시보드 `agent_teams` 행 | 중(테스트) | 회귀 안전망 | **시뮬레이션 완료** — `tests/simulate_agent_teams_thinking.mjs`(10라운드, §5) + `capabilities.agent_teams` 행. **실제 팀 검증 완료(2026-11-27)** — 대화형 세션에서 팀원 1명과 공유 작업 1건을 확인했다([실기 기록](LIVE-VALIDATION.ko.md)) |
+| 5 | P1 live probe → (서버가 thinking 미지원이면) T3 브릿지 | 중 | 로컬 thinking 패널(원하면) | **실측 완료(2026-11-27)** — 도구 왕복 성공, thinking 블록 0개(`absent`). 현재 응답은 평문으로 표시 |
 
 **A3 live 팀 검증 절차(사용자 인터랙티브 세션):**
 1. `$env:ROUTE_LOCAL_CONCURRENCY="4"` + `.\OpenClaude.ps1 -Provider Local -LocalCompat`(또는 OpenRouter).
 2. 셸 또는 settings.json `env`에 `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`.
-3. 세션에서 teammate 2~3명 spawn → `~/.claude/teams/{team}/inboxes/*.json`(메일박스)과 `~/.claude/tasks/{team}/`(공유 태스크) 파일 생성 확인, 작업 완료.
+3. 대화형 터미널에서 팀원 한 명에게 공유 작업을 배정한다. 팀 등록, 팀원 발신 메시지, 공유 작업의 완료 상태를 확인한 뒤 팀원을 종료한다. `-p`에서는 이름을 지정해도 일반 하위 에이전트로 실행된다. [Claude Code 실행 조건](https://code.claude.com/docs/en/agent-teams)
 4. 대시보드에서 `routes.external` 증가와 teammate 턴 수 일치, `local_busy` 없음을 확인(있으면 `ROUTE_LOCAL_CONCURRENCY` 상향).
 5. R4 확인: 라우팅 로그에 `native_feature:unsupported_beta` → Plan(403) 전환이 없어야 함(향후 Claude Code 버전별 재확인).
 
@@ -183,7 +179,8 @@ nativeDetail = compatProfile ? compatExclusion(body, beta)
 ```powershell
 python modelQualityProbe.py --provider local --run --thinking
 ```
-→ `thinking.thinking_status`: `present`(서버가 thinking 블록 출력 — compat 세션에서 thinking 패널 기대 가능) / `absent`(평문 응답 — T1 수준, 추론은 텍스트로 표시) / `error`(서버가 thinking 파라미터 거부 — 파라미터 없이 재확인). 더미 키면 401이므로 저장된 실제 키가 필요합니다.
+`thinking.thinking_status`의 `present`는 유효한 thinking 블록 관측, `absent`는 정상 종료된 평문 응답, `invalid`는 판정에 쓸 수 없는 응답 형식, `error`는 검사 실패를 뜻한다. 모델을 바꾸면 다시 확인한다.
+
 
 ## 5. 10회 시뮬레이션 결과와 문제점 (2026-11-12)
 
@@ -219,7 +216,7 @@ python modelQualityProbe.py --provider local --run --thinking
 **도출된 문제점:**
 - **P-T1**: 일반 로컬의 S2 — 로컬 서버가 thinking을 내는 순간 그 세션은 계속 깨짐(재시도 후 503). 유일한 해결 = `--local-compat`. 사용자 혼동 포인트 → README·대시보드 힌트로 명시.
 - **P-T2**: S5 — thinking의 *미지원 설정값*(`display` 등)은 Plan 우회로 이어지는데, 구독 없으면 403으로 죽음. compat 모드로 가려면 전체 세션을 바꿀 수 없는 일반 OpenRouter 사용자에게는 dead end — T3 브릿지가 아닌 **compat 세션 권장**이 현실적 해결.
-- **P-T3(변수, P1로 확정)**: S3의 "서버가 thinking 블록을 내는 것"은 fixture 전제 — 실제 사용자 서버(172.21.135.113:4000, LM Studio 추정)는 미확인. `absent`면 T1 수준(텍스트 추론)에서 종료, `present`이면 T3 불필요(이미 동작).
+- **P-T3**: S3은 합성 응답을 사용했다. 2026-11-27 실제 검사에서는 설정 모델이 평문만 반환했다. 다른 모델의 결과는 별도 확인한다.
 
 ### 5.3 시뮬레이션으로 확인되지 않은 것 (live 필요)
 
@@ -233,7 +230,7 @@ python modelQualityProbe.py --provider local --run --thinking
 1. **R4**: 일반 local 세션의 실험 베타 헤더 — 향후 Claude Code 버전이 새 베타를 기본 보내면 Plan 우회(구독 없는 환경 403). live 검증 + 런처의 local 세션 베타 정책 검토 필요.
 2. Agent Teams는 Claude Code 측 **실험 기능** — resume/shutdown/태스크 지연 한계는 프록시 밖.
 3. **Windows**: split panes 불가 → in-process 한정.
-4. 로컬 서버별 thinking 능력 **서버 의존** — P1 probe로 확정 (사용자 서버 포트 4000 = LM Studio 추정).
+4. thinking 응답은 서버·모델 설정에 따라 달라질 수 있다. 모델을 바꾸면 §4의 검사를 다시 실행한다.
 5. 팀의 토큰 비용 선형 증가 — 대시보드 usage 통계로 추적 가능(기존 기능).
 6. T3 서명 없는 thinking의 클라이언트 표시 의미론 — live 확인 필요.
 

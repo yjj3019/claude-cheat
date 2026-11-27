@@ -267,17 +267,20 @@ test('Empty Local responses retain validation retry policy without congestion ji
 
 test('an empty max-token response does not block later Local requests', async t => {
   let calls = 0, planCalls = 0;
+  let empty = true;
   const { send, metrics } = await fixture(t, async (url, options) => {
     if (url === PLAN) { planCalls++; return response(options); }
     calls++;
-    if (calls <= 4) return Response.json({ id: 'msg_empty', type: 'message', role: 'assistant', model: MODEL,
+    if (empty) return Response.json({ id: 'msg_empty', type: 'message', role: 'assistant', model: MODEL,
       content: [], stop_reason: 'max_tokens', usage: { input_tokens: 1, output_tokens: 321 } });
     return response(options);
   });
   assert.equal((await send()).status, 503);
+  assert.equal(calls, 2);
   assert.equal((await metrics()).circuitOpens, 0);
+  empty = false;
   assert.equal((await send()).status, 200);
-  assert.equal(calls, 5);
+  assert.equal(calls, 3);
   assert.equal(planCalls, 0);
 });
 

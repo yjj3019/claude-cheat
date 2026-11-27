@@ -19,6 +19,7 @@ SESSION_LOG.md
 .proxy-metrics.json
 *.log.*
 .session-handoff.json
+..session-handoff.json.lock
 .session-handoff.json.tmp
 .usage-cache.json
 .usage-cache.json.tmp

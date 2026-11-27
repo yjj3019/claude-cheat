@@ -217,7 +217,7 @@ class DashboardLifecycleTests(unittest.TestCase):
 
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(dash, "process_identity", side_effect=identity), \
-             mock.patch.object(dash, "_refresh_loop", lambda *args: None), \
+             mock.patch.object(dash.threading, "Thread"), \
              mock.patch.object(dash, "DashboardServer", FakeServer), \
              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             dash.serve(port=self.port)

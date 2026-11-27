@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
+import json
 import tempfile
 import threading
 import unittest
@@ -63,6 +64,39 @@ class ConfigHistoryTests(unittest.TestCase):
         self.assertEqual(entries[0]["id"], 27)
         self.assertEqual(entries[-1]["id"], cfg.HISTORY_MAX_ENTRIES + 26)
         self.assertEqual(self.path.read_text(encoding="utf-8").count(cfg._HISTORY_PREFIX), cfg.HISTORY_MAX_ENTRIES)
+
+    def test_legacy_oversized_model_allows_repair_and_reset(self):
+        long_model = "x" * (cfg.HISTORY_MAX_VALUE_LENGTH + 1)
+        revision = {"id": 1, "provider": "local", "values": {"model": long_model}}
+        legacy = f'local:\n  model: "{long_model}"\n' + cfg._HISTORY_PREFIX + json.dumps(revision) + "\n"
+        self.path.write_text(legacy, encoding="utf-8")
+        history = self.store.history("test-key")
+        self.assertEqual(history["entries"], [])
+        with self.assertRaisesRegex(cfg.ConfigError, "history_not_found"):
+            self.store.write_provider("local", {}, restore_id=1, expected_token=history["token"], history_key="test-key")
+        self.save("other/model")
+        self.store.write_provider("local", {"LOCAL_LLM_MODEL": "fixed"}, record_history=True)
+        self.store.reset_provider("local", "credential")
+        self.assertEqual(self.store.read_provider("local")["LOCAL_LLM_MODEL"], "fixed")
+        self.store.reset_provider("local", "service")
+        for path in (self.path, self.path.with_name(self.path.name + ".bak")):
+            self.assertNotIn(long_model, path.read_text(encoding="utf-8"))
+        self.assertTrue(all(entry["provider"] == "openrouter" for entry in self.store.history("test-key")["entries"]))
+
+    def test_new_oversized_revision_rejected_before_disk_write(self):
+        import routeDashboard as dashboard
+
+        bound = cfg.HISTORY_MAX_VALUE_LENGTH
+        values = {"LOCAL_LLM_URL": "http://127.0.0.1:1/v1/messages", "LOCAL_LLM_MODEL": "x" * bound}
+        with mock.patch.object(dashboard, "_store", return_value=self.store), mock.patch.object(dashboard, "config_snapshot"):
+            dashboard.save_config("local", values)
+            before = self.path.read_bytes()
+            values["LOCAL_LLM_MODEL"] += "x"
+            with self.assertRaisesRegex(ValueError, "invalid_local_model"):
+                dashboard.save_config("local", values)
+        with self.assertRaisesRegex(cfg.ConfigError, "history_value_too_long"):
+            self.store.write_provider("local", {"LOCAL_LLM_MODEL": values["LOCAL_LLM_MODEL"]}, record_history=True)
+        self.assertEqual(self.path.read_bytes(), before)
 
     def test_concurrent_saves_have_unique_revisions(self):
         failures = []

@@ -43,6 +43,7 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 
 # even while a test or an embedder stubs `subprocess.Popen`.
 _REAL_POPEN = subprocess.Popen
 LOCAL_STARTUP_MESSAGES = {
+    "local_cli_backend_unavailable": "CLI backend startup check failed. Check the configured executable, version and login.",
     "local_cli_not_found": "Claude Code executable not found. Install it or check PATH, then restart Local mode.",
     "local_node_not_found": "Node.js executable not found. Install it or check PATH, then restart Local mode.",
     "local_cli_unsupported": "Local CLI mode requires Claude Code 2.1.304 or later. Check claude --version.",
@@ -465,47 +466,43 @@ def project_context(cwd=None) -> dict:
 
 def _process_start_time(pid):
     """Creation time of a pid as epoch seconds, or None when it cannot be verified."""
-    try:
-        import ctypes
-
-        class PBI(ctypes.Structure):
-            _fields_ = [("ExitStatus", ctypes.c_void_p), ("PebBaseAddress", ctypes.c_void_p),
-                        ("AffinityMask", ctypes.c_void_p), ("BasePriority", ctypes.c_void_p),
-                        ("UniqueProcessId", ctypes.c_void_p),
-                        ("InheritedFromUniqueProcessId", ctypes.c_void_p)]
-        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
-        if not handle:
-            return None
-        info = PBI()
-        returned = ctypes.c_ulong()
-        ok = ctypes.windll.ntdll.NtQueryInformationProcess(
-            handle, 0, ctypes.byref(info), ctypes.sizeof(info), ctypes.byref(returned))
-        ctypes.windll.kernel32.CloseHandle(handle)
-        if ok != 0 or not info.UniqueProcessId:
-            return None
-        # FILETIME of the process: creation time via GetProcessTimes is simpler.
-        creation = ctypes.c_ulonglong()
-        exit_time = ctypes.c_ulonglong()
-        kernel = ctypes.c_ulonglong()
-        user = ctypes.c_ulonglong()
-        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
-        if not handle:
-            return None
-        try:
-            if not ctypes.windll.kernel32.GetProcessTimes(
-                    handle, ctypes.byref(creation), ctypes.byref(exit_time),
-                    ctypes.byref(kernel), ctypes.byref(user)):
-                return None
-        finally:
-            ctypes.windll.kernel32.CloseHandle(handle)
-        times0 = creation
-        # creation is times[0] in 100ns units since 1601-01-01.
-        return (int(times0) - 116444736000000000) / 10_000_000
-    except (OSError, AttributeError, ValueError):
+    identity = localProcessTree.process_identity(pid)
+    if identity is None:
         return None
+    # Windows FILETIME uses 100 ns ticks from 1601. Handoffs store Unix seconds.
+    return (identity[1] - 116444736000000000) / 10_000_000
 
 
-def write_handoff(*, port, nonce, proxy_pid, provider, cli_pid, mode, dual=None, instance_id=None, instance_dir=None):
+def _set_handoff_owner(record, pid):
+    record["launcher_pid"] = pid
+    started = _process_start_time(pid)
+    if started is None:
+        record.pop("launcher_started", None)
+    else:
+        record["launcher_started"] = started
+
+
+def _publish_handoff(path, payload, previous=None, replacing_instance=None):
+    """Publish under the same lock used by cleanup and other session writers."""
+    try:
+        with routeConfig.Store(path)._cross_process_lock():
+            if previous is not None and json.loads(path.read_text(encoding="utf-8")) != previous:
+                return False
+            if replacing_instance is not None:
+                try:
+                    current = json.loads(path.read_text(encoding="utf-8"))
+                except FileNotFoundError:
+                    pass  # The old owner already cleared its pointer.
+                else:
+                    if not isinstance(current, dict) or current.get("instance_id") != replacing_instance:
+                        return True  # Keep a newer primary session selected.
+            return write_json_state(path, payload)
+    except (OSError, ValueError):
+        return False
+
+
+def write_handoff(*, port, nonce, proxy_pid, provider, cli_pid, mode, dual=None, instance_id=None,
+                  instance_dir=None, detached=False, replacing_instance=None, detach_pending=False):
     """Record the live route so another terminal can take it over without changing the port.
 
     ``dual`` is the non-secret alternate topology ({provider, alias, model}) an ordinary
@@ -514,13 +511,15 @@ def write_handoff(*, port, nonce, proxy_pid, provider, cli_pid, mode, dual=None,
     """
     if not isinstance(port, int) or not isinstance(proxy_pid, int):
         return  # nothing usable to record (also keeps mocked sessions out of the file)
-    payload = {"port": port, "nonce": nonce, "proxy_pid": proxy_pid, "launcher_pid": cli_pid,
+    payload = {"port": port, "nonce": nonce, "proxy_pid": proxy_pid,
                "provider": provider, "mode": mode, "started": datetime.now(timezone.utc).isoformat(timespec="seconds")}
     # The takeover path keeps serving after the original launcher exits; a start-time
     # snapshot lets it distinguish "pid reused by another process" from "client gone".
-    started = _process_start_time(cli_pid)
-    if started is not None:
-        payload["launcher_started"] = started
+    _set_handoff_owner(payload, cli_pid)
+    if detached:
+        payload["detached"] = True
+    if detach_pending:
+        payload["detach_pending"] = True
     if dual:
         payload["dual"] = {"provider": dual["ROUTE_ALT_PROVIDER"], "alias": dual["ROUTE_ALT_ALIAS"],
                            "model": dual["ROUTE_ALT_MODEL"]}
@@ -530,9 +529,10 @@ def write_handoff(*, port, nonce, proxy_pid, provider, cli_pid, mode, dual=None,
             payload[key] = context[key]
     if instance_id and instance_dir:
         payload["instance_id"] = instance_id
-        if not write_json_state(instance_dir / "handoff.json", payload):
+        if not _publish_handoff(instance_dir / "handoff.json", payload):
             print(json.dumps({"event": "instance_handoff_unavailable"}), file=sys.stderr, flush=True)
-    write_json_state(HANDOFF_FILE, payload)
+    if not _publish_handoff(HANDOFF_FILE, payload, replacing_instance=replacing_instance):
+        print(json.dumps({"event": "session_handoff_unavailable"}), file=sys.stderr, flush=True)
 
 
 def read_handoff():
@@ -545,13 +545,20 @@ def read_handoff():
     return data
 
 
-def clear_handoff(*, proxy_pid):
+def _clear_owned_handoff(path, proxy_pid, nonce=None, instance_id=None):
     try:
-        current = json.loads(HANDOFF_FILE.read_text(encoding="utf-8"))
-        if current.get("proxy_pid") == proxy_pid:
-            HANDOFF_FILE.unlink()
+        with routeConfig.Store(path)._cross_process_lock():
+            current = json.loads(path.read_text(encoding="utf-8"))
+            if (isinstance(current, dict) and current.get("proxy_pid") == proxy_pid
+                    and (nonce is None or current.get("nonce") == nonce)
+                    and (instance_id is None or current.get("instance_id") == instance_id)):
+                path.unlink()
     except (OSError, ValueError):
         pass
+
+
+def clear_handoff(*, proxy_pid, nonce=None, instance_id=None):
+    _clear_owned_handoff(HANDOFF_FILE, proxy_pid, nonce, instance_id)
 
 
 def instance_directory(root, instance_id):
@@ -571,13 +578,7 @@ def instance_directory(root, instance_id):
 
 def clear_instance_handoff(instance_dir, proxy_pid):
     """Remove only this launcher's own live pointer; retain observed usage data."""
-    try:
-        path = instance_dir / "handoff.json"
-        current = json.loads(path.read_text(encoding="utf-8"))
-        if current.get("proxy_pid") == proxy_pid:
-            path.unlink()
-    except (OSError, ValueError, AttributeError):
-        pass
+    _clear_owned_handoff(instance_dir / "handoff.json", proxy_pid)
 
 
 def port_open(port, timeout=0.5):
@@ -635,6 +636,18 @@ def spawn_instance_keeper(instance_dir, stdin):
                             stdin=stdin, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
 
 
+def _adopt_detached_handoff(directory, pid):
+    record = read_instance_handoff(directory)
+    if not record or type(record.get("proxy_pid")) is not int:
+        return
+    owned = record.copy()
+    _set_handoff_owner(owned, pid)
+    owned["detached"] = True
+    owned.pop("detach_pending", None)
+    if owned != record and _publish_handoff(directory / "handoff.json", owned, previous=record):
+        _publish_handoff(HANDOFF_FILE, owned, previous=record)
+
+
 def keep_instance_alive(instance_dir, poll_seconds=2.0) -> int:
     """Hold a routed proxy for a detached (--bg) session after its launcher exits.
 
@@ -646,19 +659,11 @@ def keep_instance_alive(instance_dir, poll_seconds=2.0) -> int:
     stops answering its own token. Exiting closes the last pipe end and the proxy
     exits with it. Returns 0.
 
-    The keeper re-owns the instance handoff with its own pid on arrival: the
-    original launcher has already exited by then, and the dashboard's dead-handoff
-    sweep must see a live owner or it would delete the pointer and release this
-    detached session.
+    Both parent and keeper may publish the keeper's pid after frontend success.
+    Publishing before the launcher exits protects the new session from the
+    dashboard's dead-owner sweep.
     """
-    record = read_instance_handoff(instance_dir)
-    if record is not None and isinstance(record.get("port"), int) and isinstance(record.get("proxy_pid"), int):
-        try:
-            write_handoff(port=record["port"], nonce=record.get("nonce"), proxy_pid=record["proxy_pid"],
-                          provider=record.get("provider"), cli_pid=os.getpid(), mode=record.get("mode"),
-                          dual=record.get("dual"), instance_id=record.get("instance_id"), instance_dir=instance_dir)
-        except (OSError, ValueError):
-            log_route_marker("keeper handoff re-own failed; the session keeps the launcher-bound lifetime")
+    _adopt_detached_handoff(instance_dir, os.getpid())
     while True:
         record = read_instance_handoff(instance_dir)
         if record is None:
@@ -697,7 +702,34 @@ def _handover_report(response):
     return report
 
 
-def request_handover(port, nonce, timeout=None):
+def _instance_handover(port, nonce, expected_instance, timeout):
+    """Verify the selected proxy and drain it on the very same TCP connection."""
+    headers = {"x-local-route-token": nonce}
+    with contextlib.closing(http.client.HTTPConnection("127.0.0.1", port, timeout=2)) as connection:
+        connection.connect()
+        connection.auto_open = False  # Losing this socket must never select another listener.
+        connection.request("GET", "/api/metrics", headers=headers)
+        with connection.getresponse() as response:
+            raw = response.read(256 * 1024 + 1)
+            if response.status != 200 or len(raw) > 256 * 1024:
+                raise RuntimeError("Cannot verify the selected proxy; automatic takeover skipped")
+            metrics = json.loads(raw)
+        if not isinstance(metrics, dict) or metrics.get("instanceId") != expected_instance:
+            raise RuntimeError("Selected proxy instance changed; automatic takeover skipped")
+        if metrics.get("inflightRequests") != 0 or connection.sock is None:
+            raise RuntimeError("Selected proxy is busy or disconnected; automatic takeover skipped")
+        connection.sock.settimeout(timeout)
+        connection.request("POST", "/api/handover", body=b"", headers=headers)
+        with connection.getresponse() as response:
+            report = _handover_report(response)
+            if response.status == 409 and report.get("reverted") is True:
+                raise RuntimeError("The proxy kept serving an active turn and reverted the handover")
+            if response.status != 200:
+                raise RuntimeError(f"The proxy answered the handover with HTTP {response.status}")
+            return report
+
+
+def request_handover(port, nonce, timeout=None, *, expected_instance=None):
     """Ask the running proxy to drain and exit so this launcher can rebind its port.
 
     A 409 means the drain cap expired with turns still active and the proxy reverted to
@@ -705,6 +737,8 @@ def request_handover(port, nonce, timeout=None):
     """
     if timeout is None:
         timeout = handover_timeout_seconds()
+    if expected_instance is not None:
+        return _instance_handover(port, nonce, expected_instance, timeout)
     request = urllib.request.Request(f"http://127.0.0.1:{port}/api/handover", data=b"",
                                      method="POST", headers={"x-local-route-token": nonce})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoLocalRedirect())
@@ -784,22 +818,114 @@ def run_owned(args: list, env: dict, cwd: str, prompt: str = "", timeout: int = 
 
 
 @contextlib.contextmanager
+def _prepared_cli(check=False):
+    values = provider_config("cli")
+    with cliBackend.serve(values) as (backend, url, token):
+        if check and check_cli_backend(backend) != 0:
+            raise LocalStartupError("local_cli_backend_unavailable")
+        config = {**values, "LOCAL_LLM_URL": url, "LOCAL_LLM_MODEL": backend.protocol_model,
+                  "LOCAL_LLM_API_KEY": token, "LOCAL_LLM_ALLOW_REMOTE": "false", "LOCAL_LLM_HTTP_URL": ""}
+        yield config, backend
+
+
+@contextlib.contextmanager
+def _background_cli_session(debug, port, nonce, detach_if):
+    # The long-lived owner opens both listeners. Configuration and credentials stay
+    # on anonymous pipes; EOF before the detach acknowledgement cancels startup.
+    stderr = None if debug and sys.stderr.isatty() else subprocess.DEVNULL
+    child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--own-cli-session"],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
+                             text=True, encoding="utf-8", creationflags=_NO_WINDOW | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    detached = False
+    try:
+        child.stdin.write(json.dumps([debug, port, nonce]) + "\n")
+        child.stdin.flush()
+        for line in child.stdout:
+            notice = json.loads(line)
+            if "route_env" in notice:
+                delta = notice["route_env"]
+                break
+            if notice.get("owner_error") == "plan_login":
+                raise PlanLoginError()
+            if notice.get("owner_error") == "cli_backend":
+                raise cliBackend.BackendError(notice["reason"])
+            if notice.get("provider") == "cli" and "connection_check" in notice:
+                print(json.dumps(notice), flush=True)
+        else:
+            raise LocalStartupError("local_cli_backend_unavailable")
+        env = os.environ.copy()
+        for name in delta["unset"]:
+            env.pop(name, None)
+        env.update(delta["set"])
+        yield env
+        if detach_if is None or detach_if():
+            child.stdin.write("detach\n")
+            child.stdin.flush()
+            detached = True
+    finally:
+        with contextlib.suppress(BrokenPipeError):
+            child.stdin.close()
+        child.stdout.close()
+        if not detached:
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                child.terminate()
+                child.wait()
+
+
+def _own_cli_session():
+    debug, port, nonce = json.loads(sys.stdin.readline())
+    # The parent forwards the ordinary connection check, then consumes the route
+    # environment privately. No child retains a handle to its parent's output pipe.
+    with _prepared_cli() as (config, backend):
+        with _routed_session("cli", debug=debug, port=port, nonce=nonce, _config=config,
+                             _backend=backend, _with_owner=True, _detach_pending=True) as (env, proxy, directory):
+            delta = {"set": {key: value for key, value in env.items() if os.environ.get(key) != value},
+                     "unset": [key for key in os.environ if key not in env]}
+            print(json.dumps({"route_env": delta}), flush=True)
+            if sys.stdin.readline().strip() == "detach":
+                _adopt_detached_handoff(directory, os.getpid())
+                _wait_for_detached_proxy(proxy, directory)
+    return 0
+
+
+def _wait_for_detached_proxy(proxy, directory):
+    while proxy.poll() is None:
+        record = read_instance_handoff(directory)
+        if not record or record.get("proxy_pid") != proxy.pid:
+            break
+        time.sleep(1)
+
+
+@contextlib.contextmanager
 def routed_session(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False,
                    openrouter_compat: bool = False, debug: bool = False, port=None, nonce=None,
-                   background: bool = False):
+                   background: bool = False, _prepared=None, _with_owner=False, _detach_if=None,
+                   _replacing_instance=None, _plan_checked=False):
     options = dict(local_only=local_only, local_compat=local_compat, openrouter_compat=openrouter_compat,
                    debug=debug, port=port, nonce=nonce, background=background)
+    if _replacing_instance is not None:
+        options["_replacing_instance"] = _replacing_instance
+    if _plan_checked:
+        options["_plan_checked"] = True
+    if _with_owner:
+        options["_with_owner"] = True
     if provider != "cli":
+        if _detach_if is not None:
+            options["_detach_if"] = _detach_if
         with _routed_session(provider, **options) as env:
             yield env
         return
     if local_only or local_compat or openrouter_compat:
         raise ValueError("CLI backend requires ordinary Claude Code mode")
-    values = provider_config("cli")
-    with cliBackend.serve(values) as (backend, url, token):
-        config = {**values, "LOCAL_LLM_URL": url, "LOCAL_LLM_MODEL": backend.protocol_model,
-                  "LOCAL_LLM_API_KEY": token, "LOCAL_LLM_ALLOW_REMOTE": "false", "LOCAL_LLM_HTTP_URL": ""}
-        with _routed_session(provider, **options, _config=config, _backend=backend) as env:
+    if background:
+        with _background_cli_session(debug, port, nonce, _detach_if) as env:
+            yield env
+        return
+    with (contextlib.nullcontext(_prepared) if _prepared is not None else _prepared_cli()) as (config, backend):
+        with _routed_session(provider, **options, _config=config, _backend=backend,
+                             _cli_checked=_prepared is not None) as env:
             yield env
 
 
@@ -858,11 +984,34 @@ def _local_admission_env(environ=None):
     return forwarded
 
 
+def _normalize_config_dir(env):
+    config_dir = env.get("CLAUDE_CONFIG_DIR")
+    if not config_dir or Path(config_dir).resolve() == (Path.home() / ".claude-openrouter").resolve():
+        # An explicit ~/.claude moves .claude.json inside it and hides native MCP registrations.
+        env.pop("CLAUDE_CONFIG_DIR", None)
+
+
+def _check_plan_login(claude):
+    # Use the caller's login (including its OAuth token), independent of provider routing.
+    probe_env = os.environ.copy()
+    _normalize_config_dir(probe_env)
+    for name in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY", *_CLI_ENV_STRIP):
+        probe_env.pop(name, None)
+    try:
+        auth = run_owned([claude, "auth", "status", "--json"], probe_env, str(Path.home()), timeout=60)
+    except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired):
+        raise PlanLoginError() from None
+    if not (auth.get("loggedIn") is True and auth.get("authMethod") == "claude.ai"
+            and auth.get("apiProvider") == "firstParty" and auth.get("subscriptionType") == "pro"):
+        raise PlanLoginError()
+
+
 @contextlib.contextmanager
 def _routed_session(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False,
                   openrouter_compat: bool = False, debug: bool = False,
                   port: int | None = None, nonce: str | None = None, _config=None, _backend=None,
-                  background: bool = False):
+                  background: bool = False, _cli_checked=False, _with_owner=False, _replacing_instance=None,
+                  _plan_checked=False, _detach_if=None, _detach_pending=False):
     """Own one loopback proxy; ordinary sessions alone use the subscription login."""
     if (local_only and provider != "local") or (local_compat and not local_only):
         raise ValueError("Local CLI mode requires the local provider")
@@ -937,31 +1086,9 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
                  "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"]:
         if env.get(name) == LEGACY_MODEL:
             env.pop(name)
-    config_dir = env.get("CLAUDE_CONFIG_DIR")
-    if not config_dir or Path(config_dir).resolve() == (Path.home() / ".claude-openrouter").resolve():
-        # An explicit ~/.claude moves .claude.json inside it and hides native MCP registrations.
-        env.pop("CLAUDE_CONFIG_DIR", None)
-    command = [claude]
-    if not isolated:
-        # The probe reads the user's own login, including an env-provided OAuth token that
-        # the routed child must not inherit. Base it on the caller's environment.
-        probe_env = dict(os.environ)
-        if "CLAUDE_CONFIG_DIR" in env:
-            probe_env["CLAUDE_CONFIG_DIR"] = env["CLAUDE_CONFIG_DIR"]
-        else:
-            probe_env.pop("CLAUDE_CONFIG_DIR", None)
-        probe_env.pop("ANTHROPIC_BASE_URL", None)
-        probe_env.pop("ANTHROPIC_AUTH_TOKEN", None)
-        probe_env.pop("ANTHROPIC_API_KEY", None)
-        for name in _CLI_ENV_STRIP:
-            probe_env.pop(name, None)
-        try:
-            auth = run_owned(command + ["auth", "status", "--json"], probe_env, str(Path.home()), timeout=60)
-        except RuntimeError:
-            raise PlanLoginError() from None
-        if not (auth.get("loggedIn") is True and auth.get("authMethod") == "claude.ai"
-                and auth.get("apiProvider") == "firstParty" and auth.get("subscriptionType") == "pro"):
-            raise PlanLoginError()
+    _normalize_config_dir(env)
+    if not isolated and not _plan_checked:
+        _check_plan_login(claude)
     node = shutil.which("node")
     if not node:
         if isolated:
@@ -985,7 +1112,10 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
                 env.pop(name)
     if dual:
         env.update(dual_cli_env(dual))
-    connection_result = check_cli_backend(_backend) if _backend is not None else check_connection(provider, config=config)
+    if _backend is None:
+        connection_result = check_connection(provider, config=config)
+    else:
+        connection_result = 0 if _cli_checked else check_cli_backend(_backend)
     if connection_result != 0:
         if _backend is not None:
             # A failing CLI backend cannot be continued into: the session would start only to
@@ -1110,26 +1240,25 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
         mode = "openrouter_compat" if openrouter_compat else "local_compat" if local_compat else "local_only" if local_only else "ordinary"
         write_handoff(port=port, nonce=nonce, proxy_pid=proxy.pid, provider=provider,
                       cli_pid=os.getpid(), dual=dual, mode=mode,
-                      instance_id=instance_id if instance_dir else None, instance_dir=instance_dir)
+                      instance_id=instance_id if instance_dir else None, instance_dir=instance_dir,
+                      detached=_with_owner, replacing_instance=_replacing_instance,
+                      detach_pending=background or _detach_pending)
         # A --bg native session detaches after the CLI spawns its detached child, so the
         # launcher must not terminate its proxy when the foreground returns. The keeper
         # inherits a duplicated proxy pipe end; once it returns the last end closes and
-        # the proxy exits with it (keep_instance_alive). Without an instance directory
-        # (rare) the session keeps the launcher-bound lifetime.
-        keeper = None
-        if background and instance_dir is not None:
-            try:
-                keeper = spawn_instance_keeper(instance_dir, proxy.stdin)
-            except (OSError, ValueError):
-                log_route_marker("keeper spawn failed; the session keeps the launcher-bound lifetime")
-                keeper = None
-        yield env
+        # the proxy exits with it (keep_instance_alive).
+        if (background or _with_owner) and (instance_dir is None or not read_instance_handoff(instance_dir)):
+            raise RuntimeError("Background session could not register its handoff")
+        yield (env, proxy, instance_dir) if _with_owner else env
+        if background and (_detach_if is None or _detach_if()):
+            keeper = spawn_instance_keeper(instance_dir, proxy.stdin)
+            _adopt_detached_handoff(instance_dir, keeper.pid)
     finally:
         log_route_marker(f"launcher exit pid={os.getpid()}")
         if background and keeper is not None:
             log_route_marker(f"launcher handed the proxy to keeper pid={keeper.pid}; the --bg session keeps routing")
         else:
-            clear_handoff(proxy_pid=proxy.pid)
+            clear_handoff(proxy_pid=proxy.pid, nonce=nonce, instance_id=instance_id if instance_dir else None)
             if instance_dir is not None:
                 clear_instance_handoff(instance_dir, proxy.pid)
             proxy.terminate()
@@ -1243,14 +1372,18 @@ def local_cli_command(claude: str, compat: bool = False) -> list:
             "--no-chrome", "--settings", json.dumps(settings), "--append-system-prompt", workspace_context]
 
 
-def takeover(provider: str = "auto", debug: bool = False) -> int:
+def takeover(provider: str = "auto", debug: bool = False, *, expected_instance=None) -> int:
     """Hand the live port to a fresh proxy so the running CLI keeps working across a restart."""
     record = read_handoff()
     if not record:
         raise RuntimeError("No running session to take over (missing .session-handoff.json)")
+    if expected_instance is not None and record.get("instance_id") != expected_instance:
+        raise RuntimeError("Selected session changed; automatic takeover skipped")
     # Older records lack mode metadata and cannot prove that fallback was permitted.
     if record.get("mode") != "ordinary":
         raise RuntimeError("Session mode cannot be safely preserved during takeover; restart the session instead")
+    if record.get("detach_pending") is True:
+        raise RuntimeError("Background frontend startup is in progress; retry takeover after it has detached")
     port, nonce = record["port"], record.get("nonce")
     if not isinstance(nonce, str) or not nonce:
         raise RuntimeError("The recorded session has no token; restart the session normally")
@@ -1280,15 +1413,44 @@ def takeover(provider: str = "auto", debug: bool = False) -> int:
                 " same alternate; restart the CLI session instead of taking over")
     # Check predictable local failures before stopping the only working proxy. This cannot
     # guarantee a successful bind, authentication or replacement startup after the drain.
-    if not shutil.which("claude") or not shutil.which("node"):
+    claude = shutil.which("claude")
+    if not claude or not shutil.which("node"):
         raise RuntimeError("Claude Code and Node.js are required; existing session was not changed")
+    with contextlib.ExitStack() as stack:
+        options = {}
+        try:
+            if provider == "cli":
+                options["_prepared"] = stack.enter_context(_prepared_cli(check=True))
+            else:
+                provider_config(provider)
+        except (OSError, ValueError, LocalStartupError):
+            raise RuntimeError("Replacement provider configuration is invalid; existing session was not changed") from None
+        _check_plan_login(claude)
+        options["_plan_checked"] = True
+        return _take_over_port(provider, port, nonce, record, debug, options, expected_instance)
+
+
+def _detached_handoff(record):
+    if "detached" in record:
+        return record["detached"] is True
+    # Older Windows keepers did not stamp their handoff. The keeper is created
+    # after its proxy, whereas a foreground launcher always predates its child.
+    owner_started = record.get("launcher_started")
+    proxy_pid = record.get("proxy_pid")
+    if type(owner_started) in (float, int) and type(proxy_pid) is int:
+        proxy_started = _process_start_time(proxy_pid)
+        return proxy_started is not None and owner_started > proxy_started
+    return False
+
+
+def _take_over_port(provider, port, nonce, record, debug, options, expected_instance):
+    if expected_instance is not None and read_handoff() != record:
+        raise RuntimeError("Selected session changed during preflight; automatic takeover skipped")
+    detached = _detached_handoff(record)
     try:
-        provider_config(provider)
-    except (OSError, ValueError):
-        raise RuntimeError("Replacement provider configuration is invalid; existing session was not changed") from None
-    try:
-        report = request_handover(port, nonce)
-    except (OSError, ValueError) as error:
+        report = (request_handover(port, nonce) if expected_instance is None else
+                  request_handover(port, nonce, expected_instance=expected_instance))
+    except (OSError, ValueError, http.client.HTTPException) as error:
         raise RuntimeError(f"The running proxy refused the handover: {error}") from None
     if not report.get("drained"):
         # A revert means the proxy is still listening and serving; starting a replacement
@@ -1297,7 +1459,11 @@ def takeover(provider: str = "auto", debug: bool = False) -> int:
     if not wait_for_port_release(port):
         raise RuntimeError("The previous proxy did not release its port")
     log_route_marker(f"takeover port={port} provider={provider}")
-    with routed_session(provider, port=port, nonce=nonce, debug=debug):
+    if expected_instance is not None:
+        options["_replacing_instance"] = expected_instance
+    if detached:
+        options["_with_owner"] = True
+    with routed_session(provider, port=port, nonce=nonce, debug=debug, **options) as active:
         print(json.dumps({"takeover": True, "port": port, "provider": provider,
                           "drained": bool(report.get("drained")),
                           "waited_ms": report.get("waitedMs"),
@@ -1307,8 +1473,21 @@ def takeover(provider: str = "auto", debug: bool = False) -> int:
             # child-exit signals. Watch the recorded launcher instead: when that pid is gone
             # (or reused by a different process), the session is over and this tree must
             # clean up — otherwise the dashboard shows an ended session forever.
+            if detached:
+                _, proxy, directory = active
+                # Old keepers can miss the brief port release and authenticate to
+                # the replacement using the shared token. Release their own pointer.
+                old_id = record.get("instance_id")
+                if isinstance(old_id, str):
+                    with contextlib.suppress(OSError, ValueError):
+                        old_dir = instance_directory(ROOT, old_id)
+                        _clear_owned_handoff(old_dir / "handoff.json", record.get("proxy_pid"), nonce, old_id)
+                _wait_for_detached_proxy(proxy, directory)
+                return 0
             client_pid = record.get("launcher_pid")
-            client_started = _process_start_time(client_pid) if isinstance(client_pid, int) else None
+            client_started = record.get("launcher_started")
+            if type(client_started) not in (int, float):
+                client_started = _process_start_time(client_pid) if isinstance(client_pid, int) else None
             while True:
                 time.sleep(1)
                 if not isinstance(client_pid, int):
@@ -1316,7 +1495,9 @@ def takeover(provider: str = "auto", debug: bool = False) -> int:
                 current = _process_start_time(client_pid)
                 if current is not None and client_started is None:
                     client_started = current  # first observation of an already-running pid
-                gone = current is None or (client_started is not None and abs(current - client_started) > 0.5)
+                gone = not localProcessTree.process_alive(client_pid)
+                if current is not None and client_started != current:
+                    gone = True
                 if gone:
                     log_route_marker(f"takeover client pid={client_pid} gone; ending the takeover session")
                     return 0
@@ -1521,6 +1702,8 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
             command += ["--session-id", session_id, "--settings", json.dumps({"hooks": hooks})]
         command += print_args + native_args
         return run_cli(command, env, print_prompt)
+    exit_code = None
+    options = {"_detach_if": lambda: exit_code == 0} if background else {}
     if isolated and Path(claude).suffix.lower() in (".cmd", ".bat"):
         # cmd.exe re-parses the composed command line; quotes/&/%/^ in the executable path can
         # be split out of the launcher's control through a shim, so refuse those instead of
@@ -1541,9 +1724,10 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
         if openrouter_compat:
             prompt_index = command.index("--append-system-prompt") + 1
             command[prompt_index] = command[prompt_index].replace("Local session", "OpenRouter session")
-        session = routed_session(provider, openrouter_compat=True, background=background, debug=debug) if openrouter_compat else (
-            routed_session(provider, local_only=True, local_compat=True, background=background, debug=debug) if local_compat else routed_session(provider, local_only=True, background=background, debug=debug))
-        with session as env:
+        mode_options = {"openrouter_compat": True} if openrouter_compat else {"local_only": True}
+        if local_compat:
+            mode_options["local_compat"] = True
+        with routed_session(provider, background=background, debug=debug, **mode_options, **options) as env:
             # CLI settings.env outranks process env: pin the same isolated route at that boundary.
             settings_index = command.index("--settings") + 1
             settings = json.loads(command[settings_index])
@@ -1565,13 +1749,14 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
                 settings["env"][name] = ""
             command[settings_index] = json.dumps(settings)
             try:
-                return run_cli(_resolved_cli(command) + print_args + native_args, env, print_prompt)
+                exit_code = run_cli(_resolved_cli(command) + print_args + native_args, env, print_prompt)
+                return exit_code
             except OSError:
                 raise startup_error("local_cli_start_failed") from None
     print(f"Sonnet replacement: {provider}. Opus/Haiku/Fable keep Claude Plan OAuth.")
     print("Provider failures return an error without Plan fallback; native-only requests may still use Plan.")
     print("Native-only features stay on Plan. Replacement replies are buffered until validated.")
-    with routed_session(provider, background=background, debug=debug) as env:
+    with routed_session(provider, background=background, debug=debug, **options) as env:
         if (provider == "local" and "CLAUDE_CODE_DISABLE_ADVISOR_TOOL" not in os.environ
                 and any(arg.split("=", 1)[0] == "--advisor" for arg in native_args)):
             env.pop("CLAUDE_CODE_DISABLE_ADVISOR_TOOL", None)
@@ -1594,7 +1779,8 @@ def launch(provider: str = "auto", local_only: bool = False, local_compat: bool 
             session_settings["hooks"] = hooks
         if session_settings:
             command += ["--settings", json.dumps(session_settings)]
-        return run_cli(_resolved_cli(command) + print_args + native_args, env, print_prompt)
+        exit_code = run_cli(_resolved_cli(command) + print_args + native_args, env, print_prompt)
+        return exit_code
 
 
 def self_test() -> None:
@@ -1757,6 +1943,7 @@ Exit codes: 0 = success, 2 = usage/service choice required, others = failure.
         parser.add_argument("--debug", action="store_true", help="Show proxy routing logs (route_selected, circuit_open, ...) on stderr")
         parser.add_argument("--takeover", action="store_true",
                             help="Restart the routing proxy on the running session's port (no new CLI)")
+        parser.add_argument("--expect-instance", help=argparse.SUPPRESS)
         parser.add_argument("--print", dest="print_prompt", metavar="PROMPT",
                             help="Run one non-interactive turn through the proxy and exit (automation/CI)")
         parser.add_argument("--print-text", action="store_true",
@@ -1767,6 +1954,8 @@ Exit codes: 0 = success, 2 = usage/service choice required, others = failure.
         parser.add_argument("--keep-instance", default=None, help=argparse.SUPPRESS,
                            metavar="INSTANCE_DIR")
         options = parser.parse_args(arguments)
+        if options.expect_instance is not None and not options.takeover:
+            parser.error("--expect-instance requires --takeover")
         if options.version:
             # The explicit command may wait: a person asked for the answer.
             report = routeVersion.version_report(refresh=True, async_update=False, blocking=True)
@@ -1816,7 +2005,7 @@ Exit codes: 0 = success, 2 = usage/service choice required, others = failure.
         if options.takeover:
             if options.provider == "sonnet":
                 parser.error("--takeover is unavailable for original Sonnet sessions")
-            return takeover(options.provider, debug=options.debug)
+            return takeover(options.provider, debug=options.debug, expected_instance=options.expect_instance)
         return launch(options.provider, local_only=options.local_mode or options.local_compat,
                       local_compat=options.local_compat, openrouter_compat=options.openrouter_compat,
                       debug=options.debug, print_prompt=options.print_prompt,
@@ -1889,4 +2078,12 @@ Exit codes: 0 = success, 2 = usage/service choice required, others = failure.
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--own-cli-session"]:
+        try:
+            raise SystemExit(_own_cli_session())
+        except PlanLoginError:
+            print(json.dumps({"owner_error": "plan_login"}), flush=True)
+        except (cliBackend.BackendError, routeCli.CliError) as error:
+            print(json.dumps({"owner_error": "cli_backend", "reason": error.code}), flush=True)
+        raise SystemExit(1)
     sys.exit(main())

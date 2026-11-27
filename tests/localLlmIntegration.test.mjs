@@ -132,6 +132,25 @@ test('Local context errors expose a fixed diagnosis without leaking provider tex
   assert.equal(f.proCalls.length,0);
 });
 
+test('repeated Local output exhaustion preserves the caller limit and leaves the next request usable', async t => {
+  const f = await fixture(t, (_req, res) => {
+    if (f.localCalls.length <= 2) {
+      return json(res, { ...message(MODEL, []), stop_reason: 'max_tokens', usage: { input_tokens: 100, output_tokens: 64 } });
+    }
+    json(res, message());
+  });
+  const response = await f.request({ max_tokens: 64 });
+  assert.equal(response.status, 503);
+  const error = await response.text();
+  assert.match(error, /local_empty_response.*max_tokens/);
+  assert.doesNotMatch(error, /check Local recovery/);
+  assert.deepEqual(f.localCalls.map(call => call.body.max_tokens), [64, 64]);
+  const next = await f.request();
+  assert.equal(next.status, 200);
+  assert.match(await next.text(), /local fixture answer/);
+  assert.equal(f.proCalls.length, 0);
+});
+
 test('ordinary Local preserves a valid tool result with omitted content', async t => {
   const f = await fixture(t, (_req, res) => json(res, message()));
   const messages = [{role:'user', content:'Use the tool.'},

@@ -58,15 +58,35 @@ def evaluate_token_counter(call, model, measure=None):
     return result
 
 
+class ProbeDeadline(TimeoutError):
+    """The shared deadline for the entire probe has expired."""
+
+
+def _remaining(deadline):
+    if deadline is None:
+        return float("inf")
+    seconds = deadline - time.monotonic()
+    if seconds <= 0:
+        raise ProbeDeadline("probe_deadline")
+    return seconds
+
+
+def _timed_call(call, body, deadline):
+    _remaining(deadline)
+    try:
+        return call(body)
+    finally:
+        # A backend may return a valid reply, or report cancellation, after expiry.
+        _remaining(deadline)
+
+
 def evaluate(call, model, deadline=None):
     """Check a single proposed tool call and a synthetic result continuation."""
     started = time.monotonic()
     base = {"model": model, "max_tokens": 128, "stream": False, "tools": [TOOL]}
     first = {**base, "tool_choice": {"type": "tool", "name": "Lookup"},
              "messages": [{"role": "user", "content": "Call Lookup with key code."}]}
-    if deadline is not None and time.monotonic() >= deadline:
-        raise TimeoutError("probe_deadline")
-    message, metadata = call(first)
+    message, metadata = _timed_call(call, first, deadline)
     blocks = message.get("content") if isinstance(message, dict) else None
     calls = [block for block in blocks or [] if isinstance(block, dict) and block.get("type") == "tool_use"] if isinstance(blocks, list) else []
     usage_first = metadata.get("usage_measured") is True
@@ -84,9 +104,7 @@ def evaluate(call, model, deadline=None):
               {"role": "user", "content": [{"type": "tool_result", "tool_use_id": calls[0]["id"],
                                                "content": value},
                                               {"type": "text", "text": "Reply with only the exact value returned by Lookup."}]}]}
-    if deadline is not None and time.monotonic() >= deadline:
-        raise TimeoutError("probe_deadline")
-    reply, next_metadata = call(second)
+    reply, next_metadata = _timed_call(call, second, deadline)
     content = reply.get("content") if isinstance(reply, dict) else None
     valid = (isinstance(reply, dict) and reply.get("stop_reason") == "end_turn"
              and isinstance(content, list) and all(isinstance(block, dict) for block in content)
@@ -111,16 +129,20 @@ def evaluate_thinking(call, model, deadline=None):
     (reported as 'error' without failing the primary tool round-trip).
     """
     started = time.monotonic()
-    body = {"model": model, "max_tokens": 1024, "stream": False,
+    # Manual thinking needs at least 1024 tokens and room for a final answer.
+    body = {"model": model, "max_tokens": 1280, "stream": False,
             "thinking": {"type": "enabled", "budget_tokens": 1024},
             "messages": [{"role": "user", "content": "Think briefly, then reply with only: probe"}]}
-    if deadline is not None and time.monotonic() >= deadline:
-        raise TimeoutError("probe_deadline")
     try:
-        message, _ = call(body)
+        message, metadata = _timed_call(call, body, deadline)
+    except ProbeDeadline:
+        raise
     except Exception:
         # Provider errors can contain credentials or raw model output; keep the reason coarse.
         return {"thinking_status": "error", "thinking_blocks": 0, "signed": None,
+                "elapsed_ms": round((time.monotonic() - started) * 1000)}
+    if metadata.get("model_matches_requested") is not True:
+        return {"thinking_status": "unknown", "thinking_blocks": 0, "signed": None,
                 "elapsed_ms": round((time.monotonic() - started) * 1000)}
     blocks = message.get("content") if isinstance(message, dict) else None
     if not isinstance(blocks, list):
@@ -133,8 +155,13 @@ def evaluate_thinking(call, model, deadline=None):
         status = "present" if valid else "invalid"
         signed = all(isinstance(block.get("signature"), str) and block["signature"]
                      for block in thinking_blocks)
-    else:
+    elif (message.get("stop_reason") == "end_turn" and blocks
+          and all(isinstance(block, dict) and block.get("type") == "text"
+                  and isinstance(block.get("text"), str) for block in blocks)
+          and any(block["text"].strip() for block in blocks)):
         status, signed = "absent", False
+    else:
+        status, signed = "invalid", None
     return {"thinking_status": status, "thinking_blocks": len(thinking_blocks), "signed": signed,
             "elapsed_ms": round((time.monotonic() - started) * 1000)}
 
@@ -168,7 +195,7 @@ def configured_call(provider, dashboard=None, deadline=None, values=None):
             upstream = values.get("OPENROUTER_UPSTREAM_PROVIDER") or ""
             policy = {"only": [upstream], "allow_fallbacks": False} if upstream else {"allow_fallbacks": False}
             body = {**body, "provider": policy}
-        status, message = dashboard._http_json(url, headers, body, timeout=60)
+        status, message = dashboard._http_json(url, headers, body, timeout=min(60, _remaining(deadline)))
         if status != 200 or not isinstance(message, dict):
             raise ValueError("invalid_response")
         usage = message.get("usage")
@@ -197,6 +224,8 @@ def main(argv=None):
         if args.thinking and isinstance(result, dict) and result.get("reason") == "passed":
             try:
                 result["thinking"] = evaluate_thinking(call, model, deadline=deadline)
+            except ProbeDeadline:
+                raise
             except (OSError, ValueError, KeyError, TypeError, urllib.error.URLError, TimeoutError):
                 result["thinking"] = {"thinking_status": "error", "thinking_blocks": 0, "signed": None,
                                       "elapsed_ms": 0}
