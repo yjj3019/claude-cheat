@@ -11,6 +11,7 @@ import time
 import urllib.error
 
 
+PROBE_TIMEOUT_SECONDS = 180
 TOOL = {"name": "Lookup", "description": "Look up the requested key.",
         "input_schema": {"type": "object", "properties": {"key": {"type": "string"}},
                          "required": ["key"], "additionalProperties": False}}
@@ -195,7 +196,10 @@ def configured_call(provider, dashboard=None, deadline=None, values=None):
             upstream = values.get("OPENROUTER_UPSTREAM_PROVIDER") or ""
             policy = {"only": [upstream], "allow_fallbacks": False} if upstream else {"allow_fallbacks": False}
             body = {**body, "provider": policy}
-        status, message = dashboard._http_json(url, headers, body, timeout=min(60, _remaining(deadline)))
+        options = {"timeout": min(60, _remaining(deadline))}
+        if deadline is not None:
+            options["deadline"] = deadline
+        status, message = dashboard._http_json(url, headers, body, **options)
         if status != 200 or not isinstance(message, dict):
             raise ValueError("invalid_response")
         usage = message.get("usage")
@@ -218,7 +222,7 @@ def main(argv=None):
     if not args.run:
         parser.error("--run is required; real model inference consumes usage")
     try:
-        deadline = time.monotonic() + 180
+        deadline = time.monotonic() + PROBE_TIMEOUT_SECONDS
         call, model = configured_call(args.provider, deadline=deadline)
         result = evaluate(call, model, deadline=deadline)
         if args.thinking and isinstance(result, dict) and result.get("reason") == "passed":

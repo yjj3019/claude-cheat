@@ -502,7 +502,8 @@ def _publish_handoff(path, payload, previous=None, replacing_instance=None):
 
 
 def write_handoff(*, port, nonce, proxy_pid, provider, cli_pid, mode, dual=None, instance_id=None,
-                  instance_dir=None, detached=False, replacing_instance=None, detach_pending=False):
+                  instance_dir=None, detached=False, replacing_instance=None, detach_pending=False,
+                  frontend_owner=None):
     """Record the live route so another terminal can take it over without changing the port.
 
     ``dual`` is the non-secret alternate topology ({provider, alias, model}) an ordinary
@@ -516,6 +517,8 @@ def write_handoff(*, port, nonce, proxy_pid, provider, cli_pid, mode, dual=None,
     # The takeover path keeps serving after the original launcher exits; a start-time
     # snapshot lets it distinguish "pid reused by another process" from "client gone".
     _set_handoff_owner(payload, cli_pid)
+    if frontend_owner is not None:
+        payload["frontend_pid"], payload["frontend_started"] = frontend_owner
     if detached:
         payload["detached"] = True
     if detach_pending:
@@ -818,8 +821,9 @@ def run_owned(args: list, env: dict, cwd: str, prompt: str = "", timeout: int = 
 
 
 @contextlib.contextmanager
-def _prepared_cli(check=False):
-    values = provider_config("cli")
+def _prepared_cli(check=False, values=None):
+    if values is None:
+        values = provider_config("cli")
     with cliBackend.serve(values) as (backend, url, token):
         if check and check_cli_backend(backend) != 0:
             raise LocalStartupError("local_cli_backend_unavailable")
@@ -902,7 +906,7 @@ def _wait_for_detached_proxy(proxy, directory):
 def routed_session(provider: str = "openrouter", local_only: bool = False, local_compat: bool = False,
                    openrouter_compat: bool = False, debug: bool = False, port=None, nonce=None,
                    background: bool = False, _prepared=None, _with_owner=False, _detach_if=None,
-                   _replacing_instance=None, _plan_checked=False):
+                   _replacing_instance=None, _plan_checked=False, _takeover_config=None, _frontend_owner=None):
     options = dict(local_only=local_only, local_compat=local_compat, openrouter_compat=openrouter_compat,
                    debug=debug, port=port, nonce=nonce, background=background)
     if _replacing_instance is not None:
@@ -911,6 +915,10 @@ def routed_session(provider: str = "openrouter", local_only: bool = False, local
         options["_plan_checked"] = True
     if _with_owner:
         options["_with_owner"] = True
+    if _frontend_owner is not None:
+        options["_frontend_owner"] = _frontend_owner
+    if _takeover_config is not None:
+        options["_takeover_config"] = _takeover_config
     if provider != "cli":
         if _detach_if is not None:
             options["_detach_if"] = _detach_if
@@ -1011,7 +1019,7 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
                   openrouter_compat: bool = False, debug: bool = False,
                   port: int | None = None, nonce: str | None = None, _config=None, _backend=None,
                   background: bool = False, _cli_checked=False, _with_owner=False, _replacing_instance=None,
-                  _plan_checked=False, _detach_if=None, _detach_pending=False):
+                  _plan_checked=False, _detach_if=None, _detach_pending=False, _takeover_config=None, _frontend_owner=None):
     """Own one loopback proxy; ordinary sessions alone use the subscription login."""
     if (local_only and provider != "local") or (local_compat and not local_only):
         raise ValueError("Local CLI mode requires the local provider")
@@ -1051,7 +1059,12 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
     # OpenRouter keeps the stable protocol required by R1. Ordinary Local keeps
     # experimental betas so Claude Code can use deferred MCP ToolSearch; native
     # features that cannot be represented still route to Plan.
-    dual = None if isolated or compat else dual_provider_setup(provider)
+    if _takeover_config is None:
+        dual = None if isolated or compat else dual_provider_setup(provider)
+    else:
+        primary_config, dual = _takeover_config
+        if _config is None:  # The prepared CLI backend supplies its own loopback credentials.
+            _config = primary_config
     if openrouter_compat or provider == "openrouter" or (
             dual is not None and dual.get("ROUTE_ALT_PROVIDER") == "openrouter"):
         # User requirement R1 (docs/USER-REQUIREMENTS.ko.md): an ordinary OpenRouter session
@@ -1242,14 +1255,14 @@ def _routed_session(provider: str = "openrouter", local_only: bool = False, loca
                       cli_pid=os.getpid(), dual=dual, mode=mode,
                       instance_id=instance_id if instance_dir else None, instance_dir=instance_dir,
                       detached=_with_owner, replacing_instance=_replacing_instance,
-                      detach_pending=background or _detach_pending)
+                      detach_pending=background or _detach_pending, frontend_owner=_frontend_owner)
         # A --bg native session detaches after the CLI spawns its detached child, so the
         # launcher must not terminate its proxy when the foreground returns. The keeper
         # inherits a duplicated proxy pipe end; once it returns the last end closes and
         # the proxy exits with it (keep_instance_alive).
         if (background or _with_owner) and (instance_dir is None or not read_instance_handoff(instance_dir)):
             raise RuntimeError("Background session could not register its handoff")
-        yield (env, proxy, instance_dir) if _with_owner else env
+        yield (env, proxy, instance_dir) if _with_owner or _frontend_owner is not None else env
         if background and (_detach_if is None or _detach_if()):
             keeper = spawn_instance_keeper(instance_dir, proxy.stdin)
             _adopt_detached_handoff(instance_dir, keeper.pid)
@@ -1399,8 +1412,8 @@ def takeover(provider: str = "auto", debug: bool = False, *, expected_instance=N
     # would drop or change that topology: mid-session 403s on a picker entry are worse
     # than an explicit "restart instead". Credentials are rebuilt from disk either way.
     recorded_dual = record.get("dual")
+    wanted = dual_provider_setup(provider)
     if recorded_dual is not None:
-        wanted = dual_provider_setup(provider)
         topology = (isinstance(recorded_dual, dict) and isinstance(wanted, dict)
                     and wanted.get("ROUTE_ALT_PROVIDER") == recorded_dual.get("provider")
                     and wanted.get("ROUTE_ALT_ALIAS") == recorded_dual.get("alias")
@@ -1419,14 +1432,14 @@ def takeover(provider: str = "auto", debug: bool = False, *, expected_instance=N
     with contextlib.ExitStack() as stack:
         options = {}
         try:
+            config = provider_config(provider)
             if provider == "cli":
-                options["_prepared"] = stack.enter_context(_prepared_cli(check=True))
-            else:
-                provider_config(provider)
+                options["_prepared"] = stack.enter_context(_prepared_cli(check=True, values=config))
         except (OSError, ValueError, LocalStartupError):
             raise RuntimeError("Replacement provider configuration is invalid; existing session was not changed") from None
         _check_plan_login(claude)
         options["_plan_checked"] = True
+        options["_takeover_config"] = (config, wanted)
         return _take_over_port(provider, port, nonce, record, debug, options, expected_instance)
 
 
@@ -1447,6 +1460,14 @@ def _take_over_port(provider, port, nonce, record, debug, options, expected_inst
     if expected_instance is not None and read_handoff() != record:
         raise RuntimeError("Selected session changed during preflight; automatic takeover skipped")
     detached = _detached_handoff(record)
+    # Authentication and backend checks may take time. Compare effective settings
+    # immediately before drain, then start the replacement from that same snapshot.
+    try:
+        current_config = provider_config(provider), dual_provider_setup(provider)
+    except (OSError, ValueError, LocalStartupError):
+        raise RuntimeError("Replacement settings changed during preflight; existing session was not changed") from None
+    if current_config != options["_takeover_config"]:
+        raise RuntimeError("Replacement settings changed during preflight; existing session was not changed")
     try:
         report = (request_handover(port, nonce) if expected_instance is None else
                   request_handover(port, nonce, expected_instance=expected_instance))
@@ -1463,16 +1484,21 @@ def _take_over_port(provider, port, nonce, record, debug, options, expected_inst
         options["_replacing_instance"] = expected_instance
     if detached:
         options["_with_owner"] = True
+    else:
+        # Legacy foreground records identify the frontend by their launcher.
+        if "frontend_pid" in record:
+            client_pid, client_started = record["frontend_pid"], record.get("frontend_started")
+        else:
+            client_pid, client_started = record.get("launcher_pid"), record.get("launcher_started")
+        if type(client_started) not in (int, float):
+            client_started = _process_start_time(client_pid) if isinstance(client_pid, int) else None
+        options["_frontend_owner"] = (client_pid, client_started)
     with routed_session(provider, port=port, nonce=nonce, debug=debug, **options) as active:
         print(json.dumps({"takeover": True, "port": port, "provider": provider,
                           "drained": bool(report.get("drained")),
                           "waited_ms": report.get("waitedMs"),
                           "forced": bool(report.get("forced"))}), flush=True)
         try:
-            # The takeover keeps serving a CLI it did not launch, so it cannot use its own
-            # child-exit signals. Watch the recorded launcher instead: when that pid is gone
-            # (or reused by a different process), the session is over and this tree must
-            # clean up — otherwise the dashboard shows an ended session forever.
             if detached:
                 _, proxy, directory = active
                 # Old keepers can miss the brief port release and authenticate to
@@ -1484,11 +1510,9 @@ def _take_over_port(provider, port, nonce, record, debug, options, expected_inst
                         _clear_owned_handoff(old_dir / "handoff.json", record.get("proxy_pid"), nonce, old_id)
                 _wait_for_detached_proxy(proxy, directory)
                 return 0
-            client_pid = record.get("launcher_pid")
-            client_started = record.get("launcher_started")
-            if type(client_started) not in (int, float):
-                client_started = _process_start_time(client_pid) if isinstance(client_pid, int) else None
-            while True:
+            _, proxy, _ = active
+            # Serve until the original frontend exits or a subsequent takeover drains this proxy.
+            while proxy.poll() is None:
                 time.sleep(1)
                 if not isinstance(client_pid, int):
                     continue
@@ -1501,6 +1525,7 @@ def _take_over_port(provider, port, nonce, record, debug, options, expected_inst
                 if gone:
                     log_route_marker(f"takeover client pid={client_pid} gone; ending the takeover session")
                     return 0
+            return 0
         except KeyboardInterrupt:
             return 0
 

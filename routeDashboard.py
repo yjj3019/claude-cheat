@@ -46,6 +46,7 @@ from urllib.parse import parse_qs, urlsplit
 from pathlib import Path
 
 import routeConfig
+from routeHttp import NoRedirect as _NoRedirect, request_json as _http_json
 import routeVersion
 # Reuse the launcher's Windows process identity: a recorded pid is only a dashboard while
 # its creation time matches. Without the primitive (non-Windows) nothing can be verified,
@@ -1475,13 +1476,6 @@ def usage_snapshot(pricing=None, signature=None, ttl=60):
     data = scan_sessions(pricing=pricing)
     _USAGE_SNAP.update({"signature": signature, "at": now, "data": data})
     return data
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """A provider credential must never follow a redirect to another origin."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
 
 
 def account_state(key, cache=None, now=None):
@@ -3122,18 +3116,6 @@ def provider_endpoint_catalog(model, refresh=False, now=None):
     return result
 
 
-def _http_json(url, headers, body=None, timeout=12):
-    import urllib.error
-    import urllib.request
-
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
-    data = json.dumps(body).encode("utf-8") if body is not None else None
-    request = urllib.request.Request(url, data=data, headers=headers,
-                                     method="POST" if body is not None else "GET")
-    with opener.open(request, timeout=timeout) as response:
-        return response.status, json.loads(response.read(4 * 1024 * 1024 + 1))
-
-
 def _connection_reply_text(data):
     if not isinstance(data, dict) or not isinstance(data.get("content"), list):
         raise ValueError("invalid_response")
@@ -3176,6 +3158,8 @@ def _tool_probe_evidence(provider, values):
 
 def run_tool_roundtrip(provider):
     """Opt-in saved-config backend probe, serialized across the dashboard process."""
+    import modelQualityProbe
+
     base = {"provider": provider, "mode": "tool_roundtrip", "scope": "backend_only", "ok": False}
     if provider not in ("local", "openrouter", "cli"):
         return {**base, "reason": "invalid_provider"}
@@ -3183,11 +3167,10 @@ def run_tool_roundtrip(provider):
         return {**base, "reason": "probe_busy"}
     with _TOOL_EVIDENCE_LOCK:
         _TOOL_EVIDENCE.pop(provider, None)
-    deadline = time.monotonic() + 180
+    deadline = time.monotonic() + modelQualityProbe.PROBE_TIMEOUT_SECONDS
     identity = None
     evidence = {"status": "failed", "model_match": None}
     try:
-        import modelQualityProbe
         from types import SimpleNamespace
         values = dict(read_settings(provider))
         identity = _tool_config_identity(provider, values)
@@ -6472,7 +6455,7 @@ AUTO_UPDATE_LOG = ROOT / ".auto-update.log"
 AUTO_UPDATE_INTERVAL_SECONDS = 60.0
 AUTO_UPDATE_POLL_SECONDS = 5.0
 DASHBOARD_SOURCE_FILES = (Path(__file__).resolve(), ROOT / "browserPresence.js", ROOT / "monitoringPanel.js", ROOT / "startupDiagnostics.py", ROOT / "routeConfig.py", ROOT / "localProcessTree.py",
-                          ROOT / "routeVersion.py", ROOT / "VERSION")
+                          ROOT / "routeHttp.py", ROOT / "modelQualityProbe.py", ROOT / "routeVersion.py", ROOT / "VERSION")
 _AUTO_TAKEOVER_LAST = 0.0
 _AUTO_TAKEOVER_LOCK = threading.Lock()
 
@@ -6582,10 +6565,6 @@ def _auto_reload_loop(initial):
 
 
 def serve(host="127.0.0.1", port=DEFAULT_PORT, refresh=3, allow_fallback=False, open_page=None, no_takeover=False):
-    threading.Thread(target=_refresh_loop, args=(max(1, refresh),), daemon=True).start()
-    threading.Thread(target=_auto_reload_loop, args=(source_fingerprint(),), daemon=True).start()
-    threading.Thread(target=_auto_takeover_loop, daemon=True).start()
-    threading.Thread(target=_usage_refresh_loop, daemon=True).start()
     # A previous dashboard keeps its port between restarts; take it over instead of moving.
     if not no_takeover:
         _stop_previous(port)
@@ -6600,6 +6579,10 @@ def serve(host="127.0.0.1", port=DEFAULT_PORT, refresh=3, allow_fallback=False, 
         server = DashboardServer((host, 0), Handler)
         fallback = "requested_port_unavailable"
     _write_pid_record(server.server_address[1])
+    threading.Thread(target=_refresh_loop, args=(max(1, refresh),), daemon=True).start()
+    threading.Thread(target=_auto_reload_loop, args=(source_fingerprint(),), daemon=True).start()
+    threading.Thread(target=_auto_takeover_loop, daemon=True).start()
+    threading.Thread(target=_usage_refresh_loop, daemon=True).start()
     url = f"http://{_display_host(host)}:{server.server_address[1]}/"
     from urllib.parse import quote
     write_url = f"{url}#token={quote(TOKEN, safe='')}"

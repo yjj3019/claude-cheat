@@ -5,6 +5,7 @@ Covers the three defects that let a restart fail quietly: the client timeout dri
 from the server cap, a 409 revert surfacing as a bare HTTP error, and a takeover
 starting a replacement proxy while the previous one is still serving.
 """
+import contextlib
 import json
 import os
 import shutil
@@ -166,6 +167,7 @@ class TakeoverGuardTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(mock.patch.object(advisor.shutil, "which", return_value="fixture"))
         self.enterContext(mock.patch.object(advisor, "provider_config", return_value={}))
+        self.enterContext(mock.patch.object(advisor, "dual_provider_setup", return_value=None))
         self.auth = self.enterContext(mock.patch.object(advisor, "run_owned", return_value={
             "loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "pro"}))
 
@@ -273,6 +275,26 @@ class TakeoverGuardTests(unittest.TestCase):
                 self.assertNotIn("private", str(caught.exception))
                 handover.assert_not_called()
 
+    def test_config_change_during_login_never_drains(self):
+        record = {"port": 48432, "nonce": "fixture", "mode": "ordinary"}
+        for original, current, dual in (({}, {"model": "changed"}, [None, None]),
+                                        ({}, ValueError("cleared"), [None]),
+                                        ({}, {}, [None, {"ROUTE_ALT_MODEL": "added"}])):
+            with (self.subTest(current=type(current).__name__, dual=len(dual)),
+                  mock.patch.object(advisor, "read_handoff", return_value=record),
+                  mock.patch.object(advisor, "port_open", return_value=True),
+                  mock.patch.object(advisor, "provider_config", side_effect=[original, current]),
+                  mock.patch.object(advisor, "dual_provider_setup", side_effect=dual),
+                  mock.patch.object(advisor, "request_handover") as drain):
+                with self.assertRaisesRegex(RuntimeError, "settings changed"):
+                    advisor.takeover("local")
+                drain.assert_not_called()
+
+    def foreground_session(self):
+        proxy = mock.Mock()
+        proxy.poll.return_value = None
+        return mock.Mock(side_effect=lambda *a, **k: contextlib.nullcontext(({}, proxy, None)))
+
     def _with_running_session(self):
         record = {"port": 48432, "nonce": "nonce", "mode": "ordinary"}
         patches = [mock.patch.object(advisor, "read_handoff", return_value=record),
@@ -283,7 +305,7 @@ class TakeoverGuardTests(unittest.TestCase):
         self.enterContext(mock.patch.object(advisor, "port_open", return_value=True))
         self.enterContext(mock.patch.object(advisor, "request_handover", return_value={"drained": True}))
         self.enterContext(mock.patch.object(advisor, "wait_for_port_release", return_value=True))
-        self.enterContext(mock.patch.object(advisor, "routed_session"))
+        self.enterContext(mock.patch.object(advisor, "routed_session", self.foreground_session()))
         self.enterContext(mock.patch.object(advisor, "log_route_marker"))
         clock = mock.Mock(wraps=advisor.time)
         clock.sleep.side_effect = tick
@@ -384,7 +406,7 @@ class TakeoverGuardTests(unittest.TestCase):
                    mock.patch.object(advisor, "wait_for_port_release", return_value=True),
                    mock.patch.object(advisor, "_process_start_time", side_effect=[123.0, None]),
                    mock.patch.object(advisor.localProcessTree, "process_alive", return_value=False),
-                   mock.patch.object(advisor, "routed_session", mock.MagicMock()),
+                   mock.patch.object(advisor, "routed_session", self.foreground_session()),
                    mock.patch.object(advisor.time, "sleep", fake_sleep)]
         for patch in patches:
             self.enterContext(patch)
@@ -453,7 +475,7 @@ class TakeoverGuardTests(unittest.TestCase):
         handover.return_value = {"drained": True, "waitedMs": 1}
         self.enterContext(mock.patch.object(advisor, "wait_for_port_release", return_value=True))
         marker = self.enterContext(mock.patch.object(advisor, "log_route_marker"))
-        self.enterContext(mock.patch.object(advisor, "routed_session"))
+        self.enterContext(mock.patch.object(advisor, "routed_session", self.foreground_session()))
         self.enterContext(mock.patch.object(advisor.time, "sleep", side_effect=KeyboardInterrupt))
         self.assertEqual(advisor.takeover("openrouter"), 0)
         handover.assert_called_once()

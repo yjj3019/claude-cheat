@@ -3,7 +3,10 @@ import contextlib
 import io
 import json
 import sys
+import threading
+import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
 import cliBackend
@@ -208,7 +211,8 @@ class ModelQualityProbeTest(unittest.TestCase):
                 now = [0]
                 timeouts = []
 
-                def respond(url, headers, body, timeout):
+                def respond(url, headers, body, timeout, deadline):
+                    self.assertEqual(deadline, 10)
                     timeouts.append(timeout)
                     if len(timeouts) == 1:
                         now[0] = 9
@@ -253,6 +257,58 @@ class ModelQualityProbeTest(unittest.TestCase):
                         self.assertEqual(dashboard._TOOL_EVIDENCE["local"]["status"], "failed")
                 self.assertIs(result["ok"], False)
                 self.assertEqual(result["reason"], "probe_timeout")
+
+    def test_trickling_http_response_is_closed_and_dashboard_slot_is_reusable(self):
+        received = threading.Event()
+        disconnected = threading.Event()
+        stop = threading.Event()
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                self.send_response(200)
+                self.end_headers()
+                if not received.is_set():
+                    received.set()
+                    try:
+                        # A socket inactivity timeout never fires on these bytes.
+                        for _ in range(400):
+                            self.wfile.write(b" ")
+                            self.wfile.flush()
+                            if stop.wait(.05):
+                                break
+                    except OSError:
+                        disconnected.set()
+                    return
+                if "thinking" in body:
+                    msg = {"content": [{"type": "text", "text": "probe"}], "stop_reason": "end_turn"}
+                elif body["tool_choice"]["type"] == "tool":
+                    msg = tool_call()
+                else:
+                    value = body["messages"][-1]["content"][0]["content"]
+                    msg = {"content": [{"type": "text", "text": value}], "stop_reason": "end_turn"}
+                self.wfile.write(json.dumps({**msg, "model": "fixture"}).encode())
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            values = {"LOCAL_LLM_MODEL": "fixture", "LOCAL_LLM_URL": f"http://127.0.0.1:{server.server_port}/v1/messages"}
+            try:
+                with patch.object(dashboard, "read_settings", return_value=values), patch.dict(dashboard._TOOL_EVIDENCE):
+                    with patch.object(probe, "PROBE_TIMEOUT_SECONDS", 6):
+                        started = time.monotonic()
+                        self.assertEqual(dashboard.run_tool_roundtrip("local")["reason"], "probe_timeout")
+                        self.assertLess(time.monotonic() - started, 8)
+                    self.assertTrue(received.is_set(), "worker did not reach the loopback server")
+                    self.assertTrue(disconnected.wait(3), "timed-out HTTP connection stayed open")
+                    self.assertEqual(dashboard.run_tool_roundtrip("local")["reason"], "passed")
+            finally:
+                stop.set()
+                server.shutdown()
+                worker.join()
 
     def test_cli_uses_backend_directly_without_global_factory_patch(self):
         class FakeBackend:

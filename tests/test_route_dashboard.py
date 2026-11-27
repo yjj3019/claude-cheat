@@ -1481,11 +1481,33 @@ class PortTests(unittest.TestCase):
         holder.listen(1)
         port = holder.getsockname()[1]
         try:
-            with mock.patch.object(dash.threading, "Thread"):
+            with mock.patch.object(dash.threading, "Thread") as worker:
                 with self.assertRaises(SystemExit):
                     dash.serve(port=port)
+                worker.assert_not_called()
         finally:
             holder.close()
+
+    def test_fallback_starts_each_worker_after_its_port_is_registered(self):
+        import socket
+
+        ports = []
+        with socket.socket() as holder:
+            holder.bind(("127.0.0.1", 0))
+            holder.listen(1)
+            occupied = holder.getsockname()[1]
+            def thread(**kwargs):
+                ports.append(dash._read_pid_record()["port"])
+                return mock.Mock()
+            with (mock.patch.object(dash.threading, "Thread", side_effect=thread) as workers,
+                  mock.patch.object(dash.DashboardServer, "serve_forever"),
+                  contextlib.redirect_stdout(io.StringIO())):
+                dash.serve(port=occupied, no_takeover=True, allow_fallback=True)
+            self.assertCountEqual([args.kwargs["target"] for args in workers.call_args_list],
+                                  [dash._refresh_loop, dash._auto_reload_loop, dash._auto_takeover_loop,
+                                   dash._usage_refresh_loop])
+            self.assertEqual(len(set(ports)), 1)
+            self.assertNotEqual(ports[0], occupied)
 
     def test_previous_instance_is_only_stopped_for_its_own_port(self):
         self.pid_file.write_text(json.dumps({"pid": os.getpid(), "port": 1}), encoding="utf-8")

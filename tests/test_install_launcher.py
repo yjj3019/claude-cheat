@@ -84,7 +84,8 @@ class InstallLauncherTests(unittest.TestCase):
         # the arguments travel through the forwarder without starting a session.
         result = self.run_forwarder("OpenClaude.cmd", "-Provider", "Nope")
         self.assertNotEqual(result.returncode, 0)
-        combined = result.stdout + result.stderr
+        # PowerShell can wrap even the parameter name when the checkout path is long.
+        combined = (result.stdout + result.stderr).replace("\n", "")
         self.assertIn("Provider", combined)
         self.assertIn("ValidateSet", combined)
 
