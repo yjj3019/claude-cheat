@@ -24,12 +24,25 @@ advisor.ROOT = Path(__file__).resolve().parent
 advisor.HANDOFF_FILE = advisor.ROOT / "handoff.json"
 which = shutil.which
 advisor.shutil.which = lambda name: "fixture" if name == "claude" else which(name)
-advisor.provider_config = lambda *args, **kwargs: {
-    "SONNET_PROVIDER": "openrouter", "OPENROUTER_API_KEY": "fixture", "OPENROUTER_MODEL": "fixture/model"}
 advisor.dual_provider_setup = lambda *args: None
 advisor.check_connection = lambda *args, **kwargs: 0
-advisor.run_owned = lambda *args, **kwargs: {
-    "loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "pro"}
+
+def login(*args, **kwargs):
+    if (advisor.ROOT / "reset-during-login").exists():
+        advisor.routeConfig.Store(advisor.ROOT / advisor.routeConfig.CONFIG_NAME).reset_provider("openrouter", "credential")
+    return {"loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "pro"}
+
+advisor.run_owned = login
+wait_for_release = advisor.wait_for_port_release
+
+def release(port):
+    released = wait_for_release(port)
+    if released and (advisor.ROOT / "edit-after-drain").exists():
+        # Simulate a concurrent save after the old proxy is already gone.
+        (advisor.ROOT / advisor.routeConfig.CONFIG_NAME).write_text("openrouter:", encoding="utf-8")
+    return released
+
+advisor.wait_for_port_release = release
 if "--takeover" in sys.argv:
     sys.exit(advisor.main(sys.argv[1:]))
 with advisor.routed_session("openrouter"):
@@ -46,6 +59,9 @@ class HandoverTests(unittest.TestCase):
             shutil.copyfile(ROOT / filename, root / filename)
         wrapper = root / "launch.py"
         wrapper.write_text(WRAPPER, encoding="utf-8")
+        config = root / "openclaude.config.yaml"
+        settings = 'openrouter:\n  model: "fixture/model"\n  api_key: "sk-or-fixture"\n'
+        config.write_text(settings, encoding="utf-8")
         env = {key: value for key, value in os.environ.items()
                if key.upper() in {"PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "TEMP", "TMP",
                                   "USERPROFILE", "APPDATA", "LOCALAPPDATA", "COMSPEC"}}
@@ -86,15 +102,38 @@ class HandoverTests(unittest.TestCase):
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with opener.open(request, timeout=5) as response:
             self.assertEqual(response.status, 200)
+        marker = root / "reset-during-login"
+        marker.touch()
+        refused = start("--takeover", "--provider", "openrouter")
+        self.assertNotEqual(refused.wait(timeout=15), 0)
+        self.assertEqual(json.loads(handoff.read_text(encoding="utf-8")), initial)
+        with opener.open(request, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+        marker.unlink()
+        config.write_text(settings, encoding="utf-8")
+        edit = root / "edit-after-drain"
+        edit.touch()
         replacement = start("--takeover", "--provider", "openrouter")
         latest = await_record(replacement)
+        self.assertEqual(config.read_text(encoding="utf-8"), "openrouter:")
+        edit.unlink()
+        config.write_text(settings, encoding="utf-8")
         self.assertEqual(latest["port"], initial["port"])
         self.assertNotEqual(latest["proxy_pid"], initial["proxy_pid"])
         with opener.open(request, timeout=5) as response:
             self.assertEqual(response.status, 200)
+        # A second takeover must retire the intermediate owner while continuing
+        # to serve the original frontend on the same authenticated endpoint.
+        successor = start("--takeover", "--provider", "openrouter")
+        final = await_record(successor)
+        self.assertEqual(final["frontend_pid"], first.pid)
+        self.assertEqual(final["frontend_started"], initial.get("launcher_started"))
+        self.assertEqual(replacement.wait(timeout=15), 0)
+        with opener.open(request, timeout=5) as response:
+            self.assertEqual(response.status, 200)
         first.stdin.close()
         self.assertEqual(first.wait(timeout=15), 0)
-        self.assertEqual(replacement.wait(timeout=15), 0)
+        self.assertEqual(successor.wait(timeout=15), 0)
         self.assertFalse(handoff.exists())
 
 

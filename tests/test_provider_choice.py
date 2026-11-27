@@ -151,7 +151,9 @@ class ProviderChoiceTests(unittest.TestCase):
         self.set_default("openrouter")
         record = {"port": 48432, "nonce": "nonce", "provider": "local", "proxy_pid": 1, "mode": "ordinary"}
         session = mock.MagicMock()
-        session.__enter__ = mock.Mock(return_value={})
+        proxy = mock.Mock()
+        proxy.poll.return_value = None
+        session.__enter__ = mock.Mock(return_value=({}, proxy, None))
         session.__exit__ = mock.Mock(return_value=False)
         with mock.patch.object(route, "read_handoff", return_value=record), \
              mock.patch.object(route, "port_open", return_value=True), \

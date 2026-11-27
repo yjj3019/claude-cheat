@@ -59,7 +59,7 @@ class LauncherEnvironmentTests(unittest.TestCase):
             "function global:python { if ($args[0] -like '*launcherStartup.py') { $global:LASTEXITCODE = 0; return }; $global:LASTEXITCODE = 7 }; "
             f"& '{LAUNCHER}'; exit $LASTEXITCODE")
         self.assertEqual(result.returncode, 7, result.stderr[-400:])
-        self.assertIn("exited with code 7", result.stderr)
+        self.assertIn("exited with code 7", result.stderr.replace("\n", ""))
 
     def test_help_shows_examples_without_starting_a_session(self):
         result = self.run_script(f"& '{LAUNCHER}' -Help")
