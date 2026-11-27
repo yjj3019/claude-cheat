@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -186,34 +187,52 @@ class InstallLauncherTests(unittest.TestCase):
         foreign = self.target / "OpenClaude.cmd"
         self.assertFalse(foreign.exists())
 
-    def test_remove_strips_only_the_exact_user_path_entry_the_installer_added(self):
-        if os.name != "nt":
-            self.skipTest("user PATH is Windows-only")
-        probe = [POWERSHELL, "-NoProfile", "-Command",
-                 "[Environment]::GetEnvironmentVariable('Path','User')"]
-        read_path = lambda: subprocess.run(probe, capture_output=True, text=True, timeout=60,
-                                           encoding="utf-8", errors="replace").stdout
-        bare = read_path()
-        entries = [entry for entry in bare.split(";") if entry]
-        if str(self.target) in entries or str(self.target).replace("/", "\\") in entries:
-            self.skipTest("target already on user PATH")
-        try:
-            # Add the exact entry the installer's Add-UserPathEntry writes, then -Remove.
-            add = [POWERSHELL, "-NoProfile", "-Command",
-                   "[Environment]::SetEnvironmentVariable('Path', ([Environment]::GetEnvironmentVariable('Path','User').TrimEnd(';') + ';' + '" + str(self.target) + "'), 'User')"]
-            added = subprocess.run(add, capture_output=True, text=True, timeout=60,
-                                   encoding="utf-8", errors="replace")
-            self.assertEqual(added.returncode, 0, added.stderr)
-            self.assertEqual(self.run_installer().returncode, 0)
-            removed = self.run_installer("-Remove")
-            self.assertEqual(removed.returncode, 0, removed.stderr[-600:])
-            after = [entry for entry in read_path().split(";") if entry]
-            self.assertNotIn(str(self.target), after)
-            self.assertEqual(after, entries, "only the installer's own entry may be removed")
-        finally:
-            restore = [POWERSHELL, "-NoProfile", "-Command",
-                       "[Environment]::SetEnvironmentVariable('Path', '" + bare + "', 'User')"]
-            subprocess.run(restore, capture_output=True, timeout=60)
+    def test_remove_preserves_existing_path_and_removes_only_owned_entry(self):
+        # Run the real script in a child PowerShell with a process-local stand-in for
+        # the user PATH. No part of this test reads or writes the user's registry.
+        checkout = self.target.parent / "checkout"
+        checkout.mkdir()
+        script = checkout / "installLauncher.ps1"
+        source = (ROOT / script.name).read_text(encoding="utf-8-sig")
+        source = source.replace("(Join-Path $HOME '.local\\bin')", "(Join-Path $PSScriptRoot 'bin')")
+        source = source.replace("GetEnvironmentVariable('Path', 'User')",
+                                "GetEnvironmentVariable('OPENCLAUDE_TEST_USERPATH', 'Process')")
+        source = source.replace("SetEnvironmentVariable('Path',", "SetEnvironmentVariable('OPENCLAUDE_TEST_USERPATH',")
+        script.write_text(source.replace("'User')", "'Process')"), encoding="utf-8-sig")
+        for name in set(FORWARDERS.values()) - {script.name}:
+            (checkout / name).touch()
+        program = r"""
+$ErrorActionPreference = 'Stop'
+$bin = Join-Path $PWD 'bin'
+$initial = 'C:\fixture-one;;C:\fixture-two'
+$env:PATH = $initial
+$env:OPENCLAUDE_TEST_USERPATH = "$initial;$bin"
+& .\installLauncher.ps1
+& .\installLauncher.ps1 -Remove
+if ($env:OPENCLAUDE_TEST_USERPATH -cne "$initial;$bin") { throw 'lost pre-existing entry' }
+$custom = Join-Path $PWD 'custom-bin'
+$env:OPENCLAUDE_TEST_USERPATH = "$initial;$custom"
+& .\installLauncher.ps1 -Target $custom
+& .\installLauncher.ps1 -Target $custom -Remove
+if ($env:OPENCLAUDE_TEST_USERPATH -cne "$initial;$custom") { throw 'lost custom directory' }
+$env:OPENCLAUDE_TEST_USERPATH = $initial
+& .\installLauncher.ps1 -NoPath
+& .\installLauncher.ps1 -Remove
+if ($env:OPENCLAUDE_TEST_USERPATH -cne $initial) { throw 'NoPath changed PATH' }
+$env:PATH = $initial
+& .\installLauncher.ps1
+if ($env:OPENCLAUDE_TEST_USERPATH -cne "$initial;$bin") { throw 'entry not registered' }
+& .\installLauncher.ps1
+& .\installLauncher.ps1 -Remove
+if ($env:OPENCLAUDE_TEST_USERPATH -cne $initial) { throw 'owned entry or unrelated entries incorrect' }
+& .\installLauncher.ps1
+if ($env:OPENCLAUDE_TEST_USERPATH -cne "$initial;$bin") { throw 'stale process PATH blocked reinstallation' }
+& .\installLauncher.ps1 -Remove
+if ($env:OPENCLAUDE_TEST_USERPATH -cne $initial) { throw 'reinstalled entry not removed' }
+"""
+        run = subprocess.run([POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", program],
+                             cwd=checkout, capture_output=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr.decode(errors="replace"))
 
     def test_resolve_directory_keeps_a_drive_root_separator(self):
         # "C:\\" must stay "C:\\": TrimEnd would degrade it to the drive-relative "C:".
@@ -239,6 +258,87 @@ class InstallLauncherTests(unittest.TestCase):
         first = (self.target / "OpenClaude.cmd").read_bytes()
         self.assertEqual(self.run_installer().returncode, 0)
         self.assertEqual((self.target / "OpenClaude.cmd").read_bytes(), first)
+
+    def test_unrepresentable_checkout_fails_before_modifying_forwarders(self):
+        checkout = self.target.parent / "checkout-🔬"
+        checkout.mkdir()
+        script = checkout / "installLauncher.ps1"
+        # Force a Windows OEM encoding that cannot represent this character, including
+        # on hosts whose configured OEM code page happens to be UTF-8.
+        source = (ROOT / script.name).read_text(encoding="utf-8-sig").replace(
+            "[System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage", "437")
+        script.write_text(source, encoding="utf-8-sig")
+        result = subprocess.run([POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                                 str(script), "-Target", str(self.target), "-NoPath"], capture_output=True, timeout=30)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"OEM code page 437", result.stderr)
+        self.assertFalse(self.target.exists())
+
+    def test_concurrent_install_and_remove_share_one_transaction(self):
+        checkout = self.target.parent / "checkout"
+        checkout.mkdir()
+        script = checkout / "installLauncher.ps1"
+        source = (ROOT / script.name).read_text(encoding="utf-8-sig")
+        source = source.replace("(Join-Path $HOME '.local\\bin')", "(Join-Path $PSScriptRoot 'bin')")
+        source = source.replace("[Environment]::GetEnvironmentVariable('Path', 'User')",
+                                "[IO.File]::ReadAllText($env:FIXTURE_USER_PATH)")
+        for value in ("$updated", "$rawPath", "($entries -join ';')"):
+            source = source.replace(f"[Environment]::SetEnvironmentVariable('Path', {value}, 'User')",
+                                    f"[IO.File]::WriteAllText($env:FIXTURE_USER_PATH, {value})")
+        self.assertNotIn("EnvironmentVariable('Path'", source)
+        source = source.replace("$mutex = ", "[IO.File]::WriteAllText($env:FIXTURE_READY, '')\n$mutex = ")
+        source = source.replace("    Invoke-LauncherUpdate", """
+    [IO.File]::WriteAllText($env:FIXTURE_ENTERED, '')
+    if ($env:FIXTURE_GATE) {
+        while (-not [IO.File]::Exists($env:FIXTURE_GATE)) { Start-Sleep -Milliseconds 25 }
+    }
+    Invoke-LauncherUpdate""")
+        script.write_text(source, encoding="utf-8-sig")
+        for name in set(FORWARDERS.values()) - {script.name}:
+            (checkout / name).touch()
+        user_path = checkout / "user-path"
+        initial = r"C:\fixture"
+        user_path.write_text(initial, encoding="utf-8")
+        target = checkout / "bin"
+
+        def wait_for(path):
+            deadline = time.monotonic() + 25
+            while not path.exists() and time.monotonic() < deadline:
+                time.sleep(.025)
+            self.assertTrue(path.exists(), path.name)
+
+        for run, arguments in enumerate(([], ["-Remove"])):
+            with self.subTest(arguments=arguments):
+                gate = checkout / f"release-{run}"
+                processes = []
+                try:
+                    for index, extra in enumerate(([], arguments)):
+                        ready = checkout / f"ready-{run}-{index}"
+                        entered = checkout / f"entered-{run}-{index}"
+                        env = {**os.environ, "FIXTURE_USER_PATH": str(user_path), "FIXTURE_READY": str(ready),
+                               "FIXTURE_ENTERED": str(entered), "FIXTURE_GATE": "" if index else str(gate)}
+                        child = subprocess.Popen([POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                                                  "-File", str(script), *extra], env=env, stdout=subprocess.DEVNULL,
+                                                 stderr=subprocess.PIPE)
+                        processes.append(child)
+                        wait_for(ready if index else entered)
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        child.wait(timeout=.5)
+                    self.assertFalse(entered.exists(), "second installer entered the transaction concurrently")
+                    gate.touch()
+                    for child in processes:
+                        _, error = child.communicate(timeout=25)
+                        self.assertEqual(child.returncode, 0, error.decode(errors="replace"))
+                finally:
+                    gate.touch(exist_ok=True)
+                    for child in processes:
+                        if child.poll() is None:
+                            child.kill()
+                            child.communicate()
+                self.assertEqual(user_path.read_text(encoding="utf-8"), initial if arguments else initial + ";" + str(target))
+                self.assertEqual((target / ".openclaude-user-path").exists(), not arguments)
+                for name in FORWARDERS:
+                    self.assertEqual((target / name).exists(), not arguments, name)
 
 
 if __name__ == "__main__":

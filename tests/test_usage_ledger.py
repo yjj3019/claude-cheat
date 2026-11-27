@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sqlite3
 import tempfile
+import threading
 import unittest
 import uuid
 from unittest.mock import patch
@@ -20,6 +21,7 @@ class UsageLedgerTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.ledger = UsageLedger(self.root)
+        self.addCleanup(self.ledger.close_scan)
         self.session = str(uuid.uuid4())
         self.now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
 
@@ -33,6 +35,62 @@ class UsageLedgerTests(unittest.TestCase):
         path = self.root / ".usage-stats" / "instances" / self.session / "events.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
+
+    def test_retention_waits_for_a_durable_cursor_before_removing_old_sources(self):
+        import routeDashboard as dash
+        old = self.now - dt.timedelta(days=31)
+        root = self.ledger.directory / "instances"
+        for i in range(1, 34):
+            key = str(uuid.UUID(int=i))
+            folder = root / key
+            folder.mkdir(parents=True)
+            source = folder / "events.jsonl"
+            source.write_text(json.dumps(self.event(instance_id=key, timestamp=old.isoformat())) + "\n")
+            for path in (source, folder):
+                os.utime(path, (old.timestamp(), old.timestamp()))
+        with patch.object(dash, "ROOT", self.root):
+            dash._sweep_orphan_instances()
+            self.assertEqual(len(list(root.iterdir())), 33)
+            self.assertEqual(self.ledger.collect()["events_inserted"], 32)
+            dash._sweep_orphan_instances()
+            self.assertEqual(len(list(root.iterdir())), 1)
+            self.assertEqual(self.ledger.collect()["events_inserted"], 1)
+            dash._sweep_orphan_instances()
+            self.assertEqual(list(root.iterdir()), [])
+        rows = self.ledger.report("month", self.now)["rows"]
+        self.assertEqual(sum(row["requests"] for row in rows), 33)
+
+    def test_retention_preserves_partial_replaced_and_unreadable_sources(self):
+        source = self.log_path()
+        data = (json.dumps(self.event()) + "\n").encode()
+        source.write_bytes(data + b"{")
+        self.ledger.collect()
+        cutoff = self.now.timestamp() + 3600
+        self.assertFalse(self.ledger.source_ready_for_cleanup(source.parent, cutoff))
+        replacement = source.with_suffix(".new")
+        replacement.write_bytes(data)
+        os.replace(replacement, source)
+        self.assertFalse(self.ledger.source_ready_for_cleanup(source.parent, cutoff))
+        import routeDashboard as dash
+        old = self.now.timestamp() - 31 * 86400
+        for path in (source, source.parent):
+            os.utime(path, (old, old))
+        with patch.object(dash, "ROOT", self.root), patch.object(UsageLedger, "_connect", side_effect=LedgerError("storage_unavailable")):
+            dash._sweep_orphan_instances()
+        self.assertTrue(source.exists())
+
+    def test_retention_rechecks_a_source_that_grows_during_cursor_lookup(self):
+        source = self.log_path()
+        source.write_text(json.dumps(self.event()) + "\n")
+        self.ledger.collect()
+        connect = self.ledger._connect
+        def late_append(**kwargs):
+            with source.open("a") as stream:
+                stream.write(json.dumps(self.event(2)) + "\n")
+            return connect(**kwargs)
+        with patch.object(self.ledger, "_connect", side_effect=late_append):
+            self.assertFalse(self.ledger.source_ready_for_cleanup(source.parent, self.now.timestamp() + 3600))
+        self.assertEqual(self.ledger.collect()["events_inserted"], 1)
 
     def test_storage_uses_wal_journal_for_concurrent_readers_perf(self):
         # ingest() opens the store for writing only when rows exist; that creation must enable
@@ -173,6 +231,88 @@ class UsageLedgerTests(unittest.TestCase):
         self.assertEqual(report["coverage"], "partial")
         self.assertIn("source_changed", report["collection_issues"])
 
+    def test_long_line_recovers_after_restart_and_eof_without_removing_source(self):
+        import usage_ledger
+        path = self.log_path()
+        chunk = usage_ledger.MAX_FILE_CHUNK
+        path.write_bytes(b"x" * (2 * chunk + 7))
+        for _ in range(3):
+            result = UsageLedger(self.root).collect()
+            self.assertTrue(result["pending"])
+        self.assertEqual(self.ledger.report("day", self.now)["invalid_lines"], 1)
+        self.assertFalse(self.ledger.source_ready_for_cleanup(path.parent, self.now.timestamp() + 60))
+        with path.open("ab") as stream:
+            stream.write(b"\n" + json.dumps(self.event()).encode() + b"\n")
+        result = UsageLedger(self.root).collect()
+        self.assertFalse(result["pending"])
+        self.assertEqual(result["events_inserted"], 1)
+        report = self.ledger.report("day", self.now)
+        self.assertIn("line_too_long", report["collection_issues"])
+        self.assertEqual(report["invalid_lines"], 1)
+        self.assertFalse(self.ledger.source_ready_for_cleanup(path.parent, self.now.timestamp() + 60))
+
+    def test_conflicts_do_not_hide_following_rows_or_overwrite_original(self):
+        path = self.log_path()
+        self.ledger.ingest(self.session, [self.event()])
+        events = [self.event(input_tokens=20), self.event(2), self.event(2, output_tokens=99), self.event(2)]
+        path.write_text("".join(json.dumps(row) + "\n" for row in events))
+        result = self.ledger.collect()
+        self.assertEqual((result["events_inserted"], result["duplicates"], result["invalid_lines"]), (1, 1, 2))
+        self.assertIn("event_conflict", result["errors"])
+        self.assertEqual(self.ledger.collect()["invalid_lines"], 0)
+        report = self.ledger.report("day", self.now)
+        self.assertEqual(report["invalid_lines"], 2)
+        self.assertEqual((report["rows"][0]["input_tokens"], report["rows"][0]["output_tokens"]), (18, 4))
+        self.assertFalse(self.ledger.source_ready_for_cleanup(path.parent, self.now.timestamp() + 60))
+
+    def test_concurrent_collector_cannot_rewind_or_count_invalid_line_twice(self):
+        import usage_ledger
+        from concurrent.futures import ThreadPoolExecutor
+        path = self.log_path()
+        path.write_text(json.dumps(self.event()) + "\n")
+        self.ledger.collect()
+        with path.open("a") as stream:
+            stream.write("invalid\n" + json.dumps(self.event(2)) + "\n")
+        parsed, resume = threading.Event(), threading.Event()
+        parse = usage_ledger._event
+
+        def pause_worker(*args):
+            if threading.current_thread() is not threading.main_thread():
+                parsed.set()
+                if not resume.wait(5):
+                    raise RuntimeError("collector did not resume")
+            return parse(*args)
+
+        with patch.object(usage_ledger, "_event", pause_worker), ThreadPoolExecutor(1) as pool:
+            delayed = pool.submit(UsageLedger(self.root).collect)
+            try:
+                self.assertTrue(parsed.wait(5))
+                with path.open("a") as stream:
+                    stream.write(json.dumps(self.event(3)) + "\n")
+                self.assertEqual(self.ledger.collect()["events_inserted"], 2)
+            finally:
+                resume.set()
+            self.assertEqual(delayed.result()["invalid_lines"], 0)
+        with contextlib.closing(sqlite3.connect(self.ledger.path)) as db:
+            self.assertEqual(db.execute("SELECT offset,invalid_lines FROM cursors").fetchone(), (path.stat().st_size, 1))
+        self.assertEqual(self.ledger.collect()["duplicates"], 0)
+
+    def test_fresh_store_can_be_initialized_by_two_collectors(self):
+        from concurrent.futures import ThreadPoolExecutor
+        self.log_path().write_text("bad\n" + json.dumps(self.event()) + "\n")
+        gate = threading.Barrier(2)
+
+        def collect():
+            ledger = UsageLedger(self.root)
+            gate.wait(timeout=5)
+            return ledger.collect()
+
+        with ThreadPoolExecutor(2) as pool:
+            results = [future.result() for future in [pool.submit(collect), pool.submit(collect)]]
+        self.assertEqual(sum(row["events_inserted"] for row in results), 1)
+        self.assertEqual(sum(row["invalid_lines"] for row in results), 1)
+        self.assertEqual(self.ledger.report("day", self.now)["invalid_lines"], 1)
+
     def test_cursor_and_events_roll_back_together_on_failed_insert(self):
         path = self.log_path()
         path.write_text(json.dumps(self.event()) + "\n", encoding="utf-8")
@@ -213,6 +353,66 @@ class UsageLedgerTests(unittest.TestCase):
         self.assertEqual(sum(row["requests"] for row in rows), 2)
         self.assertNotEqual(rows[0]["instance_id"], rows[1]["instance_id"])
 
+    def test_discovery_resumes_after_scan_file_and_processing_limits_on_restart(self):
+        root = self.root / ".usage-stats" / "instances"
+        names = set()
+        for i in range(11):
+            name = str(uuid.uuid4())
+            names.add(uuid.UUID(name).hex)
+            folder = root / name
+            folder.mkdir(parents=True)
+            (folder / "events.jsonl").write_text(json.dumps(self.event(instance_id=name)) + "\n")
+            (root / f"unrelated-{i}").mkdir()
+        with patch("usage_ledger.MAX_DISCOVERY", 3), patch("usage_ledger.MAX_SCAN_ENTRIES", 5), \
+                patch("usage_ledger.MAX_COLLECT_FILES", 2):
+            for _ in range(30):
+                UsageLedger(self.root).collect()
+        rows = self.ledger.report("day", self.now)["rows"]
+        self.assertEqual({row["instance_id"] for row in rows}, names)
+        self.assertEqual(sum(row["requests"] for row in rows), len(names))
+
+    def test_physical_scan_budget_covers_replay_and_repeated_sweeps(self):
+        path = self.log_path()
+        path.write_text(json.dumps(self.event()) + "\n")
+        for i in range(20):
+            (path.parent.parent / f"unused-{i}").mkdir()
+        self.ledger.ingest(self.session, [self.event(2)])
+        with contextlib.closing(sqlite3.connect(self.ledger.path)) as db, db:
+            db.execute("INSERT INTO collector_state VALUES ('discovery_offset','15')")
+        real_scan = os.scandir
+        counts = []
+
+        def counting_scan(folder):
+            with real_scan(folder) as entries:
+                for entry in entries:
+                    counts[-1] += 1
+                    yield entry
+
+        with patch("usage_ledger.os.scandir", counting_scan), patch("usage_ledger.MAX_SCAN_ENTRIES", 3):
+            for index in range(40):
+                counts.append(0)
+                self.ledger.collect()
+                if index == 9:
+                    self.ledger.close_scan()  # Cold process restart with a persisted scan hint.
+                if index == 20:
+                    with path.open("a") as stream:
+                        stream.write(json.dumps(self.event(3)) + "\n")
+        self.assertEqual(max(counts), 3)
+        report = self.ledger.report("day", self.now)
+        self.assertEqual(report["rows"][0]["requests"], 3)
+
+    def test_truncated_report_keeps_cache_totals_with_their_own_group(self):
+        events = [self.event(i, schema_version=3, requested_model=f"req-{101-i:03d}",
+                             reported_model=f"model-{i:03d}", cache_read_tokens=i,
+                             cache_creation_tokens=i * 2) for i in range(1, 101)]
+        self.ledger.ingest(self.session, events)
+        with patch("usage_ledger.MAX_ROWS", 1):
+            report = self.ledger.report("day", self.now)
+        self.assertTrue(report["truncated"])
+        row, = report["rows"]
+        self.assertEqual((row["reported_model"], row["cache_read_tokens"], row["cache_creation_tokens"]),
+                         ("model-001", 1, 2))
+
     def test_discovery_limit_is_persistently_reported_as_incomplete(self):
         self.log_path().write_bytes(b"")
         base = self.root / ".usage-stats" / "instances"
@@ -238,6 +438,26 @@ class UsageLedgerTests(unittest.TestCase):
         self.assertEqual(result["events_inserted"], 1)
         self.assertFalse(result["pending"])
         self.assertEqual(result["files_seen"], 1)
+
+    def test_exact_discovery_boundaries_do_not_permanently_mark_partial(self):
+        for actual_cap in ("MAX_SCAN_ENTRIES", "MAX_DISCOVERY"):
+            with self.subTest(actual_cap=actual_cap), tempfile.TemporaryDirectory() as temp:
+                ledger = UsageLedger(temp)
+                for i in range(2):
+                    folder = ledger.directory / "instances" / str(uuid.UUID(int=i + 1))
+                    folder.mkdir(parents=True)
+                    (folder / "events.jsonl").touch()
+                with patch("usage_ledger." + actual_cap, 2):
+                    self.assertTrue(ledger.collect()["pending"])
+                    self.assertFalse(ledger.collect()["pending"])
+                    self.assertNotIn("instance_discovery_limit", ledger.report("day")["collection_issues"])
+                    third = folder.parent / str(uuid.uuid4())
+                    third.mkdir()
+                    (third / "events.jsonl").touch()
+                    self.assertTrue(ledger.collect()["pending"])
+                    ledger.collect()
+                self.assertIn("instance_discovery_limit", ledger.report("day")["collection_issues"])
+                ledger.close_scan()
 
     def test_more_than_one_batch_is_pending_only_until_all_events_are_collected(self):
         base = self.root / ".usage-stats" / "instances"

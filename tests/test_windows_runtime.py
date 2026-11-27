@@ -236,7 +236,9 @@ class AtomicJsonStateTests(unittest.TestCase):
 
     def assert_only_handoff_left(self):
         self.assertFalse(self.temporary.exists(), "a temp file was left behind")
-        self.assertEqual(sorted(path.name for path in self.directory.iterdir()), [".session-handoff.json"])
+        # The lock inode must survive cleanup so all launchers keep locking the same file.
+        self.assertEqual({path.name for path in self.directory.iterdir()},
+                         {".session-handoff.json", "..session-handoff.json.lock"})
 
     def test_transient_rename_contention_is_retried_then_replaced(self):
         real_replace, attempts = os.replace, []

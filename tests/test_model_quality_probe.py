@@ -201,6 +201,59 @@ class ModelQualityProbeTest(unittest.TestCase):
                 probe.evaluate(call, "model", deadline=180)
         self.assertEqual(len(calls), 1)
 
+    def test_late_valid_continuation_cannot_pass_and_http_uses_remaining_time(self):
+        values = {"LOCAL_LLM_URL": "http://127.0.0.1:8080/v1/messages", "LOCAL_LLM_MODEL": "model-a"}
+        for last in (10, 11):
+            with self.subTest(finished_at=last):
+                now = [0]
+                timeouts = []
+
+                def respond(url, headers, body, timeout):
+                    timeouts.append(timeout)
+                    if len(timeouts) == 1:
+                        now[0] = 9
+                        return 200, tool_call()
+                    now[0] = last
+                    value = body["messages"][-1]["content"][0]["content"]
+                    return 200, {"stop_reason": "end_turn", "content": [{"type": "text", "text": value}]}
+
+                with patch.object(probe.time, "monotonic", side_effect=lambda: now[0]), \
+                        patch.object(dashboard, "_http_json", side_effect=respond):
+                    call, model = probe.configured_call("local", dashboard, deadline=10, values=values)
+                    with self.assertRaises(probe.ProbeDeadline):
+                        probe.evaluate(call, model, deadline=10)
+                    with self.assertRaises(probe.ProbeDeadline):
+                        call({"model": model})
+                self.assertEqual(timeouts, [10, 1])
+
+    def test_late_thinking_response_is_a_timeout_in_cli_and_dashboard(self):
+        for entry in ("cli", "dashboard"):
+            with self.subTest(entry=entry):
+                now = [0]
+
+                def respond(body):
+                    now[0] += 60
+                    if "thinking" in body:
+                        return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "probe"}]}, {"model_matches_requested": True}
+                    if body["tool_choice"]["type"] == "tool":
+                        return tool_call(), {}
+                    value = body["messages"][-1]["content"][0]["content"]
+                    return {"stop_reason": "end_turn", "content": [{"type": "text", "text": value}]}, {}
+
+                with patch.object(probe.time, "monotonic", side_effect=lambda: now[0]), \
+                        patch.object(probe, "configured_call", return_value=(respond, "test")), \
+                        patch.object(dashboard, "read_settings", return_value={}), \
+                        patch.dict(dashboard._TOOL_EVIDENCE, clear=True):
+                    if entry == "cli":
+                        with contextlib.redirect_stdout(io.StringIO()) as out:
+                            self.assertEqual(probe.main(["--provider", "local", "--run", "--thinking"]), 1)
+                        result = json.loads(out.getvalue())
+                    else:
+                        result = dashboard.run_tool_roundtrip("local")
+                        self.assertEqual(dashboard._TOOL_EVIDENCE["local"]["status"], "failed")
+                self.assertIs(result["ok"], False)
+                self.assertEqual(result["reason"], "probe_timeout")
+
     def test_cli_uses_backend_directly_without_global_factory_patch(self):
         class FakeBackend:
             model = "requested-model"
@@ -222,9 +275,10 @@ class ModelQualityProbeTest(unittest.TestCase):
         def call(body):
             requests.append(body)
             self.assertEqual(body["thinking"], {"type": "enabled", "budget_tokens": 1024})
+            self.assertGreater(body["max_tokens"], body["thinking"]["budget_tokens"])
             return {"stop_reason": "end_turn",
                     "content": [{"type": "thinking", "thinking": "brief reasoning", "signature": "opaque"},
-                                {"type": "text", "text": "probe"}]}, {}
+                                {"type": "text", "text": "probe"}]}, {"model_matches_requested": True}
         result = probe.evaluate_thinking(call, "private/model")
         self.assertEqual(result["thinking_status"], "present")
         self.assertEqual(result["thinking_blocks"], 1)
@@ -233,21 +287,34 @@ class ModelQualityProbeTest(unittest.TestCase):
 
     def test_thinking_probe_reports_plain_text_as_absent(self):
         result = probe.evaluate_thinking(
-            lambda body: ({"stop_reason": "end_turn", "content": [{"type": "text", "text": "probe"}]}, {}), "model")
+            lambda body: ({"stop_reason": "end_turn", "content": [{"type": "text", "text": "probe"}]}, {"model_matches_requested": True}), "model")
         self.assertEqual(result["thinking_status"], "absent")
         self.assertEqual(result["thinking_blocks"], 0)
         self.assertFalse(result["signed"])
 
     def test_thinking_probe_reports_malformed_blocks_and_backend_errors(self):
+        for stop, blocks in (("end_turn", []), ("max_tokens", [{"type": "text", "text": "partial"}]),
+                             ("end_turn", [{"type": "text", "text": " "}]), ("end_turn", [None])):
+            with self.subTest(stop=stop, blocks=blocks):
+                message = {"stop_reason": stop, "content": blocks}
+                self.assertEqual(probe.evaluate_thinking(lambda _: (message, {"model_matches_requested": True}), "model")["thinking_status"], "invalid")
         malformed = {"stop_reason": "end_turn",
                      "content": [{"type": "thinking", "thinking": "   "}, {"type": "text", "text": "x"}]}
-        self.assertEqual(probe.evaluate_thinking(lambda body: (malformed, {}), "model")["thinking_status"], "invalid")
+        self.assertEqual(probe.evaluate_thinking(lambda body: (malformed, {"model_matches_requested": True}), "model")["thinking_status"], "invalid")
         def broken(body):
             raise ValueError("provider rejected the thinking parameter")
         result = probe.evaluate_thinking(broken, "model")
         self.assertEqual(result["thinking_status"], "error")
         self.assertIsNone(result["signed"])
         self.assertNotIn("rejected", json.dumps(result))
+
+    def test_thinking_is_unknown_for_unreported_or_substituted_model(self):
+        message = {"stop_reason": "end_turn", "content": [{"type": "thinking", "thinking": "sample"}]}
+        for metadata in ({}, {"model_matches_requested": None}, {"model_matches_requested": False}):
+            with self.subTest(metadata=metadata):
+                result = probe.evaluate_thinking(lambda _: (message, metadata), "requested")
+                self.assertEqual(result["thinking_status"], "unknown")
+                self.assertIsNone(result["signed"])
 
     def test_thinking_deadline_raises_before_the_call(self):
         calls = []
@@ -270,7 +337,7 @@ class ModelQualityProbeTest(unittest.TestCase):
                 return {"stop_reason": "end_turn", "content": [{"type": "text", "text": value}]}, {}
             self.assertIn("thinking", body)
             return {"stop_reason": "end_turn",
-                    "content": [{"type": "thinking", "thinking": "t"}, {"type": "text", "text": "probe"}]}, {}
+                    "content": [{"type": "thinking", "thinking": "t"}, {"type": "text", "text": "probe"}]}, {"model_matches_requested": True}
         out = io.StringIO()
         with patch.object(probe, "configured_call", return_value=(call, "model")), contextlib.redirect_stdout(out):
             self.assertEqual(probe.main(["--provider", "local", "--run", "--thinking"]), 0)

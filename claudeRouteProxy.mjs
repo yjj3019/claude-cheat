@@ -2448,6 +2448,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
                 : `${label} server rejected the request.`],
               context_limit: [`${errorPrefix}_context_limit`, `${label} context limit exceeded. Reduce the output token budget or conversation size; tool definitions also consume context.`],
               empty_response: [`${errorPrefix}_empty_response`, `${label} server returned an empty response.`],
+              output_limit: [`${errorPrefix}_empty_response`, `${label} server reached max_tokens before returning usable content.`],
               upstream_error: [`${errorPrefix}_upstream_error`, `${label} server request failed. Check the ${errorPrefix} routing log.`],
             };
             let description;
@@ -2456,7 +2457,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
                 [`${errorPrefix}_cooldown`, `${label} retry cooldown is active. Previous failure: ${(descriptions[circuitState.lastFailure] || descriptions.upstream_error)[1]}`];
             if (reason === 'circuit_open') previousErrorCode = (descriptions[circuitState.lastFailure] || descriptions.upstream_error)[0];
             if (!recoveryInProgress) retryAfterSeconds = remaining;
-            const retryHint = recoveryInProgress || (reason === 'fallback' && ['invalid_request', 'context_limit'].includes(detail)) ? '' : remaining > 0 ?
+            const retryHint = recoveryInProgress || (reason === 'fallback' && ['invalid_request', 'context_limit', 'output_limit'].includes(detail)) ? '' : remaining > 0 ?
               ` Wait ${remaining} second${remaining === 1 ? '' : 's'} before a new request.` :
               ` Send a new request to check ${label} recovery.`;
             const cliDiagnostic = selectedProvider === 'cli' && cliBackendError && reason === 'fallback'
@@ -2778,6 +2779,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
         // Permanent 4xx will not change on retry; request-level ones must not open the provider-wide circuit.
         let correctedToolRequest = false;
         let requestRejected = false, outputBudgetExhausted = false, retryBudgetLeft = retryBudgetMs, localContextLimit = false;
+        let consecutiveLocalOutputLimits = 0;
         for (let attempt = 0; attempt < attempts; attempt++) {
           checkBudget();
           failureStatus = null; retryAfterHintMs = null;
@@ -3039,8 +3041,12 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
               'Invalid stream metadata': 'invalid_stream_metadata', 'Expected JSON Local response': 'expected_json', 'Unsupported Local response content': 'unsupported_local_content',
               'Local thinking response disabled': 'thinking_response', 'Thinking response in ordinary mode': 'thinking_response', 'Unsupported Local response fields': 'unsupported_content_fields' }[error?.message];
             // Exhausting this request's output budget does not establish a provider outage.
-            outputBudgetExhausted = validation === 'empty_response' &&
-              emptyResponseDiagnostics.get(error)?.stop_reason === 'max_tokens';
+            const emptyDiagnostic = emptyResponseDiagnostics.get(error);
+            outputBudgetExhausted = validation === 'empty_response' && emptyDiagnostic?.stop_reason === 'max_tokens';
+            consecutiveLocalOutputLimits = target.name === 'local' && outputBudgetExhausted &&
+              Number.isSafeInteger(externalBody.max_tokens) && externalBody.max_tokens > 0 &&
+              emptyDiagnostic.usage.output_tokens === externalBody.max_tokens
+              ? consecutiveLocalOutputLimits + 1 : 0;
             if (target.name === 'cli') {
               const category = controller.signal.reason === 'attempt_timeout' ? 'timeout' :
                 status === 429 ? 'status429' : status >= 400 && status < 500 ? 'status4xx' :
@@ -3050,6 +3056,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
             providerFailure = controller.signal.reason === 'attempt_timeout' ? 'timeout' :
               status === 401 || status === 403 ? 'authentication_failed' : status === 402 ? 'payment_required' :
               localContextLimit ? 'context_limit' :
+              target.name === 'local' && outputBudgetExhausted ? 'output_limit' :
               !noPlan && [400, 404, 405, 413, 415, 422].includes(status) ? 'invalid_request' : validation === 'empty_response' ? 'empty_response' : 'upstream_error';
             if (Number.isInteger(status)) failureStatus = status;
             failureClass = toolError ? 'request' : failureClassOf(status, controller.signal.reason === 'attempt_timeout');
@@ -3100,7 +3107,8 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
             firstByteMs = null;
             // 404 is request-level too: a renamed model must not open the provider circuit.
             if (error?.message === 'Invalid tool selection' || [400, 404, 413, 422].includes(status) || error?.message === 'Thinking response in ordinary mode') requestRejected = true;
-            if (requestRejected || [401, 402, 403, 404, 405, 415].includes(status)) break;
+            // A second empty generation at the same caller-supplied limit is enough.
+            if (consecutiveLocalOutputLimits >= 2 || requestRejected || [401, 402, 403, 404, 405, 415].includes(status)) break;
           } finally {
             if (localBucket) {
               localAttemptBuckets[localBucket].attempts += 1;

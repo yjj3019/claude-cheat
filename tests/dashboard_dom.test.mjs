@@ -729,6 +729,59 @@ async function settingsPage({ config, store = new Map(), blockedStorage = false,
 
 const visible = nodes => ['openrouter', 'local'].filter(name => !nodes.get(`card-${name}`).hidden);
 
+test('two stale settings tabs submit only their own edits and explicit clears', async () => {
+  const config = {openrouter: READY_OPENROUTER, local: READY_LOCAL};
+  const saved = {CLI_KIND: 'codex', CLI_MODEL: 'first', CLI_TIMEOUT_S: '60'};
+  const tabs = [await settingsPage({config}), await settingsPage({config})];
+  const posts = [];
+  for (const page of tabs) {
+    for (const [name, value] of Object.entries(saved)) {
+      page.sandbox.document.getElementById('cfg-cli-' + name).value = value;
+    }
+    page.sandbox.fetch = async (_, options) => {
+      const payload = JSON.parse(options.body);
+      posts.push(payload);
+      if (payload.provider === 'cli') Object.assign(saved, payload.values);
+      return {json: async () => ({saved: true, config})};
+    };
+  }
+  const [a, b] = tabs;
+  a.sandbox.document.getElementById('cfg-cli-CLI_MODEL').value = 'second';
+  await vm.runInContext("DIRTY.add('cli:CLI_MODEL'); saveSettings('cli')", a.sandbox);
+  b.sandbox.document.getElementById('cfg-cli-CLI_TIMEOUT_S').value = '90';
+  await vm.runInContext("DIRTY.add('cli:CLI_TIMEOUT_S'); saveSettings('cli')", b.sandbox);
+  assert.deepEqual(posts.map(p => p.values), [{CLI_MODEL:'second'}, {CLI_TIMEOUT_S:'90'}]);
+  assert.deepEqual(saved, {CLI_KIND:'codex', CLI_MODEL:'second', CLI_TIMEOUT_S:'90'});
+  await vm.runInContext("DIRTY.add('local:LOCAL_LLM_MODELS_URL'); CLEAR.add('local:LOCAL_LLM_MODELS_URL'); saveSettings('local')", b.sandbox);
+  assert.deepEqual(posts[2], {provider:'local', values:{}, clear:['LOCAL_LLM_MODELS_URL']});
+});
+
+test('a save response preserves edits made while it was pending, also on failure', async () => {
+  for (const saved of [true, false]) {
+    const config = {openrouter: READY_OPENROUTER, local: READY_LOCAL};
+    const page = await settingsPage({config});
+    const run = code => vm.runInContext(code, page.sandbox);
+    const field = page.sandbox.document.getElementById('cfg-local-LOCAL_LLM_MODEL');
+    const host = page.nodes.get('settings');
+    let markup = host.innerHTML, resolve;
+    // Real innerHTML assignment replaces the input with a newly rendered control.
+    Object.defineProperty(host, 'innerHTML', {get: () => markup, set: value => {
+      markup = value;
+      field.value = 'submitted';
+    }});
+    page.sandbox.fetch = async () => ({json: () => new Promise(done => { resolve = done; })});
+    field.value = 'submitted';
+    run("DIRTY.add('local:LOCAL_LLM_MODEL')");
+    const pending = run("saveSettings('local')");
+    await new Promise(done => setImmediate(done));
+    field.value = 'edited during save';
+    resolve({saved, config, error: 'connection_failed'});
+    await pending;
+    assert.equal(field.value, 'edited during save');
+    assert.equal(run("DIRTY.has('local:LOCAL_LLM_MODEL')"), true);
+  }
+});
+
 const DETECTED_CLIS = [
   { kind: 'codex', found: true, name: 'codex.exe',
     dir: 'C:\\Users\\fixture\\AppData\\Local\\Programs\\OpenAI\\Codex-cli\\bin', via: 'PATH', version: '0.166.0', reason: null },

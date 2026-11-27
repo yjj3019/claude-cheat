@@ -50,6 +50,26 @@ def _kernel():
     return kernel
 
 
+def process_alive(pid):
+    """Treat access errors as unknown and release a session only on confirmed exit."""
+    if os.name != "nt":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            pass
+        return True
+    kernel = _kernel()
+    handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+    if not handle:
+        return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER for a missing PID
+    try:
+        return kernel.WaitForSingleObject(handle, 0) != 0  # WAIT_OBJECT_0 means exited
+    finally:
+        kernel.CloseHandle(handle)
+
+
 def process_identity(pid):
     """Return (pid, creation time) for a readable process, else None.
 

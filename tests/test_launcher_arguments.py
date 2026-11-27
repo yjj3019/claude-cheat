@@ -384,6 +384,31 @@ class LauncherArgumentsTests(unittest.TestCase):
             self.assertEqual(saved["proxy_pid"], 778)
             self.assertEqual(saved["nonce"], "reown-token")
 
+    def test_background_compat_detaches_only_on_frontend_success(self):
+        states = []
+        @contextlib.contextmanager
+        def session(provider, *, _detach_if, **kwargs):
+            self.assertTrue(kwargs["background"])
+            try:
+                yield {key: "fixture" for key in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS")}
+            finally:
+                states.append(_detach_if())
+        for provider, mode in [("local", {"local_only": True, "local_compat": True}),
+                               ("openrouter", {"openrouter_compat": True})]:
+            with self.subTest(provider=provider), mock.patch.object(route.shutil, "which", return_value="fixture"), \
+                    mock.patch.object(route, "version_banner", return_value=""), \
+                    mock.patch.object(route, "local_cli_command",
+                        side_effect=lambda *a, **kw: ["fixture", "--settings", '{"env":{}}', "--append-system-prompt", ""]), \
+                    mock.patch.object(route, "routed_session", side_effect=session), \
+                    mock.patch.object(route, "run_cli", side_effect=[9, OSError(), 0]):
+                self.assertEqual(route.launch(provider, cli_args=["--bg"], **mode), 9)
+                with self.assertRaises(route.LocalStartupError):
+                    route.launch(provider, cli_args=["--bg"], **mode)
+                self.assertEqual(route.launch(provider, cli_args=["--bg"], **mode), 0)
+                self.assertEqual(states[-3:], [False, False, True])
+        with self.assertRaises(route.LauncherArgumentsError):
+            route.launch("local", cli_args=["--bg"], local_only=True)
+
     def test_bg_native_args_mark_the_session_background(self):
         # --bg marks the session so the launcher hands the proxy to a keeper instead of
         # terminating it; the launch call itself only probes, never questions anything.

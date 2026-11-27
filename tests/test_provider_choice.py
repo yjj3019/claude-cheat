@@ -92,6 +92,7 @@ class ProviderChoiceTests(unittest.TestCase):
         session = mock.MagicMock()
         session.__enter__ = mock.Mock(return_value={})
         with mock.patch.object(route.shutil, "which", return_value="claude"), \
+             mock.patch.object(route, "_check_plan_login"), \
              mock.patch.object(route, "routed_session", return_value=session) as routed, \
              mock.patch.object(route.subprocess, "call", return_value=0):
             self.assertEqual(route.launch("local"), 0)
@@ -114,6 +115,7 @@ class ProviderChoiceTests(unittest.TestCase):
         session.__enter__ = mock.Mock(return_value={})
         session.__exit__ = mock.Mock(return_value=False)
         with mock.patch.object(route.shutil, "which", return_value="claude"), \
+             mock.patch.object(route, "_check_plan_login"), \
              mock.patch.object(route, "routed_session", return_value=session) as routed, \
              mock.patch.object(route.subprocess, "call", return_value=0):
             self.assertEqual(route.launch("auto"), 0)
@@ -157,6 +159,7 @@ class ProviderChoiceTests(unittest.TestCase):
              mock.patch.object(route, "wait_for_port_release", return_value=True), \
              mock.patch.object(route.shutil, "which", return_value="fixture"), \
              mock.patch.object(route, "provider_config", return_value={}), \
+             mock.patch.object(route, "_check_plan_login"), \
              mock.patch.object(route, "routed_session", return_value=session) as routed, \
              mock.patch.object(route.time, "sleep", side_effect=KeyboardInterrupt):
             self.assertEqual(route.takeover("auto"), 0)
