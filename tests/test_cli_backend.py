@@ -180,7 +180,7 @@ class BackendTest(unittest.TestCase):
         instance = self.construct(runner=runner)
         message, metadata = instance.generate(body)
         self.assertEqual(message["model"], "cli/codex")
-        self.assertEqual(metadata, {"reported_model": None, "usage_measured": False})
+        self.assertEqual(metadata, {"reported_model": None, "usage_measured": False, "usage_fields": []})
         self.error("wrong_model", instance.generate, {**body, "model": "actual-model"})
         self.assertEqual(len(calls), 1)
 
@@ -194,7 +194,19 @@ class BackendTest(unittest.TestCase):
             return claude_output(model="claude-test", usage={"input_tokens": 2, "output_tokens": 1})
         message, metadata = self.construct("claude", runner).generate(request("claude"))
         self.assertEqual(message["model"], "cli/claude")
-        self.assertEqual(metadata, {"reported_model": "claude-test", "usage_measured": True})
+        self.assertEqual(metadata, {"reported_model": "claude-test", "usage_measured": True,
+                                    "usage_fields": ["input_tokens", "output_tokens"]})
+
+    def test_grok_validates_native_usage_and_model_before_building_headers(self):
+        reply = {"text": json.dumps({"text": "ok", "tool_calls": []}), "stopReason": "end_turn",
+                 "model": "model\r\ninvalid", "usage": {"input_tokens": 0, "other": 123}}
+        _, model, usage = backend.parse_output("grok", json.dumps(reply))
+        self.assertIsNone(model)
+        self.assertEqual(usage, {"input_tokens": 0})
+        for invalid in (-1, "1", True):
+            with self.subTest(value=invalid):
+                reply["usage"] = {"output_tokens": invalid}
+                self.error("invalid_usage", backend.parse_output, "grok", json.dumps(reply))
 
     def test_loopback_auth_input_and_native_metadata(self):
         instance = self.construct(runner=lambda *_: codex_output(model="native-test", usage={"input_tokens": 2, "output_tokens": 1}))
@@ -218,6 +230,7 @@ class BackendTest(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(headers["X-CLI-Reported-Model"], "native-test")
             self.assertEqual(headers["X-CLI-Usage-Measured"], "true")
+            self.assertEqual(set(headers["X-CLI-Usage-Fields"].split(",")), {"input_tokens", "output_tokens"})
             self.assertEqual(body["model"], "cli/codex")
 
     def test_bridge_proxy_and_dashboard_share_fixed_error_codes(self):

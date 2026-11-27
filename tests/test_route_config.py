@@ -223,7 +223,8 @@ class StoreTests(unittest.TestCase):
         store = make_store(self.tmp, **{"openclaude.config.yaml": 'openrouter:\n  model: "vendor/a"\n'})
         first = store.read_provider("openrouter")
         before = store._cache
-        second = store.read_provider("openrouter")
+        with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("unchanged settings were re-read")):
+            second = store.read_provider("openrouter")
         self.assertEqual(first, second)
         self.assertEqual(before, store._cache, "an unchanged tick must reuse the cached bytes")
         store.write_provider("openrouter", {"OPENROUTER_MODEL": "vendor/b"})
@@ -610,6 +611,43 @@ try:
     import yaml  # optional: only used to prove the subset is also valid YAML, never imported by the app
 except ImportError:  # pragma: no cover
     yaml = None
+
+
+class SettingsSaveRegressionTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "DPAPI is Windows-only")
+    def test_first_save_encrypts_migrated_keys_in_settings_and_next_backup(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        store = make_store(root)
+        for provider in ("local", "openrouter"):
+            key = cfg.SECTIONS[provider]["keys"]["api_key"]
+            store._legacy(provider).write_text(f"{key}=fixture-{provider}-credential\n", encoding="utf-8")
+        store.write_provider("routing", {"ROUTE_DEFAULT_PROVIDER": "local"})
+        store.write_provider("routing", {"ROUTE_DEFAULT_PROVIDER": "auto"})
+        for path in (store.path, store.path.with_suffix(".yaml.bak")):
+            raw = path.read_text(encoding="utf-8")
+            for provider in ("local", "openrouter"):
+                with self.subTest(file=path.name, provider=provider):
+                    self.assertNotIn(f"fixture-{provider}-credential", raw)
+                    value = cfg.parse(raw).sections[provider]["values"]["api_key"]
+                    self.assertTrue(value.startswith(cfg._SECRET_PREFIX))
+                    self.assertEqual(cfg._decrypt_secret(value), f"fixture-{provider}-credential")
+
+    def test_save_preserves_same_size_and_mtime_restore_including_backup(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        for replace in (True, False):
+            with self.subTest(atomic_replace=replace):
+                store = make_store(root, **{cfg.CONFIG_NAME: 'local:\n  model: model-a\n'})
+                self.assertEqual(store.read_provider("local")["LOCAL_LLM_MODEL"], "model-a")
+                stamp = store.path.stat()
+                restored = store.path.read_bytes().replace(b"model-a", b"model-b")
+                target = root / "restored.yaml" if replace else store.path
+                target.write_bytes(restored)
+                os.utime(target, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+                if replace:
+                    os.replace(target, store.path)
+                store.write_provider("routing", {"ROUTE_DEFAULT_PROVIDER": "local"})
+                self.assertEqual(store.read_provider("local")["LOCAL_LLM_MODEL"], "model-b")
+                self.assertEqual(store.path.with_suffix(".yaml.bak").read_bytes(), restored)
 
 
 @unittest.skipUnless(os.name == "nt", "DPAPI is Windows-only")

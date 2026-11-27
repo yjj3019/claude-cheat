@@ -461,9 +461,8 @@ class Store:
         self.path = Path(path)
         # The dashboard re-reads every service's settings on each snapshot tick (3s), which
         # measured as the dominant cost (file opens plus a full YAML parse per provider).
-        # A stat-only cache invalidates on size+mtime change, so an edit is still seen
-        # immediately while an unchanged tick skips the read and parse entirely.
-        self._cache = None  # (size_ns, mtime_ns, text) or None
+        # Polls can reuse unchanged bytes. Transactions always read their disk baseline.
+        self._cache = None
 
     def _legacy(self, provider):
         """The deprecated dotenv file for a service, or None when it never had one."""
@@ -509,7 +508,7 @@ class Store:
 
     def history(self, key):
         with _WRITE_LOCK, self._cross_process_lock():
-            raw = self._read_bytes()
+            raw = self._read_bytes(fresh=True)
             # Older writers could record model names too long for a restorable revision.
             # Ignore only those revisions, retaining their IDs for ordering and retention.
             entries = [entry for entry in _history(self._decode(raw) or "") if _history_values_fit(entry["values"])]
@@ -529,7 +528,7 @@ class Store:
             yaml_updates[names[name]] = value
         with _WRITE_LOCK, self._cross_process_lock():
             # Re-read inside the lock so a concurrent save is never overwritten with stale text.
-            raw = self._read_bytes()
+            raw = self._read_bytes(fresh=True)
             original = self._decode(raw)
             entries = _history(original or "") if record_history or restore_id is not None else []
             if restore_id is not None:
@@ -654,7 +653,7 @@ class Store:
                 for path in paths:
                     if path is not None and (path.is_symlink() or (path.exists() and path.stat().st_nlink > 1)):
                         raise ConfigError("reset_unsafe_path")
-                raw = self._read_bytes()
+                raw = self._read_bytes(fresh=True)
                 # Seed retains other services' existing legacy settings if YAML is absent.
                 primary = clean_yaml(raw if raw is not None else self._seed().encode("utf-8"), primary=True)
                 backup_data = clean_yaml(backup.read_bytes()) if backup.is_file() else None
@@ -691,19 +690,20 @@ class Store:
         values = read_legacy(legacy)
         return {key: values[name] for key, name in spec["keys"].items() if name in values}
 
-    def _read_bytes(self):
+    def _read_bytes(self, *, fresh=False):
+        def signature(stat):
+            return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
         try:
-            stat = self.path.stat()
+            if fresh:
+                self._cache = None
+                return self.path.read_bytes()
             cached = self._cache
-            if cached is not None and cached[0] == (stat.st_size, stat.st_mtime_ns):
+            before = signature(self.path.stat())
+            if cached is not None and cached[0] == before:
                 return cached[1]
             raw = self.path.read_bytes()
-            # An atomic save replaces the file, so the stat taken before read_bytes could
-            # describe the previous version; only trust the cache when size+mtime match
-            # the bytes actually read.
-            after = self.path.stat()
-            if (after.st_size, after.st_mtime_ns) == (stat.st_size, stat.st_mtime_ns):
-                self._cache = ((stat.st_size, stat.st_mtime_ns), raw)
+            self._cache = (before, raw) if signature(self.path.stat()) == before else None
             return raw
         except FileNotFoundError:
             self._cache = None
@@ -783,7 +783,8 @@ class Store:
                 legacy = read_legacy(self._legacy(provider))
             except FileNotFoundError:
                 continue
-            yaml_values = {key: legacy[name] for key, name in spec["keys"].items() if name in legacy}
+            yaml_values = {key: (_encrypt_secret(legacy[name]) if key == _SECRET_KEY_FIELD else legacy[name])
+                           for key, name in spec["keys"].items() if name in legacy}
             if yaml_values:
                 base = update_text(base, provider, yaml_values)
         return base
