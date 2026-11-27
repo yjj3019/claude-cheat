@@ -615,6 +615,73 @@ except ImportError:  # pragma: no cover
 
 class SettingsSaveRegressionTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "DPAPI is Windows-only")
+    def test_dpapi_failure_preserves_primary_backup_and_legacy(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        store = make_store(root)
+        legacy = store._legacy("local")
+        legacy.write_text("LOCAL_LLM_API_KEY=fixture-secret\n", encoding="utf-8")
+        backup = store.path.with_suffix(".yaml.bak")
+        backup.write_bytes(b"# previous backup\n")
+        def snapshot():
+            return [p.read_bytes() if p.exists() else None for p in (store.path, backup, legacy)]
+        with mock.patch.object(cfg, "_dpapi", side_effect=OSError("synthetic")):
+            for existing in (False, True):
+                with self.subTest(existing=existing):
+                    if existing:
+                        store.path.write_bytes(b"routing:\n  default_provider: auto\n")
+                    before = snapshot()
+                    with self.assertRaises(cfg.ConfigError) as caught:
+                        if existing:
+                            store.write_provider("local", {"LOCAL_LLM_MODEL": "fixture"})
+                        else:
+                            store.write_provider("routing", {"ROUTE_DEFAULT_PROVIDER": "auto"})
+                    self.assertEqual(caught.exception.code, "secret_encrypt_failed")
+                    self.assertEqual(snapshot(), before)
+        store.write_provider("local", {"LOCAL_LLM_MODEL": "fixture"})
+        self.assertEqual(store.read_provider("local")["LOCAL_LLM_API_KEY"], "fixture-secret")
+
+    def test_prefix_in_plaintext_credentials_roundtrips_on_migration_and_edit(self):
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as root:
+                store = make_store(root)
+                if existing:
+                    store.path.write_bytes(b"routing:\n  default_provider: auto\n")
+                key = "enc1:plain-credential"
+                store._legacy("local").write_text(f"LOCAL_LLM_API_KEY={key}\n", encoding="utf-8")
+                store.write_provider("local", {"LOCAL_LLM_MODEL": "fixture"})
+                self.assertEqual(store.read_provider("local")["LOCAL_LLM_API_KEY"], key)
+                store.write_provider("local", {"LOCAL_LLM_API_KEY": key + "-edited"})
+                self.assertEqual(store.read_provider("local")["LOCAL_LLM_API_KEY"], key + "-edited")
+
+    def test_long_lived_reader_rechecks_in_place_restore_by_next_poll(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        store = make_store(root, **{cfg.CONFIG_NAME: 'local:\n  model: model-a\n'})
+        with mock.patch.object(cfg.time, "monotonic", return_value=10) as clock:
+            stamp = store.path.stat()
+            self.assertEqual(store.read_provider("local")["LOCAL_LLM_MODEL"], "model-a")
+            store.path.write_bytes(store.path.read_bytes().replace(b"model-a", b"model-b"))
+            os.utime(store.path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+            clock.return_value += 1
+            self.assertEqual(store.read_provider("local")["LOCAL_LLM_MODEL"], "model-b")
+
+    def test_already_migrated_literal_requires_matching_legacy_evidence(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        key = "enc1:synthetic-literal"
+        store = make_store(root, **{cfg.CONFIG_NAME: f'local:\n  api_key: "{key}"\n'})
+        store._legacy("local").write_text("LOCAL_LLM_API_KEY=other\n", encoding="utf-8")
+        with self.assertRaisesRegex(cfg.ConfigError, "secret_decrypt_failed"):
+            store.read_provider("local")
+        store._legacy("local").write_text(f"LOCAL_LLM_API_KEY={key}\n", encoding="utf-8")
+        self.assertEqual(store.read_provider("local")["LOCAL_LLM_API_KEY"], key)
+        store.write_provider("local", {"LOCAL_LLM_MODEL": "fixture", "LOCAL_LLM_API_KEY": None})
+        store._legacy("local").unlink()
+        self.assertEqual(store.read_provider("local")["LOCAL_LLM_API_KEY"], key)
+        backup = store.path.with_suffix(".yaml.bak")
+        if os.name == "nt":
+            self.assertNotIn(key.encode(), backup.read_bytes())
+        self.assertEqual(cfg.Store(backup).read_provider("local")["LOCAL_LLM_API_KEY"], key)
+
+    @unittest.skipUnless(os.name == "nt", "DPAPI is Windows-only")
     def test_first_save_encrypts_migrated_keys_in_settings_and_next_backup(self):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         store = make_store(root)

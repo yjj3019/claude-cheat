@@ -14,6 +14,7 @@ from usage_ledger import UsageLedger
 
 NODE_FIXTURE = r"""
 import { randomUUID } from 'node:crypto';
+import assert from 'node:assert/strict';
 import { mkdir, readFile } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -65,9 +66,25 @@ try {
       authorization:'Bearer sk-ant-oat-fixture','anthropic-beta':'oauth-2025-04-20'},
     body: JSON.stringify({...request,stream:s.stream})})));
   for (let i = 0; i < results.length; i++) {
-    const r = results[i]; const expected = sessions[i].fallback ? 503 : 200;
+    const r = results[i]; const expected = sessions[i].fallback || bridge?.expectedError ? 503 : 200;
     if (r.status !== expected) throw Error(`status ${r.status} (expected ${expected})`);
-    await r.text();
+    if (bridge) {
+      const body = await r.json();
+      const metricsUrl = sessions[i].url.replace('/v1/messages', '/api/metrics');
+      const metrics = await (await fetch(metricsUrl, {headers:{'x-local-route-token':'test-nonce'}})).json();
+      if (bridge.expectedError) {
+        assert.ok(JSON.stringify(body).includes(bridge.expectedError));
+        assert.equal(metrics.efficiency.measured_calls, 0);
+      } else {
+        for (const direction of ['input', 'output']) {
+          const tokens = bridge.usage[direction + '_tokens'] ?? 0;
+          assert.equal(body.usage[direction + '_tokens'], tokens);
+          assert.equal(metrics.efficiency['observed_' + direction], tokens);
+        }
+      }
+    } else {
+      await r.text();
+    }
   }
   for (const s of sessions) {
     let found = false;
@@ -118,17 +135,27 @@ print(json.dumps({'stopReason': 'end_turn', 'model': 'fixture-native',
                     ("cache", {"cache_creation_input_tokens": 2}),
                     ("unknown", {}),
                     ("complete", {"input_tokens": 0, "output_tokens": 9}),
+                    ("maximum", {"input_tokens": 2**31 - 1, "output_tokens": 3}),
+                    ("overflow", {"input_tokens": 2**31, "output_tokens": 3}),
                 ):
                     with self.subTest(case=name):
                         fake.with_suffix(".json").write_text(json.dumps(usage), encoding="utf-8")
                         workspace = Path(temp) / name
+                        bridge = {"url": url, "token": token, "usage": usage}
+                        if name == "overflow":
+                            bridge["expectedError"] = "invalid_usage"
                         result = subprocess.run(["node", "--input-type=module", "-e", NODE_FIXTURE, str(workspace), "cli"],
-                                                input=json.dumps({"url": url, "token": token}), cwd=root_dir,
+                                                input=json.dumps(bridge), cwd=root_dir,
                                                 text=True, capture_output=True, timeout=30)
                         self.assertEqual(result.returncode, 0, result.stderr)
                         ledger = UsageLedger(workspace)
                         self.assertEqual(ledger.collect()["events_inserted"], 1)
                         row, = ledger.report("day")["rows"]
+                        if name == "overflow":
+                            self.assertEqual((row["ok"], row["input_samples"], row["output_samples"]), (0, 0, 0))
+                            self.assertIsNone(row["input_tokens"])
+                            self.assertIsNone(row["output_tokens"])
+                            continue
                         self.assertEqual((row["provider"], row["reported_model"], row["ok"]), ("cli", "fixture-native", 1))
                         for field in ("input", "output"):
                             key = field + "_tokens"

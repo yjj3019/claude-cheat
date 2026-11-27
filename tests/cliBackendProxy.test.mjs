@@ -119,6 +119,26 @@ test('CLI failures attempt once and never send the conversation to Plan',async t
   assert.equal(m.routes.plan,0);
 });
 
+test('legacy CLI usage above the ledger limit is rejected before accounting', async t => {
+  const f = await fixture(t, () => Response.json({
+    ...message('cli/codex'), usage: {input_tokens: 2 ** 31, output_tokens: 3},
+  }, {headers: {'x-cli-usage-measured': 'true'}}));
+  const response = await f.request({});
+  assert.equal(response.status, 503);
+  assert.match(await response.text(), /CLI diagnostic: invalid_usage/);
+  assert.equal((await f.metrics()).efficiency.measured_calls, 0);
+});
+
+test('CLI workspace errors reach the client as server errors', async t => {
+  const f = await fixture(t, () => Response.json({error: 'cli_storage_failed'}, {
+    status: 500, headers: {'x-cli-error-code': 'cli_storage_failed'},
+  }));
+  const response = await f.request({});
+  assert.equal(response.status, 503);
+  assert.match(await response.text(), /CLI diagnostic: cli_storage_failed/);
+  assert.equal(f.calls.length, 1);
+});
+
 test('an Advisor native tool stays on the Plan path and is never sent to the CLI bridge',async t=>{
   const f=await fixture(t,()=>{throw new Error('CLI must not receive an Advisor native tool');});
   const body={tools:[{type:'advisor_20260301',name:'advisor',model:'claude-opus-5-5'}]};

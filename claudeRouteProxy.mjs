@@ -493,10 +493,14 @@ const CLI_ERROR_CODES = new Set(['invalid_request', 'unsupported_request', 'wron
   'cli_failed', 'cli_process_failed', 'cli_turn_failed', 'cli_empty_output', 'cli_reported_rate_limit',
   'cli_reported_context_limit', 'backend_version_unverified', 'invalid_response', 'invalid_tool_call', 'invalid_tool_choice',
   'invalid_usage', 'incomplete_response', 'native_tool_execution_detected', 'spawn_failed',
-  'process_tracking_unavailable', 'timeout', 'cancelled', 'request_too_large', 'output_too_large', 'backend_busy']);
+  'process_tracking_unavailable', 'timeout', 'cancelled', 'request_too_large', 'output_too_large', 'backend_busy', 'cli_storage_failed']);
 // Keep diagnostics separate from throwable provider objects: an upstream cannot inject
 // arbitrary error properties into the log. Only bounded enums/counts leave this boundary.
 const emptyResponseDiagnostics = new WeakMap();
+const MAX_USAGE_TOKENS = 2 ** 31 - 1; // SQLite usage-ledger event contract.
+function validUsageCount(n) {
+  return Number.isSafeInteger(n) && n >= 0 && n <= MAX_USAGE_TOKENS;
+}
 function safeResponseUsage(usage, fields = DIAGNOSTIC_USAGE_FIELDS) {
   return Object.fromEntries(fields.filter(name =>
     Number.isSafeInteger(usage?.[name]) && usage[name] >= 0).map(name => [name, usage[name]]));
@@ -1326,7 +1330,7 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal, on
     const response = JSON.parse(text);
     if (observeUsage) {
       const reported = safeResponseUsage(response?.usage);
-      observeUsage(() => reported);
+      observeUsage(() => reported, response?.usage);
     }
     if (response.type !== 'message' || response.model !== model || !Array.isArray(response.content) ||
         !response.content.every(validContentBlock) || !STOP_REASONS.has(response.stop_reason) ||
@@ -2391,7 +2395,7 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
             }
           }
           const ok = !aborted && !responseFailed && res.statusCode < 400;
-          const validTokens = n => Number.isSafeInteger(n) && n >= 0 && n <= 2**31 - 1 ? n : null;
+          const validTokens = n => validUsageCount(n) ? n : null;
           const inputTokens = ok && routeKind === 'external' ? validTokens(performanceSample?.inputTokens) : null;
           const outputTokens = ok && routeKind === 'external' ? validTokens(performanceSample?.outputTokens) : null;
           const measured = inputTokens !== null || outputTokens !== null;
@@ -2921,7 +2925,13 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
                   chunkCadence.push(Number(gap.toFixed(2)));
                   if (chunkCadence.length > LATENCY_WINDOW) chunkCadence.shift();
                 }, body.tool_choice, allowedTools,
-                usageFields.length ? read => { readAttemptUsage = read; } : null);
+                usageFields.length ? (read, usage) => {
+                  if (target.name === 'cli' && usageFields.some(name => Object.hasOwn(usage ?? {}, name) && !validUsageCount(usage[name]))) {
+                    cliBackendError = 'invalid_usage';
+                    throw new Error('Invalid message response');
+                  }
+                  readAttemptUsage = read;
+                } : null);
               if (localRequestCompat && shapeDiagnosis.addedTool) {
                 const calls = JSON.parse(validated.text).content.filter(block => block.type === 'tool_use');
                 for (const block of calls) {

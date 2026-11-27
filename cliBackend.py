@@ -12,6 +12,7 @@ import secrets
 import select
 import socket
 import signal
+import stat
 import subprocess
 import tempfile
 import threading
@@ -21,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import localProcessTree
 import routeCli
+from usage_ledger import MAX_TOKENS
 
 MAX_BYTES = 4 * 1024 * 1024
 # Fixed, non-sensitive bridge diagnostics. Never expose exception text or CLI output in headers.
@@ -30,7 +32,7 @@ PUBLIC_ERROR_CODES = frozenset({
     "backend_version_unverified", "invalid_response", "invalid_tool_call", "invalid_tool_choice",
     "invalid_usage", "incomplete_response", "native_tool_execution_detected", "spawn_failed",
     "process_tracking_unavailable", "timeout", "cancelled", "request_too_large", "output_too_large",
-    "backend_busy",
+    "backend_busy", "cli_storage_failed",
 })
 HEADER_TIMEOUT_SECONDS = 10
 # Audit L7: a connection without a valid token used to hold one of the 16 slots for the
@@ -195,7 +197,7 @@ def _reported(result):
     if usage is None:
         usage = {}
     fields = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
-    if not isinstance(usage, dict) or any(key in usage and (type(usage[key]) is not int or usage[key] < 0)
+    if not isinstance(usage, dict) or any(key in usage and (type(usage[key]) is not int or not 0 <= usage[key] <= MAX_TOKENS)
                                           for key in fields):
         raise BackendError("invalid_usage")
     usage = {key: usage[key] for key in fields if key in usage}
@@ -408,6 +410,51 @@ def _run(argv, prompt, env, cwd, timeout, cancelled, process_timing=None):
                 pipe.close()
 
 
+_GROK_DIRECTORY_PREFIX = "claude-cheat-grok-"
+_GROK_LEASE_MARKER = b"claude-cheat grok prompt v1\n"
+
+
+def _lock_lease(handle):
+    """The OS releases this exclusive lock even when the worker is killed."""
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _recover_grok_prompts():
+    for directory in Path(tempfile.gettempdir()).glob(_GROK_DIRECTORY_PREFIX + "*"):
+        try:
+            info = directory.lstat()
+            if (not stat.S_ISDIR(info.st_mode)
+                    or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+                    or (os.name == "posix" and (info.st_uid != os.getuid() or info.st_mode & 0o077))):
+                continue
+            prompt = directory / "prompt.txt"
+            lease = directory / "owner.lock"
+            # No prompt is published until the writer holds its lease. Never open a
+            # foreign/reparse file or recursively remove other workspace contents.
+            for path in (prompt, lease):
+                entry = path.lstat()
+                if (not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1
+                        or getattr(entry, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+                    break
+            else:
+                with lease.open("r+b") as owner:
+                    _lock_lease(owner)
+                    if owner.read(len(_GROK_LEASE_MARKER) + 1) != _GROK_LEASE_MARKER:
+                        continue
+                    prompt.unlink()
+                lease.unlink()
+                directory.rmdir()
+        except OSError:
+            # Active lease, inaccessible entry, or another process already recovered it.
+            continue
+
+
 class Backend:
     def __init__(self, values, runner=None):
         if not isinstance(values, dict):
@@ -416,6 +463,11 @@ class Backend:
         if not isinstance(self.kind, str) or self.kind.strip() not in routeCli.KINDS:
             raise BackendError("invalid_cli_kind")
         self.kind = self.kind.strip()
+        if self.kind == "grok":
+            try:
+                _recover_grok_prompts()
+            except OSError:
+                raise BackendError("cli_storage_failed") from None
         self.model = values.get("CLI_MODEL")
         if self.model is not None and not isinstance(self.model, str):
             raise BackendError("invalid_cli_model")
@@ -457,7 +509,17 @@ class Backend:
         effort = output_config.get("effort") if isinstance(output_config, dict) else None
         # Only the common documented levels have a verified native representation.
         native_effort = effort if effort in ("low", "medium", "high") else None
-        with tempfile.TemporaryDirectory(prefix="claude-cheat-cli-backend-") as directory:
+        with contextlib.ExitStack() as resources:
+            prefix = _GROK_DIRECTORY_PREFIX if self.kind == "grok" else "claude-cheat-cli-backend-"
+            try:
+                directory = resources.enter_context(tempfile.TemporaryDirectory(prefix=prefix))
+                if self.kind == "grok":
+                    owner = resources.enter_context((Path(directory) / "owner.lock").open("x+b"))
+                    _lock_lease(owner)
+                    owner.write(_GROK_LEASE_MARKER)
+                    owner.flush()
+            except OSError:
+                raise BackendError("cli_storage_failed") from None
             if self.kind == "codex":
                 schema = Path(directory) / "response-schema.json"
                 schema.write_text(json.dumps(SCHEMA), encoding="utf-8")
@@ -479,7 +541,11 @@ class Backend:
                 if len(encoded) > MAX_BYTES:
                     raise BackendError("request_too_large")
                 prompt_file = Path(directory) / "prompt.txt"
-                prompt_file.write_bytes(encoded)
+                resources.callback(prompt_file.unlink, missing_ok=True)
+                try:
+                    prompt_file.write_bytes(encoded)
+                except OSError:
+                    raise BackendError("cli_storage_failed") from None
                 prompt = ""
                 # Containment (verified 2026-11-07 against 1.0.77):
                 # --disable-web-search/--no-subagents block those surfaces, and
@@ -647,7 +713,8 @@ def serve(values):
                     return
                 code = error.code if isinstance(error, BackendError) else "invalid_request"
                 diagnostic = error.diagnostic if isinstance(error, BackendError) else None
-                self.send(400, {"error": code}, {"error_diagnostic": diagnostic})
+                status = {"cli_storage_failed": 500, "invalid_usage": 502, "request_too_large": 413}.get(code, 400)
+                self.send(status, {"error": code}, {"error_diagnostic": diagnostic})
     class Server(ThreadingHTTPServer):
         daemon_threads = False
 
