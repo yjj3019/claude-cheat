@@ -1,18 +1,20 @@
 # SPDX-License-Identifier: MIT
 """Dashboard pid-record lifecycle: a signal is sent only to a provably matching process.
 
-Slow-path-free and mock-only: the identity query, the port probe and os.kill are all
-injected, so no real dashboard or unrelated process is ever signalled.
+Signals are mocked. Listener and PID-file tests use isolated local resources.
 
     python -m unittest tests.test_dashboard_lifecycle
 """
 import contextlib
+import concurrent.futures
 import importlib.util
 import io
 import json
 import os
 import signal
+import socket
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -29,6 +31,7 @@ class DashboardLifecycleTests(unittest.TestCase):
         self.pid_file = self.root / ".dashboard.pid"
         self.enterContext(mock.patch.object(dash, "PID_FILE", self.pid_file))
         self.port = dash.DEFAULT_PORT
+        self.real_port_open = dash._port_open
         self.enterContext(mock.patch.object(dash, "_port_open", return_value=True))
         self.enterContext(mock.patch.object(dash, "own_tree_pids", return_value=set()))
         self.killer = self.enterContext(mock.patch.object(dash.os, "kill"))
@@ -51,8 +54,11 @@ class DashboardLifecycleTests(unittest.TestCase):
             code = dash.main(["--stop"])
         return code, out.getvalue(), err.getvalue()
 
-    def assert_no_stray_files(self):
-        self.assertEqual(sorted(path.name for path in self.root.iterdir()), [".dashboard.pid"])
+    def assert_no_stray_files(self, *, lock=False):
+        expected = {".dashboard.pid"}
+        if lock:
+            expected.add("..dashboard.pid.lock")
+        self.assertEqual({path.name for path in self.root.iterdir()}, expected)
 
     def test_reload_keeps_the_dashboard_token(self):
         with mock.patch.dict(os.environ, {"ROUTE_DASHBOARD_AUTO_RELOAD": "1"}), \
@@ -65,8 +71,84 @@ class DashboardLifecycleTests(unittest.TestCase):
              mock.patch.object(dash.subprocess, "Popen") as spawn, \
              mock.patch.object(dash.os, "_exit", side_effect=RuntimeError("exit")):
             with self.assertRaisesRegex(RuntimeError, "exit"):
-                dash._auto_reload_loop("original")
+                dash._auto_reload_loop("original", 54321)
         self.assertEqual(spawn.call_args.kwargs["env"]["DASHBOARD_TOKEN"], dash.TOKEN)
+        self.assertEqual(spawn.call_args.kwargs["stdout"], dash.subprocess.DEVNULL)
+        self.assertEqual(spawn.call_args.kwargs["stderr"].name, str(self.root / "reload.log"))
+        self.assertEqual(spawn.call_args.args[0][-2:], ["--port", "54321"])
+
+    def test_reload_from_old_supervisor_omits_write_url_from_startup_output(self):
+        with mock.patch.dict(os.environ, {"ROUTE_DASHBOARD_REEXEC": "4321:fixture"}), \
+             mock.patch.object(dash, "_port_open", return_value=False), \
+             mock.patch.object(dash.threading, "Thread"), \
+             mock.patch.object(dash.DashboardServer, "serve_forever"), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            dash.serve(port=0)
+        report = json.loads(out.getvalue())
+        self.assertIn("dashboard", report)
+        self.assertNotIn("write_url", report)
+        self.assertTrue(dash.TOKEN not in out.getvalue())
+
+    def test_reexec_only_waits_and_never_signals(self):
+        self.write_record(started="fixture")
+        for marker in ("4321", "4321:fixture", "1"):
+            with self.subTest(marker=marker), mock.patch.dict(os.environ, {"ROUTE_DASHBOARD_REEXEC": marker}):
+                self.assertFalse(dash._stop_previous(self.port, timeout=0))
+                self.killer.assert_not_called()
+        with mock.patch.dict(os.environ, {"ROUTE_DASHBOARD_REEXEC": "1"}), \
+             mock.patch.object(dash, "_port_open", side_effect=[True, False]):
+            self.assertTrue(dash._stop_previous(self.port))
+        self.killer.assert_not_called()
+
+    def test_retiring_owner_cannot_remove_a_replacement_record(self):
+        owner = dash._write_pid_record(12345)
+        reading = threading.Event()
+        release = threading.Event()
+        original_read = dash._read_pid_record
+
+        def paused_read():
+            previous = original_read()
+            reading.set()
+            if not release.wait(5):
+                raise TimeoutError("cleanup was not released")
+            return previous
+
+        with concurrent.futures.ThreadPoolExecutor(2) as pool:
+            with mock.patch.object(dash, "_read_pid_record", side_effect=paused_read):
+                cleanup = pool.submit(dash._remove_pid_record, owner)
+                self.assertTrue(reading.wait(5))
+                writer = pool.submit(dash._write_pid_record, 23456)
+                try:
+                    with self.assertRaises(concurrent.futures.TimeoutError):
+                        writer.result(timeout=.15)
+                finally:
+                    release.set()
+                cleanup.result(timeout=5)
+                replacement = writer.result(timeout=5)
+        dash._remove_pid_record(owner)
+        self.assertEqual(original_read(), replacement)
+
+    def test_ipv6_cli_binds_probes_and_stops_the_recorded_address(self):
+        try:
+            with socket.socket(socket.AF_INET6) as probe:
+                probe.bind(("::1", 0))
+        except OSError:
+            self.skipTest("IPv6 loopback unavailable")
+
+        def check(server):
+            record = dash._read_pid_record()
+            self.assertEqual(record["host"], "::1")
+            self.assertTrue(self.real_port_open(record["port"], "::1"))
+            with mock.patch.object(dash, "_port_open", wraps=self.real_port_open) as probe:
+                self.assertEqual(self.stop()[0], 0)
+                probe.assert_called_once_with(record["port"], "::1")
+
+        with mock.patch.object(dash.DashboardServer, "serve_forever", check), \
+             mock.patch.object(dash.threading, "Thread"), \
+             mock.patch.object(dash, "process_identity", return_value=(os.getpid(), 123)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(dash.main(["--host", "::1", "--port", "0", "--no-takeover"]), 0)
+        self.killer.assert_called_once_with(os.getpid(), signal.SIGTERM)
 
     # --- the record ----------------------------------------------------------
     def test_written_record_carries_the_identity_and_stays_reader_compatible(self):
@@ -78,14 +160,14 @@ class DashboardLifecycleTests(unittest.TestCase):
         stored = dash._read_pid_record()
         self.assertEqual((stored["pid"], stored["port"], stored["process_created"]),
                          (os.getpid(), self.port, 987654321))
-        self.assert_no_stray_files()
+        self.assert_no_stray_files(lock=True)
 
     def test_a_platform_without_identity_writes_a_legacy_compatible_record(self):
         with mock.patch.object(dash, "process_identity", return_value=None):
             record = dash._write_pid_record(self.port)
         self.assertNotIn("process_created", record)
         self.assertEqual(dash._read_pid_record()["pid"], os.getpid())
-        self.assert_no_stray_files()
+        self.assert_no_stray_files(lock=True)
 
     # --- verdicts ------------------------------------------------------------
     def test_verify_pid_record_classifies_every_case(self):
@@ -229,7 +311,7 @@ class DashboardLifecycleTests(unittest.TestCase):
         self.assertIn('"dashboard"', out.getvalue())
         self.assertIn("dashboard_previous_instance_refused", err.getvalue())
         self.assertFalse(self.pid_file.exists(), "the owner removes its record on exit")
-        self.assertEqual(list(self.root.iterdir()), [], "no temp or pid file may be left behind")
+        self.assertEqual({p.name for p in self.root.iterdir()}, {"..dashboard.pid.lock"})
 
 
 if __name__ == "__main__":

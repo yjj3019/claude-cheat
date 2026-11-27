@@ -149,6 +149,19 @@ class StartupTests(unittest.TestCase):
             self.assertFalse(startup.dashboard())
             browser.assert_not_called()
 
+    def test_existing_ipv6_dashboard_uses_the_verified_loopback_for_both_urls(self):
+        record = {"pid": 1, "port": startup.dash.DEFAULT_PORT, "host": "::1"}
+        with mock.patch.object(startup.dash, "_port_open", return_value=True) as probe, \
+             mock.patch.object(startup.dash, "_read_pid_record", return_value=record), \
+             mock.patch.object(startup.dash, "_verify_pid_record", return_value="verified"), \
+             mock.patch.object(startup, "urlopen", side_effect=OSError) as post, \
+             mock.patch.object(startup.webbrowser, "open") as browser:
+            self.assertTrue(startup.dashboard(setup=True))
+        probe.assert_called_once_with(record["port"], "::1")
+        base = f"http://[::1]:{record['port']}"
+        self.assertEqual(post.call_args.args[0].full_url, base + "/api/browser")
+        self.assertEqual(browser.call_args.args[0].partition("#")[0], base + "/settings")
+
     def test_existing_browser_is_reused_for_launch_and_setup(self):
         record = {"pid": 1, "port": startup.dash.DEFAULT_PORT}
         def response(request, **kwargs):

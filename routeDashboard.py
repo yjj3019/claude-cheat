@@ -6266,9 +6266,11 @@ class DashboardServer(ThreadingHTTPServer):
     # a connection flood cannot turn into an unbounded thread pile.
     max_connections = 64
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, server_address, *args, **kwargs):
+        if server_address[0] == "::1":
+            self.address_family = socket.AF_INET6
         self._connection_slots = threading.BoundedSemaphore(self.max_connections)
-        super().__init__(*args, **kwargs)
+        super().__init__(server_address, *args, **kwargs)
 
     def process_request(self, connection, address):
         if not self._connection_slots.acquire(blocking=False):
@@ -6358,18 +6360,31 @@ def _read_pid_record(path=None):
     return None
 
 
-def _write_pid_record(port, path=None):
+def _write_pid_record(port, path=None, *, host="127.0.0.1"):
     """Persist this instance with the identity a later stop must prove before signalling."""
-    record = {"pid": os.getpid(), "port": port,
+    path = Path(path or PID_FILE)
+    record = {"pid": os.getpid(), "port": port, "host": host,
               "started": datetime.now(timezone.utc).isoformat(timespec="seconds")}
     identity = process_identity(os.getpid())
     if identity is not None:
         record["process_created"] = identity[1]
-    try:
-        Path(path or PID_FILE).write_text(json.dumps(record), encoding="utf-8")
-    except OSError:
-        pass
+    with routeConfig.Store(path)._cross_process_lock():
+        fd, name = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + ".", suffix=".tmp")
+        temp = Path(name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(record, stream)
+            os.replace(temp, path)
+        finally:
+            temp.unlink(missing_ok=True)
     return record
+
+
+def _remove_pid_record(expected):
+    """Remove only the generation observed by this caller, serialized with writers."""
+    with routeConfig.Store(PID_FILE)._cross_process_lock():
+        if expected is not None and _read_pid_record() == expected:
+            PID_FILE.unlink(missing_ok=True)
 
 
 def _verify_pid_record(record):
@@ -6404,51 +6419,49 @@ def _refusal_report(record, verdict):
 
 
 def _port_open(port, host="127.0.0.1"):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+    family = socket.AF_INET6 if host == "::1" else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as probe:
         probe.settimeout(0.25)
         return probe.connect_ex((host, port)) == 0
 
 
-def _stop_previous(port, path=None, timeout=5.0):
+def _stop_previous(port, path=None, timeout=5.0, *, host="127.0.0.1"):
     """Terminate a dashboard this launcher started before, keeping the requested port stable.
 
     A signal is only sent when the record's pid still carries the recorded creation time.
     A legacy, recycled, unreadable or own-tree pid is reported on stderr and left
     untouched; the caller then proceeds and overwrites the stale record when it binds.
     """
+    # The old dashboard exits itself after spawning us. A reload marker (including
+    # one inherited from an older version) only permits waiting, never signalling.
+    reloading = os.environ.pop("ROUTE_DASHBOARD_REEXEC", None)
+    host = "::1" if host == "::1" else "127.0.0.1"
+    if reloading:
+        deadline = time.monotonic() + timeout
+        while _port_open(port, host):
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+        return True
     record = _read_pid_record(path)
-    if not record or record.get("port") != port:
-        return False
-    if not _port_open(port):
+    if (not record or record.get("port") != port or record.get("host", "127.0.0.1") != host
+            or not _port_open(port, host)):
         return False
     verdict = _verify_pid_record(record)
-    # An in-place auto-reload spawns the replacement as a child of the process it is
-    # replacing; the normal own-tree guard would refuse to stop the old instance.
-    forced = os.environ.pop("ROUTE_DASHBOARD_REEXEC", None)
-    # The re-exec token carries the pid and, when set by a current build, the record's started
-    # instant, so a recycled pid with an unrelated process cannot pass even on the forced path
-    # (audit C4/C8). Tokens from older builds (pid only) lose the forced bypass.
-    forced_pid, _, forced_started = (forced or "").partition(":")
-    forced_ok = forced_pid == str(record.get("pid")) and (not forced_started or forced_started == record.get("started"))
-    if verdict != "verified" and not forced_ok:
+    if verdict != "verified":
         print(json.dumps({"event": "dashboard_previous_instance_refused",
                           **_refusal_report(record, verdict)}), file=sys.stderr, flush=True)
         return False
     try:
         os.kill(record["pid"], signal.SIGTERM)
     except OSError:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if not _port_open(port):
-                return True
-            time.sleep(0.05)
-        return not _port_open(port)
+        pass  # A concurrent exit can race the signal. Observe the listener below.
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if not _port_open(port):
+        if not _port_open(port, host):
             return True
         time.sleep(0.15)
-    return not _port_open(port)
+    return not _port_open(port, host)
 
 
 AUTO_UPDATE_LOG = ROOT / ".auto-update.log"
@@ -6527,13 +6540,8 @@ def _auto_takeover_loop():
             _record_auto_update(f"auto-update check failed: {type(error).__name__}: {error}")
 
 
-def _auto_reload_loop(initial):
-    """Restart this dashboard when its own sources change.
-
-    The replacement is spawned first; it uses the normal single-instance restart path
-    (``_stop_previous``) to stop this process and bind the same port, so the listening
-    socket is never closed by a serving thread.
-    """
+def _auto_reload_loop(initial, bound_port=None):
+    """Spawn the replacement, then exit so it can bind the same listener."""
     if os.environ.get("ROUTE_DASHBOARD_AUTO_RELOAD", "1").strip().lower() in {"0", "off", "false", "no", "disabled"}:
         return
     while True:
@@ -6545,7 +6553,6 @@ def _auto_reload_loop(initial):
                 current = source_fingerprint()
                 if current != initial:
                     _record_auto_update("dashboard source changed; restarting the dashboard")
-                    os.environ["ROUTE_DASHBOARD_REEXEC"] = f"{os.getpid()}:{(_read_pid_record(PID_FILE) or {}).get('started', '')}"
                     flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
                     args = list(sys.argv[1:])
                     if "--open" in args:
@@ -6554,11 +6561,14 @@ def _auto_reload_loop(initial):
                         if index < len(args) and not args[index].startswith("-"):
                             del args[index]
                     args = [arg for arg in args if arg != "--no-takeover" and not arg.startswith("--open=")]
+                    if bound_port is not None and args[-2:] != ["--port", str(bound_port)]:
+                        args.extend(["--port", str(bound_port)])
                     with AUTO_UPDATE_LOG.open("a", encoding="utf-8") as log:
                         subprocess.Popen(
                             [sys.executable, str(Path(__file__).resolve()), *args],
-                            cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-                            creationflags=flags, close_fds=True, env={**os.environ, "DASHBOARD_TOKEN": TOKEN})
+                            cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log,
+                            creationflags=flags, close_fds=True,
+                            env={**os.environ, "DASHBOARD_TOKEN": TOKEN, "ROUTE_DASHBOARD_REEXEC": "1"})
                     os._exit(0)
         except (OSError, routeConfig.ConfigError):
             continue
@@ -6566,8 +6576,9 @@ def _auto_reload_loop(initial):
 
 def serve(host="127.0.0.1", port=DEFAULT_PORT, refresh=3, allow_fallback=False, open_page=None, no_takeover=False):
     # A previous dashboard keeps its port between restarts; take it over instead of moving.
+    reloading = bool(os.environ.get("ROUTE_DASHBOARD_REEXEC"))
     if not no_takeover:
-        _stop_previous(port)
+        _stop_previous(port, host=host)
     fallback = None
     try:
         server = DashboardServer((host, port), Handler)
@@ -6578,15 +6589,20 @@ def serve(host="127.0.0.1", port=DEFAULT_PORT, refresh=3, allow_fallback=False, 
                 f"--port <port>, or pass --allow-port-fallback to pick a free port.") from None
         server = DashboardServer((host, 0), Handler)
         fallback = "requested_port_unavailable"
-    _write_pid_record(server.server_address[1])
+    try:
+        record = _write_pid_record(server.server_address[1], host=server.server_address[0])
+    except (OSError, routeConfig.ConfigError):
+        server.server_close()
+        raise
     threading.Thread(target=_refresh_loop, args=(max(1, refresh),), daemon=True).start()
-    threading.Thread(target=_auto_reload_loop, args=(source_fingerprint(),), daemon=True).start()
+    threading.Thread(target=_auto_reload_loop, args=(source_fingerprint(), server.server_address[1]), daemon=True).start()
     threading.Thread(target=_auto_takeover_loop, daemon=True).start()
     threading.Thread(target=_usage_refresh_loop, daemon=True).start()
     url = f"http://{_display_host(host)}:{server.server_address[1]}/"
     from urllib.parse import quote
-    write_url = f"{url}#token={quote(TOKEN, safe='')}"
-    print(json.dumps({"dashboard": url, "write_url": write_url, "route_log": str(ROUTE_LOG),
+    # Older supervisors redirect our stdout to their update log during an upgrade.
+    write_access = {} if reloading else {"write_url": f"{url}#token={quote(TOKEN, safe='')}"}
+    print(json.dumps({"dashboard": url, **write_access, "route_log": str(ROUTE_LOG),
                       "config_writes": True, "mode": "local_operator",
                       **({"port_fallback": fallback} if fallback else {})}), flush=True)
     if open_page:
@@ -6601,12 +6617,7 @@ def serve(host="127.0.0.1", port=DEFAULT_PORT, refresh=3, allow_fallback=False, 
         pass
     finally:
         server.server_close()
-        record = _read_pid_record()
-        if record and record.get("pid") == os.getpid():
-            try:
-                PID_FILE.unlink()
-            except OSError:
-                pass
+        _remove_pid_record(record)
 
 
 def _diagnostic_model(value, sensitive):
@@ -7110,13 +7121,11 @@ def main(argv=None):
         if not record:
             print(json.dumps({"stopped": False, "reason": "no_record"}))
             return 1
-        if not isinstance(record.get("port"), int) or not _port_open(record["port"]):
+        host = "::1" if record.get("host") == "::1" else "127.0.0.1"
+        if not _port_open(record["port"], host):
             # The recorded instance is gone (crash or reboot): drop the stale record instead
             # of signalling a PID that may now belong to an unrelated process.
-            try:
-                PID_FILE.unlink()
-            except OSError:
-                pass
+            _remove_pid_record(record)
             print(json.dumps({"stopped": False, "reason": "stale_record", "pid": record.get("pid")}))
             return 1
         verdict = _verify_pid_record(record)
