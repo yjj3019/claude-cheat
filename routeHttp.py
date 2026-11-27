@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: MIT
 """Direct JSON requests and wall-clock-bounded requests for model probes."""
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -34,7 +36,7 @@ def request_json(url, headers, body=None, timeout=12, *, deadline=None):
     # urllib's timeout bounds an individual socket operation. A slow header or
     # body can keep those operations succeeding indefinitely. Own the transport
     # in a process so expiry also closes the socket and reaps the outstanding read.
-    payload = json.dumps([url, headers, body, timeout]).encode("utf-8")
+    payload = json.dumps([url, headers, body, timeout, deadline]).encode("utf-8")
     with subprocess.Popen([sys.executable, "-I", "-B", str(Path(__file__).resolve())],
                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)) as worker:
@@ -56,7 +58,16 @@ def request_json(url, headers, body=None, timeout=12, *, deadline=None):
 
 if __name__ == "__main__":
     try:
-        result = _request(*json.load(sys.stdin.buffer))
+        url, headers, body, timeout, deadline = json.load(sys.stdin.buffer)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            sys.exit(2)
+        # The supervisor may exit during a blocking read. Enforce its original
+        # monotonic deadline in this disposable process as well.
+        watchdog = threading.Timer(remaining, os._exit, args=(2,))
+        watchdog.daemon = True
+        watchdog.start()
+        result = _request(url, headers, body, timeout)
         sys.stdout.buffer.write(json.dumps(result).encode("utf-8"))
     except TimeoutError:
         sys.exit(2)

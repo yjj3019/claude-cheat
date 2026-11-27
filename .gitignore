@@ -9,6 +9,8 @@ node_modules/
 .*-test-output.txt
 .browser-real-output.txt
 .dashboard.pid
+..dashboard.pid.lock
+..dashboard.pid.*.tmp
 .dashboard.token
 .analysis/
 *.bundle

@@ -185,16 +185,18 @@ def _update_locked(session_check=None):
 def dashboard(setup=False):
     """Reuse a verified dashboard or start one without stopping any existing process."""
     port = dash.DEFAULT_PORT
+    record = dash._read_pid_record()
+    host = "::1" if record and record.get("port") == port and record.get("host") == "::1" else "127.0.0.1"
     # Open the token-backed write_url so the settings page can save; a plain
     # http://127.0.0.1:<port>/ visit is read-only by design (token_required).
     def open_write_url():
         page = 'settings' if setup else ''
-        webbrowser.open(f"http://127.0.0.1:{port}/{page}#token={quote(getattr(dash, 'TOKEN', ''), safe='')}")
+        webbrowser.open(f"http://{dash._display_host(host)}:{port}/{page}#token={quote(getattr(dash, 'TOKEN', ''), safe='')}")
     def browser_present():
         headers = {"x-dashboard-token": dash.TOKEN}
         headers["content-type"] = "application/json"
         def post(payload, timeout=2):
-            request = Request(f"http://127.0.0.1:{port}/api/browser", headers=headers,
+            request = Request(f"http://{dash._display_host(host)}:{port}/api/browser", headers=headers,
                               data=json.dumps(payload).encode())
             with urlopen(request, timeout=timeout) as response:
                 data = json.load(response)
@@ -225,14 +227,14 @@ def dashboard(setup=False):
             except (OSError, ValueError, TypeError):
                 pass
         return False
-    if dash._port_open(port):
-        record = dash._read_pid_record()
+    if dash._port_open(port, host):
         if record and record.get("port") == port and dash._verify_pid_record(record) == "verified":
             if not browser_present():
                 open_write_url()
             return True
         print("OpenClaude: dashboard port is occupied by an unverified process.", file=sys.stderr)
         return False
+    host = "127.0.0.1"  # A newly launched dashboard uses the default IPv4 listener.
     try:
         process = subprocess.Popen([sys.executable, str(ROOT / "routeDashboard.py"), "--no-takeover"],
                          cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -244,7 +246,7 @@ def dashboard(setup=False):
         return False
     for _ in range(50):
         record = dash._read_pid_record()
-        if record and record.get("port") == port and dash._port_open(port):
+        if record and record.get("port") == port and record.get("host", host) == host and dash._port_open(port):
             if record.get("pid") == process.pid or dash._verify_pid_record(record) == "verified":
                 if not browser_present():
                     open_write_url()

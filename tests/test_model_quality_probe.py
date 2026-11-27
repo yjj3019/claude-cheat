@@ -2,17 +2,21 @@
 import contextlib
 import io
 import json
+import socket
+import subprocess
 import sys
 import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from unittest.mock import patch
 
 import cliBackend
 import modelQualityProbe as probe
 import routeConfig
 import routeDashboard as dashboard
+import routeHttp
 from tests import live_smoke
 from tests.live_cli_smoke import _request_adapter
 
@@ -309,6 +313,39 @@ class ModelQualityProbeTest(unittest.TestCase):
                 stop.set()
                 server.shutdown()
                 worker.join()
+
+    def test_http_worker_closes_socket_at_deadline_after_supervisor_exits(self):
+        parent = (
+            "import sys, time, routeHttp; "
+            "routeHttp.request_json(sys.argv[1], {}, timeout=30, deadline=time.monotonic()+4)"
+        )
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            listener.settimeout(10)
+            url = f"http://127.0.0.1:{listener.getsockname()[1]}/"
+            with subprocess.Popen([sys.executable, "-B", "-c", parent, url],
+                                  cwd=Path(routeHttp.__file__).resolve().parent,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as supervisor:
+                try:
+                    conn, _ = listener.accept()
+                    with conn:
+                        conn.settimeout(6)
+                        with conn.makefile("rb") as request:
+                            self.assertTrue(request.readline().startswith(b"GET / "))
+                            while request.readline() not in (b"\r\n", b""):
+                                pass
+                        conn.sendall(b"HTTP/1.0 200 OK\r\nContent-Length: 100\r\n\r\n ")
+                        self.assertIsNone(supervisor.poll())
+                        supervisor.kill()
+                        supervisor.wait(timeout=3)
+                        try:
+                            self.assertEqual(conn.recv(1), b"")
+                        except ConnectionResetError:
+                            pass  # Windows may reset a socket when its owning process exits.
+                finally:
+                    if supervisor.poll() is None:
+                        supervisor.kill()
 
     def test_cli_uses_backend_directly_without_global_factory_patch(self):
         class FakeBackend:
