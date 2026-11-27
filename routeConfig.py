@@ -41,6 +41,7 @@ from pathlib import Path
 # and is re-encrypted on the next save. On non-Windows systems encryption is
 # unavailable and values stay as-is with a one-time warning.
 _SECRET_PREFIX = "enc1:"
+_LITERAL_SECRET_PREFIX = "enc1:literal:"
 _SECRET_KEY_FIELD = "api_key"
 _secret_warned = False
 
@@ -72,30 +73,28 @@ def _dpapi(data, encrypt):
 
 
 def _encrypt_secret(value):
-    """Encrypt a credential for storage; returns the original when DPAPI is unavailable."""
+    """Encode a plaintext credential supplied by a caller or read from dotenv."""
     global _secret_warned
-    if not value or value.startswith(_SECRET_PREFIX):
+    if not value:
         return value
     if os.name != "nt":
         if not _secret_warned:
             _secret_warned = True
             logging.getLogger("openclaude").warning(
                 "DPAPI unavailable on this OS; the API key stays plaintext in the settings file.")
-        return value
+        return _LITERAL_SECRET_PREFIX + value if value.startswith(_SECRET_PREFIX) else value
     try:
         return _SECRET_PREFIX + base64.b64encode(_dpapi(value.encode("utf-8"), True)).decode("ascii")
     except Exception:
-        if not _secret_warned:
-            _secret_warned = True
-            logging.getLogger("openclaude").warning(
-                "DPAPI failed; the API key stays plaintext in the settings file.")
-        return value
+        raise ConfigError("secret_encrypt_failed") from None
 
 
 def _decrypt_secret(value):
     """Decrypt a stored credential; plaintext (legacy/hand-written) passes through."""
     if not isinstance(value, str) or not value.startswith(_SECRET_PREFIX):
         return value
+    if value.startswith(_LITERAL_SECRET_PREFIX + _SECRET_PREFIX):
+        return value[len(_LITERAL_SECRET_PREFIX):]
     try:
         return _dpapi(base64.b64decode(value[len(_SECRET_PREFIX):]), False).decode("utf-8")
     except Exception as error:
@@ -496,7 +495,7 @@ class Store:
             if provider in doc.sections:
                 # An empty value means "not set" (the shipped example and a cleared field both use it),
                 # so it never hides a built-in default such as the local Messages URL.
-                return {spec["keys"][key]: (_decrypt_secret(value) if key == _SECRET_KEY_FIELD else value)
+                return {spec["keys"][key]: (self._read_secret(provider, value) if key == _SECRET_KEY_FIELD else value)
                         for key, value in doc.sections[provider]["values"].items() if value != ""}
         legacy = self._legacy(provider)
         if legacy is None:
@@ -505,6 +504,21 @@ class Store:
             return read_legacy(legacy)
         except FileNotFoundError:
             return {}
+
+    def _matches_legacy_key(self, provider, value):
+        # Older versions copied a plaintext enc1: key verbatim from dotenv.
+        try:
+            return self._legacy_values(provider).get(_SECRET_KEY_FIELD) == value
+        except (OSError, ConfigError, UnicodeError):
+            return False
+
+    def _read_secret(self, provider, value):
+        try:
+            return _decrypt_secret(value)
+        except ConfigError:
+            if self._matches_legacy_key(provider, value):
+                return value
+            raise
 
     def history(self, key):
         with _WRITE_LOCK, self._cross_process_lock():
@@ -543,7 +557,7 @@ class Store:
                 yaml_updates = dict(target["values"])
                 record_history = True
             if original is None:
-                text = self._seed()
+                text = self._seed(omit_credential=provider if yaml_updates.get(_SECRET_KEY_FIELD) is not None else None)
             else:
                 doc = parse(original)
                 error = doc.first_error(provider)
@@ -552,6 +566,15 @@ class Store:
                     # or the save would look accepted while the next read refuses it.
                     raise error
                 text = original
+                # Repair only an old prefix collision corroborated by the original
+                # dotenv key. The backup must not acquire a new plaintext copy.
+                for service, section in doc.sections.items():
+                    stored = section["values"].get(_SECRET_KEY_FIELD, "")
+                    if (service in SECTIONS and not section["errors"] and stored.startswith(_SECRET_PREFIX)
+                            and self._matches_legacy_key(service, stored) and self._read_secret(service, stored) == stored):
+                        text = update_text(text, service, {_SECRET_KEY_FIELD: _encrypt_secret(stored)})
+                if text != original:
+                    raw = text.encode("utf-8-sig" if raw.startswith(b"\xef\xbb\xbf") else "utf-8")
                 # A service whose section does not exist yet is still being served from its
                 # deprecated .env file. Creating the section without those legacy values would
                 # silently shadow (hide) the stored credential, so the section starts from them;
@@ -655,7 +678,7 @@ class Store:
                         raise ConfigError("reset_unsafe_path")
                 raw = self._read_bytes(fresh=True)
                 # Seed retains other services' existing legacy settings if YAML is absent.
-                primary = clean_yaml(raw if raw is not None else self._seed().encode("utf-8"), primary=True)
+                primary = clean_yaml(raw if raw is not None else self._seed(omit_credential=provider).encode("utf-8"), primary=True)
                 backup_data = clean_yaml(backup.read_bytes()) if backup.is_file() else None
                 legacy_data = clean_legacy(legacy) if legacy is not None and legacy.is_file() else None
             except ConfigError as error:
@@ -700,10 +723,13 @@ class Store:
                 return self.path.read_bytes()
             cached = self._cache
             before = signature(self.path.stat())
-            if cached is not None and cached[0] == before:
+            # On Windows ctime can be creation time. A same-size in-place restore
+            # can preserve every stat field, so verify bytes again by the next poll.
+            now = time.monotonic()
+            if cached is not None and cached[0] == before and now < cached[2]:
                 return cached[1]
             raw = self.path.read_bytes()
-            self._cache = (before, raw) if signature(self.path.stat()) == before else None
+            self._cache = (before, raw, now + 1.0) if signature(self.path.stat()) == before else None
             return raw
         except FileNotFoundError:
             self._cache = None
@@ -770,7 +796,7 @@ class Store:
                     pass
             handle.close()
 
-    def _seed(self):
+    def _seed(self, *, omit_credential=None):
         """Text for a first save: the shipped example, plus every service's legacy values."""
         try:
             base = self._example().read_text(encoding="utf-8-sig")
@@ -784,7 +810,8 @@ class Store:
             except FileNotFoundError:
                 continue
             yaml_values = {key: (_encrypt_secret(legacy[name]) if key == _SECRET_KEY_FIELD else legacy[name])
-                           for key, name in spec["keys"].items() if name in legacy}
+                           for key, name in spec["keys"].items() if name in legacy
+                           and not (provider == omit_credential and key == _SECRET_KEY_FIELD)}
             if yaml_values:
                 base = update_text(base, provider, yaml_values)
         return base

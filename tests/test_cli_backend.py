@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: MIT
 """Synthetic protocol and owned-process tests; never call an authenticated CLI."""
 import copy
+import errno
 import http.client
 import json
 import os
 from pathlib import Path
 import re
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -44,12 +46,12 @@ class BackendTest(unittest.TestCase):
             function(*args, **kwargs)
         self.assertEqual(caught.exception.code, code)
 
-    def construct(self, kind="codex", runner=None, **values):
+    def construct(self, kind="codex", runner=None, version=None, **values):
         with patch.multiple(backend.routeCli,
                             find_binary=lambda *_: {"path": "synthetic"},
                             resolve_command=lambda _: ["synthetic"],
                             child_env=lambda _: {"SYNTHETIC": "yes"},
-                            probe_version=lambda *_: {"ok": True, "version": {"codex": "0.165.0", "claude": "2.1.312", "grok": "1.0.70"}[kind]}):
+                            probe_version=lambda *_: {"ok": True, "version": version or {"codex": "0.165.0", "claude": "2.1.312", "grok": "1.0.70"}[kind]}):
             return backend.Backend({"CLI_KIND": kind, **values}, runner)
 
     def test_strict_json_rejects_ambiguous_and_nonfinite_values(self):
@@ -203,10 +205,56 @@ class BackendTest(unittest.TestCase):
         _, model, usage = backend.parse_output("grok", json.dumps(reply))
         self.assertIsNone(model)
         self.assertEqual(usage, {"input_tokens": 0})
-        for invalid in (-1, "1", True):
+        for invalid in (-1, "1", True, 2**31):
             with self.subTest(value=invalid):
                 reply["usage"] = {"output_tokens": invalid}
                 self.error("invalid_usage", backend.parse_output, "grok", json.dumps(reply))
+
+    def test_restart_recovers_crashed_grok_prompt_and_preserves_active_request(self):
+        child = """import os, sys, tempfile
+sys.path.insert(0, 'tests')
+from test_cli_backend import BackendTest, request
+tempfile.tempdir = sys.argv[1]
+backend = BackendTest().construct('grok', lambda *_: os._exit(73), version='1.0.77')
+backend.generate(request('grok'))
+"""
+        with tempfile.TemporaryDirectory() as root, patch.object(tempfile, "tempdir", root):
+            result = subprocess.run([sys.executable, "-B", "-c", child, root],
+                                    cwd=Path(__file__).resolve().parents[1], timeout=30)
+            self.assertEqual(result.returncode, 73)
+            abandoned, = Path(root).glob("*/prompt.txt")
+            self.assertIn("synthetic prompt", abandoned.read_text(encoding="utf-8"))
+            unrelated = Path(root) / "claude-cheat-grok-unrelated"
+            unrelated.mkdir(mode=0o700)
+            (unrelated / "owner.lock").write_bytes(b"unrelated")
+            (unrelated / "prompt.txt").write_bytes(b"keep")
+            def active(argv, prompt, env, directory, timeout, cancelled):
+                self.construct("grok", version="1.0.77")
+                self.assertIn("synthetic prompt", (Path(directory) / "prompt.txt").read_text(encoding="utf-8"))
+                return json.dumps({"stopReason": "end_turn", "text": json.dumps({"text": "ok", "tool_calls": []})})
+            instance = self.construct("grok", active, version="1.0.77")
+            self.assertFalse(abandoned.exists())
+            instance.generate(request("grok"))
+            self.assertEqual(list(Path(root).iterdir()), [unrelated])
+            self.assertEqual((unrelated / "prompt.txt").read_bytes(), b"keep")
+
+    def test_grok_storage_failures_send_only_fixed_server_diagnostic(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(tempfile, "tempdir", root):
+            instance = self.construct("grok", lambda *_: self.fail("CLI must not start"), version="1.0.77")
+            with patch.object(backend, "Backend", return_value=instance), backend.serve({}) as (_, url, token):
+                parsed = urlsplit(url)
+                for target, method in ((tempfile, "mkdtemp"), (Path, "write_bytes")):
+                    with self.subTest(method=method), patch.object(target, method, side_effect=OSError(errno.ENOSPC, "private path")):
+                        conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=5)
+                        try:
+                            conn.request("POST", parsed.path, json.dumps(request("grok")), {"Authorization": "Bearer " + token})
+                            response = conn.getresponse()
+                            self.assertEqual(response.status, 500)
+                            self.assertEqual(response.getheader("X-CLI-Error-Code"), "cli_storage_failed")
+                            self.assertEqual(json.loads(response.read()), {"error": "cli_storage_failed"})
+                        finally:
+                            conn.close()
+            self.assertEqual(list(Path(root).iterdir()), [])
 
     def test_loopback_auth_input_and_native_metadata(self):
         instance = self.construct(runner=lambda *_: codex_output(model="native-test", usage={"input_tokens": 2, "output_tokens": 1}))

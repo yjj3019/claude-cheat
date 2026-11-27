@@ -533,7 +533,7 @@ _CLI_PUBLIC_DIAGNOSTICS = frozenset({
     "backend_version_unverified", "invalid_response", "invalid_tool_call", "invalid_tool_choice",
     "invalid_usage", "incomplete_response", "native_tool_execution_detected", "spawn_failed",
     "process_tracking_unavailable", "timeout", "cancelled", "request_too_large", "output_too_large",
-    "backend_busy",
+    "backend_busy", "cli_storage_failed",
 })
 
 
@@ -2674,7 +2674,7 @@ def _cli_test(mode, values):
                    "backend_cancelled", "backend_not_found", "invalid_cli_kind", "invalid_cli_model",
                    "invalid_cli_binary", "invalid_cli_timeout", "cli_not_found", "cli_timeout", "not_found", "not_logged_in", "cli_failed", "timeout", "cancelled",
                    "invalid_response", "incomplete_response", "invalid_tool_call", "invalid_tool_choice",
-                   "invalid_usage", "unsupported_request", "spawn_failed", "process_tracking_unavailable",
+                   "invalid_usage", "unsupported_request", "spawn_failed", "process_tracking_unavailable", "cli_storage_failed",
                    "output_too_large", "request_too_large", "native_tool_execution_detected", "wrong_model"}
         return {**base, "reason": code if code in allowed else "cli_backend_failed", "kind": kind}
 
