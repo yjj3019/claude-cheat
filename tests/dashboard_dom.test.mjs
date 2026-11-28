@@ -123,7 +123,11 @@ test('usage filters historical details and chart by selected instance', () => {
   const row=(id,model,tokens)=>({bucket:'2026-10-29',provider:'local',instance_id:id,requested_model:model,
     requests:1,failed:0,input_samples:1,input_tokens:tokens,output_samples:1,output_tokens:1});
   const payload={status:'ready',report:{rows:[row(a,'first-model',11),row(b,'second-model',29)]},sessions:[]};
+  Object.assign(payload.report.rows[1], {cache_read_tokens:42, cache_read_samples:1,
+    cache_creation_tokens:0, cache_creation_samples:1});
   sandbox.renderUsage(payload);
+  assert.match(context.nodes.get('usage-grid').innerHTML,/캐시 읽기<\/dt><dd>42 토큰<small>1 \/ 2건 보고/);
+  assert.match(context.nodes.get('usage-grid').innerHTML,/캐시 쓰기<\/dt><dd>0 토큰<small>1 \/ 2건 보고/);
   assert.match(context.nodes.get('usage-grid').innerHTML,/first-model/);
   assert.match(context.nodes.get('usage-grid').innerHTML,/second-model/);
   vm.runInContext(`usageInstance='${a}'`,sandbox);
@@ -131,6 +135,7 @@ test('usage filters historical details and chart by selected instance', () => {
   const html=context.nodes.get('usage-grid').innerHTML;
   assert.match(html,/first-model/); assert.doesNotMatch(html,/second-model/);
   assert.match(html,/최대 11 토큰/);
+  assert.match(html,/캐시 읽기<\/dt><dd>미보고<small>0 \/ 1건 보고/);
 });
 
 test('Plan reasons compare sessions by release and code hash with explicit missing reports', () => {
@@ -364,6 +369,30 @@ test('overview presents live model and key metrics before detailed insights', ()
   assert.match(html, /10\.0% \(5 \/ 50건 완료\)/);
   assert.match(html, /10\.00 토큰\/초 \(2건\)/);
   assert.match(html, /2\.50초/);
+});
+
+test('visible overview uses windowed route counts and distinguishes zero from missing observations', () => {
+  const ctx = buildContext(), body = fakeElement();
+  ctx.document.querySelector = selector => selector === '#grid .overview'
+    ? {querySelector: () => body} : null;
+  const sandbox = vm.createContext(ctx);
+  vm.runInContext(ASSETS.dashboard, sandbox);
+  const data = fixture({
+    active_session: true, proxy_metrics: {routes: {external: 99, plan: 1}},
+    routing: {state: 'external', counts: {external: 3, plan: 1}, window_minutes: 10},
+    usage: {today: {external: [0,0,0,0], plan: [0,0,0,0]}, cost_usd: 35}
+  });
+  sandbox.renderOverviewHero(data);
+  assert.match(body.innerHTML, /최근 10분 경로/);
+  assert.match(body.innerHTML, /외부 3건 · 75%/);
+  assert.match(body.innerHTML, /Plan 1건 · 25%/);
+  assert.match(body.innerHTML, /href="\/usage">0 토큰/);
+  assert.doesNotMatch(body.innerHTML, /35\.000/);
+  sandbox.renderOverviewHero({...data, active_session: null, routing: {counts: {external:0, plan:0}}, usage:{}});
+  assert.match(body.innerHTML, /활성 세션 없음/);
+  assert.match(body.innerHTML, /외부 0건/);
+  assert.match(body.innerHTML, /href="\/usage">사용량 보기/);
+  assert.doesNotMatch(body.innerHTML, /100%|ov-bar measured|href="#session-monitor"/);
 });
 
 test('overview does not mistake historical metrics for a live session', () => {

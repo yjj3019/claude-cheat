@@ -1270,13 +1270,12 @@ class PageTests(unittest.TestCase):
         self.assertIn('이중 공급자 별칭 사용', page)
         self.assertIn("payload.get(\"dual_provider\")", Path('routeDashboard.py').read_text(encoding='utf-8'))
 
-    def test_overview_metric_tiles_are_two_columns_and_context_follows(self):
+    def test_overview_metric_tiles_adapt_to_width_and_context_follows(self):
         css=dash.PAGE_CSS
-        self.assertIn('.ov-tiles{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))',css)
-        self.assertNotIn('.overview-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr))',css)
-        self.assertIn('@media(max-width:420px){.overview-grid{grid-template-columns:repeat(2,minmax(0,1fr))',css)
-        self.assertIn('.overview-tile:nth-child(n+3){padding-top:10px;border-top:1px solid var(--line)}',css)
-        self.assertIn('.overview,.flow-card{height:560px;min-height:560px;overflow:hidden}',css)
+        self.assertIn('.ov-tiles{display:grid;grid-template-columns:repeat(4,minmax(0,1fr))',css)
+        self.assertRegex(css,r'@media\(max-width:800px\)\{\s*\.ov-top\{grid-template-columns:minmax\(0,1fr\)')
+        self.assertIn('.ov-tiles{grid-template-columns:repeat(2,minmax(0,1fr))',css)
+        self.assertNotIn('.overview,.flow-card{height:560px',css)
         page=dash.PAGE
         self.assertIn("tile('관측 속도'",page)
         self.assertIn("tile('외부 p95'",page)
@@ -1317,9 +1316,9 @@ class PageTests(unittest.TestCase):
         self.assertIn('overviewCompleted', dash.PAGE)
         self.assertIn('건 완료', dash.PAGE)
         self.assertIn('data.summary ? data.summary', dash.PAGE)
-        # Content-length changes must not resize the top cards and shift everything below.
-        self.assertIn('Stable dashboard geometry', dash.PAGE_CSS)
-        self.assertIn('height:560px', dash.PAGE_CSS)
+        # The summary grows for long model names and metrics without clipping their units.
+        self.assertIn('.ov-tile .v small{', dash.PAGE_CSS)
+        self.assertIn('.ov-tile .v{display:flex;align-items:baseline;flex-wrap:wrap', dash.PAGE_CSS)
         self.assertIn('-webkit-line-clamp:3', dash.PAGE_CSS)
         self.assertIn('white-space:normal;overflow-wrap:anywhere', dash.PAGE)
         self.assertNotIn('.ov-tile .c{font-size:10.5px;color:var(--fg-4);margin-top:3px;white-space:nowrap', dash.PAGE)
