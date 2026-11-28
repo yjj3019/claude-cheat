@@ -2299,7 +2299,9 @@ def _display_session():
             _SHOWN_INSTANCE = _read_shown_instance()
             _SHOWN_INSTANCE_LOADED = True
         _SHOWN_INSTANCE = session.get("instance_id")
-        return session, metrics, []
+        summary = _session_summary({"session": session, "metrics": metrics or {}})
+        summary.update(selected=True, status="active" if metrics and not metrics.get("stale") else "unknown")
+        return session, metrics, [summary]
     if not _SHOWN_INSTANCE_LOADED:
         _SHOWN_INSTANCE = _read_shown_instance()
         _SHOWN_INSTANCE_LOADED = True
@@ -5089,8 +5091,9 @@ function renderUsage(payload) {
   if (!payload) {status.textContent='모니터링 정보를 불러오지 못했습니다.';grid.innerHTML='';return;}
   const reportBuilding = payload.status === 'building';
   const report=payload.report || {}, allRows=Array.isArray(report.rows)?report.rows:[], sessions=Array.isArray(payload.sessions)?payload.sessions:[];
-  const ids=[...new Set(allRows.map(row=>row.instance_id).filter(id=>typeof id==='string' && /^[a-f0-9]{32}$/i.test(id)))].sort();
-  if (usageInstance && !ids.includes(usageInstance)) usageInstance='';
+  const available = new Set(allRows.map(row=>row.instance_id).filter(id=>typeof id==='string' && /^[a-f0-9]{32}$/i.test(id)));
+  if (usageInstance) available.add(usageInstance);
+  const ids = [...available].sort();
   const rows=usageInstance ? allRows.filter(row=>row.instance_id===usageInstance) : allRows;
   const recordingWarning = sessions.some(s => s.status !== 'active' || !s.recording || s.recording.enabled !== true || [s.recording.dropped,s.recording.errors,s.recording.pending].some(value => !Number.isSafeInteger(value) || value !== 0));
   const partial=recordingWarning || payload.error || payload.sessions_error || payload.sessions_partial || payload.collection?.pending || (payload.collection?.errors||[]).length || report.coverage==='partial' || report.truncated;
@@ -5152,9 +5155,13 @@ function renderUsage(payload) {
     + cacheMetric('캐시 쓰기', 'cache_creation_tokens', 'cache_creation_samples') + '</dl>' : '';
   const filterFocused = document.activeElement?.id === 'usage-instance';
   const selector=`<label for="usage-instance">사용량 범위</label> <select id="usage-instance" class="input"><option value="">전체 수집 실행기</option>${ids.map(id=>`<option value="${esc(id)}"${id===usageInstance?' selected':''}>${esc(id.slice(0,8))}</option>`).join('')}</select><p class="hint">캐시 읽기·쓰기, 토큰 추이와 상세 표에 적용됩니다.</p>`;
-  grid.innerHTML=card('기간별 사용량','선택한 기간과 실행기의 보고값',selector + cacheSummary + usageChart(rows,report.period || document.getElementById('usage-period').value || 'day')) +
+  const emptyUsage = reportBuilding ? '선택한 범위의 사용량을 수집하고 있습니다.'
+    : usageInstance ? '조회 기간에 선택한 실행기의 기록이 없습니다.' : '조회 기간에 수집된 사용량이 없습니다.';
+  const emptyUsageHtml = `<p class="empty">${emptyUsage}</p>`;
+  const chart = rows.length ? usageChart(rows,report.period || document.getElementById('usage-period').value || 'day') : emptyUsageHtml;
+  grid.innerHTML=card('기간별 사용량','선택한 기간과 실행기의 보고값',selector + cacheSummary + chart) +
     card('실행기별 현재 상태','수집 시점 기준 · 경로는 실행기 시작 후 선택 건수 · 직접 Sonnet은 미관측', sessionRows ? `<div class="table-scroll"><table><thead><tr><th>실행기</th><th>서비스</th><th>상태</th><th>진행</th><th>대기</th><th>요청</th><th>외부 / Plan</th><th>실패</th><th>p95</th></tr></thead><tbody>${sessionRows}</tbody></table></div>` : '<p class="empty">인증된 실행기 기록이 없습니다. 기존 실행기와 직접 Sonnet은 표시되지 않을 수 있습니다.</p>') +
-    card('기간 · 모델 · 실행기별','괄호는 토큰을 보고한 응답 수 / 전체 요청 수', details ? `<div class="table-scroll"><table><thead><tr><th>기간</th><th>서비스</th><th>요청 모델</th><th>보고 모델</th><th>실행기</th><th>요청</th><th>실패</th><th>입력 토큰</th><th>출력 토큰</th><th>평균 시간</th></tr></thead><tbody>${details}</tbody></table></div>` : '<p class="empty">조회 기간에 수집된 사용량이 없습니다.</p>') + telemetryCard + buildCard;
+    card('기간 · 모델 · 실행기별','괄호는 토큰을 보고한 응답 수 / 전체 요청 수', details ? `<div class="table-scroll"><table><thead><tr><th>기간</th><th>서비스</th><th>요청 모델</th><th>보고 모델</th><th>실행기</th><th>요청</th><th>실패</th><th>입력 토큰</th><th>출력 토큰</th><th>평균 시간</th></tr></thead><tbody>${details}</tbody></table></div>` : emptyUsageHtml) + telemetryCard + buildCard;
   if (filterFocused) document.getElementById('usage-instance')?.focus?.({preventScroll:true});
   document.getElementById('usage-instance')?.addEventListener('change', event=>{usageInstance=event.target.value;renderUsage(payload);});
 }
@@ -5536,8 +5543,9 @@ function renderOverviewHero(data) {
   const requests = number(current?.requests), ok = number(current?.ok);
   const failed = number(current?.failed), aborted = number(current?.aborted);
   const errors = failed !== null && (aborted ?? 0) <= failed ? failed - (aborted ?? 0) : null;
-  const completed = ok !== null && errors !== null ? ok + errors : null;
-  const failureRate = completed ? (100 * errors / completed).toFixed(1) : null;
+  const ended = ok !== null && failed !== null ? ok + failed : null;
+  const nonCancelled = ok !== null && errors !== null ? ok + errors : null;
+  const failureRate = nonCancelled ? (100 * errors / nonCancelled).toFixed(1) : null;
   const performance = current?.modelPerformance?.[current.configuration?.provider];
   const rate = number(performance?.outputTokens) !== null && number(performance?.elapsedMs)
     ? (1000 * performance.outputTokens / performance.elapsedMs).toFixed(1) : null;
@@ -5557,12 +5565,12 @@ function renderOverviewHero(data) {
   const repoLine = [selected?.repo !== selected?.project ? selected?.repo : '', selected?.branch, selected?.port ? ':' + selected.port : ''].filter(Boolean).join(' · ');
   const tile = (label, value, unit, detail) => `<div class="ov-tile"><div class="k">${esc(label)}</div>`
     + `<div class="v">${value === null ? '—' : `${esc(value)}<small>${esc(unit)}</small>`}</div><div class="c">${esc(detail)}</div></div>`;
-  body.innerHTML = `<div class="ov-top"><div class="ov-state"><h3 class="ov-title"><i class="ov-led ${led}" aria-hidden="true"></i>${esc(stateText)}</h3>`
+  body.innerHTML = `<div class="ov-top"><div class="ov-state"><h3 class="ov-title" id="overview-state" tabindex="-1"><i class="ov-led ${led}" aria-hidden="true"></i>${esc(stateText)}</h3>`
     + `<span class="ov-sub">${esc(model)} · 마지막 결정 ${esc(ageText)}</span></div>`
     + `<div class="ov-route"><div class="ov-route-head"><b>최근 ${esc(routing.window_minutes || 60)}분 경로</b><span>${total === null ? '기록 없음' : count(total) + '건'}</span></div>`
     + `<div class="ov-bar${share === null ? '' : ' measured'}" aria-hidden="true"><i style="width:${share ?? 0}%"></i></div>`
     + `<div class="ov-route-foot"><span>외부 ${count(external)}건${share === null ? '' : ` · ${share}%`}</span><span>Plan ${count(plan)}건${share === null ? '' : ` · ${100-share}%`}</span></div></div></div>`
-    + `<div class="ov-tiles">${tile('요청', requests === null ? null : count(requests), '건', current ? `완료 ${count(completed)} · 진행 ${count(number(current.inflightRequests))}` : '현재 세션 데이터 없음')}`
+    + `<div class="ov-tiles">${tile('요청', requests === null ? null : count(requests), '건', current ? `종료 ${count(ended)} · 취소 ${count(aborted)} · 진행 ${count(number(current.inflightRequests))}` : '현재 세션 데이터 없음')}`
     + `${tile('실패율', failureRate, '%', `실패 ${count(errors)} · 취소 ${count(aborted)} 제외`)}`
     + `${tile('관측 속도', rate, '토큰/초', '출력 토큰 / 전체 요청 시간')}`
     + `${tile('외부 p95', p95 === null ? null : (p95 / 1000).toFixed(2), '초', '최근 외부 요청 기준')}</div>`
@@ -5574,11 +5582,8 @@ function renderOverviewHero(data) {
 }
 const renderGridWithOverviewHero = renderGrid;
 renderGrid = function (data) {
-  const focused = document.activeElement?.id;
   renderGridWithOverviewHero(data);
   renderOverviewHero(data);
-  if (['overview-sessions', 'overview-usage', 'session-monitor'].includes(focused))
-    document.getElementById(focused)?.focus?.({preventScroll:true});
 };
 """
 JS_DASHBOARD += """
@@ -5623,7 +5628,7 @@ function renderAttentionQueue(data) {
     return;
   }
   host.innerHTML = `<section class="attention" aria-labelledby="attention-title">
-    <header class="attention-head"><div><h2 id="attention-title">지금 필요한 것</h2>
+    <header class="attention-head"><div><h2 id="attention-title" tabindex="-1">지금 필요한 것</h2>
     <p class="sub">${counts.critical ? '치명 ' + counts.critical + ' · ' : ''}조치 ${open.length}건</p></div>
     <span class="pill ${counts.critical ? 'signal-red' : 'signal-warn'}">${counts.critical ? '확인 필요' : '주의'}</span></header>
     <div class="card-b">${guide}<div class="attention-list">${open.map(attentionItem).join('')}</div></div></section>`;
@@ -5638,6 +5643,37 @@ function attentionHistory(data) {
     ${history.map(item => `<div class="attention-body"><b>${esc(item.title)}</b><p>${esc(item.detail || '')}</p><small>${esc(attentionAge(item))}${item.project ? ' · ' + esc(item.project) : ''} · 해결</small></div>`).join('')}
   </div></div>`;
 }
+// Alerts and the session table are both replaced during a snapshot refresh.
+const renderBeforeFocusRestore = render;
+function controlOffset(control, viewport) {
+  const rect = control.getBoundingClientRect();
+  const bounds = viewport.getBoundingClientRect();
+  return {x:rect.left - bounds.left, y:rect.top - bounds.top};
+}
+render = function(data) {
+  const focused = document.activeElement;
+  const key = focused?.dataset;
+  const viewport = (key?.attentionAction || key?.sessionSelect) && focused.closest('.attention-list, .table-scroll');
+  const offset = viewport && controlOffset(focused, viewport);
+  renderBeforeFocusRestore(data);
+  let next;
+  if (key?.attentionAction) {
+    next = Array.from(document.querySelectorAll('[data-attention-action]')).find(button =>
+      button.dataset.attentionId === key.attentionId && button.dataset.attentionAction === key.attentionAction)
+      || document.getElementById('attention-title');
+  } else if (key?.sessionSelect) {
+    next = Array.from(document.querySelectorAll('[data-session-select]')).find(button =>
+      button.dataset.sessionSelect === key.sessionSelect) || document.getElementById('session-monitor');
+  } else if (['overview-sessions','overview-usage','session-monitor','attention-title','overview-state'].includes(focused?.id)) {
+    next = document.getElementById(focused.id);
+  } else return;
+  const newViewport = offset && next?.closest('.attention-list, .table-scroll');
+  if (newViewport) {
+    const position = controlOffset(next, newViewport);
+    newViewport.scrollBy(position.x - offset.x, position.y - offset.y);
+  }
+  (next || document.getElementById('overview-state'))?.focus({preventScroll:true});
+};
 const renderAlertsLegacy = renderAlerts;
 renderAlerts = function (data) {
   if (!data || !data.attention) return renderAlertsLegacy(data);

@@ -61,6 +61,45 @@ async function launch(port, setup=false) {
       assert.ok(readable, `overview must fit at ${width}px without hiding status or units`);
     }
     await second.setViewportSize(originalSize);
+    const snapshot = await second.evaluate(() => SNAP);
+    const first = {instance_id:'a'.repeat(32),provider:'local',selected:true};
+    const other = {instance_id:'b'.repeat(32),provider:'cli'};
+    const alert = id => ({id, state:'open', level:'warn', title:id});
+    const items = [alert('first'), ...Array.from({length:8}, (_, i) => alert('extra-' + i)), alert('second')];
+    const live = {...snapshot, configured:true, sessions:[first,other],
+      attention:{counts:{warn:items.length},items}};
+    const snapshotRoute = route => route.fulfill({json:live});
+    await second.route('**/api/snapshot*', snapshotRoute);
+    try {
+      await second.evaluate(() => tick(true));
+      const sessionButton = second.locator(`[data-session-select="${other.instance_id}"]`);
+      await sessionButton.focus();
+      live.sessions.reverse();
+      await second.evaluate(() => tick(true));
+      assert.ok(await sessionButton.evaluate(el => el === document.activeElement));
+      const snooze = second.locator('[data-attention-id="second"][data-attention-action="snooze"]');
+      const focusedAndVisible = el => {
+        const rect = el.getBoundingClientRect();
+        const bounds = el.closest('.attention-list').getBoundingClientRect();
+        return el === document.activeElement && rect.top >= bounds.top - 1 && rect.bottom <= bounds.bottom + 1;
+      };
+      await snooze.focus();
+      await second.evaluate(() => tick(true));
+      assert.ok(await snooze.evaluate(focusedAndVisible), 'polling keeps the focused alert in view');
+      live.attention.items.reverse();
+      await second.evaluate(() => tick(true));
+      assert.ok(await snooze.evaluate(focusedAndVisible), 'reordering keeps the focused alert in view');
+      live.attention.items = [alert('first')];
+      await second.evaluate(() => tick(true));
+      assert.equal(await second.evaluate(() => document.activeElement.id), 'attention-title');
+      await sessionButton.focus();
+      live.sessions = [first];
+      await second.evaluate(() => tick(true));
+      assert.equal(await second.evaluate(() => document.activeElement.id), 'session-monitor');
+    } finally {
+      await second.unroute('**/api/snapshot*', snapshotRoute);
+      await second.evaluate(() => tick(true));
+    }
     assert.match(await second.locator('#gateway-evidence').textContent(),/running-model/);
     assert.match(await second.locator('#gateway-evidence').textContent(),/saved-model/);
     await second.locator('#gateway-evidence details[data-section="startup"] summary').click();
