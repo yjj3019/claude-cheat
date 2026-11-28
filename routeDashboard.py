@@ -4497,7 +4497,7 @@ def _page(kind="dashboard"):
     # Present on every page: the badge answers "which build am I looking at".
     version_pill = ('<button class="pill pill-mute" id="version-pill" type="button"'
                     ' aria-label="버전 확인 중" title="버전 확인 중" onclick="checkVersionNow()">v…</button>')
-    actions = version_pill + (
+    actions = (
                '<span class="pill signal-neutral" id="live-pill" role="status" aria-label="라우팅 상태: 확인 중">'
                '<span class="signal-lamps" aria-hidden="true"><i class="signal-red-lamp"></i>'
                '<i class="signal-warn-lamp"></i><i class="signal-green-lamp"></i></span>'
@@ -4519,8 +4519,8 @@ def _page(kind="dashboard"):
             '<style>' + PAGE_CSS + '</style></head><body>\n'
             '<header class="topbar"><div class="wrap topbar-in">\n'
             '  <div class="brand"><span class="logo"></span><div style="min-width:0">\n'
-            '    <h1>' + title + '</h1><p id="stamp">불러오는 중…</p></div></div>\n'
-            '  <nav class="top-nav">' + nav + '</nav>\n'
+            '    <h1>' + title + '</h1><p id="stamp">불러오는 중…</p></div>' + version_pill + '</div>\n'
+            '  <nav class="top-nav" aria-label="주 메뉴">' + nav + '</nav>\n'
             '  <div class="top-actions">' + actions + '</div>\n'
             '</div></header>\n'
             '<main class="wrap">' + body + '</main>\n'
@@ -4534,7 +4534,6 @@ JS_SETTINGS += "\nfunction renderDefaultCli() {\n  const options = document.getE
 # Dashboard hierarchy: keep the live flow prominent without pushing trends below the fold.
 PAGE_CSS += """
 @media(min-width:1200px){
- .overview{grid-column:span 5}.flow-card{grid-column:span 7}
  .overview-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:16px 0}
  .overview-tile:nth-child(2){border-right:0}.overview-tile:nth-child(3){padding-left:0}
  .overview-tile:nth-child(n+3){padding-top:12px;border-top:1px solid var(--line)}
@@ -5035,8 +5034,10 @@ USAGE_BODY = '''<section class="card" aria-labelledby="usage-title">
     <select id="usage-period" class="input"><option value="day">일별 · 최근 31일</option><option value="week">주별 · 최근 12주</option><option value="month">월별 · 최근 13개월</option></select>
     <button class="btn" type="button" onclick="loadUsage()">새로고침</button></div>
     <p class="hint" id="usage-status" role="status" aria-live="polite">사용량 확인 중…</p>
+    <details class="measurement-notes"><summary>수집 범위와 집계 기준</summary>
     <p class="hint">새 수집 시작 이후의 프록시 관측값입니다. 주는 월요일에 시작하며 날짜는 이 컴퓨터의 시간대입니다. 기존 이력과 직접 실행한 Sonnet은 포함되지 않을 수 있습니다.</p>
     <p class="hint">요청·토큰·대기·지연은 이 실행기에서 관측한 작업량입니다. 호스트 CPU·메모리는 OS 표본, 프록시 RSS는 인증된 세션별 프로세스 표본이며 공유 GPU·GPU 메모리는 측정하지 않습니다. 합계와 표본 범위는 아래 카드에 표시합니다.</p>
+    </details>
   </div></section><div class="grid" id="usage-grid"></div>'''
 
 JS_USAGE = '''
@@ -5094,7 +5095,7 @@ function renderUsage(payload) {
   const recordingWarning = sessions.some(s => s.status !== 'active' || !s.recording || s.recording.enabled !== true || [s.recording.dropped,s.recording.errors,s.recording.pending].some(value => !Number.isSafeInteger(value) || value !== 0));
   const partial=recordingWarning || payload.error || payload.sessions_error || payload.sessions_partial || payload.collection?.pending || (payload.collection?.errors||[]).length || report.coverage==='partial' || report.truncated;
   status.textContent=reportBuilding?'사용량 ledger 수집 대기 중입니다. host 자원과 인증된 proxy 상태는 별도 수집분으로 표시합니다.':partial?'일부 수집이 지연되거나 누락됐습니다. 표시된 수치는 확인된 범위만 포함합니다.':
-    (report.collection_started ? '첫 관측: '+report.collection_started+' · 수집된 범위만 표시' : '아직 수집된 요청이 없습니다.');
+    (report.collection_started ? '첫 관측: '+report.collection_started+' · 수집된 범위만 표시' : allRows.length ? '첫 관측 시각 미보고 · 수집된 범위만 표시' : '아직 수집된 요청이 없습니다.');
   if (Number.isSafeInteger(report.model_provenance_unverified) && report.model_provenance_unverified > 0) status.textContent += ` 이전 수집 형식 ${usageNumber(report.model_provenance_unverified)}건의 실제 모델 출처 미확인: 보고 모델 미보고로 표시.`;
   const recordingText = s => { const r=s.recording; if (s.status !== 'active' || !r || r.enabled === null) return '기록 상태 미보고'; if (!r.enabled) return '기록 꺼짐'; return `누락 ${usageNumber(r.dropped)} · 오류 ${usageNumber(r.errors)} · 대기 ${usageNumber(r.pending)}`; };
   const blockerText=counts=>counts==null?'미보고':Object.entries(counts).sort((a,b)=>b[1]-a[1]).map(([k,n])=>(k==='other'?'기타':esc(k))+' '+usageNumber(n)).join(' · ')||'0건';
@@ -5135,10 +5136,26 @@ function renderUsage(payload) {
     `<div class="m"><span class="k">활성 실행기 요청 · 진행</span><span class="v">${usageNumber(aggregate.requests)} · ${usageNumber(aggregate.inflight)}</span></div></div>`+
     `<p class="hint">추론 요청 / 전송 / 재전송: ${val('logical_messages')} / ${val('upstream_calls')} / ${val('repeat_calls')} · 첫 전송 성공: ${val('first_call_success')} · 사용량 보고 전송: ${val('measured_calls')} · 관측 입력 / 출력: ${val('observed_input')} / ${val('observed_output')} · 캐시 읽기 / 쓰기: ${val('cache_read')} / ${val('cache_write')} · 대화별 Plan 후 Local 첫 시도 성공 / 최종 복귀 / 적격: ${val('first_local_returns')} / ${val('local_returns')} / ${val('eligible_after_plan')} · 대화 미식별 실행기 후속: ${val('instance_followups')} · 재전송 관측 토큰: ${val('repeat_tokens')} · 경로 선택 합계 외부 / Plan: ${val('route_external')} / ${val('route_plan')} · ${esc(requestLimits)} · ${esc(rejectTotals)}</p><p class="hint">${esc(hostStatus)} · ${esc(aggregateStatus)} · 표본 ${esc(coverageText||'미보고')} · ${esc(providerTotals)}. 합계는 인증된 활성 세션의 필드가 모두 보고될 때만 표시합니다. 최대 ${MAX_USAGE_INSTANCES}개 인스턴스를 조회하며 초과 세션은 순환 수집합니다. OS host 메모리와 proxy RSS는 별도 지표입니다. GPU 메모리는 측정하지 않습니다.</p>`);
   const details=rows.map(row=>`<tr><td>${esc(row.bucket||'—')}</td><td>${esc(usageProviders[row.provider]||'제공자 미확인')}</td><td class="mono">${esc(row.requested_model||'미보고')}</td><td class="mono">${esc(row.reported_model||'미보고')}</td><td class="mono">${esc((row.instance_id||'').slice(0,8))}</td><td class="num">${usageNumber(row.requests)}</td><td class="num">${usageNumber(row.failed)}</td><td class="num">${usageNumber(row.input_tokens)} <small>(${usageNumber(row.input_samples)}/${usageNumber(row.requests)})</small></td><td class="num">${usageNumber(row.output_tokens)} <small>(${usageNumber(row.output_samples)}/${usageNumber(row.requests)})</small></td><td class="num">${usageDuration(row.mean_elapsed_ms)}</td></tr>`).join('');
-  const selector=`<label for="usage-instance">사용량 범위</label> <select id="usage-instance" class="input"><option value="">전체 수집 실행기</option>${ids.map(id=>`<option value="${esc(id)}"${id===usageInstance?' selected':''}>${esc(id.slice(0,8))}</option>`).join('')}</select><p class="hint">선택은 기간별 토큰 추이와 아래 상세 표에 적용됩니다. 전체는 수집된 범위이며 미보고 토큰을 포함하지 않습니다.</p>`;
-  grid.innerHTML=telemetryCard + buildCard + card('실행기 선택','기간별 사용량 범위',selector) + card('기간별 토큰 추이','보고된 사용량만 집계',usageChart(rows,report.period || document.getElementById('usage-period').value || 'day')) +
+  const requestTotal = rows.reduce((total, row) => total + row.requests, 0);
+  function cacheMetric(label, tokenKey, sampleKey) {
+    let tokens = 0, samples = 0;
+    for (const row of rows) {
+      if (Number.isSafeInteger(row[tokenKey]) && row[tokenKey] >= 0 && Number.isSafeInteger(row[sampleKey]) && row[sampleKey] > 0) {
+        tokens += row[tokenKey];
+        samples += row[sampleKey];
+      }
+    }
+    return `<div><dt>${label}</dt><dd>${samples ? num(tokens) + ' 토큰' : '미보고'}<small>${num(samples)} / ${num(requestTotal)}건 보고</small></dd></div>`;
+  }
+  const cacheSummary = rows.length ? '<dl class="usage-cache">'
+    + cacheMetric('캐시 읽기', 'cache_read_tokens', 'cache_read_samples')
+    + cacheMetric('캐시 쓰기', 'cache_creation_tokens', 'cache_creation_samples') + '</dl>' : '';
+  const filterFocused = document.activeElement?.id === 'usage-instance';
+  const selector=`<label for="usage-instance">사용량 범위</label> <select id="usage-instance" class="input"><option value="">전체 수집 실행기</option>${ids.map(id=>`<option value="${esc(id)}"${id===usageInstance?' selected':''}>${esc(id.slice(0,8))}</option>`).join('')}</select><p class="hint">캐시 읽기·쓰기, 토큰 추이와 상세 표에 적용됩니다.</p>`;
+  grid.innerHTML=card('기간별 사용량','선택한 기간과 실행기의 보고값',selector + cacheSummary + usageChart(rows,report.period || document.getElementById('usage-period').value || 'day')) +
     card('실행기별 현재 상태','수집 시점 기준 · 경로는 실행기 시작 후 선택 건수 · 직접 Sonnet은 미관측', sessionRows ? `<div class="table-scroll"><table><thead><tr><th>실행기</th><th>서비스</th><th>상태</th><th>진행</th><th>대기</th><th>요청</th><th>외부 / Plan</th><th>실패</th><th>p95</th></tr></thead><tbody>${sessionRows}</tbody></table></div>` : '<p class="empty">인증된 실행기 기록이 없습니다. 기존 실행기와 직접 Sonnet은 표시되지 않을 수 있습니다.</p>') +
-    card('기간 · 모델 · 실행기별','괄호는 토큰을 보고한 응답 수 / 전체 요청 수', details ? `<div class="table-scroll"><table><thead><tr><th>기간</th><th>서비스</th><th>요청 모델</th><th>보고 모델</th><th>실행기</th><th>요청</th><th>실패</th><th>입력 토큰</th><th>출력 토큰</th><th>평균 시간</th></tr></thead><tbody>${details}</tbody></table></div>` : '<p class="empty">조회 기간에 수집된 사용량이 없습니다.</p>');
+    card('기간 · 모델 · 실행기별','괄호는 토큰을 보고한 응답 수 / 전체 요청 수', details ? `<div class="table-scroll"><table><thead><tr><th>기간</th><th>서비스</th><th>요청 모델</th><th>보고 모델</th><th>실행기</th><th>요청</th><th>실패</th><th>입력 토큰</th><th>출력 토큰</th><th>평균 시간</th></tr></thead><tbody>${details}</tbody></table></div>` : '<p class="empty">조회 기간에 수집된 사용량이 없습니다.</p>') + telemetryCard + buildCard;
+  if (filterFocused) document.getElementById('usage-instance')?.focus?.({preventScroll:true});
   document.getElementById('usage-instance')?.addEventListener('change', event=>{usageInstance=event.target.value;renderUsage(payload);});
 }
 async function loadUsage() {
@@ -5338,11 +5355,6 @@ async function selectSession(instance) {
 '''
 
 PAGE_CSS += """
-# Stable dashboard geometry: value/sentence changes must not move the cards below.
-@media(min-width:1400px){
- .overview,.flow-card{height:560px;min-height:560px;overflow:hidden}
- .overview>.card-b,.flow-card>.card-b{overflow:hidden}
-}
 .metrics-strip .v{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .overview-state{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .overview-tile .context{display:block;max-height:2.8em;overflow:hidden}
@@ -5425,7 +5437,7 @@ function renderSessionMonitor(data) {
       <td>${age(session.last_ts)}${busy(session) ? ' <span class="chip chip-load">부하</span>' : ''}</td>
     </tr>`;
   }).join('');
-  const card = `<section class="card col-12 session-monitor" id="session-monitor"><header class="card-h"><div><h2>세션별 모니터링</h2><p class="sub">세션별 요청·토큰·지연·프로세스 부하 · ${sessions.length}개 세션</p></div></header><div class="card-b"><div class="table-scroll"><table><thead><tr><th>세션 · 작업</th><th>요청</th><th>경로</th><th>실패/취소</th><th>진행</th><th>p95</th><th>출력</th><th>입력/출력 토큰</th><th>프로세스</th><th>마지막</th></tr></thead><tbody>${rows}</tbody></table></div><p class="hint">요청·토큰은 각 세션 프록시가 보고한 값입니다. 부하는 진행·대기 요청이 있거나 이벤트 루프 p95가 250ms 이상일 때 표시합니다. 표시 버튼을 누르면 위 상세 카드가 해당 세션 기준으로 전환됩니다.</p></div></section>`;
+  const card = `<section class="card col-12 session-monitor" id="session-monitor" tabindex="-1"><header class="card-h"><div><h2>세션별 모니터링</h2><p class="sub">세션별 요청·토큰·지연·프로세스 부하 · ${sessions.length}개 세션</p></div></header><div class="card-b"><div class="table-scroll"><table><thead><tr><th>세션 · 작업</th><th>요청</th><th>경로</th><th>실패/취소</th><th>진행</th><th>p95</th><th>출력</th><th>입력/출력 토큰</th><th>프로세스</th><th>마지막</th></tr></thead><tbody>${rows}</tbody></table></div><p class="hint">요청·토큰은 각 세션 프록시가 보고한 값입니다. 부하는 진행·대기 요청이 있거나 이벤트 루프 p95가 250ms 이상일 때 표시합니다. 표시 버튼을 누르면 위 상세 카드가 해당 세션 기준으로 전환됩니다.</p></div></section>`;
   const historyCard = Array.from(grid.children).find(node => node.textContent.includes('최근 요청 추이'));
   if (historyCard) historyCard.insertAdjacentHTML('afterend', card);
   else grid.insertAdjacentHTML('beforeend', card);
@@ -5442,93 +5454,131 @@ document.addEventListener('click', event => {
 });
 """
 PAGE_CSS += """
-/* Overview: one readable status hero, four measured tiles, and session context. */
-.ov-top{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;padding-bottom:16px;border-bottom:1px solid var(--line)}
-.ov-state{display:flex;gap:12px;min-width:0}
-.ov-led{width:13px;height:13px;border-radius:50%;margin-top:7px;flex:0 0 auto;background:#718097;box-shadow:0 0 0 4px #71809722}
-.ov-led.green{background:#43d9a3;box-shadow:0 0 0 4px #43d9a322}
-.ov-led.red{background:#ff7089;box-shadow:0 0 0 4px #ff708922}
-.ov-led.amber{background:#f2b95e;box-shadow:0 0 0 4px #f2b95e22}
-.ov-kicker{display:block;font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--fg-4);font-weight:700}
-.ov-title{font-size:27px;font-weight:750;line-height:1.15;letter-spacing:-.5px;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.ov-sub{display:block;color:var(--fg-3);font-size:12.5px;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.ov-route{flex:0 1 320px;min-width:220px}
-.ov-route-head{display:flex;justify-content:space-between;gap:10px;color:var(--fg-3);font-size:11px;margin-bottom:7px}
-.ov-route-head b{color:var(--fg)}
-.ov-bar{height:9px;border-radius:99px;overflow:hidden;background:#26384c}
-.ov-bar i{display:block;height:100%;background:linear-gradient(90deg,#43d9a3,#79b7ff)}
-.ov-route-foot{display:flex;justify-content:space-between;color:var(--fg-4);font-size:10.5px;margin-top:6px}
-.ov-tiles{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 10px;margin:12px 0}
-.ov-tile{padding:11px 12px;border:1px solid #30475c;border-left:3px solid #79b7ff;border-radius:10px;background:rgba(5,12,22,.5);min-width:0}
-.ov-tile.coral{border-left-color:#ff879b}.ov-tile.amber{border-left-color:#efc67b}.ov-tile.violet{border-left-color:#9caaff}
-.ov-tile .k{font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--fg-4);font-weight:700}
-.ov-tile .v{font-size:23px;font-weight:750;line-height:1.2;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.ov-tile .c{font-size:10.5px;color:var(--fg-3);line-height:1.4;margin-top:4px;white-space:normal;overflow-wrap:anywhere}
-.ov-context{display:grid;grid-template-columns:1.3fr .7fr 1fr;gap:12px;padding-top:13px;border-top:1px dashed var(--line)}
-.ov-ctx span{display:block;font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--fg-4);font-weight:700}
-.ov-ctx b{display:block;font-size:13px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.ov-ctx small{display:block;font-size:10.5px;color:var(--fg-4);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-@media(max-width:1240px){.ov-tiles{grid-template-columns:repeat(2,minmax(0,1fr))}.ov-context{grid-template-columns:1fr 1fr}.ov-route{flex-basis:240px}}
+/* The routing summary is read before the live diagram and the minute-by-minute trends. */
+#grid>.overview{grid-column:1/-1;border-color:#39556a;background:#101e2b}
+.overview>.card-h{padding:16px 22px 0}
+.overview>.card-h h2{color:#c7d9e7;font-size:14px}
+.overview>.card-b{padding:12px 22px 16px}
+.ov-top{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);align-items:center;gap:24px}
+.ov-state{min-width:0}
+.ov-title{display:flex;align-items:baseline;gap:11px;font-size:clamp(23px,2.1vw,34px);font-weight:720;line-height:1.22;letter-spacing:-.035em;overflow-wrap:anywhere}
+.ov-led{width:11px;height:11px;flex:none;align-self:center;border-radius:50%;background:#98aab8}
+.ov-led.green{background:#51dbb0}.ov-led.red{background:#ff8194}.ov-led.amber{background:#f6c678}
+.ov-sub{display:block;margin-top:5px;color:var(--fg-2);font-size:13px;overflow-wrap:anywhere}
+.ov-route{min-width:0;padding:10px 14px;background:#0c1722;border-radius:8px}
+.ov-route-head,.ov-route-foot{display:flex;flex-wrap:wrap;justify-content:space-between;gap:3px 12px;font-size:12px;color:var(--fg-2)}
+.ov-route-head b{font-variant-numeric:tabular-nums;color:var(--fg);font-weight:600}
+.ov-bar{height:6px;border-radius:6px;overflow:hidden;background:#354859;margin:7px 0}
+.ov-bar.measured{background:#aa9de7}.ov-bar i{display:block;height:100%;background:#62d8cb}
+.ov-route-foot{font-size:12px}
+.ov-tiles{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));margin:16px 0 12px;padding:13px 0;border-block:1px solid #34495b}
+.ov-tile{min-width:0;padding:0 16px;border-inline-start:1px solid #34495b}
+.ov-tile:first-child{border:0;padding-inline-start:0}
+.ov-tile .k,.ov-ctx>span{font-size:12px;color:#bed0de;font-weight:600}
+.ov-tile .v{display:flex;align-items:baseline;flex-wrap:wrap;gap:0 4px;margin:2px 0;font-size:clamp(21px,2vw,30px);font-variant-numeric:tabular-nums;line-height:1.25;font-weight:680;overflow-wrap:anywhere}
+.ov-tile .v small{font-size:12px;color:var(--fg-2);font-weight:500}
+.ov-tile .c,.ov-ctx small{color:#aabecf;font-size:12px;line-height:1.4;overflow-wrap:anywhere}
+.ov-context{display:grid;grid-template-columns:1.25fr 1fr 1.25fr;gap:8px 20px}
+.ov-ctx{min-width:0;overflow-wrap:anywhere}
+.ov-ctx b,.ov-ctx small{display:block}.ov-ctx b{font-size:14px;font-variant-numeric:tabular-nums}
+.ov-ctx a{color:#a7d8ff;text-decoration:underline;text-underline-offset:3px;padding-block:4px}
+.ov-ctx a:focus-visible,.top-nav a:focus-visible{outline:2px solid #a7d8ff;outline-offset:3px}
+.usage-cache{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin:12px 0;padding:12px 0;border-block:1px solid var(--line)}
+.usage-cache dt,.usage-cache small{font-size:12px;color:var(--fg-2)}
+.usage-cache dd{margin:3px 0 0;font-weight:650;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.usage-cache small{display:block;font-weight:400}
+#session-monitor{scroll-margin-top:7rem}
+.top-nav .nav-link{background:transparent;border:1px solid transparent;color:#b8cad9;border-radius:6px}
+.top-nav .nav-link.active{background:#1c3445;border-color:#476672;color:#e1fff8}
+.top-nav .nav-link:hover{background:#213849;color:white}
+.topbar .wrap{padding-inline:clamp(12px,2vw,28px)}
+.top-actions:empty{display:none}
+.brand #version-pill{flex:none}
+@media(max-width:720px){.brand #version-pill{margin-left:auto}}
+@media(min-width:1180px){
+ .topbar .topbar-in{display:grid;grid-template-columns:minmax(200px,1fr) auto minmax(0,auto);gap:16px;align-items:center;padding-block:8px}
+ .topbar .top-nav,.topbar .top-actions{margin:0;order:0}
+ #grid>.flow-card{grid-column:span 6}
+ #grid>.flow-card+.card{grid-column:span 6}
+ #grid>.flow-card+.card .trend-panels{grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+ #grid>.flow-card+.card .trend-panel:nth-child(odd){border-left:0;padding-left:0}
+ #grid:has(>.flow-card+.card>.card-b>.empty)>.overview{grid-column:span 7}
+ #grid:has(>.flow-card+.card>.card-b>.empty)>.flow-card{grid-column:8/-1;grid-row:span 2}
+ #grid>.flow-card+.card:has(>.card-b>.empty){grid-column:1/span 7}
+}
+@media(max-width:800px){
+ .ov-top{grid-template-columns:minmax(0,1fr);gap:10px}
+ .ov-route{padding:8px 12px}
+ .ov-tiles{grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 0}
+ .ov-tile:nth-child(odd){border:0;padding-left:0}
+ .ov-context{grid-template-columns:repeat(2,minmax(0,1fr))}
+ .ov-ctx:first-child{grid-column:1/-1}
+ .ov-ctx:first-child b,.ov-ctx:first-child small{display:inline;margin-left:6px}
+ .overview>.card-h{padding:14px 16px 0}
+ .overview>.card-b{padding:10px 16px 14px}
+ #session-monitor{scroll-margin-top:12px}
+}
 """
 JS_DASHBOARD += """
 function renderOverviewHero(data) {
-  const card = typeof document.querySelector === 'function' ? document.querySelector('#grid .overview') : null;
-  const body = card && card.querySelector('.card-b');
+  const card = document.querySelector?.('#grid .overview');
+  const body = card?.querySelector('.card-b');
   if (!body) return;
-  const current = data.proxy_metrics;
-  const live = data.active_session && current && !current.stale;
-  const routes = live ? (current.routes || {}) : {};
+  const current = data.active_session && !data.proxy_metrics?.stale ? data.proxy_metrics : null;
   const sessions = Array.isArray(data.sessions) ? data.sessions : [];
-  const selected = sessions.find(session => session.selected === true) || null;
-  const value = item => typeof item === 'number' && Number.isFinite(item) ? item : null;
-  const count = item => value(item) === null ? '—' : num(item);
-  const tokens = list => Array.isArray(list) ? list.reduce((sum, item) => sum + (Number(item) || 0), 0) : 0;
-  const external = Number(routes.external) || 0, plan = Number(routes.plan) || 0;
-  const routeTotal = external + plan;
-  const share = routeTotal ? Math.round(external * 100 / routeTotal) : 0;
-  const requests = live ? value(current.requests) : null;
-  const ok = live ? value(current.ok) : null;
-  const failed = live ? value(current.failed) : null;
-  const aborted = live ? value(current.aborted) : null;
-  const inflight = live ? value(current.inflightRequests) : null;
-  const completed = ok !== null && failed !== null ? ok + failed - (aborted || 0) : null;
-  const failureRate = completed ? ((failed || 0) - (aborted || 0)) * 100 / completed : null;
-  const p95 = live ? value((current.latencyMs || {}).external?.p95) : null;
-  const performance = live ? ((current.modelPerformance || {})[current.configuration?.provider] || {}) : {};
-  const outputRate = value(performance.outputTokens) !== null && value(performance.elapsedMs)
-    ? performance.outputTokens * 1000 / performance.elapsedMs : null;
-  const today = data.usage?.today || {};
-  const todayTokens = tokens(today.external) + tokens(today.plan);
-  const todayCost = data.usage?.today_cost_usd ?? data.usage?.cost_usd;
-  const remaining = data.account?.remaining_usd;
-  const state = data.routing?.state || 'unknown';
+  const selected = sessions.find(session => session.selected);
+  const number = value => Number.isFinite(value) && value >= 0 ? value : null;
+  const count = value => value == null ? '—' : num(value);
+  const routing = data.routing || {};
+  const external = number(routing.counts?.external), plan = number(routing.counts?.plan);
+  const total = external === null || plan === null ? null : external + plan;
+  const share = total ? Math.round(100 * external / total) : null;
+  const requests = number(current?.requests), ok = number(current?.ok);
+  const failed = number(current?.failed), aborted = number(current?.aborted);
+  const errors = failed !== null && (aborted ?? 0) <= failed ? failed - (aborted ?? 0) : null;
+  const completed = ok !== null && errors !== null ? ok + errors : null;
+  const failureRate = completed ? (100 * errors / completed).toFixed(1) : null;
+  const performance = current?.modelPerformance?.[current.configuration?.provider];
+  const rate = number(performance?.outputTokens) !== null && number(performance?.elapsedMs)
+    ? (1000 * performance.outputTokens / performance.elapsedMs).toFixed(1) : null;
+  const p95 = number(current?.latencyMs?.external?.p95);
+  const tokens = values => Array.isArray(values) && values.length && values.every(n => number(n) !== null)
+    ? values.reduce((sum, n) => sum + n, 0) : null;
+  const externalTokens = tokens(data.usage?.today?.external), planTokens = tokens(data.usage?.today?.plan);
+  const todayTokens = externalTokens !== null && planTokens !== null ? externalTokens + planTokens : null;
+  const todayCost = number(data.usage?.today_cost_usd), remaining = number(data.account?.remaining_usd);
+  const age = number(routing.last?.age_seconds);
+  const ageText = age === null ? '기록 없음' : age < 60 ? `${Math.round(age)}초 전` : `${Math.round(age / 60)}분 전`;
+  const state = current ? routing.state : null;
   const led = state === 'plan' ? 'red' : state === 'external' ? 'green' : state === 'idle' ? 'amber' : '';
-  const stateText = (typeof routingStateText === 'function' ? routingStateText(data.routing) : null) || '상태 확인';
-  const lastAge = data.routing?.last?.age_seconds;
-  const ageText = typeof lastAge === 'number' ? (lastAge < 60 ? Math.round(lastAge) + '초 전' : Math.round(lastAge / 60) + '분 전') : '기록 없음';
-  const model = data.model || selected?.model || '모델 미설정';
-  const project = selected?.project || '정보 없음';
-  const repoLine = [selected?.repo && selected.repo !== project ? selected.repo : null, selected?.branch || null,
-                    selected?.port ? ':' + selected.port : null].filter(Boolean).join(' · ') || '재시작 후 표시';
-  const source = selected?.project_source === 'inferred' ? ' · 추정' : selected ? ' · 실행기 보고' : '';
-  const tile = (label, valueText, context, tone) => `<div class="ov-tile ${tone}"><div class="k">${esc(label)}</div>`
-    + `<div class="v">${esc(valueText)}</div><div class="c">${esc(context)}</div></div>`;
-  body.innerHTML = `<div class="ov-top"><div class="ov-state"><span class="ov-led ${led}"></span><div><span class="ov-kicker">현재 라우팅</span>`
-    + `<div class="ov-title">${esc(stateText)}</div><span class="ov-sub">${esc(model)} · 마지막 결정 ${esc(ageText)}</span></div></div>`
-    + `<div class="ov-route"><div class="ov-route-head"><span>최근 ${data.routing?.window_minutes || 60}분 경로</span><b>외부 ${count(external)} · Plan ${count(plan)}</b></div>`
-    + `<div class="ov-bar"><i style="width:${share}%"></i></div><div class="ov-route-foot"><span>${share}% 외부</span><span>${100 - share}% Plan</span></div></div></div>`
-    + `<div class="ov-tiles">${tile('요청', live ? count(requests) + '건' : '—', live ? `완료 ${count(completed)} · 진행 ${count(inflight)}` : '현재 세션 데이터 없음', 'blue')}`
-    + `${tile('실패율', failureRate === null ? '—' : failureRate.toFixed(1) + '%', `실패 ${count(failed)} · 취소 ${count(aborted)}`, 'coral')}`
-    + `${tile('관측 속도', outputRate === null ? '—' : outputRate.toFixed(1) + ' 토큰/초', '출력 토큰 / 전체 요청 시간', 'amber')}`
-    + `${tile('외부 p95', p95 === null ? '—' : (p95 / 1000).toFixed(2) + '초', '최근 외부 요청 기준', 'violet')}</div>`
-    + `<div class="ov-context"><div class="ov-ctx"><span>표시 세션</span><b>${esc(project)}</b><small>${esc(repoLine)}${esc(source)}</small></div>`
-    + `<div class="ov-ctx"><span>활성 세션</span><b>${sessions.length}개</b><small>${sessions.length ? '세션별 모니터링에서 전환' : '실행 중인 세션 없음'}</small></div>`
-    + `<div class="ov-ctx"><span>오늘 사용</span><b>${count(todayTokens)}토큰</b><small>${count(tokens(today.plan))} Plan · $${typeof todayCost === 'number' ? todayCost.toFixed(3) : '—'}${typeof remaining === 'number' ? ' · 잔액 $' + remaining.toFixed(2) : ''}</small></div></div>`;
+  const stateText = current ? routingStateText(routing) || '상태 확인'
+    : data.active_session ? '세션 지표 확인 중' : '활성 세션 없음';
+  const model = current?.configuration?.model || data.model || selected?.model || '모델 미설정';
+  const repoLine = [selected?.repo !== selected?.project ? selected?.repo : '', selected?.branch, selected?.port ? ':' + selected.port : ''].filter(Boolean).join(' · ');
+  const tile = (label, value, unit, detail) => `<div class="ov-tile"><div class="k">${esc(label)}</div>`
+    + `<div class="v">${value === null ? '—' : `${esc(value)}<small>${esc(unit)}</small>`}</div><div class="c">${esc(detail)}</div></div>`;
+  body.innerHTML = `<div class="ov-top"><div class="ov-state"><h3 class="ov-title"><i class="ov-led ${led}" aria-hidden="true"></i>${esc(stateText)}</h3>`
+    + `<span class="ov-sub">${esc(model)} · 마지막 결정 ${esc(ageText)}</span></div>`
+    + `<div class="ov-route"><div class="ov-route-head"><b>최근 ${esc(routing.window_minutes || 60)}분 경로</b><span>${total === null ? '기록 없음' : count(total) + '건'}</span></div>`
+    + `<div class="ov-bar${share === null ? '' : ' measured'}" aria-hidden="true"><i style="width:${share ?? 0}%"></i></div>`
+    + `<div class="ov-route-foot"><span>외부 ${count(external)}건${share === null ? '' : ` · ${share}%`}</span><span>Plan ${count(plan)}건${share === null ? '' : ` · ${100-share}%`}</span></div></div></div>`
+    + `<div class="ov-tiles">${tile('요청', requests === null ? null : count(requests), '건', current ? `완료 ${count(completed)} · 진행 ${count(number(current.inflightRequests))}` : '현재 세션 데이터 없음')}`
+    + `${tile('실패율', failureRate, '%', `실패 ${count(errors)} · 취소 ${count(aborted)} 제외`)}`
+    + `${tile('관측 속도', rate, '토큰/초', '출력 토큰 / 전체 요청 시간')}`
+    + `${tile('외부 p95', p95 === null ? null : (p95 / 1000).toFixed(2), '초', '최근 외부 요청 기준')}</div>`
+    + `<div class="ov-context"><div class="ov-ctx"><span>표시 세션</span><b>${esc(selected?.project || '정보 없음')}</b>`
+    + (selected ? `<small>${esc([repoLine, selected.project_source === 'inferred' ? '추정' : '실행기 보고'].filter(Boolean).join(' · '))}</small>` : '') + `</div>`
+    + `<div class="ov-ctx"><span>활성 세션</span><b>${sessions.length ? `<a id="overview-sessions" href="#session-monitor">${sessions.length}개 · 세션 보기</a>` : '0개'}</b></div>`
+    + `<div class="ov-ctx"><span>오늘 사용</span><b><a id="overview-usage" href="/usage">${todayTokens === null ? '사용량 보기' : `${count(todayTokens)} 토큰`}</a></b>`
+    + `<small>${esc([todayCost !== null ? '오늘 $' + todayCost.toFixed(3) : '', remaining !== null ? '잔액 $' + remaining.toFixed(2) : ''].filter(Boolean).join(' · '))}</small></div></div>`;
 }
 const renderGridWithOverviewHero = renderGrid;
 renderGrid = function (data) {
+  const focused = document.activeElement?.id;
   renderGridWithOverviewHero(data);
   renderOverviewHero(data);
+  if (['overview-sessions', 'overview-usage', 'session-monitor'].includes(focused))
+    document.getElementById(focused)?.focus?.({preventScroll:true});
 };
 """
 JS_DASHBOARD += """

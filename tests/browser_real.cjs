@@ -48,6 +48,19 @@ async function launch(port, setup=false) {
     await page.waitForTimeout(1800);assert.ok(configReads>prior);assert.equal(await page.locator('#cfg-local-LOCAL_LLM_MODEL').inputValue(),'unsaved-draft');
     await second.bringToFront();await second.reload();
     await second.locator('#gateway-evidence').waitFor();
+    const originalSize = second.viewportSize();
+    for (const width of [320, 390, 1440]) {
+      await second.setViewportSize({width, height: 850});
+      const readable = await second.locator('.overview').evaluate(card => {
+        const state = card.querySelector('.ov-state').getBoundingClientRect();
+        const route = card.querySelector('.ov-route').getBoundingClientRect();
+        return (state.right <= route.left + 1 || state.bottom <= route.top + 1)
+          && Array.from(card.querySelectorAll('.ov-sub,.ov-title,.ov-tile .v')).every(el => el.scrollWidth <= el.clientWidth + 1)
+          && document.documentElement.scrollWidth <= innerWidth;
+      });
+      assert.ok(readable, `overview must fit at ${width}px without hiding status or units`);
+    }
+    await second.setViewportSize(originalSize);
     assert.match(await second.locator('#gateway-evidence').textContent(),/running-model/);
     assert.match(await second.locator('#gateway-evidence').textContent(),/saved-model/);
     await second.locator('#gateway-evidence details[data-section="startup"] summary').click();
