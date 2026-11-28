@@ -554,7 +554,7 @@ class AuditRegressionTests(unittest.TestCase):
         self.assertEqual(payload["version"], dash.USAGE_CACHE_VERSION)
         self.assertEqual(payload["claims_evicted"], 0)
         flat = [values for file_claims in claims.values() for values in file_claims.values()]
-        self.assertEqual(flat, [[10, 1, 0, 0]])
+        self.assertEqual(flat, [[10, 1, 0, 0, 0, 0]])
         self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [10, 1, 0, 0])
         self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [10, 1, 0, 0])
         appended = [row, self.assistant_turn(7, message_id="msg_persist2", request_id="req_persist2")]
@@ -608,8 +608,8 @@ class AuditRegressionTests(unittest.TestCase):
             [],
             {claim_key: [1, 2, 3]},
             {claim_key: [1, 2, 3, 4, 5]},
-            {claim_key: [1, -1, 0, 0]},
-            {"not-a-hex-key": [1, 2, 3, 4]},
+            {claim_key: [1, -1, 0, 0, 0, 0]},
+            {"not-a-hex-key": [1, 2, 3, 4, 0, 0]},
         ]
         for claims in damaged_variants:
             damaged = json.loads(json.dumps(payload))
@@ -619,7 +619,7 @@ class AuditRegressionTests(unittest.TestCase):
                              [30, 2, 0, 0], str(claims)[:40])
         # One turn owned by two files is a corrupt ledger: rescan from scratch.
         twice_owned = json.loads(json.dumps(payload))
-        twice_owned["files"][str(second)]["claims"][claim_key] = [10, 1, 0, 0]
+        twice_owned["files"][str(second)]["claims"][claim_key] = list(payload["files"][key]["claims"][claim_key])
         cache.write_text(json.dumps(twice_owned), encoding="utf-8")
         self.assertEqual(self.scan_usage(cache, restart=True)["totals"]["external"], [30, 2, 0, 0])
         # More claims than the cap is oversized, not trusted.

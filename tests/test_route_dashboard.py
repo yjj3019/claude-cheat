@@ -541,6 +541,21 @@ class CostProvenanceTests(unittest.TestCase):
         self.assertEqual(usage["sessions"][0]["cost_status"], "included")
         self.assertEqual(usage["sessions"][0]["cost_usd"], 0.0)
 
+    def test_cache_rate_excludes_unknown_and_deduplicates_later_measurements(self):
+        unknown = self.assistant("msg_partial", tokens=(100, 2, 0, 0))
+        del unknown["message"]["usage"]["cache_read_input_tokens"]
+        self.append([unknown])
+        self.assertIsNone(self.scan()["today_external_cache_hit_percent"])
+        zero = self.assistant("msg_zero", tokens=(20, 2, 0, 0))
+        self.append([zero])
+        self.assertEqual(self.scan()["today_external_cache_hit_percent"], 0)
+        measured = self.assistant("msg_measured", tokens=(10, 2, 60, 10))
+        self.append([measured, measured, unknown])
+        self.assertEqual(self.scan()["today_external_cache_hit_percent"], 60)
+        completed = self.assistant("msg_partial", tokens=(100, 2, 100, 0))
+        self.append([completed, completed])
+        self.assertAlmostEqual(self.scan()["today_external_cache_hit_percent"], 16000 / 300)
+
     def test_cache_write_ttl_split_is_separated_and_priced(self):
         self.append([self.assistant(tokens=(10, 2, 0, 100), cache_1h=60)])
         usage = self.scan(pricing=self.RATES)
@@ -1288,8 +1303,8 @@ class PageTests(unittest.TestCase):
         self.assertIn('캐시 적중률', page)
         self.assertIn('today.external[2]', page)
         self.assertIn('today.external[0]', page)
-        # The rate is derived from read vs (fresh input + fresh write), never a constant.
-        self.assertIn('read * 100 / (read + fresh)', page)
+        self.assertIn('Number.isFinite(usage.today_external_cache_hit_percent)', page)
+        self.assertIn("usage.today_external_cache_hit_percent.toFixed(1)}%` : '측정 불가'", page)
 
     def test_hidden_elements_and_empty_charts_do_not_mislead(self):
         # A .pill/.btn author display rule beats the UA [hidden] rule; zero metrics must not

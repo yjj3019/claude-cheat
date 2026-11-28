@@ -186,8 +186,18 @@ const PROMPT_CACHE_FOOTER = /<total_tokens>\d+ tokens left<\/total_tokens>$/;
 function peelPromptCacheFooter(text) {
   const match = PROMPT_CACHE_FOOTER.exec(text);
   if (!match || match.index + match[0].length !== text.length) return text;
-  // An odd number of fences before the footer means it is code, not a client tracker line.
-  if ((text.slice(0, match.index).split('```').length - 1) % 2 === 1) return text;
+  // Only a standalone tracker line is metadata. Preserve inline examples and fenced instructions.
+  if (match.index > 0 && text[match.index - 1] !== '\n') return text;
+  let fence = '';
+  for (const delimiter of text.slice(0, match.index).matchAll(/^ {0,3}(`{3,}|~{3,})([^\r\n]*)/gm)) {
+    const [, run, tail] = delimiter;
+    if (!fence) {
+      if (run[0] !== '`' || !tail.includes('`')) fence = run;
+    } else if (run.startsWith(fence) && !tail.trim()) {
+      fence = '';
+    }
+  }
+  if (fence) return text;
   return text.slice(0, match.index);
 }
 function stabilizeSystem(system) {
@@ -204,8 +214,21 @@ function stabilizeSystem(system) {
   const stripped = peelPromptCacheFooter(text);
   if (stripped === text) return system;
   const blocks = system.slice();
-  blocks[index] = { ...system[index], text: stripped };
+  // A standalone tracker must not leave a blank text block or orphan a client breakpoint.
+  if (!stripped.trim() && Object.keys(system[index]).every(key => key === 'type' || key === 'text')) {
+    blocks.splice(index, 1);
+  } else {
+    blocks[index] = { ...system[index], text: stripped.trim() ? stripped : '<total_tokens/>' };
+  }
   return blocks;
+}
+
+function hasPromptCacheDirective(body) {
+  const marked = block => block != null && Object.hasOwn(block, 'cache_control');
+  const markedBlocks = blocks => Array.isArray(blocks) && blocks.some(marked);
+  return marked(body) || markedBlocks(body.tools) || markedBlocks(body.system) ||
+    body.messages.some(message => Array.isArray(message.content) && message.content.some(block =>
+      marked(block) || (block?.type === 'tool_result' && markedBlocks(block.content))));
 }
 
 // Diagnostic mirror: routing events also land in a file so a session can be explained afterwards.
@@ -501,9 +524,43 @@ const MAX_USAGE_TOKENS = 2 ** 31 - 1; // SQLite usage-ledger event contract.
 function validUsageCount(n) {
   return Number.isSafeInteger(n) && n >= 0 && n <= MAX_USAGE_TOKENS;
 }
+class InvalidCacheUsage extends Error {
+  constructor() { super('[invalid_usage] Provider returned invalid cache token counts.'); }
+}
+
+function validCacheUsage(usage) {
+  if (!usage) return true;
+  const read = usage.cache_read_input_tokens, write = usage.cache_creation_input_tokens;
+  const split = usage.cache_creation;
+  if (read == null && write == null && split == null) return true;
+  const short = split?.ephemeral_5m_input_tokens, long = split?.ephemeral_1h_input_tokens;
+  for (const count of [read, write, short, long]) {
+    if (count != null && !validUsageCount(count)) return false;
+  }
+  if (split != null && (typeof split !== 'object' || Array.isArray(split))) return false;
+  const subtotal = (short ?? 0) + (long ?? 0);
+  const completeSplit = short != null && long != null && Object.keys(split).length === 2;
+  if (write != null && (subtotal > write || (completeSplit && subtotal !== write))) return false;
+  // Some Messages adapters also report inclusive prompt usage. Compare only provided evidence.
+  const details = usage.prompt_tokens_details;
+  if (details != null && (typeof details !== 'object' || Array.isArray(details))) return false;
+  const cached = details?.cached_tokens;
+  if (cached != null && (!validUsageCount(cached) || (read != null && cached !== read))) return false;
+  const total = usage.prompt_tokens, fresh = usage.input_tokens;
+  if (total != null) {
+    if (!validUsageCount(total) || (fresh != null && !validUsageCount(fresh))) return false;
+    const knownRead = read ?? cached;
+    const known = (fresh ?? 0) + (knownRead ?? 0) + (write ?? subtotal);
+    const complete = fresh != null && knownRead != null && (write != null || completeSplit);
+    if (known > total || (complete && known !== total)) return false;
+  }
+  return true;
+}
 function safeResponseUsage(usage, fields = DIAGNOSTIC_USAGE_FIELDS) {
-  return Object.fromEntries(fields.filter(name =>
-    Number.isSafeInteger(usage?.[name]) && usage[name] >= 0).map(name => [name, usage[name]]));
+  // Failed or empty answers may still contribute diagnostics. Never add contradicted cache counts.
+  const cacheValid = validCacheUsage(usage);
+  return Object.fromEntries(fields.filter(name => validUsageCount(usage?.[name]) &&
+    (cacheValid || name === 'input_tokens' || name === 'output_tokens')).map(name => [name, usage[name]]));
 }
 function emptyResponseError(detail, format, stopReason, counts = {}, usage = {}) {
   const error = Object.assign(new Error('Empty message response'), { validationDetail: detail });
@@ -1099,6 +1156,7 @@ const validMessageMeta = message => typeof message?.id === 'string' && message.i
   Number.isSafeInteger(message.usage?.output_tokens) && message.usage.output_tokens >= 0;
 
 // Frames a provider may send once a message has started.
+const STREAM_USAGE_FIELDS = [...DIAGNOSTIC_USAGE_FIELDS, 'prompt_tokens', 'prompt_tokens_details', 'cache_creation'];
 const STREAM_EVENTS = new Set(['message_start', 'content_block_start', 'content_block_delta',
   'content_block_stop', 'message_delta', 'message_stop', 'ping']);
 
@@ -1112,7 +1170,15 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false,
   const blocks = new Map();
   const indices = new Set();
   const diagnosticCounts = {};
+  const reportedUsage = {};
   let diagnosticUsage = {};
+  function updateReportedUsage(update) {
+    for (const field of STREAM_USAGE_FIELDS) {
+      if (Object.hasOwn(update ?? {}, field)) reportedUsage[field] = update[field];
+    }
+    if (!validCacheUsage(reportedUsage)) throw new InvalidCacheUsage();
+    diagnosticUsage = safeResponseUsage(reportedUsage);
+  }
   let measuredInput = null, measuredOutput = null;
   const chosenCalls = [];
   const seenIds = new Set();
@@ -1157,12 +1223,12 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false,
       if (stopped) { if (event.type === 'ping') return ''; throw new Error('Event after message stop'); }
       if (event.type === 'message_start') {
         if (started || event.message?.model !== model) throw new Error('Wrong response model');
+        updateReportedUsage(event.message.usage);
         if (strictMeta && !validMessageMeta(event.message)) throw new Error('Invalid stream metadata');
         if (event.message.content !== undefined && (!Array.isArray(event.message.content) || event.message.content.length))
           throw new Error('Nonempty stream start content');
         reportedModel = event.message.model;
         started = true;
-        diagnosticUsage = safeResponseUsage(event.message.usage);
         measuredInput = diagnosticUsage.input_tokens ?? null;
         event.message.model = clientModel;
       } else if (event.type !== 'ping' && !started) throw new Error('Missing start');
@@ -1220,7 +1286,8 @@ function streamValidator(model, clientModel, strictMeta, rejectThinking = false,
         delta = true;
         stopReason = event.delta.stop_reason;
         const deltaUsage = safeResponseUsage(event.usage);
-        diagnosticUsage = { ...diagnosticUsage, ...deltaUsage };
+        updateReportedUsage(event.usage);
+        measuredInput = diagnosticUsage.input_tokens ?? null;
         measuredOutput = deltaUsage.output_tokens ?? null;
       }
       if (event.type === 'message_stop') {
@@ -1335,8 +1402,11 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal, on
     if (response.type !== 'message' || response.model !== model || !Array.isArray(response.content) ||
         !response.content.every(validContentBlock) || !STOP_REASONS.has(response.stop_reason) ||
         (response.stop_reason === 'tool_use' && !response.content.some(block => block.type === 'tool_use')) ||
-        (response.stop_reason === 'end_turn' && response.content.some(block => block.type === 'tool_use')) ||
-        (strictMeta && !validMessageMeta(response))) throw new Error('Invalid message response');
+        (response.stop_reason === 'end_turn' && response.content.some(block => block.type === 'tool_use'))) throw new Error('Invalid message response');
+    if (strictMeta && !validMessageMeta(response)) {
+      if (!validCacheUsage(response.usage)) throw new InvalidCacheUsage();
+      throw new Error('Invalid message response');
+    }
     if (rejectThinking && response.content.some(block => ['thinking', 'redacted_thinking'].includes(block.type)))
       throw new Error('Thinking response in ordinary mode');
     if (!response.content.some(usableContent) && !CONTROL_STOPS.has(response.stop_reason)) {
@@ -1345,6 +1415,7 @@ async function bufferedResponse(upstream, model, clientModel, stream, signal, on
       throw emptyResponseError(response.content.length ? 'content_without_usable_output' : 'empty_content',
         'json', response.stop_reason, counts, response.usage);
     }
+    if (!validCacheUsage(response.usage)) throw new InvalidCacheUsage();
     const seenIds = new Set();
     for (const block of response.content) if (block.type === 'tool_use') checkToolIdentity(block, allowedTools, seenIds);
     if (choice) {
@@ -1566,7 +1637,10 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
   sharedAdmission = false,
   // Opt-in: peel the CLI's trailing token-count footer from system text before the external
   // request so the provider's prefix cache survives between turns. Documented in the README.
-  stabilizePromptCache = process.env.ROUTE_STABILIZE_PROMPT_CACHE === '1',
+  stabilizePromptCache = process.env.ROUTE_STABILIZE_PROMPT_CACHE === undefined
+    ? undefined : process.env.ROUTE_STABILIZE_PROMPT_CACHE === '1',
+  openrouterPromptCache = process.env.ROUTE_OPENROUTER_PROMPT_CACHE === '1',
+  localPromptCache = process.env.ROUTE_LOCAL_PROMPT_CACHE === '1',
   onHandover = null,
   // Optional second provider for ordinary sessions: a request whose model equals altAlias
   // goes to that provider instead of the session's primary one. Absent = single provider.
@@ -2736,9 +2810,14 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
           const reasoning = openrouterReasoning(altRequested ? (altReasoning || openrouterReasoningOption) : openrouterReasoningOption);
           if (reasoning) externalBody.reasoning = reasoning;
         }
+        const requestAutoCache = (target.name === 'local' && localPromptCache) ||
+          (target.openrouter && openrouterPromptCache && externalModel.startsWith('anthropic/claude-'));
+        if (requestAutoCache && !countTokens && !hasPromptCacheDirective(externalBody)) {
+          externalBody.cache_control = { type: 'ephemeral' };
+        }
         // Opt-in prefix-cache stabilization: only the very last system text block may lose a
         // trailing, unfenced token-count footer. User/assistant content is never touched.
-        if (stabilizePromptCache && externalBody.system !== undefined) {
+        if ((stabilizePromptCache ?? requestAutoCache) && externalBody.system !== undefined) {
           externalBody.system = stabilizeSystem(externalBody.system);
         }
         // CLI backends receive equivalent guidance in their adapter; do not duplicate it.
@@ -3018,9 +3097,16 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
           } catch (error) {
             const diagnostic = emptyResponseDiagnostics.get(error);
             if (diagnostic && target.name === 'cli') diagnostic.usage = safeResponseUsage(diagnostic.usage, usageFields);
-            const observed = safeResponseUsage(readAttemptUsage ? readAttemptUsage() : diagnostic?.usage, usageFields);
-            if (!succeeded) recordCallUsage(target.name, observed);
+            const badCacheUsage = error instanceof InvalidCacheUsage;
+            if (!succeeded && !badCacheUsage) {
+              const observed = safeResponseUsage(readAttemptUsage ? readAttemptUsage() : diagnostic?.usage, usageFields);
+              recordCallUsage(target.name, observed);
+            }
             client.signal.throwIfAborted();
+            if (badCacheUsage && !res.headersSent) {
+              logEvent({event: 'external_attempt_failed', provider: target.name, attempt: attempt + 1, validation: 'invalid_usage'});
+              return reject(502, error.message);
+            }
             const toolErrors = new Map([['Unsupported tool schema','unsupported_tool_schema'], ['Invalid tool input','invalid_tool_input'],
               ['Duplicate tool call id','duplicate_tool_id'], ['Undeclared tool call','undeclared_tool'], ['Invalid tool selection','invalid_tool_selection']]);
             const toolError = toolErrors.get(error?.message);
@@ -3040,11 +3126,11 @@ export function createProxy({ key, nonce, fetchImpl = process.env.ROUTE_UPSTREAM
                 metrics.circuitOpens += 1;
                 logEvent({ event: 'circuit_open', provider: target.name, failure: failureClass });
               }
-              logEvent({ event: 'stream_broken', provider: target.name, category: toolError ? 'validation' : 'upstream',
-                ...(toolError && { validation: toolError }) });
+              logEvent({ event: 'stream_broken', provider: target.name, category: badCacheUsage || toolError ? 'validation' : 'upstream',
+                ...((badCacheUsage || toolError) && { validation: badCacheUsage ? 'invalid_usage' : toolError }) });
               try {
                 res.write(`event: error\ndata: ${JSON.stringify({ type: 'error',
-                  error: { type: 'api_error', message: 'upstream stream failed' } })}\n\n`);
+                  error: { type: 'api_error', message: badCacheUsage ? error.message : 'upstream stream failed' } })}\n\n`);
               } catch {}
               res.end();
               return;

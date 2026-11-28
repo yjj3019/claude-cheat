@@ -156,6 +156,19 @@ test('empty JSON diagnostics contain bounded enums/counts and safe usage, never 
   assert.ok(!JSON.stringify(events).includes(secret));
 });
 
+test('contradicted cache counters on empty replies stay out of diagnostics and measured usage', async t => {
+  const events = captureEvents(t);
+  const empty = message(MODEL, []);
+  empty.usage = {input_tokens: 5, output_tokens: 0, cache_read_input_tokens: 57, prompt_tokens: 45};
+  const f = await fixture(t, async () => Response.json(empty), {localOnly: true});
+  await (await f.send()).text();
+  const failure = events.find(event => event.event === 'external_attempt_failed');
+  assert.equal(failure.validation, 'empty_response');
+  assert.deepEqual(failure.response_diagnostic.usage, {input_tokens: 5, output_tokens: 0});
+  const metrics = await f.metrics();
+  assert.equal(metrics.efficiency.cache_read, 0);
+});
+
 test('empty SSE retains safe start/delta usage and block counts without token text', async t => {
   const events = captureEvents(t);
   const payload = frame('message_start', { message: { ...message(), content: [],

@@ -184,3 +184,185 @@ test('credential-shaped model identifiers never reach usage files or metrics', a
     assert.equal((await f.metrics()).configuration.model,null);
   }
 });
+
+const cacheTrace = [
+  // System, tool revision, virtual time, expected cache read and checkpoint.
+  ['A', 'v1', 0, 0, 'cold start'],
+  ['A', 'v1', 1, 32, 'repeated prefix'],
+  ['A', 'v2', 2, 0, 'changed tool'],
+  ['B', 'v2', 3, 0, 'changed system'],
+  ['B', 'v2', 4, 32, 'inside TTL'],
+  ['B', 'v2', 14, 0, 'expired prefix'],
+  ['B', 'v2', 15, 0, 'after reset'],
+];
+
+const cacheFaultCases = [
+  ['healthy'],
+  ['dirty start', 'cold start: unexpected read'],
+  ['disabled reads', 'repeated prefix: missed read', 'inside TTL: missed read'],
+  ['tool omitted from key', 'changed tool: unexpected read'],
+  ['system omitted from key', 'changed system: unexpected read'],
+  ['expiry ignored', 'expired prefix: unexpected read'],
+  ['reset ignored', 'after reset: unexpected read'],
+  ['previous answer replayed', 'repeated prefix: stale answer'],
+  ['double-counted input', 'repeated prefix: token total'],
+  ['read not reported', 'repeated prefix: missing read'],
+  ['negative read', 'repeated prefix: invalid read'],
+];
+
+async function runCacheFault(t, fault) {
+  const cache = new Map();
+  let sent = 0, previousAnswer;
+  const proxy = await setup(t, async (_url, {body: raw}) => {
+    const req = JSON.parse(raw);
+    const [, , now] = cacheTrace[sent];
+    assert.deepEqual(req.cache_control, {type: 'ephemeral'});
+    const key = JSON.stringify([req.model, fault === 'tool omitted from key' ? null : req.tools,
+      fault === 'system omitted from key' ? null : req.system]);
+    if (sent === 0 && fault === 'dirty start') cache.set(key, now + 10);
+    if (sent === 6 && fault !== 'reset ignored') cache.clear();
+    const hit = fault !== 'disabled reads' && cache.has(key) && (fault === 'expiry ignored' || now < cache.get(key));
+    cache.set(key, now + 10);
+
+    const reply = answer();
+    const currentAnswer = 'result ' + req.messages.at(-1).content;
+    reply.content[0].text = sent === 1 && fault === 'previous answer replayed' ? previousAnswer : currentAnswer;
+    previousAnswer = currentAnswer;
+    // The fixture's prefix costs 32 tokens and its uncached suffix costs 8 on every turn.
+    reply.usage = {input_tokens: 8, output_tokens: 2, cache_read_input_tokens: hit ? 32 : 0,
+      cache_creation_input_tokens: hit ? 0 : 32};
+    if (sent === 1) {
+      if (fault === 'double-counted input') reply.usage.input_tokens += 32;
+      if (fault === 'read not reported') delete reply.usage.cache_read_input_tokens;
+      if (fault === 'negative read') reply.usage.cache_read_input_tokens = -1;
+    }
+    sent++;
+    return Response.json(reply);
+  }, {localOnly: true, localPromptCache: true});
+
+  const findings = [], clientReads = [];
+  for (const [index, [system, revision, , expectedRead, checkpoint]] of cacheTrace.entries()) {
+    const content = 'question ' + index;
+    const tracker = '<total_tokens>' + (8000 - index) + ' tokens left</total_tokens>';
+    const r = await proxy.send({...body, system: system + '\n' + tracker,
+      tools: [{name: 'Read', description: revision, input_schema: {type: 'object'}}],
+      messages: [{role: 'user', content}]});
+    if (fault === 'negative read' && index === 1) {
+      assert.equal(r.status, 502);
+      assert.match(await r.text(), /invalid_usage/);
+      findings.push(checkpoint + ': invalid read');
+      clientReads.push(null);
+      continue;
+    }
+    assert.equal(r.status, 200, checkpoint);
+    const reply = await r.json(), usage = reply.usage;
+    const read = usage.cache_read_input_tokens;
+    const validRead = Number.isSafeInteger(read) && read >= 0;
+    clientReads.push(validRead ? read : null);
+    if (reply.content[0].text !== 'result ' + content) findings.push(checkpoint + ': stale answer');
+    if (read === undefined) findings.push(checkpoint + ': missing read');
+    else if (!validRead) findings.push(checkpoint + ': invalid read');
+    else {
+      if (read !== expectedRead) findings.push(checkpoint + (expectedRead ? ': missed read' : ': unexpected read'));
+      if (usage.input_tokens + read + usage.cache_creation_input_tokens !== 40) findings.push(checkpoint + ': token total');
+    }
+  }
+  assert.equal(sent, cacheTrace.length);
+  const rows = await waitRows(proxy.events, sent);
+  assert.deepEqual(rows.map(row => row.cache_read_tokens ?? null), clientReads,
+    'persist valid reads once and keep missing or invalid measurements unknown');
+  return findings;
+}
+
+test('differential prompt-cache fault simulations', async t => {
+  for (const [fault, ...expected] of cacheFaultCases) {
+    await t.test(fault, async t => {
+      const findings = await runCacheFault(t, fault);
+      assert.deepEqual(findings, expected);
+    });
+  }
+});
+
+test('invalid provider cache counters fail before publication and are never billed twice by retries', async t => {
+  const invalid = [
+    {cache_read_input_tokens: -1}, {cache_creation_input_tokens: '5'},
+    {cache_read_input_tokens: false}, {cache_creation_input_tokens: 1.5},
+    {cache_read_input_tokens: 2 ** 31}, {cache_read_input_tokens: 40, prompt_tokens: 44},
+    {cache_read_input_tokens: 40, prompt_tokens_details: {cached_tokens: 23}},
+    {cache_read_input_tokens: 40, prompt_tokens_details: []},
+    {cache_creation_input_tokens: 0, prompt_tokens_details: {cached_tokens: true}},
+    {cache_creation_input_tokens: 0, prompt_tokens_details: {cached_tokens: 40}, prompt_tokens: 44},
+    {cache_creation_input_tokens: 5, cache_creation: {ephemeral_5m_input_tokens: 3, ephemeral_1h_input_tokens: 3}},
+    {input_tokens: undefined, cache_read_input_tokens: 50, prompt_tokens: 49},
+    {cache_read_input_tokens: 40, cache_creation_input_tokens: 0, prompt_tokens: 46},
+  ];
+  for (const provider of ['local', 'openrouter']) {
+    let calls = 0, sample;
+    const f = await setup(t, async () => {
+      calls++;
+      const reply = answer();
+      Object.assign(reply.usage, sample);
+      return Response.json(reply);
+    }, {provider, key: 'fixture', openrouterModel: model});
+    for (const fields of invalid) {
+      sample = fields;
+      const r = await f.send(body);
+      assert.equal(r.status, 502, JSON.stringify(fields));
+      assert.match(await r.text(), /invalid_usage/);
+    }
+    assert.equal(calls, invalid.length);
+    const rows = await waitRows(f.events, invalid.length);
+    assert.ok(rows.every(row => row.status === 'failed' && !row.usage_measured && row.cache_read_tokens == null));
+    assert.equal((await f.metrics()).efficiency.cache_read, 0);
+  }
+});
+
+test('nullable and missing cache counters stay unknown and explicitly measured zero is preserved', async t => {
+  let counts;
+  const f = await setup(t, async () => {
+    const reply = answer();
+    Object.assign(reply.usage, counts);
+    return Response.json(reply);
+  });
+  const cases = [{}, {cache_read_input_tokens: null, cache_creation_input_tokens: null},
+    {cache_read_input_tokens: 0}, {cache_read_input_tokens: 40, prompt_tokens: 45},
+    {cache_read_input_tokens: 40, cache_creation_input_tokens: 3, prompt_tokens: 48,
+      prompt_tokens_details: {cached_tokens: 40}, cache_creation: {ephemeral_5m_input_tokens: 1, ephemeral_1h_input_tokens: 2}}];
+  for (const fields of cases) {
+    counts = fields;
+    const r = await f.send(body);
+    assert.equal(r.status, 200);
+    const {usage} = await r.json();
+    for (const key of ['cache_read_input_tokens', 'cache_creation_input_tokens']) assert.equal(usage[key], fields[key]);
+  }
+  const rows = await waitRows(f.events, cases.length);
+  assert.deepEqual(rows.map(row => row.cache_read_tokens), [null, null, 0, 40, 40]);
+});
+
+test('bad cache usage is stopped in buffered and passthrough SSE at start or delta', async t => {
+  const frame = (type, values) => 'event: ' + type + '\ndata: ' + JSON.stringify({type, ...values}) + '\n\n';
+  for (const passthrough of [false, true]) {
+    let payload;
+    const f = await setup(t, async () => new Response(payload, {headers: {'content-type': 'text/event-stream'}}),
+      {provider: 'openrouter', key: 'fixture', openrouterModel: model, streamPassthrough: passthrough});
+    for (const [index, [start, delta]] of [
+      [{cache_read_input_tokens: -2}, {}],
+      [{}, {cache_creation_input_tokens: -2}],
+      [{cache_read_input_tokens: 40, prompt_tokens: 45}, {cache_read_input_tokens: 57}],
+    ].entries()) {
+      payload = [frame('message_start', {message: {id: 'fixture', role: 'assistant', model, usage: {input_tokens: 5, output_tokens: 0, ...start}}}),
+        frame('content_block_start', {index: 0, content_block: {type: 'text', text: ''}}),
+        frame('content_block_delta', {index: 0, delta: {type: 'text_delta', text: 'fixture'}}),
+        frame('content_block_stop', {index: 0}),
+        frame('message_delta', {delta: {stop_reason: 'end_turn'}, usage: {output_tokens: 2, ...delta}}),
+        frame('message_stop', {})].join('');
+      const r = await f.send({...body, stream: true});
+      const wire = await r.text();
+      assert.equal(r.status, passthrough && index > 0 ? 200 : 502);
+      assert.match(wire, /invalid_usage/);
+      assert.doesNotMatch(wire, /"cache_(?:read|creation)_input_tokens":(?:-2|57)|event: message_stop/);
+    }
+    const rows = await waitRows(f.events, 3);
+    assert.ok(rows.every(row => row.status === 'failed' && row.cache_read_tokens == null));
+  }
+});

@@ -47,7 +47,11 @@ Proxy behavior can be tuned with these environment variables (the defaults are e
 | `ROUTE_REQUEST_BUDGET_MS` | `0` | Opt-in whole-request budget (0–1800000) covering Local queue wait plus every attempt and retry wait. `0` keeps the existing per-stage limits only. When enabled, no new attempt or wait starts past the deadline; an answer already forwarded is never replaced. Exhaustion is also counted in `retryBudgetExceeded` |
 | `ROUTE_PREWARM` | on | `0` disables the one-time upstream origin pre-warm (HEAD) at startup |
 | `ROUTE_UPSTREAM_H2` | off | `1` switches the upstream client to per-origin `node:http2` sessions (multiplexing; h2 over https, h2c over plaintext) |
-| `ROUTE_STABILIZE_PROMPT_CACHE` | off | `1` peels the trailing `<total_tokens>…` footer from system text before the external request to keep the prefix cache (opt-in) |
+| `ROUTE_STABILIZE_PROMPT_CACHE` | Auto | With an eligible Local or OpenRouter prompt-cache option enabled, strip the changing system token-budget footer. Set `0` to preserve it or `1` to stabilize all external routes. |
+| `ROUTE_LOCAL_PROMPT_CACHE` | off | Set to `1` for Local Messages servers that support top-level `cache_control`. Adds an ephemeral directive to generation requests without existing directives. Engine-level automatic prefix caching uses the server's own settings. |
+| `ROUTE_OPENROUTER_PROMPT_CACHE` | off | Set to `1` to request automatic prompt caching for OpenRouter `anthropic/claude-*` generation requests that have no explicit cache directives. Cache reads and initial writes follow provider pricing. |
+
+The proxy returns `502 [invalid_usage]` for malformed cache counts or counts that contradict a supplied prompt total or TTL breakdown. A stream already in progress ends with an error event. Missing counters stay unmeasured. When no independent count is available, a plausible positive number is recorded as provider-reported usage. To check reported savings and stale replies on a dedicated, single-slot loopback llama-server, set `LLAMA_CACHE_PROBE_URL` and run `node --test tests/prompt_cache_reference.test.mjs`.
 
 Routing metadata uses `route_selected` with provider `openrouter`, `local` or `plan`. Reason `replacement` identifies a validated external response; `native_feature` identifies a native-feature bypass; provider failures and cooldowns return errors without switching to Plan. `external_attempt_failed` records a failed attempt, and `circuit_open` / `circuit_recovered` report circuit transitions. These logs omit keys and request bodies; requests sent to external services may still contain conversation, code, tool definitions and results.
 
@@ -202,6 +206,8 @@ On supported Claude Code versions, direct Sonnet requests Opus Advisor by defaul
 The **Usage** menu shows daily, weekly and monthly observations by provider, requested and reported model, and launcher instance. Weeks start on Monday in the computer's local time zone. New instance records are not combined with the older single-session history. Existing sessions and direct Sonnet are not observed by the new proxy ledger; unreported models or tokens remain unknown.
 
 While visible, Usage refreshes the existing cache every 30 seconds and pauses polling in hidden tabs. On a temporary fetch failure it retains the last successful result for the same period and marks it stale. The per-launcher request and failure counters cover the launcher lifetime, independently of the selected reporting period. Historical folders without a live handoff or event file do not consume the corresponding 32-file processing limit. Discovery stops after 4,096 directory entries and reports partial coverage; entries beyond that limit may remain undiscovered.
+
+In the usage report, `cache_read_samples` and `cache_creation_samples` count requests that reported each metric. A reported zero counts as a sample. Divide each sample count by the group's request count to check coverage.
 
 `.usage-stats/` holds a local SQLite ledger and per-instance event files without prompt or tool content. The 13-month display window does not delete stored data. These are observed usage and latency, not billing or GPU load. Recording errors or process termination may lose the last asynchronous event; check the coverage warning and collection start date.
 

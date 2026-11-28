@@ -17,6 +17,10 @@ python -m unittest discover -s tests -p test_fuzz_dashboard.py  # 대시보드 �
 python tests/live_smoke.py --dry-run       # 설정 존재 여부만 확인(무과금)
 ```
 
+릴리스에서 캐시 검증을 필수로 실행하려면 `LLAMA_CACHE_PROBE_REQUIRED=1`과 전용 단일 슬롯 루프백 llama-server의 `LLAMA_CACHE_PROBE_URL`을 설정한 뒤 `node --test tests/prompt_cache_reference.test.mjs`를 실행합니다. 필수 실행에서 주소가 빠지면 테스트가 실패합니다. 두 입력 전체를 토큰화하고 실제로 일치하는 접두부 토큰 수와 보고된 캐시 읽기를 대조합니다.
+
+모든 PR과 머지 큐에서 `Prompt cache verification`을 실행합니다. Windows x64에서 같은 엔진 검사를 실행하려면 Python 3.12와 Node.js 22로 `python -B tests/run_prompt_cache_check.py`를 실행하세요. 고정된 CPU 엔진과 소형 모델을 내려받아 SHA-256을 확인하고, 임시 루프백 서버에서 검사한 뒤 정리합니다. CI는 프록시·CLI·사용량 원장 회귀 테스트도 실행합니다. 기본 브랜치에서 머지를 차단하려면 GitHub Actions의 이 검사 이름을 필수 상태 검사로 지정합니다.
+
 현재 저장소 기준 회귀 검사 수는 **Node 726개**(대시보드 DOM 99개 포함), **Python 712개**(11개는 환경 의존 검사로 skip)입니다. 테스트 수는 릴리스마다 달라질 수 있으므로 위 명령으로 직접 확인하세요.
 
 - Windows 프로세스 트리 테스트(`test_local_lifecycle`)와 동시성 스트레스(`test_dashboard_concurrency`)는 **기본 스위트에서 건너뜁니다**. 실제 프로세스 트리를 띄우거나 서버에 12스레드를 걸기 때문에 느리고 부하에 민감합니다. 필요할 때만 `$env:CLAUDE_CHEAT_SLOW = '1'`로 켜세요.

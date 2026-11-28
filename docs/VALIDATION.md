@@ -16,6 +16,10 @@ python -m unittest tests.test_fuzz_dashboard   # dashboard fuzzing
 python tests/live_smoke.py --dry-run       # report which settings exist, no billing
 ```
 
+To require the prompt-cache check for a release, set `LLAMA_CACHE_PROBE_REQUIRED=1` and `LLAMA_CACHE_PROBE_URL` to a dedicated single-slot loopback llama-server, then run `node --test tests/prompt_cache_reference.test.mjs`. A missing endpoint fails the required run. The probe tokenizes both complete inputs and checks the reported reads against their shared token IDs.
+
+Every PR and merge queue run includes `Prompt cache verification`. To reproduce the engine check on Windows x64 with Python 3.12 and Node.js 22, run `python -B tests/run_prompt_cache_check.py`. It downloads the pinned CPU engine and small model, verifies their SHA-256 digests, runs the probe on a temporary loopback server, and removes the files. CI also runs the proxy, CLI, and usage ledger regression tests. To block merges on the default branch, require the GitHub Actions status check with that exact name.
+
 - The Windows process-tree tests (`test_local_lifecycle`) and the concurrency stress (`test_dashboard_concurrency`) are **skipped by default**: they spawn real process trees or 12 threads, so they are slow and load sensitive. Enable them with `$env:CLAUDE_CHEAT_SLOW = '1'`.
 - The process-tree suite needs **Git Bash**. `C:\Windows\System32\bash.exe` is WSL and cannot run the Windows python path the harness passes, so it skips itself.
 - The dashboard enforces a **Host allowlist** (127.0.0.1, localhost, ::1) against DNS rebinding and sends `nosniff`, `no-referrer` and `X-Frame-Options: DENY`. Write endpoints require the session token and a same-origin request.
