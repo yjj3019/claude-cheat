@@ -5061,6 +5061,22 @@ class MultiSessionTests(unittest.TestCase):
                 "metrics": {"requests": requests, "inflightRequests": 0,
                             "configuration": {"model": "vendor/model"}, "routes": {"external": requests, "plan": 0}}}
 
+    def test_authenticated_singleton_is_counted_even_without_an_instance_id(self):
+        for instance in (None, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"):
+            with self.subTest(instance=instance):
+                row = self.row(instance, 7)
+                with mock.patch.object(dash, "live_sessions", return_value=[]), \
+                     mock.patch.object(dash, "_live_session", return_value=(row["session"], row["metrics"])):
+                    session, _, summaries = dash._display_session()
+                self.assertEqual(session["instance_id"], instance)
+                self.assertEqual(len(summaries), 1)
+                summary = summaries[0]
+                self.assertEqual((summary["instance_id"], summary["requests"], summary["selected"], summary["status"]),
+                                 (instance, 7, True, "active"))
+        with mock.patch.object(dash, "live_sessions", return_value=[]), \
+             mock.patch.object(dash, "_live_session", return_value=(None, None)):
+            self.assertEqual(dash._display_session(), (None, None, []))
+
     def test_no_saved_selection_shows_the_busiest_live_session(self):
         a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"

@@ -136,6 +136,16 @@ test('usage filters historical details and chart by selected instance', () => {
   assert.match(html,/first-model/); assert.doesNotMatch(html,/second-model/);
   assert.match(html,/최대 11 토큰/);
   assert.match(html,/캐시 읽기<\/dt><dd>미보고<small>0 \/ 1건 보고/);
+  for (const result of [{status:'building',report:null},
+                        {status:'ready',report:{period:'week',rows:[payload.report.rows[1]]}}]) {
+    sandbox.renderUsage(result);
+    const pending = context.nodes.get('usage-grid').innerHTML;
+    assert.ok(pending.includes(`value="${a}" selected`));
+    assert.doesNotMatch(pending,/second-model|42 토큰/);
+    assert.match(pending,result.status === 'building' ? /사용량을 수집하고 있습니다/ : /선택한 실행기의 기록이 없습니다/);
+  }
+  sandbox.renderUsage(payload);
+  assert.equal(context.nodes.get('usage-grid').innerHTML,html);
 });
 
 test('Plan reasons compare sessions by release and code hash with explicit missing reports', () => {
@@ -393,6 +403,11 @@ test('visible overview uses windowed route counts and distinguishes zero from mi
   assert.match(body.innerHTML, /외부 0건/);
   assert.match(body.innerHTML, /href="\/usage">사용량 보기/);
   assert.doesNotMatch(body.innerHTML, /100%|ov-bar measured|href="#session-monitor"/);
+  for (const [ok,failed,aborted,inflight,rate] of [[0,10,10,0,null],[6,4,2,3,'25.0'],[0,0,0,0,null],[4,0,0,1,'0.0']]) {
+    sandbox.renderOverviewHero({...data,proxy_metrics:{requests:ok+failed+inflight,ok,failed,aborted,inflightRequests:inflight}});
+    assert.ok(body.innerHTML.includes(`종료 ${ok+failed} · 취소 ${aborted} · 진행 ${inflight}`));
+    assert.ok(body.innerHTML.includes('<div class="k">실패율</div><div class="v">'+(rate===null?'—':rate+'<small>%</small>')+'</div>'));
+  }
 });
 
 test('overview does not mistake historical metrics for a live session', () => {
