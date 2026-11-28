@@ -585,7 +585,9 @@ class UsageLedger:
             response["model_provenance_unverified"] = db.execute(
                 "SELECT COUNT(*) FROM events WHERE " + ("event_version < 2" if version >= 2 else "1")
                 + " AND timestamp >= ? AND timestamp <= ?", (start_epoch, local.timestamp())).fetchone()[0]
-            cache_columns = ", SUM(cache_read_tokens), SUM(cache_creation_tokens)" if version >= 3 else ", NULL, NULL"
+            cache_columns = (", SUM(cache_read_tokens), SUM(cache_creation_tokens), "
+                             "COUNT(cache_read_tokens), COUNT(cache_creation_tokens)"
+                             if version >= 3 else ", NULL, NULL, 0, 0")
             sql = f"""SELECT {bucket} AS bucket, provider, requested_model, {model} AS actual_model, instance_id,
                 COUNT(*), SUM(status='ok'), SUM(status='failed'), SUM(status='aborted'),
                 COUNT(input_tokens), SUM(input_tokens), COUNT(output_tokens), SUM(output_tokens),
@@ -597,7 +599,7 @@ class UsageLedger:
             keys = ("bucket", "provider", "requested_model", "reported_model", "instance_id", "requests",
                     "ok", "failed", "aborted", "input_samples", "input_tokens", "output_samples",
                     "output_tokens", "mean_elapsed_ms", "max_elapsed_ms")
-            keys += ("cache_read_tokens", "cache_creation_tokens")
+            keys += ("cache_read_tokens", "cache_creation_tokens", "cache_read_samples", "cache_creation_samples")
             response["truncated"] = len(result) > MAX_ROWS
             response["rows"] = [dict(zip(keys, row)) for row in result[:MAX_ROWS]]
             response["storage_bytes"] = self.path.stat().st_size

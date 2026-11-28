@@ -41,6 +41,21 @@ def claude_output(value=None, **reported):
 
 
 class BackendTest(unittest.TestCase):
+    def test_native_prompt_prefix_is_stable_across_key_order_and_growing_history(self):
+        body = {"messages": [{"role": "user", "content": "first"}], "system": "shared",
+                "tools": [{"name": "example", "input_schema": {"type": "object"}}], "model": "fixture"}
+        prompt = backend.request_prompt(body)
+        self.assertEqual(prompt, backend.request_prompt(dict(reversed(body.items()))))
+        _, serialized = prompt.split("REQUEST_JSON:\n", 1)
+        self.assertEqual(list(json.loads(serialized))[-1], "messages")
+        history = list(body["messages"])
+        for turn in range(10):
+            history.extend([{"role": "assistant", "content": str(turn)}, {"role": "user", "content": "next"}])
+            current = backend.request_prompt({**body, "messages": history})
+            self.assertTrue(current.startswith(prompt[:-2] + ","))
+            self.assertEqual(json.loads(current.split("REQUEST_JSON:\n", 1)[1])["messages"], history)
+            prompt = current
+
     def error(self, code, function, *args, **kwargs):
         with self.assertRaises(backend.BackendError) as caught:
             function(*args, **kwargs)
@@ -129,6 +144,52 @@ class BackendTest(unittest.TestCase):
         self.assertIsNone(backend._cli_failure_diagnostic(b"not json: HTTP 429 secret"))
         self.assertNotIn("private fixture", repr(backend._cli_failure_diagnostic(
             b'{"type":"turn.failed","error":{"message":"HTTP 429: private fixture"}}')))
+
+    def test_native_cache_evidence_is_checked_before_normalization_discards_it(self):
+        cases = [
+            ("claude", claude_output, {"input_tokens": 5, "cache_read_input_tokens": 40, "prompt_tokens": 44}),
+            ("claude", claude_output, {"cache_read_input_tokens": 1, "prompt_tokens_details": {"cached_tokens": True}}),
+            ("claude", claude_output, {"cache_creation_input_tokens": 5, "cache_creation":
+                                      {"ephemeral_1h_input_tokens": 2, "ephemeral_5m_input_tokens": 4}}),
+            ("codex", codex_output, {"input_tokens": 100, "cached_input_tokens": 60, "prompt_tokens": 99}),
+            ("codex", codex_output, {"input_tokens": 100, "cached_input_tokens": 60,
+                                     "prompt_tokens_details": {"cached_tokens": 45}}),
+        ]
+        for kind, make, usage in cases:
+            with self.subTest(kind=kind, usage=usage):
+                self.error("invalid_usage", backend.parse_output, kind, make(usage=usage))
+        valid = {"input_tokens": 100, "cached_input_tokens": 60, "prompt_tokens": 100,
+                 "prompt_tokens_details": {"cached_tokens": 60}}
+        self.assertEqual(backend.parse_output("codex", codex_output(usage=valid))[2],
+                         {"input_tokens": 40, "cache_read_input_tokens": 60})
+        split = {"ephemeral_1h_input_tokens": 10, "ephemeral_5m_input_tokens": 0}
+        self.assertEqual(backend.parse_output("codex", codex_output(usage={**valid, "cache_creation": split}))[2],
+                         {"input_tokens": 30, "cache_read_input_tokens": 60, "cache_creation_input_tokens": 10})
+        for partial in ({"ephemeral_1h_input_tokens": 10}, {"ephemeral_1h_input_tokens": 0}, {}):
+            with self.subTest(partial=partial):
+                self.assertEqual(backend.parse_output("codex", codex_output(usage={**valid, "cache_creation": partial}))[2],
+                                 {"cache_read_input_tokens": 60})
+        optional = {"input_tokens": 5, "cache_read_input_tokens": None, "cache_creation_input_tokens": 0}
+        self.assertEqual(backend.parse_output("claude", claude_output(usage=optional))[2],
+                         {"input_tokens": 5, "cache_creation_input_tokens": 0})
+        incomplete = {"cache_creation_input_tokens": 6, "cache_creation": {"ephemeral_1h_input_tokens": 2}}
+        self.assertEqual(backend.parse_output("claude", claude_output(usage=incomplete))[2],
+                         {"cache_creation_input_tokens": 6})
+
+    def test_codex_cache_counts_use_disjoint_messages_buckets(self):
+        for native, expected in (
+            ({"input_tokens": 100, "cached_input_tokens": 60, "cache_write_input_tokens": 10},
+             {"input_tokens": 30, "cache_read_input_tokens": 60, "cache_creation_input_tokens": 10}),
+            ({"input_tokens": 5, "cached_input_tokens": 0}, {"input_tokens": 5, "cache_read_input_tokens": 0}),
+            ({"cached_input_tokens": 3}, {"cache_read_input_tokens": 3}),
+            ({"input_tokens": 5}, {"input_tokens": 5}),
+        ):
+            with self.subTest(native=native):
+                self.assertEqual(backend.parse_output("codex", codex_output(usage=native))[2], expected)
+        for invalid in ({"cached_input_tokens": True}, {"cache_write_input_tokens": -1},
+                        {"input_tokens": 5, "cached_input_tokens": 3, "cache_write_input_tokens": 3},
+                        {"cached_input_tokens": 2, "cache_read_input_tokens": 1}):
+            self.error("invalid_usage", backend.parse_output, "codex", codex_output(usage=invalid))
 
     def test_codex_requires_terminal_success_and_rejects_native_execution(self):
         value, model, usage = backend.parse_output("codex", codex_output(model="gpt-test", usage={"input_tokens": 2, "output_tokens": 3}))

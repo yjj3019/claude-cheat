@@ -147,7 +147,14 @@ def request_prompt(body):
     if pending:
         raise BackendError("unsupported_request")
     try:
-        serialized = json.dumps(body, ensure_ascii=False, allow_nan=False)
+        # Keep the model, tools and system ahead of growing history for native CLI prefix caches.
+        # Only reorder the envelope. Tool schemas, content blocks and conversation order are preserved.
+        envelope = {key: body[key] for key in ("model", "tools", "system") if key in body}
+        for key in sorted(body, key=str):
+            if key != "messages" and key not in envelope:
+                envelope[key] = body[key]
+        envelope["messages"] = body["messages"]
+        serialized = json.dumps(envelope, ensure_ascii=False, allow_nan=False)
     except (TypeError, ValueError, RecursionError):
         raise BackendError("unsupported_request") from None
     # Preserve roles, tool IDs, system instructions and full tool definitions; never truncate context.
@@ -192,15 +199,89 @@ def validate_reply(value, body):
     return blocks
 
 
-def _reported(result):
-    usage = result.get("usage")
-    if usage is None:
-        usage = {}
-    fields = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
-    if not isinstance(usage, dict) or any(key in usage and (type(usage[key]) is not int or not 0 <= usage[key] <= MAX_TOKENS)
-                                          for key in fields):
+def _valid_token_count(value):
+    return type(value) is int and 0 <= value <= MAX_TOKENS
+
+
+def _normalize_cache_usage(native, counts, inclusive_input):
+    """Check native evidence before exposing only the normalized Messages counters."""
+    read = counts.get("cache_read_input_tokens")
+    write = counts.get("cache_creation_input_tokens")
+    split = native.get("cache_creation")
+    if read is None and write is None and split is None:
+        return
+    if split is not None and not isinstance(split, dict):
         raise BackendError("invalid_usage")
-    usage = {key: usage[key] for key in fields if key in usage}
+    split = split or {}
+    short, long = split.get("ephemeral_5m_input_tokens"), split.get("ephemeral_1h_input_tokens")
+    if any(n is not None and not _valid_token_count(n) for n in (short, long)):
+        raise BackendError("invalid_usage")
+    subtotal = (short or 0) + (long or 0)
+    complete_split = short is not None and long is not None and len(split) == 2
+    if write is not None and (subtotal > write or (complete_split and subtotal != write)):
+        raise BackendError("invalid_usage")
+
+    details = native.get("prompt_tokens_details")
+    if details is not None and not isinstance(details, dict):
+        raise BackendError("invalid_usage")
+    cached = (details or {}).get("cached_tokens")
+    if cached is not None and (not _valid_token_count(cached) or (read is not None and read != cached)):
+        raise BackendError("invalid_usage")
+    # Codex supplies an inclusive input total. Subtract only after checking the native
+    # evidence; a partial write breakdown cannot determine fresh input, even if its known part is zero.
+    if inclusive_input is not None:
+        if read is None and cached is not None:
+            counts["cache_read_input_tokens"] = read = cached
+        if write is None and complete_split:
+            counts["cache_creation_input_tokens"] = write = subtotal
+        reused_or_written = (read or 0) + (write if write is not None else subtotal)
+        if reused_or_written > inclusive_input:
+            raise BackendError("invalid_usage")
+        if write is None and native.get("cache_creation") is not None:
+            del counts["input_tokens"]
+        else:
+            counts["input_tokens"] = inclusive_input - reused_or_written
+
+    total = native.get("prompt_tokens")
+    if total is None:
+        return
+    fresh = counts.get("input_tokens")
+    known_read = read if read is not None else cached
+    known = (fresh or 0) + (known_read or 0) + (write if write is not None else subtotal)
+    complete = fresh is not None and known_read is not None and (write is not None or complete_split)
+    if (not _valid_token_count(total) or known > total or (complete and known != total)
+            or (inclusive_input is not None and inclusive_input != total)):
+        raise BackendError("invalid_usage")
+
+
+def _reported(result, *, codex=False):
+    native = result.get("usage")
+    if native is None:
+        native = {}
+    if not isinstance(native, dict):
+        raise BackendError("invalid_usage")
+    fields = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+    if codex:
+        fields += ("cached_input_tokens", "cache_write_input_tokens")
+    usage = {}
+    for key in fields:
+        if key not in native or (native[key] is None and key not in ("input_tokens", "output_tokens")):
+            continue
+        if not _valid_token_count(native[key]):
+            raise BackendError("invalid_usage")
+        usage[key] = native[key]
+
+    inclusive_input = None
+    if codex and ("cached_input_tokens" in usage or "cache_write_input_tokens" in usage):
+        # Codex input includes cache reads/writes; Messages reports disjoint buckets.
+        for source, target in (("cached_input_tokens", "cache_read_input_tokens"),
+                               ("cache_write_input_tokens", "cache_creation_input_tokens")):
+            if source in usage:
+                if target in usage and usage[target] != usage[source]:
+                    raise BackendError("invalid_usage")
+                usage[target] = usage.pop(source)
+        inclusive_input = usage.get("input_tokens")
+    _normalize_cache_usage(native, usage, inclusive_input)
     models = result.get("modelUsage") or {}
     model = result.get("model")
     if not model and isinstance(models, dict) and len(models) == 1:
@@ -275,7 +356,7 @@ def parse_output(kind, text):
                 or not messages or not isinstance(messages[-1].get("text"), str)):
             raise BackendError("incomplete_response")
         value = _json(messages[-1]["text"])
-        model, usage = _reported(complete[0])
+        model, usage = _reported(complete[0], codex=True)
         return value, model, usage
     if kind != "claude":
         raise BackendError("backend_version_unverified")

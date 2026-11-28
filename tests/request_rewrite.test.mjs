@@ -187,6 +187,62 @@ test('provider failures keep tool ids untouched and never send a Plan fallback',
   });
 
 const FOOTER = '<total_tokens>1234 tokens left</total_tokens>';
+
+test('Local automatic prompt caching is independent of OpenRouter and CLI', async t => {
+  const localUrl = 'http://127.0.0.1:11434/v1/messages';
+  const body = {model: MODEL, max_tokens: 32, messages: [{role: 'user', content: 'fixture'}]};
+  const respond = call => Response.json(message(call.parsed.model));
+  const local = await startProxy(t, {provider: 'local', localModel: 'fixture', localUrl, localPromptCache: true, respond});
+  await (await local.send(body)).text();
+  assert.equal(local.calls[0].url, localUrl);
+  assert.deepEqual(local.calls[0].parsed.cache_control, {type: 'ephemeral'});
+  const system = [{type: 'text', text: 'shared', cache_control: {type: 'ephemeral', ttl: '1h'}}];
+  await (await local.send({...body, system})).text();
+  assert.equal(local.calls[1].parsed.cache_control, undefined);
+  assert.deepEqual(local.calls[1].parsed.system[0], system[0]);
+  for (const config of [
+    {provider: 'openrouter', openrouterModel: 'anthropic/claude-sonnet-4.5', openrouterPromptCache: false},
+    {provider: 'cli', cliKind: 'codex', localUrl, localKey: 'synthetic', localModel: 'cli/codex'},
+  ]) {
+    const proxy = await startProxy(t, {...config, localPromptCache: true, respond});
+    const reply = await proxy.send(body);
+    assert.equal(reply.status, 200);
+    await reply.text();
+    assert.equal(proxy.calls[0].parsed.cache_control, undefined);
+  }
+});
+
+test('OpenRouter Claude requests opt in to automatic caching only without client directives', async t => {
+  const model = 'anthropic/claude-sonnet-4.5';
+  const body = {model: MODEL, max_tokens: 32, messages: [{role: 'user', content: 'fixture'}]};
+  const directive = {type: 'ephemeral', ttl: '1h'};
+  const respond = call => Response.json(message(call.parsed.model));
+  const proxy = await startProxy(t, {openrouterModel: model, openrouterPromptCache: true, respond});
+  for (const extra of [
+    {}, {cache_control: directive},
+    {system: [{type: 'text', text: 'fixture', cache_control: directive}]},
+    {tools: [{name: 'Read', input_schema: {type: 'object'}, cache_control: directive}]},
+    {messages: [{role: 'user', content: [{type: 'text', text: 'fixture', cache_control: directive}]}]},
+  ]) {
+    const reply = await proxy.send({...body, ...extra});
+    assert.equal(reply.status, 200);
+    await reply.text();
+    const call = proxy.calls.at(-1);
+    assert.equal(call.url, EXTERNAL);
+    assert.deepEqual(call.parsed.cache_control, Object.keys(extra).length ? extra.cache_control : {type: 'ephemeral'});
+  }
+  for (const config of [
+    {openrouterModel: model, openrouterPromptCache: false},
+    {openrouterModel: 'other/model', openrouterPromptCache: true},
+    {provider: 'local', localModel: model, localUrl: 'http://127.0.0.1:11434/v1/messages', openrouterPromptCache: true},
+  ]) {
+    const other = await startProxy(t, {...config, respond});
+    const reply = await other.send(body);
+    assert.equal(reply.status, 200);
+    await reply.text();
+    assert.equal(other.calls[0].parsed.cache_control, undefined);
+  }
+});
 const withoutHostGuidance = system => typeof system === 'string'
   ? system.slice(0, system.lastIndexOf('\n\nHost tool access:'))
   : system.slice(0, -1);
@@ -259,6 +315,9 @@ test('the stabilizer leaves non-matching and fenced footers byte-identically unt
     const disabled = await startProxy(t);
     const cases = [
       `Intro ${FOOTER} then more`,
+      `Literal instruction: ${FOOTER}`,
+      `~~~text\n${FOOTER}`,
+      '````\n```\n' + FOOTER,
       `\`\`\`\n${FOOTER}`,
       `${FOOTER}\n`,
       'no footer here',
@@ -305,3 +364,57 @@ test('the last system text block is peeled with its cache marker intact',
     assert.equal(captured[1].text, 'tracked\n');
     assert.deepEqual(captured[1].cache_control, { type: 'ephemeral' });
   });
+
+test('cache-enabled requests preserve reusable prefixes and never reuse a stale response', async t => {
+  for (const config of [
+    {provider: 'local', localModel: 'fixture', localUrl: 'http://127.0.0.1:11434/v1/messages', localPromptCache: true},
+    {openrouterModel: 'anthropic/claude-sonnet-4.5', openrouterPromptCache: true},
+  ]) {
+    let calls = 0;
+    const prefixes = new Set();
+    const respond = ({parsed}) => {
+      calls++;
+      const prefix = JSON.stringify([parsed.model, parsed.tools, parsed.system]);
+      const hit = prefixes.has(prefix);
+      prefixes.add(prefix);
+      const reply = message(parsed.model);
+      reply.content[0].text = parsed.messages.at(-1).content;
+      reply.usage.cache_read_input_tokens = hit ? 80 : 0;
+      return Response.json(reply);
+    };
+    const proxy = await startProxy(t, {...config, respond});
+    for (let round = 0; round < 10; round++) {
+      for (let turn = 0; turn < 4; turn++) {
+        const prompt = 'turn-' + round + '-' + turn;
+        const revision = Math.floor(turn / 2);
+        const tools = [{name: 'Read', description: 'tool-' + (round % 2 ? revision : 0), input_schema: {type: 'object'}}];
+        const system = 'instructions-' + round + '-' + (round % 2 ? 0 : revision) +
+          '\n<total_tokens>' + turn + ' tokens left</total_tokens>';
+        const r = await proxy.send({model: MODEL, max_tokens: 32, system, tools, messages: [{role: 'user', content: prompt}]});
+        assert.equal(r.status, 200);
+        const reply = await r.json();
+        assert.equal(reply.content[0].text, prompt);
+        assert.deepEqual(proxy.calls.at(-1).parsed.cache_control, {type: 'ephemeral'});
+        assert.equal(reply.usage.cache_read_input_tokens, turn % 2 ? 80 : 0);
+      }
+    }
+    assert.equal(calls, 40);
+  }
+});
+
+test('an explicit stabilization override preserves the full prefix and footer-only cache blocks stay valid', async t => {
+  const config = {openrouterModel: 'anthropic/claude-sonnet-4.5', openrouterPromptCache: true,
+    respond: ({parsed}) => Response.json(message(parsed.model))};
+  const body = {model: MODEL, max_tokens: 32, messages: [{role: 'user', content: 'fixture'}]};
+  const system = [{type: 'text', text: FOOTER, cache_control: {type: 'ephemeral', ttl: '1h'}}];
+  const preserved = await startProxy(t, {...config, stabilizePromptCache: false});
+  await (await preserved.send({...body, system})).text();
+  assert.deepEqual(preserved.calls[0].parsed.system[0], system[0]);
+  const stable = await startProxy(t, {...config, stabilizePromptCache: true});
+  await (await stable.send({...body, system})).text();
+  const block = stable.calls[0].parsed.system[0];
+  assert.ok(block.text.trim());
+  assert.ok(!block.text.includes(FOOTER));
+  assert.deepEqual(block.cache_control, system[0].cache_control);
+  assert.equal(stable.calls[0].parsed.cache_control, undefined);
+});

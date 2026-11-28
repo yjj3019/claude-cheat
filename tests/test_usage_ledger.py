@@ -530,6 +530,19 @@ class UsageLedgerTests(unittest.TestCase):
         rows = self.ledger.report("day", self.now)["rows"]
         self.assertEqual(rows[0]["cache_read_tokens"], 400)
 
+    def test_cache_sample_counts_distinguish_zero_missing_and_partial_reports(self):
+        common = {"provider": "local", "reported_model": "fixture"}
+        self.ledger.ingest(self.session, [
+            self.event(1, **common, schema_version=2),
+            self.event(2, **common, schema_version=3, cache_read_tokens=0, cache_creation_tokens=None),
+            self.event(3, **common, schema_version=3, cache_read_tokens=40, cache_creation_tokens=0),
+        ])
+        for period in ("day", "week", "month"):
+            row, = self.ledger.report(period, self.now)["rows"]
+            self.assertEqual(row["requests"], 3)
+            self.assertEqual((row["cache_read_tokens"], row["cache_read_samples"]), (40, 2))
+            self.assertEqual((row["cache_creation_tokens"], row["cache_creation_samples"]), (0, 1))
+
 
 if __name__ == "__main__":
     unittest.main()

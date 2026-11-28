@@ -32,7 +32,7 @@ async function instance(fallback, stream = false) {
   await mkdir(directory, { recursive: true });
   const events = join(directory, 'events.jsonl');
   const config = bridge
-    ? { provider: 'cli', localModel: 'cli/grok', cliKind: 'grok', localKey: bridge.token, localUrl: bridge.url }
+    ? { provider: 'cli', localModel: 'cli/' + (bridge.kind ?? 'grok'), cliKind: bridge.kind ?? 'grok', localKey: bridge.token, localUrl: bridge.url }
     : { provider: (stream || fallback) ? 'openrouter' : 'local', localModel: model, localUrl: 'http://127.0.0.1:11434/v1/messages' };
   const server = createProxy({ ...config, nonce: 'test-nonce',
     key: 'sk-or-fixture', openrouterModel: model, streamPassthrough: stream,
@@ -104,6 +104,28 @@ try {
 
 @unittest.skipUnless(shutil.which("node"), "node is required")
 class UsageEndToEndTests(unittest.TestCase):
+    def test_codex_cached_input_reaches_proxy_and_ledger_once(self):
+        reply = json.dumps({"text": "fixture", "tool_calls": []})
+        events = [
+            {"type": "item.completed", "item": {"type": "agent_message", "text": reply}},
+            {"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 4,
+                                                "cached_input_tokens": 60, "cache_write_input_tokens": 10}},
+        ]
+        with tempfile.TemporaryDirectory() as temp, patch.multiple(
+                cliBackend.routeCli, find_binary=lambda *_: {"path": "fixture"}, resolve_command=lambda _: ["fixture"],
+                probe_version=lambda *_: {"ok": True, "version": "0.167.0"}), patch.object(
+                cliBackend, "_run", return_value="\n".join(json.dumps(e) for e in events)), \
+                cliBackend.serve({"CLI_KIND": "codex"}) as (_, url, token):
+            fixture = {"url": url, "token": token, "kind": "codex", "usage": {"input_tokens": 30, "output_tokens": 4}}
+            subprocess.run(["node", "--input-type=module", "-e", NODE_FIXTURE, temp, "cli"],
+                           cwd=Path(__file__).resolve().parent.parent, input=json.dumps(fixture),
+                           capture_output=True, text=True, check=True, timeout=30)
+            ledger = UsageLedger(temp)
+            self.assertEqual(ledger.collect()["events_inserted"], 1)
+            row, = ledger.report("day")["rows"]
+            self.assertEqual((row["input_tokens"], row["cache_read_tokens"], row["cache_creation_tokens"],
+                              row["output_tokens"]), (30, 60, 10, 4))
+
     def test_long_grok_prompt_from_bridge_through_proxy_to_usage_ledger(self):
         root_dir = Path(__file__).resolve().parent.parent
         with tempfile.TemporaryDirectory() as temp:
@@ -137,12 +159,13 @@ print(json.dumps({'stopReason': 'end_turn', 'model': 'fixture-native',
                     ("complete", {"input_tokens": 0, "output_tokens": 9}),
                     ("maximum", {"input_tokens": 2**31 - 1, "output_tokens": 3}),
                     ("overflow", {"input_tokens": 2**31, "output_tokens": 3}),
+                    ("contradicted_cache", {"input_tokens": 5, "output_tokens": 3, "cache_read_input_tokens": 40, "prompt_tokens": 44}),
                 ):
                     with self.subTest(case=name):
                         fake.with_suffix(".json").write_text(json.dumps(usage), encoding="utf-8")
                         workspace = Path(temp) / name
                         bridge = {"url": url, "token": token, "usage": usage}
-                        if name == "overflow":
+                        if name in ("overflow", "contradicted_cache"):
                             bridge["expectedError"] = "invalid_usage"
                         result = subprocess.run(["node", "--input-type=module", "-e", NODE_FIXTURE, str(workspace), "cli"],
                                                 input=json.dumps(bridge), cwd=root_dir,
@@ -151,7 +174,7 @@ print(json.dumps({'stopReason': 'end_turn', 'model': 'fixture-native',
                         ledger = UsageLedger(workspace)
                         self.assertEqual(ledger.collect()["events_inserted"], 1)
                         row, = ledger.report("day")["rows"]
-                        if name == "overflow":
+                        if name in ("overflow", "contradicted_cache"):
                             self.assertEqual((row["ok"], row["input_samples"], row["output_samples"]), (0, 0, 0))
                             self.assertIsNone(row["input_tokens"])
                             self.assertIsNone(row["output_tokens"])
